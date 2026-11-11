@@ -4,8 +4,26 @@ import path from "node:path";
 import sharp from "sharp";
 import { describe, expect, it } from "vitest";
 import { BundledPluginStore } from "../src/daemon/bundled-plugins.js";
+import { PluginSettingsStore } from "../src/daemon/plugin-settings.js";
+import { workflowGuideTools } from "../src/daemon/workflow-guide.js";
 
 describe("bundled plugins", () => {
+  it("delivers the complete controlled Blender guide and reference while respecting disabled skills", async () => {
+    const store = new BundledPluginStore(path.resolve("plugins"));
+    await store.load();
+    const settings = new PluginSettingsStore(await temporaryTestDirectory("ohmygame-blender-guide-"));
+    await settings.load();
+    const tool = workflowGuideTools("web-game", store, settings)[0]!;
+    const read = (reference?: string) => tool.execute("guide", { guide: "blender-assets", reference }, undefined, undefined, {} as never);
+    const guide = JSON.stringify((await read()).content);
+    expect(guide).toContain("## Deliver to the game");
+    expect(guide).toContain("recover_blender_run");
+    expect(JSON.stringify((await read("pipeline.md")).content)).toContain("contactPoint");
+    await expect(read("../scripts/pipeline.py")).rejects.toThrow();
+    await settings.update(store.read("ohmygame:blender")!, { enabled: false, components: {} });
+    await expect(read()).rejects.toThrow("unavailable");
+  });
+
   it("loads beta plugins with their native skills and connections", async () => {
     const store = new BundledPluginStore(path.resolve("plugins"));
     await store.load();

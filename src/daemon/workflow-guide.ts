@@ -42,9 +42,7 @@ export function workflowGuideTools(type: ProjectType, store: BundledPluginStore,
       const source = reference ? path.join(path.dirname(entry.skillId), "references", reference) : entry.skillId;
       const file = await readSafeProjectFile(entry.root, path.join(entry.root, source), 64 * 1024);
       const content = file.toString("utf8");
-      // The external Blender CLI directions belong to editions that can actually launch Blender.
-      const text = guide === "blender-assets" && !reference ? content.split("\n## Run Blender\n")[0]! : content;
-      return { content: [{ type: "text", text }], details: { guide, source } };
+      return { content: [{ type: "text", text: content }], details: { guide, source } };
     },
   })];
 }

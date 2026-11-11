@@ -897,6 +897,9 @@ function toolPresentation(item: Extract<ThreadItem, { type: "dynamicToolCall" | 
     case "web_search": return { icon: Search, label: searchLabel("searchingWeb", values) };
     case "game_use": return { icon: Gamepad2, label: playtestLabel(values, false) };
     case "prepare_three_runtime": return { icon: Wrench, label: t("timeline.preparingThree") };
+    case "blender_status": return { icon: Wrench, label: t("timeline.checkingBlender") };
+    case "run_blender": return { icon: Wrench, label: t("timeline.runningBlender") };
+    case "recover_blender_run": return { icon: Wrench, label: t("timeline.recoveringBlender") };
     case "list_media_capabilities": return { icon: Search, label: t("timeline.checkingMediaModels") };
     case "list_animation_actions": return { icon: Search, label: t("timeline.checkingAnimationActions") };
     case "recover_media":
@@ -926,6 +929,9 @@ function completedToolPresentation(item: Extract<ThreadItem, { type: "dynamicToo
     case "web_search": return { icon: Search, label: searchLabel("searchedWeb", values) };
     case "game_use": return { icon: Gamepad2, label: playtestLabel(values, true) };
     case "prepare_three_runtime": return { icon: Wrench, label: t("timeline.preparedThree") };
+    case "blender_status": return { icon: Wrench, label: t("timeline.checkedBlender") };
+    case "run_blender": return { icon: Wrench, label: t("timeline.ranBlender") };
+    case "recover_blender_run": return { icon: Wrench, label: t("timeline.recoveredBlender") };
     case "list_media_capabilities": return { icon: Search, label: t("timeline.checkedMediaModels") };
     case "list_animation_actions": return { icon: Search, label: t("timeline.checkedAnimationActions") };
     case "recover_media":

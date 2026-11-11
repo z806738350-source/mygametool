@@ -25,7 +25,7 @@ import { inspectSafeProjectMedia, readSafeProjectFile } from "./safe-project-fil
 import { imageDigest, prepareWorkingImage, retainImageOriginal, retainImagePreparation, replaceWorkingImages, serializeWorkingImages, withLocalImageRecovery } from "./image-working-assets.js";
 import { assertLocalImagePublicationsSettled, reserveDerivedMediaSpace, type DerivedMediaSpaceReservation, type LocalImageRecoveryAnchor } from "./recovery-space.js";
 import { localAgentPath } from "./agent-local-files.js";
-import { inspectProjectSourceBudget, mediaHeaderMatches, withCheckedFileStream, type ProjectSourceProfile } from "./isolated-project-files.js";
+import { blenderAuthoringPath, inspectProjectSourceBudget, mediaHeaderMatches, withCheckedFileStream, type ProjectSourceProfile } from "./isolated-project-files.js";
 import { runtimeMediaFileLimit } from "../shared/execution-capacity-profiles.js";
 import { knownSensitiveValueRevision } from "../shared/sensitive-values.js";
 import { inheritToolPreflightFailure, toolPreflightError } from "./agent-tool-errors.js";
@@ -739,7 +739,7 @@ export class ProjectManager {
       };
       const stalePaths: string[] = [];
       for (const [assetPath, linkedId] of Object.entries(metadata.libraryAssets)) {
-        if (linkedId !== assetId || isCanvasMediaPath(assetPath) !== candidate) continue;
+        if (linkedId !== assetId || isCanvasMediaPath(assetPath) !== candidate || blenderAuthoringPath(assetPath)) continue;
         try {
           await getWorkspaceMedia(project.workspacePath, assetPath);
           return await finish(assetPath);

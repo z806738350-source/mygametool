@@ -585,7 +585,15 @@ export interface PublicPackage {
   data: string;
 }
 
+// Editable Blender runs stay in project archives/checkpoints. Only Library runtime
+// copies enter the game VM; excluding this exact source namespace grants no transfer.
+export function blenderAuthoringPath(value: string): boolean {
+  return /^assets\/blender\/[a-z0-9][a-z0-9-]{0,63}\/runs\/[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}(?:\/|$)/i.test(value);
+}
+
 export function transferPath(value: string): void {
+  if (blenderAuthoringPath(value))
+    throw new Error("Blender authoring files cannot enter isolated execution. Use get_model_asset and its returned runtimePath in the game.");
   if (
     !value ||
     value.length > 1000 ||
@@ -799,6 +807,7 @@ async function inspectBudget(
         continue;
       const relative = prefix + item.name;
       if (isPrivateProjectPath(relative)) continue;
+      if (item.isDirectory() && blenderAuthoringPath(relative)) continue;
       transferPath(relative);
       if (ignored?.has(relative)) continue;
       const stat = await lstat(path.join(directory, item.name));
@@ -975,6 +984,7 @@ export async function projectFiles(
         continue;
       const relative = prefix + item.name;
       if (isPrivateProjectPath(relative)) continue;
+      if (item.isDirectory() && blenderAuthoringPath(relative)) continue;
       transferPath(relative);
       if (ignored?.has(relative)) continue;
       if (item.isSymbolicLink())

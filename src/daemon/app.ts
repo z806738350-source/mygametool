@@ -124,6 +124,8 @@ import { MinimaxSettingsStore } from "./minimax-settings.js";
 import { BundledPluginAdapter, LocalPluginAdapter, PluginCatalogService, pluginSummary } from "./plugin-catalog.js";
 import { BundledPluginStore } from "./bundled-plugins.js";
 import { workflowGuideTools } from "./workflow-guide.js";
+import { BlenderRunner } from "./blender-runner.js";
+import { BlenderWorkflow } from "./blender-tools.js";
 import { LocalPluginError, LocalPluginStore } from "./local-plugins.js";
 import { inspectPluginSource, installPlugin } from "./plugin-installer.js";
 import { InvalidPluginSettingsError, PluginSettingsStore } from "./plugin-settings.js";
@@ -1110,6 +1112,32 @@ export function createApp(options: AppOptions = {}) {
     await options.projectExecution?.assertSourceReviewSettled?.(project);
     return operation();
   });
+  const blenderWorkflows = new Map<string, BlenderWorkflow>();
+  const blenderTools = (project: ProjectState) => {
+    const key = `${project.id}:${project.workspacePath}`;
+    let workflow = blenderWorkflows.get(key);
+    if (!workflow) {
+      const privateRoot = path.join(dataDirectory, "blender-jobs", project.id);
+      workflow = new BlenderWorkflow({
+        workspace: project.workspacePath, privateRoot,
+        bundledScriptsDirectory: path.join(options.bundledPluginsDirectory ?? path.join(repositoryRoot, "plugins"), "blender", "skills", "blender-assets", "scripts"),
+        runner: new BlenderRunner(privateRoot),
+        enabled: () => {
+          const bundled = bundledPlugins.read("ohmygame:blender");
+          const plugin = bundled && pluginSettings.decorate(bundled);
+          return !!plugin?.enabled && !!plugin.projectTypes?.includes(project.type) && plugin.skills.some(skill => skill.id === "skills/blender-assets/SKILL.md" && skill.enabled);
+        },
+        mutate: operation => mutateWorkspace(project, async () => {
+          projectLifecycle.assertAvailable(project.id);
+          return operation();
+        }),
+        bindModel: filename => projects.ensureLibraryAsset(project.id, filename),
+        touch: () => projects.touch(project.id),
+      });
+      blenderWorkflows.set(key, workflow);
+    }
+    return workflow.tools();
+  };
   /** OhMyGame's own tools for a conversation, the same for Pi and for a coding agent. */
   const projectAgentTools = (project: ProjectState, conversation: StoredConversation, fileTools: ToolDefinition[] = []) => {
     const playtestKey = `${project.id}:${conversation.summary.id}`;
@@ -1118,7 +1146,7 @@ export function createApp(options: AppOptions = {}) {
       playtest = new OwnedPlaytestDriver(options.playtestDriver);
       agentPlaytests.set(playtestKey, playtest);
     }
-    return [...fileTools, ...workflowGuideTools(project.type, bundledPlugins, pluginSettings), createProjectMediaCapabilitiesTool(() => projects.get(project.id), {
+    return [...fileTools, ...workflowGuideTools(project.type, bundledPlugins, pluginSettings), ...blenderTools(project), createProjectMediaCapabilitiesTool(() => projects.get(project.id), {
       images: providerImages, videos: providerVideos, models3D: providerModels3D, audio: providerAudio, defaultModel: mediaDefaultModel,
     }), ...(options.projectExecution && project.workspaceLocation !== "external" ? [createIsolatedShellTool(async (command, timeout, signal) => {
       signal?.throwIfAborted();
@@ -1221,7 +1249,7 @@ export function createApp(options: AppOptions = {}) {
       const execute = (tool as ToolDefinition).execute;
       const assertAllowed = async () => {
         await assertSourcePublicationSettled(project.workspacePath);
-        if (!["read", "read_project_file", "ls", "find", "grep", "read_attachment", "recall_image", "read_workflow_guide", "list_media_capabilities", "canvas_check", "playable_check", "questionnaire", "update_plan"].includes(tool.name))
+        if (!["read", "read_project_file", "ls", "find", "grep", "read_attachment", "recall_image", "read_workflow_guide", "blender_status", "list_media_capabilities", "canvas_check", "playable_check", "questionnaire", "update_plan"].includes(tool.name))
           await options.projectExecution?.assertSourceReviewSettled?.(project);
       };
       const recover = (tool as ToolDefinition & { recoverAfterHttp500?: ToolDefinition["execute"] }).recoverAfterHttp500;

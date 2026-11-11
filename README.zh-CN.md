@@ -6,6 +6,8 @@
 > 受控公共 npm 安装、构建及动态 Web 预览已在专用启动项存储及登记的 VM 测试存储中验收；
 > 其他项目存储仍关闭执行。详见[本地安全策略](docs/local-security.md)。
 > 本地启动项说明和剩余检查见[人工验收记录](docs/manual-acceptance.md)。
+> 受控本地 Blender 工作流串联主 Agent、可选的 Tripo 初模，以及分阶段建模、绑骨和动画制作。
+> 入口与验收方式见 [3D 工作流](docs/3d-providers.md#controlled-local-blender-workflow)。
 > 下方功能与首次运行介绍保留的是**上游框架能力**，不代表本版所有流程可用。
 > 上游下载按钮和发行版**不包含**这些本地修改。版权与上游参考链接继续保留。
 

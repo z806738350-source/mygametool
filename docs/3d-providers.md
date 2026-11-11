@@ -37,6 +37,85 @@ not the local enabled-service list. Its Meshy column is historical only.
 | Action library | Live numeric IDs and previews | Bundled identifiers scoped to rig version/type | — |
 | Own-key balance | Balance | Available and frozen credits | Remaining credits |
 
+## Controlled local Blender workflow
+
+The main Agent can orchestrate local Blender without buying Tripo rigging or
+animation. Tripo remains an optional initial-mesh provider; the Agent writes and
+revises scripts and parameters, Blender executes them, and the user reviews shape,
+joints, deformation and motion. Existing paid-task recovery is unchanged.
+
+Enable the bundled **Blender** workflow for the project, then ask the main Agent to
+use the Blender workflow for the desired asset. The Agent reads `blender-assets`
+and checks `blender_status`. The current runner supports the local macOS install
+at `/Applications/Blender.app`; unavailable platforms/installations fail closed.
+It does not install Blender, invoke Blender MCP, enable host shell, or inherit
+Blender user preferences. The same controlled tools serve the built-in main Agent
+and the optional controlled coding-agent connections.
+
+| Tool | Purpose |
+| --- | --- |
+| `blender_status` | Inspect local executable and controlled execution availability; no model submission. |
+| `run_blender` | Run a bundled stage or a project Python script against explicitly listed input snapshots. |
+| `recover_blender_run` | Recover a saved local run by `runId`; never rerun Blender or a paid provider. |
+
+Use a stable `workflow` slug and a new run for every revision. The stages are
+`parts`, `clean`, `joints`, `rig`, `animate`, `export`, and `custom`. The bundled
+[Blender guide](../plugins/blender/skills/blender-assets/SKILL.md) and its
+[pipeline reference](../plugins/blender/skills/blender-assets/references/pipeline.md)
+define configuration examples, coordinates, joint/region rules and supported motion.
+The guide is available inside the app through `read_workflow_guide`.
+
+- **Hard surfaces:** approve a dimensioned `parts.json`, construct individual
+  pieces in Blender, review proportions and assembly, and export. Fully specified
+  procedural objects do not need Tripo or paid multi-view generation.
+- **Organic shapes:** approve consistent reference views, generate or reuse a
+  Tripo GLB, and review its silhouette before cleanup. Prefer a clear A-pose with
+  limbs separated; preserve a requested T-pose. Weapons stay separate from hands.
+  Normalize the source, review explicit joints and region assignments, rig, inspect
+  stress poses, then author and review actions on that same skeleton.
+
+Every successful run publishes a new directory under
+`assets/blender/<workflow>/runs/<runId>/`. Keep the `.blend`, configuration/script
+snapshots, review images and reports with the runtime GLB. Prior runs and the
+original Tripo file are preserved. This exact authoring-run namespace is excluded from
+isolated game source transfer; use only the runtime path returned by `get_model_asset`
+in game code. Project archives and checkpoints retain the editable runs.
+Failures and interrupted delivery keep local
+run evidence; recover by the returned `runId` before deciding whether a corrected
+local run is needed. Unfinished outputs must not be called a finished asset.
+
+The bundled idle/walk implementation is a starting point for a specified humanoid
+skeleton. It cannot reliably infer all garments, separate fused hands or legs,
+automatically retopologize a bad mesh, or choose joints for arbitrary animals.
+The Agent can write a custom Blender script with explicit inputs for these cases;
+show unresolved regions instead of describing a generic automatic-weight pass as
+quality assurance. Numeric foot-contact, loop and weight checks do not establish
+natural movement or attractive deformation.
+
+Human reviews happen in the existing conversation/questionnaire: dimensions or
+references, initial shape, joints/regions, stress-pose deformation, then animation.
+The Agent presents concrete files and waits for the user's decision, retaining
+accepted decisions in the asset document. These are production review steps, not
+a claim that a script can certify visual quality.
+
+GLB is the primary project runtime format. Export verifies a clean reimport, then
+`get_model_asset` prepares the model through the existing inspected-resource path.
+Register the final asset on the Canvas, integrate it into the actual game and play
+every clip with the target engine. FBX is optional exchange output, and its existing
+static preview path does not validate skeletal animation. Report structural,
+visual, human and in-game checks separately.
+
+Local verification on 2026-11-11 used Blender 5.3.0: dimension-driven prop and
+explicit humanoid fixtures ran through the stages; editable sources, textures,
+geometry, bones, clips and sampled deformed motion were checked after export.
+The actual tool-to-Library-to-runtime path and interrupted-delivery recovery were
+exercised. Three.js 172 loaded the resulting humanoid, played both 1-second Idle
+and Walk clips, and passed pause/resume/switch checks without reported errors.
+These engineering fixtures do not establish the artistic quality of an arbitrary
+Tripo character. No paid Tripo or main-model request was submitted for these checks.
+
+For security and platform boundaries see [local security](local-security.md).
+
 ## Canvas and agent tools
 
 The **Model 3D** node has Image to 3D, Text to 3D, Retexture, and Remesh modes. Text

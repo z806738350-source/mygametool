@@ -143,6 +143,7 @@ const READ_ONLY = new Set([
   "grep",
   "recall_image",
   "read_workflow_guide",
+  "blender_status",
   "list_media_capabilities",
   "list_animation_actions",
   "canvas_check",
@@ -150,7 +151,7 @@ const READ_ONLY = new Set([
   "recover_media",
   "recover_canvas_media",
 ]);
-const REPAIR_READS = new Set(["read", "read_project_file", "read_attachment", "ls", "find", "grep", "recall_image", "read_workflow_guide", "list_media_capabilities", "list_animation_actions", "canvas_check", "playable_check"]);
+const REPAIR_READS = new Set(["read", "read_project_file", "read_attachment", "ls", "find", "grep", "recall_image", "read_workflow_guide", "blender_status", "list_media_capabilities", "list_animation_actions", "canvas_check", "playable_check"]);
 const REPAIR_ACTIONS = new Set(["inspect", "capacity", "plan_capacity", "plan_first_allocation", "inspect_capacity_migration", "review", "read_image", "prepare-review", "optimize", "adopt", "recover", "verify"]);
 const OBSERVATION_ACTIONS = new Set(["inspect", "capacity", "plan_capacity", "plan_first_allocation", "inspect_capacity_migration", "read_image"]);
 

@@ -57,6 +57,7 @@ def main():
             export_cameras=False,
             export_lights=False,
             export_apply=options.apply_modifiers,
+            export_anim_slide_to_zero=True,
         )
         if "FINISHED" not in result or not temporary.is_file():
             raise RuntimeError("Blender did not finish the GLB export")

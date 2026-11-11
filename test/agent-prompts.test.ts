@@ -29,6 +29,10 @@ describe("OhMyGame system prompt", () => {
       expect(text).toContain("before starting the next long-running step");
       expect(text).toContain("save the generation node on the Canvas before submitting");
       expect(text).toContain("read_workflow_guide");
+      expect(text).toContain("blender_status");
+      expect(text).toContain("recover_blender_run");
+      expect(text).toContain("Do not switch to paid provider rigging as a fallback");
+      expect(text).toContain("Never mark artistic acceptance from a numeric report");
       expect(text).toContain("recover_isolated_changes instead of rerunning the command");
       expect(text).toContain("action capacity and no other arguments");
       expect(text).toContain("stopped or incomplete guest capacity is unknown");

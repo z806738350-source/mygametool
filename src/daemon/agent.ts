@@ -3122,7 +3122,7 @@ function appendPlanState(sessionManager: CodingSession["sessionManager"], state:
 
 const BASE_TOOL_NAMES = ["read", "write", "edit", "ls", "find", "grep", "read_attachment", "recall_image"];
 const LOCAL_AGENT_TOOL_NAMES = new Set([
-  ...BASE_TOOL_NAMES, "read_workflow_guide", "questionnaire", "update_plan", "canvas_check", "canvas_initialize", "prepare_three_runtime", "list_media_capabilities",
+  ...BASE_TOOL_NAMES, "read_workflow_guide", "blender_status", "run_blender", "recover_blender_run", "questionnaire", "update_plan", "canvas_check", "canvas_initialize", "prepare_three_runtime", "list_media_capabilities",
   "isolated_shell", "recover_isolated_changes", "build_game", "playable_add_node", "playable_check", "game_use", "generate_canvas_media", "get_model_asset", "optimize_image_asset", "use_canvas_asset",
   "generate_image", "generate_reference_image", "generate_video", "generate_3d_asset", "generate_3d_from_views", "animate_3d_asset",
   "generate_speech", "generate_sound_effect", "generate_music", "recover_media", "recover_canvas_media", "replace_canvas_media",

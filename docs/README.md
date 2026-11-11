@@ -81,7 +81,7 @@ and how an import becomes a new project.
 | [external-agents.md](external-agents.md)         | OhMyGame as an MCP server for Claude Code, Codex, and other external agents: setup, launcher, tools, and contract.            |
 | [plugins.md](plugins.md)                         | Plugin packages, configuration, credentials, MCP sessions, authoring, and migration.                                           |
 | [custom-models.md](custom-models.md)             | Provider protocols, capabilities, visibility, model definitions, and defaults.                                                 |
-| [3d-providers.md](3d-providers.md)               | 3D operations, provider compatibility, paid-task recovery, and GLB validation.                                                 |
+| [3d-providers.md](3d-providers.md)               | Controlled local Blender modeling/rig/animation, provider compatibility, paid-task recovery, and GLB validation.                                                 |
 | [free-cloud-models.md](free-cloud-models.md)     | Upstream account/quota contract; these services are disabled in the local edition. |
 | [agent-errors.md](agent-errors.md)               | Error classification, diagnostics, redaction, and the Pi compatibility patch.                                                  |
 | [model-image-history.md](model-image-history.md) | Request image budgets, recall, OpenAI continuation, and file lifecycle.                                                        |

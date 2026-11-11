@@ -8,6 +8,8 @@
 > verified in the dedicated launcher store and registered VM test store; execution
 > remains disabled for other stores. See [local security policy](docs/local-security.md).
 > Local launcher instructions and remaining checks are in [manual acceptance notes](docs/manual-acceptance.md).
+> A controlled local Blender workflow connects the main Agent, optional Tripo initial models,
+> and staged model/rig/animation production. See [3D workflows](docs/3d-providers.md#controlled-local-blender-workflow).
 > The feature and first-run descriptions below document the **upstream framework**,
 > not a promise that every workflow is available in this edition. Upstream download
 > buttons and releases do **not** contain these local changes. Copyright and
