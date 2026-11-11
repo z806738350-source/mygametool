@@ -1133,6 +1133,15 @@ export function createApp(options: AppOptions = {}) {
         }),
         bindModel: filename => projects.ensureLibraryAsset(project.id, filename),
         touch: () => projects.touch(project.id),
+        presentReview: async review => {
+          const entries = [];
+          for (const [index, file] of review.files.entries()) entries.push({
+            nodeId: `blender-${review.runId}-${index}`,
+            assetId: await projects.ensureLibraryAsset(project.id, file),
+            title: `${review.workflow} · ${review.stage} · ${path.basename(file)}`,
+          });
+          return canvasStore.presentLocalAssets(project.id, entries, review.boardId);
+        },
       });
       blenderWorkflows.set(key, workflow);
     }

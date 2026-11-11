@@ -11,6 +11,7 @@ const flow = vi.hoisted(() => ({
   propsById: new Map<string, ReactFlowProps<Node, Edge>>(),
   minimap: undefined as MiniMapProps<Node> | undefined,
   width: 1000,
+  domNode: undefined as HTMLElement | undefined,
   initialized: false,
   fitView: vi.fn<() => Promise<boolean>>(),
   getViewport: vi.fn(() => ({ x: 80, y: 40, zoom: 0.4 })),
@@ -40,7 +41,7 @@ vi.mock("@xyflow/react", () => ({
   ViewportPortal: () => null,
   useNodesInitialized: () => flow.initialized,
   useStore: (selector: (state: object) => unknown) =>
-    selector({ width: flow.width, height: 700, transform: [0, 0, 1] }),
+    selector({ width: flow.width, height: 700, transform: [0, 0, 1], domNode: flow.domNode, minZoom: 0.1, maxZoom: 2 }),
   useViewport: () => ({ x: 0, y: 0, zoom: 1 }),
   useReactFlow: () => ({
     fitView: flow.fitView,
@@ -60,6 +61,7 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   flow.initialized = false;
   flow.width = 1000;
+  flow.domNode = undefined;
   flow.minimap = undefined;
   flow.propsById.clear();
   flow.setCenter.mockClear();
@@ -231,6 +233,23 @@ it("keeps existing scroll, pinch and drag behavior while wheel policy is under r
   expect(flow.props?.zoomOnScroll).toBe(false);
   expect(flow.props?.zoomOnPinch).toBe(true);
   expect(flow.props?.panOnDrag).toEqual([1, 2]);
+});
+
+it("leaves a model's pinch zoom to its viewer while retaining canvas pinch over scrolling text", async () => {
+  const content = <><div className="nowheel" data-testid="text-scroll" /><div className="model-preview-interactive nowheel"><span data-testid="model" /></div></>;
+  await render(false, nodes, vi.fn(), content);
+  flow.domNode = canvas();
+  await render(false, nodes, vi.fn(), content);
+  const pinch = (selector: string) => {
+    // happy-dom's WheelEvent does not inherit MouseEvent modifier fields.
+    const event = Object.assign(new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: -10 }), { ctrlKey: true, clientX: 50, clientY: 50 });
+    container.querySelector(selector)!.dispatchEvent(event);
+    return event;
+  };
+  expect(pinch('[data-testid="model"]').defaultPrevented).toBe(false);
+  expect(flow.setViewport).not.toHaveBeenCalled();
+  expect(pinch('[data-testid="text-scroll"]').defaultPrevented).toBe(true);
+  expect(flow.setViewport).toHaveBeenCalledOnce();
 });
 
 it("activates shortcuts by focusing the canvas, including main-keyboard and numpad keys", async () => {

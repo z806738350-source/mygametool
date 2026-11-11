@@ -1649,6 +1649,10 @@ const zhCN: typeof en = {
     submit: "提交答案",
   },
   agentError: {
+    tool_outcome_unconfirmed: {
+      title: "工具结果待确认",
+      message: "此前一次工具调用的结果尚未确认，自动继续已暂停。请让主 Agent 先检查或恢复原来的任务及已保留的文件，再继续工作。此次没有重复执行该操作。",
+    },
     repeated_media_arguments: {
       title: "已停止重复的无效素材调用",
       message: "主 Agent 连续两次传入相同的无效参数。两次均在本地校验时被拦截。展开最后一次工具调用可查看需要修正的字段。",
@@ -1748,6 +1752,7 @@ const zhCN: typeof en = {
       providerResponse: "服务商返回",
       streamDetails: "流式响应详情",
       localCli: "本地 CLI 详情",
+      localTool: "本地执行详情",
       provider: "服务商",
       model: "模型",
       endpoint: "端点",
@@ -3297,6 +3302,8 @@ const zhCN: typeof en = {
     loadingProgress: "正在加载 3D 模型 {{percent}}%",
     loading: "正在加载 3D 模型",
     clip: "动画片段",
+    play: "播放动画",
+    pause: "暂停动画",
   },
   markdown: {
     openInCode: "在代码中打开 {{path}}",

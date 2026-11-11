@@ -266,17 +266,67 @@ it.each([false, true])("rotates a visible canvas model independently of controls
   } finally { await act(async () => root.unmount()); }
 });
 
-it("preserves interactive camera controls and the viewer's interaction rotation delay", async () => {
+it("keeps interactive previews at a manual camera angle by default", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); vi.stubGlobal("IntersectionObserver", undefined);
   const container = document.createElement("div"), root = createRoot(container);
   try {
     await act(async () => root.render(<ModelPreview source="blob:interactive" label="Interactive model" />));
     const viewer = container.querySelector("model-viewer")!;
-    expect(viewer.hasAttribute("camera-controls")).toBe(true); expect(viewer.hasAttribute("auto-rotate")).toBe(true);
+    expect(viewer.hasAttribute("camera-controls")).toBe(true); expect(viewer.hasAttribute("auto-rotate")).toBe(false);
+    expect(viewer.getAttribute("interaction-prompt")).toBe("none");
     expect(viewer.hasAttribute("auto-rotate-delay")).toBe(false);
     expect(viewer.hasAttribute("rotation-per-second")).toBe(false);
     await act(async () => viewer.dispatchEvent(new CustomEvent("camera-change", { detail: { source: "user-interaction" } })));
     expect(viewer.getAttribute("src")).toBe("blob:interactive");
+  } finally { await act(async () => root.unmount()); }
+});
+
+it("keeps an explicitly paused animation paused across visibility and clip changes", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  let notify!: (visible: boolean) => void;
+  class Observer {
+    constructor(callback: IntersectionObserverCallback) { notify = visible => callback([{ isIntersecting: visible } as IntersectionObserverEntry], this as unknown as IntersectionObserver); }
+    observe() {}
+    disconnect() {}
+  }
+  vi.stubGlobal("IntersectionObserver", Observer);
+  if (!customElements.get("model-viewer")) customElements.define("model-viewer", class extends HTMLElement {});
+  const container = document.createElement("div"), root = createRoot(container);
+  const pointer = vi.fn(), doubleClick = vi.fn();
+  try {
+    await act(async () => root.render(<div onPointerDown={pointer} onDoubleClick={doubleClick}><ModelPreview source="blob:review" label="Review" /></div>));
+    const viewer = container.querySelector("model-viewer")! as HTMLElement & { paused: boolean; currentTime: number; pause: () => void; play: () => void };
+    const pause = vi.fn(() => { viewer.paused = true; }), play = vi.fn(() => { viewer.paused = false; });
+    Object.assign(viewer, { pause, play, paused: true, currentTime: 0.75, availableAnimations: ["Idle", "Walk"] });
+    await act(async () => { viewer.dispatchEvent(new Event("load")); notify(true); });
+    expect(viewer.hasAttribute("camera-controls")).toBe(true);
+    expect(play).toHaveBeenCalledOnce();
+    const button = () => container.querySelector<HTMLButtonElement>(".model-preview-controls button")!;
+    expect(button().getAttribute("aria-label")).toBe(t("modelPreview.pause"));
+    await act(async () => button().click());
+    expect(pause).toHaveBeenCalledOnce();
+    expect(button().getAttribute("aria-label")).toBe(t("modelPreview.play"));
+    await act(async () => notify(false));
+    await act(async () => notify(true));
+    const select = container.querySelector("select")!;
+    await act(async () => { select.value = "Walk"; select.dispatchEvent(new Event("change", { bubbles: true })); });
+    expect(viewer.getAttribute("animation-name")).toBe("Walk");
+    expect(viewer.hasAttribute("autoplay")).toBe(false);
+    expect(play).toHaveBeenCalledOnce();
+    await act(async () => button().click());
+    expect(play).toHaveBeenCalledTimes(2);
+    expect(viewer.currentTime).toBe(0.75);
+    await act(async () => {
+      viewer.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      viewer.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    });
+    expect(pointer).not.toHaveBeenCalled(); expect(doubleClick).not.toHaveBeenCalled();
+    await act(async () => root.render(<ModelPreview source="blob:static" label="Static" />));
+    const staticViewer = container.querySelector("model-viewer")!;
+    Object.assign(staticViewer, { availableAnimations: [] });
+    await act(async () => staticViewer.dispatchEvent(new Event("load")));
+    expect(container.querySelector(".model-preview-controls")).toBeNull();
+    expect(staticViewer.hasAttribute("autoplay")).toBe(false);
   } finally { await act(async () => root.unmount()); }
 });
 

@@ -242,10 +242,26 @@ describe.skipIf(!blender)("Blender production stages", () => {
     const original = await readFile(source);
     expect(original.subarray(0, 7).toString()).toBe("BLENDER");
     expect((await run("clean", source)).technicalChecksPassed).toBe(true);
-    expect(
-      (await run("joints", path.join(root, "clean", "scene.blend")))
-        .technicalChecksPassed,
-    ).toBe(true);
+    const reviewConfig = path.join(root, "review-config.json");
+    await writeFile(
+      reviewConfig,
+      JSON.stringify({ ...config, previews: true, previewSize: 64 }),
+    );
+    const jointReview = await run(
+      "joints",
+      path.join(root, "clean", "scene.blend"),
+      "joints",
+      reviewConfig,
+    );
+    expect(jointReview.technicalChecksPassed).toBe(true);
+    expect(jointReview.previews).toEqual([
+      "review-front.png",
+      "review-side.png",
+    ]);
+    expect(jointReview.checks.regions.previews).toEqual([
+      "regions-front.png",
+      "regions-side.png",
+    ]);
     const rig = await run("rig", path.join(root, "joints", "scene.blend"));
     expect(rig.checks.rig).toMatchObject({
       passed: true,
@@ -265,6 +281,48 @@ describe.skipIf(!blender)("Blender production stages", () => {
       animation.checks.animation,
       JSON.stringify(animation.checks.animation),
     ).toMatchObject({ passed: true });
+    for (const stage of ["parts", "clean", "joints", "rig", "animate"]) {
+      const report = JSON.parse(
+        await readFile(path.join(root, stage, "report.json"), "utf8"),
+      );
+      expect(report).toMatchObject({
+        previewModel: "review.glb",
+        humanReview: "pending",
+        checks: { previewRoundtrip: { passed: true } },
+      });
+      expect(report.outputs).toContain("review.glb");
+      const preview = (
+        await new NodeIO().read(path.join(root, stage, "review.glb"))
+      ).getRoot();
+      expect(preview.listMeshes()).toHaveLength(parts.length);
+      expect(
+        preview
+          .listNodes()
+          .filter((node) => node.getMesh())
+          .map((node) => node.getName())
+          .sort(),
+      ).toEqual(parts.map((part) => part.name).sort());
+      expect(preview.listCameras()).toHaveLength(0);
+      expect(preview.listMaterials()).toHaveLength(parts.length);
+      expect(preview.listSkins()).toHaveLength(
+        ["rig", "animate"].includes(stage) ? 1 : 0,
+      );
+      expect(preview.listAnimations().map((clip) => clip.getName())).toEqual(
+        stage === "animate" ? ["Idle", "Walk"] : [],
+      );
+      if (stage === "animate") {
+        expect(report.checks.previewRoundtrip.playback).toHaveLength(2);
+        for (const sample of report.checks.previewRoundtrip.playback)
+          expect(sample.sampledVertexDisplacement).toBeGreaterThan(0.000001);
+        for (const clip of preview.listAnimations()) {
+          const times = clip
+            .listSamplers()
+            .flatMap((sampler) => Array.from(sampler.getInput()!.getArray()!));
+          expect(Math.min(...times)).toBe(0);
+          expect(Math.max(...times)).toBeCloseTo(1, 6);
+        }
+      }
+    }
     const exported = await run(
       "export",
       path.join(root, "animate", "scene.blend"),

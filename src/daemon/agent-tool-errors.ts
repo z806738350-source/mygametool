@@ -11,6 +11,7 @@ const dispositions = {
   invalid_animation_action: "correctable",
   invalid_model_reference: "correctable",
   invalid_media_options: "correctable",
+  invalid_blender_input: "correctable",
   unsafe_path: "blocked",
   protected_content: "blocked",
   authorization_denied: "blocked",
@@ -55,4 +56,39 @@ export function parseToolPreflightFailure(value: unknown): ToolPreflightFailure 
   const reason = input.reason as ToolPreflightReason;
   if (input.disposition !== dispositions[reason]) return;
   return Object.freeze({ effect: "none", reason, disposition: dispositions[reason] });
+}
+
+export interface ToolConfirmedFailure {
+  readonly reason: "blender_run_failed";
+  readonly runId: string;
+}
+
+const confirmed = new WeakMap<object, ToolConfirmedFailure>();
+
+/** Only the host's retained, terminated Blender job may confirm this failure. */
+export function confirmBlenderRunFailure<T extends object>(target: T, runId: string): T {
+  const failure = parseToolConfirmedFailure({ reason: "blender_run_failed", runId });
+  if (!failure) throw new TypeError("Invalid retained Blender run ID");
+  confirmed.set(target, failure);
+  return target;
+}
+
+export function getToolConfirmedFailure(value: unknown): ToolConfirmedFailure | undefined {
+  return value !== null && (typeof value === "object" || typeof value === "function")
+    ? confirmed.get(value as object) : undefined;
+}
+
+export function inheritToolConfirmedFailure<T extends object>(target: T, original: unknown): T {
+  const failure = getToolConfirmedFailure(original);
+  if (failure) confirmed.set(target, failure);
+  return target;
+}
+
+/** Validate host journal metadata; plain tool output is never execution evidence. */
+export function parseToolConfirmedFailure(value: unknown): ToolConfirmedFailure | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return;
+  const input = value as Record<string, unknown>;
+  if (input.reason !== "blender_run_failed" || typeof input.runId !== "string" ||
+    !/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(input.runId)) return;
+  return Object.freeze({ reason: "blender_run_failed", runId: input.runId });
 }

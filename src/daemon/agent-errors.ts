@@ -93,6 +93,7 @@ function classifyAgentError(message: string, diagnostics: AgentErrorDiagnostics)
   const causes = diagnostics.causes ?? [];
   const transportText = [message, ...causes.flatMap((cause) => [cause.name, cause.message])].filter(Boolean).join(" ");
   const codes = [diagnostics.errorCode, ...causes.map((cause) => cause.code)].filter(Boolean).join(" ").toUpperCase();
+  if (/^Automatic continuation stopped: the outcome of \S+ \([^)\r\n]+\) is unconfirmed\./.test(message)) return "tool_outcome_unconfirmed";
   if (/AGENT_RUNTIME_INCOMPATIBLE/.test(codes) || /^Local CLI compatibility: /.test(message)) return "runtime_incompatible";
   if (/AGENT_RUNTIME_PROBE_FAILED/.test(codes) || /^Local CLI check failed: /.test(message)) return "runtime_probe_failed";
   if (/^No API key\b/i.test(message) || /select an available model|selected model .* is not available|provider .* is disabled/i.test(message)) return "model_not_configured";

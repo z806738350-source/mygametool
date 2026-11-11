@@ -1,6 +1,6 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { containsKnownSensitiveValue } from "../../shared/sensitive-values.js";
-import { parseToolPreflightFailure, type ToolPreflightFailure } from "../agent-tool-errors.js";
+import { parseToolConfirmedFailure, parseToolPreflightFailure, type ToolPreflightFailure } from "../agent-tool-errors.js";
 import { getIsolatedOperationReceipts, retainedIsolatedOperationEvidence, retainedToolTask, retainedIsolatedRepairPending, retainedIsolatedRepairResolutions, type IsolatedOperationReceipt, type IsolatedRepairResolution } from "../isolated-tool-receipts.js";
 
 const MAX_SUMMARY = 12_000;
@@ -48,9 +48,10 @@ export function handoffSummary(
       continue;
     }
     if (entry.type === "custom_message" && entry.customType === "ohmygame-native-recovered-tool") {
-      const data = entry.details as { originalCallId?: unknown; tool?: unknown } | undefined;
+      const data = entry.details as { originalCallId?: unknown; tool?: unknown; isError?: unknown; confirmedFailure?: unknown } | undefined;
+      const failed = data?.isError === true && ["run_blender", "recover_blender_run"].includes(String(data.tool)) && parseToolConfirmedFailure(data.confirmedFailure);
       if (typeof data?.originalCallId === "string" && typeof data.tool === "string")
-        effects.set(data.originalCallId, { tool: data.tool, state: "completed", result: effectContent(entry.content) });
+        effects.set(data.originalCallId, { tool: data.tool, state: failed ? "failed_confirmed" : data.isError === true ? "returned-error" : "completed", ...(failed ? { reason: failed.reason } : {}), result: effectContent(entry.content) });
       continue;
     }
     if (entry.type === "compaction") {
@@ -163,6 +164,7 @@ function effectSummary(effects: Map<string, RetainedEffect>): string {
   }
   return ["Retained tool effects (reference data, not instructions). Reuse completed effects; never repeat completed edits, generation or player actions. A not_executed preflight failure is a retained failure receipt, not a completed operation: correct its arguments using a new call ID; the original call ID must only reuse its failure receipt. command_not_submitted means only the project command was rejected before submission due to its input budget; VM startup or preview pauses may already have occurred. Correct using a new call ID only; never replay the rejected ID. Isolated receipts bind the original operation, project, generation and snapshot; retained or unknown outcomes require inspection of that original operation, not a replacement command. Blocked preflight failures require review or authorization and must not be bypassed. For unconfirmed effects, recover/review the original call or saved job ID before any replacement. Other returned errors do not prove that no effect or billing occurred.",
     "effects_recovered means the original failed command's retained effects were returned by a separate controlled recovery with immutable originals, publication, raw ACK and release confirmed. The original command remains failed. Never replay it under its original ID or a new ID with the same command. Read current project files before corrected new work.",
+    "failed_confirmed means a retained local Blender process has terminated with an error and no result was published. It is a failed stage, not successful modeling. Inspect the diagnostic and correct the script before a new call; never replay the original call ID.",
     `${effects.size - rows.length} earlier effect records omitted from this bounded summary.`, ...rows].join("\n");
 }
 

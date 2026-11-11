@@ -44,6 +44,7 @@ import {
 } from "./checkpoint-extension.js";
 import { normalizeAssistantMessage, normalizeAssistantText, AssistantTextStreamNormalizer } from "./assistant-thinking.js";
 import { AUTO_CONTINUE_DELAYS, AUTO_CONTINUE_ENTRY, AUTO_CONTINUE_PROMPT, AutoContinueTools, isRecoverableInterruption, waitForContinuation, type AgentInterruption } from "./agent-auto-continue.js";
+import { getToolConfirmedFailure } from "./agent-tool-errors.js";
 
 const CONTINUATION_SUPERSEDED = Symbol("newer user message");
 
@@ -3253,9 +3254,10 @@ export async function createPiSession(
   const prepareContinuation = async (signal: AbortSignal) => {
       assertCheckpoint();
       await continuationTools.prepare(signal, async (result, tool, callId) => {
+        const confirmedFailure = getToolConfirmedFailure(result);
         await session.sendCustomMessage({ customType: "ohmygame-recovered-media", display: false,
-          content: [{ type: "text", text: `Recovered the existing result of ${tool}, original call ${callId}. No replacement generation was submitted.` }, ...result.content],
-          details: { tool, originalCallId: callId } }, { triggerTurn: false });
+          content: [{ type: "text", text: `${confirmedFailure ? "Confirmed the failed outcome" : "Recovered the existing result"} of ${tool}, original call ${callId}. No replacement operation was submitted.` }, ...result.content],
+          details: { tool, originalCallId: callId, ...(confirmedFailure ? { isError: true, confirmedFailure } : {}) } }, { triggerTurn: false });
       });
   };
   const resumeAfterInterruption = async () => {
@@ -3368,7 +3370,7 @@ function recoverableSessionInterruption(session: CodingSession, failure: ThreadI
     return source && interruption?.source === source && isRecoverableInterruption(interruption) ? interruption : undefined;
   }
   if (failure.code && ["authentication_failed", "access_denied", "quota_exceeded", "invalid_request", "model_unavailable",
-    "sse_validation_failed", "runtime_incompatible", "runtime_probe_failed"].includes(failure.code)) return;
+    "sse_validation_failed", "runtime_incompatible", "runtime_probe_failed", "tool_outcome_unconfirmed"].includes(failure.code)) return;
   const diagnostics = failure.diagnostics;
   if (/auth|credential|permission|policy|quota|credit|billing|payment|budget/i.test(diagnostics?.errorCode ?? "")) return;
   const repair = session.interruption;

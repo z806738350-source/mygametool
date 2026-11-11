@@ -16,7 +16,7 @@ import { AGENT_ERROR_ENTRY } from "../src/daemon/agent-errors.js";
 import { CHECKPOINT_ENTRY, CHECKPOINT_UNDONE_ENTRY, TURN_END_ENTRY, turnRange } from "../src/daemon/checkpoint-extension.js";
 import { AssistantTextStreamNormalizer, normalizeAssistantText } from "../src/daemon/assistant-thinking.js";
 import { AUTO_CONTINUE_DELAYS, AUTO_CONTINUE_ENTRY, AUTO_CONTINUE_TOOL_ENTRY, AutoContinueTools, isRecoverableInterruption } from "../src/daemon/agent-auto-continue.js";
-import { getToolPreflightFailure, inheritToolPreflightFailure, toolPreflightError } from "../src/daemon/agent-tool-errors.js";
+import { confirmBlenderRunFailure, getToolConfirmedFailure, getToolPreflightFailure, inheritToolPreflightFailure, toolPreflightError } from "../src/daemon/agent-tool-errors.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createIsolatedRepairPending, createIsolatedRepairProof, getIsolatedRepairPending, getIsolatedRepairResolutions, getRepairTargets, inheritIsolatedRepairPending, inheritIsolatedRepairProof, settleIsolatedRepair, getIsolatedOperationReceipts, isolatedInputBudgetError, reportIsolatedOperation, type IsolatedOperationReceipt, type IsolatedRepairProof } from "../src/daemon/isolated-tool-receipts.js";
 import { handoffSummary } from "../src/daemon/agent-runtimes/handoff.js";
@@ -465,6 +465,95 @@ describe("continuation tool safety", () => {
     expect(saved).toHaveBeenCalledExactlyOnceWith("old-canvas", { boardId: "board", nodeId: "node" }, expect.any(AbortSignal), undefined, {});
     expect(persisted).toHaveBeenCalledWith(result, "generate_canvas_media", "old-canvas");
     await run(wrapped, "repeat", { boardId: "board", nodeId: "node" }); expect(execute).toHaveBeenCalledOnce();
+  });
+  const blenderRunId = "3fc6a611-fb60-49ce-80fe-41ccba63f99a";
+  const blenderFailure = () => confirmBlenderRunFailure({
+    content: [{ type: "text" as const, text: "The retained Blender process exited with code 2; nothing was published" }],
+    details: { blender: { runId: blenderRunId, status: "failed", published: false } }, isError: true,
+  }, blenderRunId);
+  it("keeps a confirmed Blender failure visible and permits a corrected script at the same path under a new call", async () => {
+    const failed = blenderFailure(), execute = vi.fn<ToolDefinition["execute"]>().mockResolvedValueOnce(failed).mockResolvedValue(result);
+    const guard = new AutoContinueTools([tool("run_blender", execute)]), blender = guard.wrap()[0]!, input = { scriptPath: "analysis.py", stage: "custom" };
+    await guard.prepare(new AbortController().signal);
+    await expect(run(blender, "failed", input)).resolves.toBe(failed);
+    expect(guard.stopRequested).toBe(false); expect(guard.recoverySummary).toContain("failed_confirmed");
+    expect(guard.recoverySummary).toContain(blenderRunId);
+    const cached = await run(blender, "failed", input);
+    expect(cached).toMatchObject({ isError: true }); expect(getToolConfirmedFailure(cached)).toEqual(getToolConfirmedFailure(failed));
+    await guard.prepare(new AbortController().signal);
+    await expect(run(blender, "corrected", input)).resolves.toBe(result);
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+  it.each([false, true])("recovers only the original Blender run and clears an unknown block without rerunning it (already continuing=%s)", async continuing => {
+    const failed = blenderFailure(), execute = vi.fn<ToolDefinition["execute"]>().mockRejectedValueOnce(new Error("Delivery uncertain")).mockResolvedValue(result);
+    const recover = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(failed);
+    const recoverable = { ...tool("run_blender", execute), recoverAfterHttp500: recover };
+    const guard = new AutoContinueTools([recoverable]), blender = guard.wrap()[0]!;
+    if (continuing) await guard.prepare(new AbortController().signal);
+    const input = { scriptPath: "analysis.py", stage: "custom" };
+    await expect(run(blender, "original", input)).rejects.toThrow("Delivery uncertain");
+    if (continuing) expect(guard.stopRequested).toBe(true);
+    const persisted = vi.fn(async () => {});
+    await guard.prepare(new AbortController().signal, persisted);
+    expect(recover).toHaveBeenCalledExactlyOnceWith("original", input, expect.any(AbortSignal), undefined, {});
+    expect(persisted).toHaveBeenCalledWith(failed, "run_blender", "original");
+    expect(guard.stopRequested).toBe(false); expect(() => guard.assertSafe()).not.toThrow();
+    expect(await run(blender, "original", input)).toMatchObject({ isError: true });
+    expect(execute).toHaveBeenCalledOnce();
+    await run(blender, "corrected", input); expect(execute).toHaveBeenCalledTimes(2);
+  });
+  it.each(["plain-result", "error-text", "other-tool", "unconfirmed-recovery"])("does not trust %s as a confirmed Blender failure", async variant => {
+    const descriptor = getToolConfirmedFailure(blenderFailure());
+    const execute = vi.fn<ToolDefinition["execute"]>();
+    if (variant === "error-text") execute.mockRejectedValue(Object.assign(new Error("Retained Blender run failed " + blenderRunId), { confirmedFailure: descriptor }));
+    else execute.mockResolvedValue(variant === "other-tool" ? blenderFailure() : { ...result, isError: true, details: { confirmedFailure: descriptor } });
+    const recover = vi.fn<ToolDefinition["execute"]>().mockResolvedValue({ ...result, isError: true, details: { confirmedFailure: descriptor } });
+    const guard = new AutoContinueTools([{ ...tool(variant === "other-tool" ? "write" : "run_blender", execute), ...(variant === "unconfirmed-recovery" ? { recoverAfterHttp500: recover } : {}) }]);
+    await run(guard.wrap()[0]!, "original").catch(() => {});
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("unconfirmed");
+    expect(execute).toHaveBeenCalledOnce();
+    expect(guard.recoverySummary).not.toContain("failed_confirmed");
+  });
+  it("does not clear an unknown Blender block when its confirmed recovery could not be retained", async () => {
+    const recoverable = { ...tool("run_blender", vi.fn<ToolDefinition["execute"]>().mockRejectedValue(new Error("Delivery uncertain"))), recoverAfterHttp500: vi.fn<ToolDefinition["execute"]>().mockResolvedValue(blenderFailure()) };
+    const guard = new AutoContinueTools([recoverable]);
+    await guard.prepare(new AbortController().signal);
+    await run(guard.wrap()[0]!, "original").catch(() => {});
+    await expect(guard.prepare(new AbortController().signal, async () => { throw new Error("Session storage unavailable"); })).rejects.toThrow("could not be recorded");
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("could not be recorded");
+    expect(guard.stopRequested).toBe(true); expect(recoverable.execute).toHaveBeenCalledOnce();
+    expect(recoverable.recoverAfterHttp500).toHaveBeenCalledOnce();
+  });
+  it.each([false, true])("restores a confirmed Blender failure and its no-replay semantics from the host journal (recovered=%s)", async recovered => {
+    const manager = SessionManager.inMemory("/tmp/confirmed-blender-failure"), user = manager.appendMessage({ role: "user", content: "Create model", timestamp: 1 });
+    const input = { scriptPath: "analysis.py", stage: "custom" }, failed = blenderFailure();
+    manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "original", name: "run_blender", arguments: input }], timestamp: 2 } as never);
+    const execute = vi.fn<ToolDefinition["execute"]>();
+    if (recovered) execute.mockRejectedValueOnce(new Error("Unknown delivery")); else execute.mockResolvedValueOnce(failed);
+    execute.mockResolvedValue(result);
+    const recover = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(failed), tools = [{ ...tool("run_blender", execute), recoverAfterHttp500: recover }];
+    const guard = new AutoContinueTools(tools, { sessionManager: manager }); guard.reset(user);
+    await run(guard.wrap()[0]!, "original", input).catch(() => {});
+    manager.appendMessage({ role: "toolResult", toolCallId: "original", toolName: "run_blender", content: failed.content, details: failed.details, isError: true, timestamp: 3 } as never);
+    if (recovered) await guard.prepare(new AbortController().signal);
+    const restored = new AutoContinueTools(tools, { sessionManager: manager }); restored.reset(user);
+    await restored.prepare(new AbortController().signal);
+    expect(restored.recoverySummary).toContain("failed_confirmed");
+    expect(await run(restored.wrap()[0]!, "original", input)).toMatchObject({ isError: true });
+    await run(restored.wrap()[0]!, "corrected", input); expect(execute).toHaveBeenCalledTimes(2);
+    expect(recover).toHaveBeenCalledTimes(recovered ? 1 : 0);
+  });
+  it.each(["missing-result", "success-result", "wrong-call", "wrong-tool", "changed-arguments", "other-tool", "bad-id", "untrusted-details"])("does not restore %s as confirmed Blender execution evidence", async variant => {
+    const manager = SessionManager.inMemory("/tmp/unconfirmed-blender-journal"), user = manager.appendMessage({ role: "user", content: "Create model", timestamp: 1 });
+    const name = variant === "other-tool" ? "write" : "run_blender", input = { scriptPath: "analysis.py" };
+    const confirmedFailure = { reason: "blender_run_failed", runId: variant === "bad-id" ? "not-a-run-id" : blenderRunId };
+    manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "original", name, arguments: input }], timestamp: 2 } as never);
+    manager.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: user, tool: name, callId: "original", state: variant === "untrusted-details" ? "unknown" : "failed_confirmed", ...(variant === "untrusted-details" ? {} : { confirmedFailure }) });
+    if (variant === "changed-arguments") manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "original", name, arguments: { scriptPath: "other.py" } }], timestamp: 2 } as never);
+    if (variant !== "missing-result") manager.appendMessage({ role: "toolResult", toolCallId: variant === "wrong-call" ? "other" : "original", toolName: variant === "wrong-tool" ? "other" : name, content: result.content, details: { confirmedFailure }, isError: variant !== "success-result", timestamp: 3 } as never);
+    const execute = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(result), guard = new AutoContinueTools([tool(name, execute)], { sessionManager: manager }); guard.reset(user);
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("unconfirmed");
+    expect(execute).not.toHaveBeenCalled(); expect(guard.recoverySummary).not.toContain("failed_confirmed");
   });
   it("keeps reads fresh and honors cancellation even for a cached completed effect", async () => {
     const read = tool("read"), write = tool("write"), guard = new AutoContinueTools([read, write]), [r, w] = guard.wrap();

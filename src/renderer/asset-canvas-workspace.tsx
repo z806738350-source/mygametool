@@ -108,7 +108,7 @@ import { canvasNodeTitle } from "../shared/canvas-assets.js";
 import type { CanvasAssetCatalogEntry } from "../shared/canvas-assets.js";
 import { prepareVideoReferenceFile, readMediaFileDuration } from "./video-reference-files.js";
 import { findAssetCanvasCoverSource, type AssetCanvasCoverSource } from "../shared/asset-canvas-cover.js";
-import { ModelPreview } from "./model-preview.js";
+import { ModelPreview, useModelPlayback } from "./model-preview.js";
 import { LibraryAssetPicker } from "./node-workbench.js";
 import { AssetDialogShell, AssetMedia, useNearViewport, type AssetMediaType } from "./asset-gallery.js";
 import { ANIMATION_ACTIONS_PER_REQUEST, DEFAULT_IMAGE_NODE_CONFIG, DEFAULT_MODEL_3D_CONFIG, DEFAULT_ANIMATION_ACTION_IDS, DEFAULT_CHARACTER_HEIGHT_METERS, DEFAULT_VIDEO_NODE_CONFIG, MAX_ANIMATION_ACTIONS, MODEL_3D_MAX_REFERENCE_IMAGES, mediaGenerationNeedsConfirmation, normalizeModel3DConfig, resolveModel3D, resolveModel3DConnection } from "../shared/generation-config.js";
@@ -2662,6 +2662,7 @@ function Model3DNode({ data, selected }: Pick<NodeProps<AssetCanvasFlowNode>, "d
 
 function AssetNode({ data, selected }: Pick<NodeProps<AssetCanvasFlowNode>, "data" | "selected">) {
   const kind = data.mediaType ?? "image";
+  const [modelPlayback, setModelPlayback] = useModelPlayback(data.assetId);
   const [element, visible] = useNearViewport<HTMLDivElement>(true);
   const [playing, setPlaying] = useState(false);
   useEffect(() => setPlaying(false), [data.assetId]);
@@ -2678,7 +2679,7 @@ function AssetNode({ data, selected }: Pick<NodeProps<AssetCanvasFlowNode>, "dat
         {preview.url && kind !== "audio" ? <MediaViewButton /> : null}
         {preview.url && kind === "image" ? <img ref={image} src={preview.url} alt={data.name || t("assetCanvas.libraryImage")} onLoad={mediaLayout.onImageLoad} /> : null}
         {preview.url && kind === "video" ? <CanvasVideo src={preview.url} onLoadedMetadata={mediaLayout.onVideoMetadata} onPlayingChange={setPlaying} /> : null}
-        {preview.url && kind === "model" ? <ModelPreview source={preview.url} label={data.name || "3D model"} minHeight={220} interactive={false} autoRotate animate rotationPerSecond="10deg" /> : null}
+        {preview.url && kind === "model" ? <ModelPreview source={preview.url} label={data.name || "3D model"} minHeight={220} interactive autoRotate={false} animate playback={modelPlayback} onPlaybackChange={setModelPlayback} /> : null}
         {preview.url && kind === "audio" ? <CanvasAudio src={preview.url} onPlayingChange={setPlaying} /> : null}
         {!preview.url ? <div className="story-media-empty"><Icon size={34} /><strong>{data.assetError || preview.error ? t("assetCanvas.assetUnavailable") : t("assetCanvas.loadingAsset")}</strong>{data.assetError ? <span>{data.assetError}</span> : <CanvasAssetRecovery preview={preview} />}</div> : null}
       </div>
@@ -3030,6 +3031,7 @@ function MediaNodeShell({ kind, textKind, label: labelOverride, selected, panelO
   emptyHint?: string;
   children: React.ReactNode;
 }) {
+  const [modelPlayback, setModelPlayback] = useModelPlayback(assetId);
   const [element, visible] = useNearViewport<HTMLDivElement>(true);
   const [playing, setPlaying] = useState(false);
   useEffect(() => setPlaying(false), [assetId]);
@@ -3053,7 +3055,7 @@ function MediaNodeShell({ kind, textKind, label: labelOverride, selected, panelO
         {preview.url && kind === "image" ? <img ref={image} src={preview.url} alt={t("timeline.generatedImage")} onLoad={mediaLayout.onImageLoad} /> : null}
         {preview.url && kind === "video" ? <CanvasVideo src={preview.url} onLoadedMetadata={mediaLayout.onVideoMetadata} onPlayingChange={setPlaying} /> : null}
         {preview.url && audio ? <CanvasAudio src={preview.url} onPlayingChange={setPlaying} /> : null}
-        {preview.url && threeD ? <ModelPreview source={preview.url} label={kind === "animation" ? t("assetCanvas.animated3d") : t("timeline.generated3d")} minHeight={220} interactive={false} autoRotate animate rotationPerSecond="10deg" onError={() => setModelFailed(true)} /> : null}
+        {preview.url && threeD ? <ModelPreview source={preview.url} label={kind === "animation" ? t("assetCanvas.animated3d") : t("timeline.generated3d")} minHeight={220} interactive autoRotate={false} animate playback={modelPlayback} onPlaybackChange={setModelPlayback} onError={() => setModelFailed(true)} /> : null}
         {!preview.url && !runtime?.generating ? (
           <div className="story-media-empty">
             <Icon size={34} />

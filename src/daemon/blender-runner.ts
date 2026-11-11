@@ -55,6 +55,8 @@ export interface BlenderRunInput {
   inputs: string[];
   args?: string[];
   timeoutMs?: number;
+  /** Host-owned call identity, retained before execution for recovery without replay. */
+  invocation?: { callId: string; sessionFile: string; request: unknown };
 }
 export interface BlenderRunResult {
   id: string;
@@ -443,6 +445,15 @@ export class BlenderRunner {
         }),
         { flag: "wx", mode: 0o400 },
       );
+      if (input.invocation)
+        await writeFile(
+          path.join(directory, "invocation.json"),
+          JSON.stringify(input.invocation),
+          {
+            flag: "wx",
+            mode: 0o400,
+          },
+        );
       signal?.throwIfAborted();
       const child = spawn(
         SANDBOX,

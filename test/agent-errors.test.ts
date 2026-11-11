@@ -6,6 +6,24 @@ import type { ThreadItemErrorCode } from "../src/shared/contracts.js";
 import { AgentRuntimeCompatibilityError, AgentRuntimeProbeError } from "../src/daemon/agent-runtimes/compatibility.js";
 
 describe("agent error diagnostics", () => {
+  it("presents unconfirmed tool outcomes as local recovery in live and restored errors", () => {
+    const message = "Automatic continuation stopped: the outcome of run_blender (call_retained) is unconfirmed. Recover or review the original operation and retained changes; no replacement was submitted.";
+    for (const error of [
+      thrownAgentError(new Error(message)),
+      assistantMessageError({ errorMessage: message, provider: "fixture", model: "fixture" }),
+      normalizeAgentError(message, { statusCode: 503, errorCode: "ETIMEDOUT", network: { source: "manual" } }),
+    ]) {
+      expect(error.code).toBe("tool_outcome_unconfirmed");
+      expect(agentErrorPresentation(error).title).toBe("Tool outcome needs confirmation");
+      const text = agentErrorDiagnosticText(error);
+      expect(text).toContain("inspect or recover that original run");
+      expect(text).toContain(`Local operation details: ${message}`);
+      expect(text).not.toContain("Provider response:");
+      expect(text).not.toContain("Network configuration:");
+      expect(text).not.toContain("HTTP status:");
+    }
+    expect(normalizeAgentError("Provider response is unconfirmed", { statusCode: 503 }).code).toBe("provider_unavailable");
+  });
   it("shows repeated preflight rejections as a local media tool error", () => {
     const error = thrownAgentError(new RepeatedMediaArgumentsError("generate_image"));
     expect(agentErrorPresentation(error).title).toBe("Repeated invalid media call");

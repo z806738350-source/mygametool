@@ -45,6 +45,15 @@ script and result paths in the project's asset production document. If delivery 
 interrupted, call `recover_blender_run` with that runId; it recovers saved work and
 never starts Blender or submits a provider request.
 
+Use the current Canvas `boardId` when known. Bundled modeling stages produce
+`review.glb`; export produces `model.glb`. The host adds each run's model and
+auxiliary PNGs to that board and returns `canvas.boardId` / `canvas.nodeIds`.
+Reuse those nodes rather than adding duplicates. Model review happens in the
+interactive Canvas viewer: the user can rotate/zoom, pause/play and switch clips.
+Front/side/back images and joint/region overlays are supporting evidence, not a
+replacement for the actual model. Custom modeling scripts must also export a
+`review.glb` from their saved scene; diagnostic-only scripts need no model.
+
 Custom scripts run inside Blender's bundled Python, in a private directory without
 network or access to other host files. Parse `--input-dir` and `--output-dir` after
 `--` in `sys.argv`; read only declared inputs and save results under output-dir.
@@ -84,6 +93,8 @@ Read every stage report and inspect actual images with an image-capable model. R
 uncertain visual decisions to the user. At dimensions/reference, initial-shape,
 joint/region, deformation and animation milestones, show concrete evidence and ask
 for human acceptance through the conversation/questionnaire. Wait for the answer.
+Point to the returned 3D node at each model milestone, and have the user play
+each animation at the motion milestone. Static images alone cannot approve motion.
 Keep any accepted decisions and requested changes in the asset document. Never record
 human approval from an Agent's own assessment, a script exit code or a passing metric.
 Limit automatic repair of one stage to three attempts, then present the unresolved
@@ -92,8 +103,8 @@ problem and retain all evidence.
 ## Deliver to the game
 
 Use `get_model_asset` on the exported model for the project's runtime asset path and
-resource checks. Register the final result on the existing Canvas with its original
-source links, then actually use the returned runtime resources in the game. Load it
+resource checks. Reuse the automatically published Canvas model node and retain its
+original source links, then actually use the returned runtime resources in the game. Load it
 in the project's engine, verify scale, pivot, orientation, texture, skeleton and every
 clip, and use `game_use` when available. Distinguish structural checks, rendered
 inspection, human acceptance and actual game playback. If one is missing, say which.

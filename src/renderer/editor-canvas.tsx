@@ -270,6 +270,8 @@ function PinchZoomOverScrollingContent() {
     if (!domNode) return;
     const pinch = (event: WheelEvent) => {
       if (!event.ctrlKey || !(event.target instanceof Element) || !event.target.closest(".nowheel")) return;
+      // The 3D viewer owns pinch zoom as well as wheel zoom.
+      if (event.target.closest(".model-preview-interactive")) return;
       event.preventDefault();
       const bounds = domNode.getBoundingClientRect();
       void setViewport(pinchedViewport(

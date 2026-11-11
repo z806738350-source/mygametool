@@ -98,6 +98,24 @@ The Agent presents concrete files and waits for the user's decision, retaining
 accepted decisions in the asset document. These are production review steps, not
 a claim that a script can certify visual quality.
 
+Model review uses the interactive Canvas model as its primary evidence. Each
+bundled modeling stage produces `review.glb`; export produces `model.glb`.
+Successful runs automatically add the model and supporting images to the selected
+`boardId` (or the first board). Drag inside the model to rotate, zoom over it,
+and use play/pause and the clip selector for animations. Drag the node header to
+move the card. Views do not rotate automatically. Off-screen and hidden-page
+playback pauses; returning to a released Canvas model restores its selected clip
+and playback position, including a manual pause. Joint/region overlays
+and stress-pose images remain supporting evidence; static images do not validate
+motion. Custom modeling scripts must also export a review GLB. Diagnostic-only
+scripts need no model. Recovery reuses the same nodes and preserves user edits.
+
+Local script failures with a confirmed stopped job remain failures, but no longer
+block all later automatic continuation as an unknown side effect. The original
+call is never re-executed; corrected work uses a new call. Unknown outcomes query
+only the original conversation's retained job. The UI identifies unconfirmed
+tool results as a local recovery issue rather than a provider request failure.
+
 GLB is the primary project runtime format. Export verifies a clean reimport, then
 `get_model_asset` prepares the model through the existing inspected-resource path.
 Register the final asset on the Canvas, integrate it into the actual game and play

@@ -17,6 +17,7 @@ import { t } from "../src/renderer/i18n.js";
 
 type CanvasProps = Parameters<typeof EditorCanvas<Node>>[0];
 let props: CanvasProps;
+let realModelPreview = false;
 const getWorkspaceAsset = vi.fn(
   async (_projectId: string, filePath: string, _signal?: AbortSignal, _sha256?: string) =>
     new Blob(["media"], {
@@ -30,7 +31,10 @@ const rebuildModelPreview = vi.fn(async () => ({}));
 const rebuildProjectModelPreview = vi.fn(async () => ({}));
 const getNativeMediaUrl = vi.fn();
 const listWorkspaceFiles = vi.fn(async (_projectId: string, _assets?: boolean): Promise<import("../src/shared/contracts.js").WorkspaceFile[]> => []);
-vi.doMock(path.resolve("src/renderer/model-preview.tsx"), () => ({ ModelPreview: ({ source, label, autoRotate, animate, rotationPerSecond }: { source: string; label: string; autoRotate?: boolean; animate?: boolean; rotationPerSecond?: string }) => <img src={source} alt={label} data-auto-rotate={autoRotate ? "true" : undefined} data-animate={animate ? "true" : undefined} data-rotation-rate={rotationPerSecond} /> }));
+vi.doMock(path.resolve("src/renderer/model-preview.tsx"), async original => {
+  const actual = await original<typeof import("../src/renderer/model-preview.js")>();
+  return { ...actual, ModelPreview: (props: Parameters<typeof actual.ModelPreview>[0]) => realModelPreview ? <actual.ModelPreview {...props} /> : <img src={props.source} alt={props.label} data-interactive={props.interactive ? "true" : undefined} data-auto-rotate={props.autoRotate ? "true" : undefined} data-animate={props.animate ? "true" : undefined} /> };
+});
 vi.doMock(path.resolve("src/renderer/editor-canvas.tsx"), async (original) => ({
   ...(await original<typeof import("../src/renderer/editor-canvas.js")>()),
   EditorCanvas: (value: CanvasProps) => {
@@ -236,6 +240,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  realModelPreview = false;
   await act(async () => root.unmount());
   container.remove();
   vi.restoreAllMocks();
@@ -243,13 +248,77 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 
-it.each(["asset", "model-3d", "animate-3d"])("opts the visible %s canvas result into slow model motion without changing the thumbnail default", async kind => {
+it.each(["asset", "model-3d", "animate-3d"])("enables camera interaction and motion for the visible %s canvas result", async kind => {
   const View = props.nodeTypes![kind] as ComponentType<{ data: Record<string, unknown>; selected: boolean }>;
   const data = kind === "asset" ? { assetId: "model-output", mediaType: "model" } : { ...props.nodes.find(node => node.id === "model")!.data, assetId: "model-output", actionIds: ["preset:walk"] };
   await act(async () => root.render(<ReactFlowProvider><CanvasAssetProvider assets={canvasAssetSources("download", assets)}><View data={data} selected /></CanvasAssetProvider></ReactFlowProvider>));
-  const preview = container.querySelector<HTMLImageElement>('img[data-auto-rotate="true"]')!;
+  const preview = container.querySelector<HTMLImageElement>('img[data-interactive="true"]')!;
   expect(preview).not.toBeNull(); expect(preview.getAttribute("data-animate")).toBe("true");
-  expect(preview.getAttribute("data-rotation-rate")).toBe("10deg");
+  expect(preview.hasAttribute("data-auto-rotate")).toBe(false);
+  expect(preview.getAttribute("data-interactive")).toBe("true");
+});
+
+it.each(["asset", "model-3d", "animate-3d"])("restores %s playback after releasing its offscreen viewer and resets for a different asset", async kind => {
+  realModelPreview = true;
+  const observers = new Map<Element, (visible: boolean) => void>();
+  class Observer {
+    element?: Element;
+    constructor(private callback: IntersectionObserverCallback) {}
+    observe(element: Element) { this.element = element; observers.set(element, visible => this.callback([{ target: element, isIntersecting: visible } as IntersectionObserverEntry], this as unknown as IntersectionObserver)); }
+    disconnect() { if (this.element) observers.delete(this.element); }
+  }
+  vi.stubGlobal("IntersectionObserver", Observer);
+  class Viewer extends HTMLElement {
+    static observedAttributes = ["animation-name"];
+    // Like model-viewer's Lit property, React writes src without reflecting an attribute.
+    src: string | null = null;
+    loaded = false; availableAnimations = ["Idle", "Walk"]; currentTime = 0; paused = true;
+    updateComplete = Promise.resolve();
+    get animationName() { return this.getAttribute("animation-name") ?? undefined; }
+    set animationName(value: string | undefined) { if (value) this.setAttribute("animation-name", value); }
+    attributeChangedCallback() { this.updateComplete = Promise.resolve().then(() => { this.currentTime = 0; }); }
+    play() { this.paused = false; }
+    pause() { this.paused = true; }
+  }
+  if (!customElements.get("model-viewer")) customElements.define("model-viewer", Viewer);
+  const View = props.nodeTypes![kind] as ComponentType<{ data: Record<string, unknown>; selected: boolean }>;
+  const renderNode = async (assetId = "model-output") => {
+    const data = kind === "asset" ? { assetId, mediaType: "model" } : { ...props.nodes.find(node => node.id === "model")!.data, assetId, actionIds: ["preset:walk"] };
+    await act(async () => root.render(<ReactFlowProvider><CanvasAssetProvider assets={canvasAssetSources("download", assets)}><View data={data} selected={false} /></CanvasAssetProvider></ReactFlowProvider>));
+  };
+  const visible = async (selector: string, value: boolean) => { await act(async () => observers.get(container.querySelector(selector)!)!(value)); };
+  const load = async () => {
+    const viewer = container.querySelector<Viewer>("model-viewer")!;
+    await act(async () => { viewer.loaded = true; viewer.dispatchEvent(new Event("load")); });
+    await visible(".model-preview", true);
+    return viewer;
+  };
+  await renderNode();
+  await visible(".story-node", true);
+  const first = await load();
+  expect(first.src).toBe("blob:canvas-test");
+  expect(first.getAttribute("src")).toBeNull();
+  const select = container.querySelector<HTMLSelectElement>(".model-preview-clips")!;
+  await act(async () => { select.value = "Walk"; select.dispatchEvent(new Event("change", { bubbles: true })); });
+  first.currentTime = 0.75;
+  await act(async () => container.querySelector<HTMLButtonElement>(".model-preview-controls button")!.click());
+  await visible(".story-node", false);
+  expect(container.querySelector("model-viewer")).toBeNull();
+  expect(first.src).toBeNull();
+  expect(first.getAttribute("src")).toBeNull();
+  await visible(".story-node", true);
+  const restored = await load();
+  expect(restored).not.toBe(first);
+  expect(restored.animationName).toBe("Walk");
+  expect(restored.paused).toBe(true);
+  expect(restored.currentTime).toBe(0.75);
+  expect(restored.hasAttribute("auto-rotate")).toBe(false);
+  expect(container.querySelector<HTMLButtonElement>(".model-preview-controls button")!.getAttribute("aria-label")).toBe(t("modelPreview.play"));
+  await renderNode("fbx-output");
+  const replacement = await load();
+  expect(replacement.animationName).toBeUndefined();
+  expect(replacement.currentTime).toBe(0);
+  expect(replacement.paused).toBe(false);
 });
 
 it.each(["image", "video"] as const)("loads an actual %s node only near the viewport and keeps its layout stable", async (kind) => {

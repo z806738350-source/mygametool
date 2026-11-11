@@ -4,6 +4,7 @@ import {
   readFile,
   readdir,
   realpath,
+  rm,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -21,6 +22,7 @@ import {
 } from "../src/daemon/agent-tools.js";
 import { ProjectManager } from "../src/daemon/projects.js";
 import { AssetLibrary } from "../src/daemon/asset-library.js";
+import { CanvasStore } from "../src/daemon/canvas-workspace.js";
 import { temporaryTestDirectory } from "./temporary-test-directory.js";
 import { model3DFixture } from "./model3d-fixture.js";
 import {
@@ -30,7 +32,10 @@ import {
   type RuntimeMedia,
 } from "../src/daemon/isolated-project-files.js";
 import { excludedFromProjectArchive } from "../src/daemon/project-archive.js";
-import { AutoContinueTools } from "../src/daemon/agent-auto-continue.js";
+import {
+  AutoContinueTools,
+  type RecoverableTool,
+} from "../src/daemon/agent-auto-continue.js";
 
 async function fixture(blendHeader = "BLENDER17-01v0503") {
   const root = await realpath(
@@ -106,6 +111,25 @@ async function fixture(blendHeader = "BLENDER17-01v0503") {
     projects.ensureLibraryAsset(project.id, file),
   );
   const enabled = vi.fn(() => true);
+  const canvas = new CanvasStore(projects, library, {} as never);
+  const presentReview = vi.fn(
+    async (review: {
+      runId: string;
+      workflow: string;
+      stage: string;
+      boardId?: string;
+      files: string[];
+    }) => {
+      const entries = [];
+      for (const [index, file] of review.files.entries())
+        entries.push({
+          nodeId: `blender-${review.runId}-${index}`,
+          assetId: await projects.ensureLibraryAsset(project.id, file),
+          title: `${review.workflow} · ${review.stage} · ${path.basename(file)}`,
+        });
+      return canvas.presentLocalAssets(project.id, entries, review.boardId);
+    },
+  );
   const workflow = new BlenderWorkflow({
     workspace: project.workspacePath,
     privateRoot,
@@ -114,8 +138,13 @@ async function fixture(blendHeader = "BLENDER17-01v0503") {
     bundledScriptsDirectory: bundle,
     mutate: (operation) => operation(),
     bindModel,
+    presentReview,
   });
-  const guardedTools = new AutoContinueTools(workflow.tools()).wrap();
+  const guard = new AutoContinueTools(workflow.tools());
+  const guardedTools = guard.wrap();
+  const context = {
+    sessionManager: { getSessionFile: () => path.join(root, "session.jsonl") },
+  };
   const call = (
     name: string,
     args: unknown,
@@ -129,7 +158,7 @@ async function fixture(blendHeader = "BLENDER17-01v0503") {
   const guardedCall = (name: string, args: unknown, callId: string) =>
     guardedTools
       .find((tool) => tool.name === name)!
-      .execute(callId, args as never, undefined, undefined, {} as never);
+      .execute(callId, args as never, undefined, undefined, context as never);
   return {
     root,
     project,
@@ -140,14 +169,163 @@ async function fixture(blendHeader = "BLENDER17-01v0503") {
     runner,
     call,
     guardedCall,
+    guard,
+    context,
     workflow,
     enabled,
     bindModel,
+    canvas,
+    presentReview,
     buffers,
   };
 }
 
 describe("controlled Blender project tools", () => {
+  it("keeps a missing script correctable without launching or replaying a Blender job", async () => {
+    const f = await fixture();
+    const input = { workflow: "hero", stage: "custom", scriptPath: "missing.py" };
+    await expect(f.guardedCall("run_blender", input, "missing-script")).rejects.toThrow("ENOENT");
+    expect(f.runner.run).not.toHaveBeenCalled();
+    expect(f.guard.recoverySummary).toContain("not_executed (invalid_blender_input)");
+    await f.guard.prepare(new AbortController().signal);
+    await writeFile(path.join(f.project.workspacePath, "missing.py"), "# corrected local script");
+    await expect(f.guardedCall("run_blender", input, "missing-script")).rejects.toThrow("ENOENT");
+    expect(f.runner.run).not.toHaveBeenCalled();
+    await f.guardedCall("run_blender", input, "corrected-script");
+    expect(f.runner.run).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])("keeps the original default review board after reordering (missing receipt=%s)", async missingReceipt => {
+    const f = await fixture();
+    const response = await f.call("run_blender", { workflow: "hero", stage: "parts", configPath: "parts.json" });
+    const original = (response.details!.blender as { canvas: { boardId: string } }).canvas.boardId;
+    expect(JSON.parse(await readFile(path.join(f.directory, "canvas-review.json"), "utf8"))).toEqual({ boardId: original });
+    if (missingReceipt) await rm(path.join(f.directory, "canvas-review.json"));
+    const index = await f.canvas.changeBoards(f.project.id, { type: "create", name: "Other board" });
+    const other = index.boards.at(-1)!.id;
+    await f.canvas.changeBoards(f.project.id, { type: "move", boardId: other, direction: -1 });
+    const recovered = await f.call("recover_blender_run", { runId: f.retained.id });
+    expect(recovered.details!.blender).toMatchObject({ canvas: { boardId: original } });
+    expect((await f.canvas.board(f.project.id, original)).board.nodes).toHaveLength(1);
+    expect((await f.canvas.board(f.project.id, other)).board.nodes).toHaveLength(0);
+    expect(f.runner.run).toHaveBeenCalledOnce();
+  });
+
+  it("does not redirect a retained review after its original board is deleted", async () => {
+    const f = await fixture();
+    const response = await f.call("run_blender", { workflow: "hero", stage: "parts", configPath: "parts.json" });
+    const original = (response.details!.blender as { canvas: { boardId: string } }).canvas.boardId;
+    const index = await f.canvas.changeBoards(f.project.id, { type: "create", name: "Other board" });
+    const other = index.boards.at(-1)!.id;
+    await f.canvas.changeBoards(f.project.id, { type: "delete", boardId: original });
+    await expect(f.call("recover_blender_run", { runId: f.retained.id })).rejects.toThrow("Canvas board not found");
+    expect((await f.canvas.board(f.project.id, other)).board.nodes).toHaveLength(0);
+    expect(f.runner.run).toHaveBeenCalledOnce();
+  });
+
+  it("preserves a user's replacement model instead of claiming the original review was restored", async () => {
+    const f = await fixture();
+    const response = await f.call("run_blender", { workflow: "hero", stage: "parts", configPath: "parts.json" });
+    const original = (response.details!.blender as { canvas: { boardId: string } }).canvas.boardId;
+    await writeFile(path.join(f.project.workspacePath, "other.glb"), f.buffers.get("model.glb")!);
+    const replacement = await f.projects.ensureLibraryAsset(f.project.id, "other.glb");
+    const detail = await f.canvas.board(f.project.id, original);
+    expect(detail.board.nodes[0].type).toBe("asset");
+    if (detail.board.nodes[0].type !== "asset") throw new Error("Expected a review asset");
+    expect(replacement).not.toBe(detail.board.nodes[0].data.assetId);
+    detail.board.nodes[0].data.assetId = replacement;
+    await f.canvas.saveBoard(f.project.id, detail.board, detail.revision);
+    await expect(f.call("recover_blender_run", { runId: f.retained.id })).rejects.toThrow("changed its asset or type");
+    expect((await f.canvas.board(f.project.id, original)).board.nodes).toMatchObject([{ data: { assetId: replacement } }]);
+    expect(f.runner.run).toHaveBeenCalledOnce();
+  });
+
+  it("refuses ambiguous review placement when a delivery receipt is missing", async () => {
+    const f = await fixture();
+    const response = await f.call("run_blender", { workflow: "hero", stage: "parts", configPath: "parts.json" });
+    const original = (response.details!.blender as { canvas: { boardId: string } }).canvas.boardId;
+    await rm(path.join(f.directory, "canvas-review.json"));
+    const index = await f.canvas.changeBoards(f.project.id, { type: "create", name: "Copied review" });
+    const other = await f.canvas.board(f.project.id, index.boards.at(-1)!.id);
+    const source = await f.canvas.board(f.project.id, original);
+    other.board.nodes = structuredClone(source.board.nodes);
+    other.board.editorLayout.nodes = structuredClone(source.board.editorLayout.nodes);
+    await f.canvas.saveBoard(f.project.id, other.board, other.revision);
+    await expect(f.call("recover_blender_run", { runId: f.retained.id })).rejects.toThrow("multiple boards");
+    expect((await f.canvas.board(f.project.id, original)).board.nodes).toHaveLength(1);
+    expect((await f.canvas.board(f.project.id, other.board.id)).board.nodes).toHaveLength(1);
+    expect(f.runner.run).toHaveBeenCalledOnce();
+  });
+
+  it("automatically publishes a stage model to Canvas and recovers without replacing user edits", async () => {
+    const f = await fixture();
+    const response = await f.call("run_blender", {
+      workflow: "hero",
+      stage: "parts",
+      configPath: "parts.json",
+    });
+    const delivery = response.details!.blender as {
+      canvas: { boardId: string; nodeIds: string[] };
+    };
+    expect(delivery.canvas.nodeIds).toEqual([`blender-${f.retained.id}-0`]);
+    const detail = await f.canvas.board(f.project.id, delivery.canvas.boardId);
+    expect(detail.board.nodes).toHaveLength(1);
+    expect(detail.board.nodes[0]).toMatchObject({
+      type: "asset",
+      data: { mediaType: "model" },
+    });
+    detail.board.nodes[0].title = "My accepted candidate title";
+    await f.canvas.saveBoard(f.project.id, detail.board, detail.revision);
+    await f.call("recover_blender_run", { runId: f.retained.id });
+    const recovered = await f.canvas.board(
+      f.project.id,
+      delivery.canvas.boardId,
+    );
+    expect(recovered.board.nodes).toHaveLength(1);
+    expect(recovered.board.nodes[0].title).toBe("My accepted candidate title");
+    const workspace = await f.canvas.workspace(f.project.id);
+    expect(workspace.assets[0]).toMatchObject({
+      mediaType: "model",
+      canvasOnly: true,
+    });
+    expect(
+      await readFile(
+        path.join(f.project.workspacePath, workspace.assets[0].path),
+      ),
+    ).toEqual(f.buffers.get("model.glb"));
+    expect(f.runner.run).toHaveBeenCalledOnce();
+  });
+
+  it("recovers Canvas publication failure on the original chosen board without rerunning", async () => {
+    const f = await fixture();
+    f.presentReview.mockRejectedValueOnce(
+      new Error("Canvas write interrupted"),
+    );
+    const index = await f.canvas.changeBoards(f.project.id, {
+      type: "create",
+      name: "3D review",
+    });
+    const boardId = index.boards.at(-1)!.id;
+    await expect(
+      f.call("run_blender", {
+        workflow: "hero",
+        stage: "parts",
+        configPath: "parts.json",
+        boardId,
+      }),
+    ).rejects.toThrow("is retained");
+    const output = await f.call("recover_blender_run", {
+      runId: f.retained.id,
+    });
+    expect(output.details!.blender).toMatchObject({ canvas: { boardId } });
+    expect(
+      (await f.canvas.board(f.project.id, boardId)).board.nodes,
+    ).toHaveLength(1);
+    expect(
+      (await f.canvas.board(f.project.id, index.boards[0].id)).board.nodes,
+    ).toHaveLength(0);
+    expect(f.runner.run).toHaveBeenCalledOnce();
+  });
   it("publishes exact outputs, executed sources and a recoverable project model binding", async () => {
     const f = await fixture();
     const input = {
@@ -410,6 +588,99 @@ describe("controlled Blender project tools", () => {
     });
     expect(f.runner.readJob).not.toHaveBeenCalled();
     expect(f.bindModel).not.toHaveBeenCalled();
+  });
+
+  it("settles a failed script, never replays its call, and permits corrected work after continuation", async () => {
+    const f = await fixture();
+    f.runner.run.mockRejectedValueOnce(
+      new BlenderRunError("Blender exited with code 2", f.retained.id),
+    );
+    f.runner.inspectJob.mockResolvedValue({
+      id: f.retained.id,
+      status: "failed",
+      log: "argparse: required input missing",
+    });
+    const input = {
+      workflow: "hero",
+      stage: "parts",
+      configPath: "parts.json",
+    };
+    const failed = await f.guardedCall("run_blender", input, "original");
+    expect(failed).toMatchObject({
+      isError: true,
+      details: { blender: { status: "failed", published: false } },
+    });
+    expect(f.bindModel).not.toHaveBeenCalled();
+    await f.guard.prepare(new AbortController().signal);
+    expect(await f.guardedCall("run_blender", input, "original")).toMatchObject(
+      { isError: true },
+    );
+    expect(f.runner.run).toHaveBeenCalledOnce();
+    await writeFile(
+      path.join(f.project.workspacePath, "parts.json"),
+      '{"parts":[],"corrected":true}',
+    );
+    await f.guardedCall("run_blender", input, "corrected");
+    expect(f.runner.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("recovers only the original conversation call after delivery fails, without restarting Blender", async () => {
+    const f = await fixture();
+    f.runner.run.mockImplementationOnce(async (input) => {
+      await writeFile(
+        path.join(f.directory, "invocation.json"),
+        JSON.stringify(input.invocation),
+      );
+      return f.retained;
+    });
+    f.bindModel.mockRejectedValueOnce(new Error("binding interrupted"));
+    const input = {
+      workflow: "hero",
+      stage: "parts",
+      configPath: "parts.json",
+    };
+    await expect(
+      f.guardedCall("run_blender", input, "original"),
+    ).rejects.toThrow("is retained");
+    await f.guard.prepare(new AbortController().signal);
+    expect(f.runner.run).toHaveBeenCalledOnce();
+    const output = await f.guardedCall("run_blender", input, "original");
+    expect((output.details as { blender: unknown }).blender).toMatchObject({
+      runId: f.retained.id,
+      workflow: "hero",
+    });
+    const tool = f.workflow
+      .tools()
+      .find((tool) => tool.name === "run_blender") as RecoverableTool;
+    await expect(
+      tool.recoverAfterHttp500!("original", input, undefined, undefined, {
+        sessionManager: { getSessionFile: () => "another-session" },
+      } as never),
+    ).rejects.toThrow("could not be identified");
+    await expect(
+      tool.recoverAfterHttp500!(
+        "original",
+        { ...input, workflow: "other" },
+        undefined,
+        undefined,
+        f.context as never,
+      ),
+    ).rejects.toThrow("could not be identified");
+    f.runner.inspectJob.mockResolvedValue({
+      id: f.retained.id,
+      status: "interrupted",
+      log: "",
+    });
+    await expect(
+      tool.recoverAfterHttp500!(
+        "original",
+        input,
+        undefined,
+        undefined,
+        f.context as never,
+      ),
+    ).rejects.toThrow("still unconfirmed");
+    expect(f.runner.run).toHaveBeenCalledOnce();
   });
 
   it("does not share a call-ID cache across fresh conversation wrappers", async () => {

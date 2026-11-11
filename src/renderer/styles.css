@@ -7556,12 +7556,18 @@ button.home-nav-item-active:hover {
   min-height: inherit;
 }
 
-.model-preview-clips {
+.model-preview-controls {
   position: absolute;
   z-index: 2;
   bottom: 8px;
   left: 8px;
   max-width: calc(100% - 16px);
+  display: flex;
+  gap: 4px;
+}
+
+.model-preview-controls button,
+.model-preview-clips {
   height: 26px;
   padding: 0 8px;
   border: 0;
@@ -7571,6 +7577,20 @@ button.home-nav-item-active:hover {
   cursor: pointer;
   font: inherit;
   font-size: 11px;
+}
+
+.model-preview-controls button {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.model-preview-clips { min-width: 0; }
+
+.model-preview-controls button:focus-visible,
+.model-preview-clips:focus-visible {
+  outline: 2px solid var(--theme-accent);
+  outline-offset: 2px;
 }
 
 .model-preview-state {

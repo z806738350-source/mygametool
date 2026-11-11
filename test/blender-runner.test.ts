@@ -212,6 +212,66 @@ bpy.ops.render.render(write_still=True)
     );
   }, 20_000);
 
+  it("retains invocation identity on a real argument failure and supports nested inputs with the documented parser", async () => {
+    const invocation = {
+      callId: "original",
+      sessionFile: "/private/session.jsonl",
+      request: { stage: "custom" },
+    };
+    await writeFile(
+      path.join(workspace, "model.py"),
+      'import argparse\np = argparse.ArgumentParser()\np.add_argument("--input-dir", required=True)\np.parse_args()\n',
+    );
+    const failure = await runner
+      .run({ workspace, scriptPath: "model.py", inputs: [], invocation })
+      .catch((error) => error as BlenderRunError);
+    expect(failure).toBeInstanceOf(BlenderRunError);
+    const id = (failure as BlenderRunError).jobId!;
+    expect(await runner.inspectJob(id)).toMatchObject({
+      status: "failed",
+      log: expect.stringContaining("--input-dir"),
+    });
+    expect(
+      JSON.parse(
+        await readFile(
+          path.join(directory, "jobs", id, "invocation.json"),
+          "utf8",
+        ),
+      ),
+    ).toEqual(invocation);
+    await mkdir(path.join(workspace, "nested"));
+    await writeFile(
+      path.join(workspace, "nested/source.json"),
+      '{"preserved":true}',
+    );
+    await writeFile(
+      path.join(workspace, "model.py"),
+      `import argparse, sys
+from pathlib import Path
+p = argparse.ArgumentParser()
+p.add_argument("--input-dir", required=True)
+p.add_argument("--output-dir", required=True)
+p.add_argument("--input", required=True)
+a = p.parse_args(sys.argv[sys.argv.index("--") + 1:])
+(Path(a.output_dir) / "report.json").write_bytes((Path(a.input_dir) / a.input).read_bytes())
+`,
+    );
+    const corrected = await runner.run({
+      workspace,
+      scriptPath: "model.py",
+      inputs: ["nested/source.json"],
+      args: ["--input", "nested/source.json"],
+    });
+    expect(
+      JSON.parse(
+        await readFile(
+          path.join(corrected.outputDirectory, "report.json"),
+          "utf8",
+        ),
+      ),
+    ).toEqual({ preserved: true });
+  }, 30_000);
+
   it("refuses a symlink output directory instead of reading a path outside its job", async () => {
     await writeFile(
       path.join(workspace, "model.py"),

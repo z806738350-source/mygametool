@@ -20,7 +20,7 @@ import { NATIVE_API } from "./replay.js";
 import { inside } from "./policy.js";
 import { sessionImageReferenceContext, sessionImageReferences } from "../session-images.js";
 import { isRecoverableInterruption, type AgentInterruption, type AutoContinueTools } from "../agent-auto-continue.js";
-import { getToolPreflightFailure } from "../agent-tool-errors.js";
+import { getToolConfirmedFailure, getToolPreflightFailure } from "../agent-tool-errors.js";
 import { getIsolatedOperationReceipts, getIsolatedRepairResolutions, getIsolatedRepairPending } from "../isolated-tool-receipts.js";
 
 /** The custom entry that records which native session a conversation's branch continues. */
@@ -380,10 +380,11 @@ export class NativeCodingSession implements CodingSession {
     await guard.prepare(signal, async (result, tool, callId) => {
       this.#assertContinuation();
       signal.throwIfAborted();
+      const confirmedFailure = getToolConfirmedFailure(result);
       this.sessionManager.appendCustomMessageEntry("ohmygame-native-recovered-tool", [
-        { type: "text", text: `Recovered the existing result of ${tool}, original call ${callId}. No replacement operation was submitted.` },
+        { type: "text", text: `${confirmedFailure ? "Confirmed the failed outcome" : "Recovered the existing result"} of ${tool}, original call ${callId}. No replacement operation was submitted.` },
         ...result.content,
-      ] as never, false, { tool, originalCallId: callId });
+      ] as never, false, { tool, originalCallId: callId, ...(confirmedFailure ? { isError: true, confirmedFailure } : {}) });
     });
     signal.throwIfAborted();
     await this.options.assertContinuation?.();

@@ -1670,6 +1670,10 @@ const en = {
     submit: "Submit answer",
   },
   agentError: {
+    tool_outcome_unconfirmed: {
+      title: "Tool outcome needs confirmation",
+      message: "Automatic continuation paused because a previous tool's result is unconfirmed. Ask the agent to inspect or recover that original run and its retained files before continuing. The operation was not repeated.",
+    },
     repeated_media_arguments: {
       title: "Repeated invalid media call",
       message: "The agent stopped after submitting the same invalid tool arguments twice. Both calls were rejected locally. See the last tool result for the fields to correct.",
@@ -1780,6 +1784,7 @@ const en = {
       providerResponse: "Provider response",
       streamDetails: "Stream details",
       localCli: "Local CLI details",
+      localTool: "Local operation details",
       provider: "Provider",
       model: "Model",
       endpoint: "Endpoint",
@@ -3374,6 +3379,8 @@ const en = {
     loadingProgress: "Loading 3D model {{percent}}%",
     loading: "Loading 3D model",
     clip: "Animation clip",
+    play: "Play animation",
+    pause: "Pause animation",
   },
   markdown: {
     openInCode: "Open {{path}} in Code",

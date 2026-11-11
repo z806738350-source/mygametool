@@ -27,8 +27,11 @@ The underlying script accepts:
 
 Paths after `--config`/`--input` are relative to the input directory. Inputs are
 never saved over. The output directory must be empty. Every successful stage
-saves `scene.blend` and `report.json`. Review stages also produce PNGs. `export`
-adds `model.glb`. Keep using the returned source path, not a guessed filename.
+saves `scene.blend` and `report.json`. Modeling stages add a roundtrip-checked
+`review.glb` and auxiliary PNGs; `export` instead adds `model.glb`. Preview GLBs
+come from the saved scene, excluding temporary joint markers and render helpers.
+Animation previews include the clips for actual playback. Keep using the returned
+source path, not a guessed filename.
 An interrupted stage is not permission to discard its earlier outputs.
 
 `report.technicalChecksPassed` describes only the checks actually recorded.
@@ -37,6 +40,12 @@ finish successfully with failed technical checks. Read them before continuing.
 Missing information or unsupported data produces an error report. Set
 `previews:false` only for a repeat of an already inspected technical check;
 production reviews need actual images and the user's decisions.
+The host publishes the model and images as Canvas assets on the supplied `boardId`
+(otherwise the first board), returning the node IDs. The model viewer supports
+rotation, zoom, play/pause and clip selection; use it as the primary review.
+Keep joint/region overlays and stress-pose images alongside it. Recovery reuses
+the same nodes and preserves their edited titles and layout. Preview publication
+does not mark the asset approved or add it to the running game.
 
 The shipped baseline has been exercised with Blender 5.3. Its ordinary Python
 uses Blender's `bpy`, `bmesh` and `mathutils`, with no external Python packages.
@@ -46,6 +55,35 @@ and explicitly save their `.blend` with `bpy.ops.wm.save_as_mainfile(filepath=..
 (the publisher validates an ordinary `BLENDER` file header, not a compressed wrapper).
 Custom scripts can `import pipeline` and `import export_glb` to reuse these helpers;
 the host preserves the exact executed sources in `recipe/` alongside each result.
+Use this argument setup in custom scripts. Blender's `--` separator is present in
+`sys.argv`; passing the whole argument list to `argparse` hides the options.
+Inputs keep their project-relative subdirectories, so use the supplied `--input`
+instead of searching only the root input directory:
+
+```python
+import argparse
+import sys
+from pathlib import Path
+import bpy
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--input-dir", required=True)
+parser.add_argument("--output-dir", required=True)
+parser.add_argument("--input")
+parser.add_argument("--config")
+args = parser.parse_args(sys.argv[sys.argv.index("--") + 1:])
+inputs = Path(args.input_dir)
+output = Path(args.output_dir)
+if args.input:
+    bpy.ops.wm.open_mainfile(filepath=str(inputs / args.input))  # .blend input
+# Read only declared inputs. Write results only below output.
+```
+
+A confirmed script failure returns its retained run ID, failure status and log;
+it does not approve or publish partial files. Fix the script/configuration and
+make a new call. Repeating the original call returns its original outcome.
+For an unknown or interrupted delivery, inspect/recover that exact retained run
+before starting new work. Never recreate a Tripo initial model to fix a local error.
 The runner is responsible for process and
 file isolation; Python argument validation is not a sandbox.
 

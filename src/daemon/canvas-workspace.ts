@@ -475,6 +475,46 @@ export class CanvasStore {
       return detail;
     });
   }
+  /** Add retained local review media without replacing the user's nodes or layout. */
+  async presentLocalAssets(id: string, entries: readonly { nodeId: string; assetId: string; title: string }[], boardId?: string): Promise<{ boardId: string; nodeIds: string[] }> {
+    const project = this.#project(id), workspace = project.workspacePath;
+    return withCanvasLock(workspace, async () => {
+      const index = await ensureCanvasIndex(workspace);
+      let selected = boardId;
+      if (!selected) {
+        // A board write can succeed before its caller retains the delivery receipt.
+        const nodeIds = new Set(entries.map(entry => entry.nodeId));
+        const existing: string[] = [];
+        for (const item of index.boards) {
+          const { board } = await this.board(id, item.id);
+          if (board.nodes.some(node => nodeIds.has(node.id))) existing.push(item.id);
+        }
+        if (existing.length > 1) throw new CanvasError("The retained review nodes exist on multiple boards; review their original placement before recovery", 409);
+        selected = existing[0] ?? index.boards[0]!.id;
+      }
+      const { board } = await this.board(id, selected);
+      for (const entry of entries) {
+        const node = board.nodes.find(node => node.id === entry.nodeId);
+        if (node && (node.type !== "asset" || node.data.assetId !== entry.assetId))
+          throw new CanvasError("A retained review node changed its asset or type; preserving the user's edit instead of replacing it", 409);
+      }
+      const pending = entries.filter(entry => !board.nodes.some(node => node.id === entry.nodeId));
+      if (pending.length) {
+        const manifest = await ensureCanvasAssets(project, this.projects, this.library, pending.map(entry => entry.assetId));
+        const assets = await canvasAssetCatalog(workspace, manifest, pending.map(entry => entry.assetId));
+        for (const entry of pending) {
+          validId(entry.nodeId);
+          const asset = assets.find(asset => asset.id === entry.assetId)!;
+          board.nodes.push({ id: entry.nodeId, type: "asset", position: { x: 0, y: 0 }, title: entry.title, data: { assetId: entry.assetId, mediaType: asset.mediaType } });
+        }
+        board.editorLayout = fitCanvasLayout(board.nodes, board.editorLayout);
+        for (const node of board.nodes) node.position = board.editorLayout.nodes[node.id]!;
+        await writeCanvasBoard(workspace, board);
+        await this.projects.touch(id);
+      }
+      return { boardId: selected, nodeIds: entries.map(entry => entry.nodeId) };
+    });
+  }
   /** Publish an agent request and its sources atomically before any provider call. */
   async createAgentMediaNode(id: string, nodeId: string, create: (reference: (source: { path: string } | { assetId: string; audioReference?: true } | { attachmentReference: string; image: PromptImage; signal?: AbortSignal }) => Promise<AssetCanvasReference>) => Promise<AssetCanvasNode>, boardId?: string): Promise<{ boardId: string; nodeId: string }> {
     const project = this.#project(id), workspace = project.workspacePath;

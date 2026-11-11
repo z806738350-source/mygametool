@@ -8,10 +8,15 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
   getToolPreflightFailure,
+  confirmBlenderRunFailure,
+  getToolConfirmedFailure,
+  inheritToolConfirmedFailure,
   inheritToolPreflightFailure,
+  parseToolConfirmedFailure,
   parseToolPreflightFailure,
   toolPreflightError,
   type ToolPreflightFailure,
+  type ToolConfirmedFailure,
 } from "./agent-tool-errors.js";
 import { getIsolatedOperationReceipts, inheritIsolatedOperationReceipts, isolatedCommandsNotSubmitted, isolatedInputBudgetError,
   isIsolatedInputBudgetError, retainedIsolatedOperationEvidence, withIsolatedOperationScope, type IsolatedOperationReceipt } from "./isolated-tool-receipts.js";
@@ -77,9 +82,10 @@ export interface AutoContinueAttemptSummary {
   userEntryId?: string;
   tool: string;
   callId: string;
-  state: "started" | "completed" | "unknown" | "not_executed" | "command_not_submitted" | "effects_recovered" | "observed" | "blocked";
+  state: "started" | "completed" | "failed_confirmed" | "unknown" | "not_executed" | "command_not_submitted" | "effects_recovered" | "observed" | "blocked";
   anchorId?: string;
   preflightFailure?: ToolPreflightFailure;
+  confirmedFailure?: ToolConfirmedFailure;
   isolatedOperations?: readonly IsolatedOperationReceipt[];
   effectsRecovered?: readonly IsolatedRepairResolution[];
   repairResolutions?: readonly IsolatedRepairResolution[];
@@ -93,6 +99,7 @@ type Attempt = {
   retainedResult?: Result;
   failure?: unknown;
   preflightFailure?: ToolPreflightFailure;
+  confirmedFailure?: ToolConfirmedFailure;
   isolatedOperations?: readonly IsolatedOperationReceipt[];
   commandNotSubmitted?: boolean;
   effectsRecovered?: readonly IsolatedRepairResolution[];
@@ -154,6 +161,7 @@ const READ_ONLY = new Set([
 const REPAIR_READS = new Set(["read", "read_project_file", "read_attachment", "ls", "find", "grep", "recall_image", "read_workflow_guide", "blender_status", "list_media_capabilities", "list_animation_actions", "canvas_check", "playable_check"]);
 const REPAIR_ACTIONS = new Set(["inspect", "capacity", "plan_capacity", "plan_first_allocation", "inspect_capacity_migration", "review", "read_image", "prepare-review", "optimize", "adopt", "recover", "verify"]);
 const OBSERVATION_ACTIONS = new Set(["inspect", "capacity", "plan_capacity", "plan_first_allocation", "inspect_capacity_migration", "read_image"]);
+const BLENDER_TOOLS = new Set(["run_blender", "recover_blender_run"]);
 
 // Request identities stay in memory. Neither arguments nor their fingerprints enter diagnostics.
 function identity(value: unknown): string {
@@ -188,7 +196,7 @@ export class AutoContinueTools {
     if (this.#unrecorded.size || task.blocked && task.blockedKind !== "unknown") return false;
     if ([...task.attempts.values()].some(attempt => attempt.preflightFailure?.disposition === "blocked")) return false;
     try { this.#assertBranch(task); } catch { return false; }
-    const unknown = [...task.attempts.values()].filter(attempt => !attempt.observation && !attempt.result && !attempt.preflightFailure && !attempt.commandNotSubmitted && !attempt.effectsRecovered?.length);
+    const unknown = [...task.attempts.values()].filter(attempt => !attempt.observation && !attempt.result && !attempt.confirmedFailure && !attempt.preflightFailure && !attempt.commandNotSubmitted && !attempt.effectsRecovered?.length);
     return unknown.length > 0 && unknown.every(attempt => this.#targets(task, attempt).length > 0 || this.#pendingTargets(task, attempt).length > 0);
   }
 
@@ -241,7 +249,7 @@ export class AutoContinueTools {
         settled.push(...entries);
       }
       if (settled.length) {
-        task.repairOnly = [...task.attempts.values()].some(attempt => attempt !== repair && !attempt.observation && !attempt.result && !attempt.preflightFailure && !attempt.commandNotSubmitted && !attempt.effectsRecovered?.length);
+        task.repairOnly = [...task.attempts.values()].some(attempt => attempt !== repair && !attempt.observation && !attempt.result && !attempt.confirmedFailure && !attempt.preflightFailure && !attempt.commandNotSubmitted && !attempt.effectsRecovered?.length);
         task.verifyOnly = [...task.attempts.values()].some(attempt => this.#pendingTargets(task, attempt).length > 0);
         if (!task.repairOnly && task.blockedKind === "unknown") { task.blocked = undefined; task.blockedKind = undefined; }
         task.needsRead = true;
@@ -271,7 +279,7 @@ export class AutoContinueTools {
             item.state +
             (item.preflightFailure
               ? " (" + item.preflightFailure.reason + ")"
-              : "") + (item.isolatedOperations ? " — project-command receipts " + JSON.stringify(item.isolatedOperations) + ". Command submission scope only; VM startup or preview pauses may already have occurred." : "") +
+              : "") + (item.confirmedFailure ? " — retained Blender run " + item.confirmedFailure.runId + "; process failed, no result published. Inspect its diagnostic and correct the script before a new call; the original call must not be replayed." : "") + (item.isolatedOperations ? " — project-command receipts " + JSON.stringify(item.isolatedOperations) + ". Command submission scope only; VM startup or preview pauses may already have occurred." : "") +
             (item.pendingVerification ? " — pending publication verification " + JSON.stringify({ reviewId: item.pendingVerification.reviewId, recoveryOperationId: item.pendingVerification.recoveryOperationId, rawSnapshotId: item.pendingVerification.rawSnapshotId, preparedSnapshotId: item.pendingVerification.preparedSnapshotId, publicationId: item.pendingVerification.publicationId }) : ""),
         )
         .join("\n") +
@@ -325,6 +333,7 @@ export class AutoContinueTools {
         ![
           "started",
           "completed",
+          "failed_confirmed",
           "unknown",
           "not_executed",
           "command_not_submitted",
@@ -390,6 +399,7 @@ export class AutoContinueTools {
       if (!wasUnknown && !changedCall && item.state === "observed" && item.tool === "recover_isolated_changes" && (input as Record<string, unknown> | undefined)?.action === "verify") attempt.observation = true;
       attempt.settled = item.state !== "started";
       attempt.preflightFailure = undefined;
+      attempt.confirmedFailure = undefined;
       attempt.commandNotSubmitted = false;
       attempt.failure = undefined;
       attempt.retainedResult = undefined;
@@ -400,6 +410,15 @@ export class AutoContinueTools {
         !changedCall
           ? ({ content: message.content, details: message.details } as Result)
           : undefined;
+      const confirmedFailure = parseToolConfirmedFailure(item.confirmedFailure);
+      if (item.state === "failed_confirmed" && BLENDER_TOOLS.has(attempt.tool) &&
+        original && !changedCall && message?.isError && confirmedFailure) {
+        attempt.confirmedFailure = confirmedFailure;
+        attempt.unconfirmed = false;
+        attempt.retainedResult = confirmBlenderRunFailure({
+          content: message.content, details: message.details, isError: true,
+        } as Result, confirmedFailure.runId);
+      }
       const rejection = parseToolPreflightFailure(item.preflightFailure);
       const canonicalRejection = parseToolPreflightFailure(
         (message as unknown as { preflightFailure?: unknown } | undefined)
@@ -466,7 +485,7 @@ export class AutoContinueTools {
       if (
         item.state !== "started" &&
         !attempt.result &&
-        !attempt.preflightFailure && !attempt.commandNotSubmitted && !attempt.observation
+        !attempt.confirmedFailure && !attempt.preflightFailure && !attempt.commandNotSubmitted && !attempt.observation
       )
         attempt.unconfirmed = true;
       task.attempts.set(item.callId, attempt);
@@ -613,6 +632,7 @@ export class AutoContinueTools {
         const unknown = [...task.attempts.values()].find(
           (attempt) =>
             !attempt.result &&
+            !attempt.confirmedFailure &&
             !attempt.observation && attempt.preflightFailure?.disposition !== "correctable" && !attempt.commandNotSubmitted && !attempt.effectsRecovered?.length,
         );
         if (task.continuing && unknown && !(task.repairOnly && repairAction)) throw this.#stop(task, unknown);
@@ -690,6 +710,9 @@ export class AutoContinueTools {
       failure = cause;
     }
     attempt.failure = failure;
+    attempt.confirmedFailure = BLENDER_TOOLS.has(attempt.tool) &&
+      (result as (Result & { isError?: boolean }) | undefined)?.isError
+      ? getToolConfirmedFailure(result) : undefined;
     attempt.pendingVerification = getIsolatedRepairPending(failure) ?? getIsolatedRepairPending(result);
     const isolated = getIsolatedOperationReceipts(failure) ?? getIsolatedOperationReceipts(result);
     if (isolated) attempt.isolatedOperations = isolated;
@@ -740,6 +763,7 @@ export class AutoContinueTools {
       );
     } catch {
       attempt.result = undefined;
+      attempt.confirmedFailure = undefined;
       attempt.preflightFailure = undefined;
       attempt.commandNotSubmitted = false;
       task.blocked =
@@ -749,9 +773,9 @@ export class AutoContinueTools {
     } finally {
       attempt.pending = undefined;
     }
-    if (!attempt.observation && !attempt.result && !attempt.preflightFailure && !attempt.commandNotSubmitted && task.continuing)
+    if (!attempt.observation && !attempt.result && !attempt.confirmedFailure && !attempt.preflightFailure && !attempt.commandNotSubmitted && task.continuing)
       { task.blocked = this.#unknownMessage(attempt); task.blockedKind = "unknown"; }
-    if (!attempt.observation && !attempt.result && !attempt.preflightFailure && !attempt.commandNotSubmitted && (attempt.isolatedOperations?.length || attempt.pendingVerification)) {
+    if (!attempt.observation && !attempt.result && !attempt.confirmedFailure && !attempt.preflightFailure && !attempt.commandNotSubmitted && (attempt.isolatedOperations?.length || attempt.pendingVerification)) {
       if (this.repairable) { task.repairOnly = true; task.verifyOnly = [...task.attempts.values()].some(attempt => this.#pendingTargets(task, attempt).length > 0); }
       else { task.blocked = this.#unknownMessage(attempt); task.blockedKind = "unknown"; }
     }
@@ -795,16 +819,16 @@ export class AutoContinueTools {
 
   #reuse(task: Task, attempt: Attempt): Result {
     if (attempt.result) return originalResult(attempt.result, attempt);
-    if (attempt.preflightFailure || attempt.commandNotSubmitted || attempt.effectsRecovered?.length || attempt.observation || this.#targets(task, attempt).length || this.#pendingTargets(task, attempt).length) {
+    if (attempt.confirmedFailure || attempt.preflightFailure || attempt.commandNotSubmitted || attempt.effectsRecovered?.length || attempt.observation || this.#targets(task, attempt).length || this.#pendingTargets(task, attempt).length) {
       if (attempt.failure !== undefined) throw attempt.failure;
       if (attempt.retainedResult)
-        return inheritIsolatedRepairPending(inheritIsolatedRepairResolutions(inheritIsolatedOperationReceipts(inheritToolPreflightFailure(
+        return inheritToolConfirmedFailure(inheritIsolatedRepairPending(inheritIsolatedRepairResolutions(inheritIsolatedOperationReceipts(inheritToolPreflightFailure(
           {
             ...attempt.retainedResult,
             content: [...attempt.retainedResult.content],
           },
           attempt.retainedResult,
-        ), attempt.retainedResult), attempt.retainedResult), attempt.retainedResult);
+        ), attempt.retainedResult), attempt.retainedResult), attempt.retainedResult), attempt.retainedResult);
     }
     throw this.#stop(task, attempt);
   }
@@ -821,9 +845,12 @@ export class AutoContinueTools {
     const task = this.#task;
     await this.#assertCurrent(task, signal);
     if (this.repairable) { task.repairOnly = true; task.verifyOnly = [...task.attempts.values()].some(attempt => this.#pendingTargets(task, attempt).length > 0); task.continuing = true; return; }
-    this.assertSafe();
+    // An unknown local outcome may now have a retained terminal receipt. Only
+    // the original tool's recovery hook can resolve it; execution is never retried.
+    if (task.blockedKind !== "unknown" || this.#unrecorded.size) this.assertSafe();
     for (const attempt of task.attempts.values()) {
       if (attempt.result) continue;
+      if (attempt.confirmedFailure) continue;
       if (attempt.observation) continue;
       if (attempt.preflightFailure?.disposition === "correctable") continue;
       if (attempt.commandNotSubmitted) continue;
@@ -866,21 +893,27 @@ export class AutoContinueTools {
               undefined,
               attempt.call[4],
             );
-        if ((result as Result & { isError?: boolean }).isError)
+        if ((result as Result & { isError?: boolean }).isError &&
+          !(BLENDER_TOOLS.has(attempt.tool) && getToolConfirmedFailure(result)))
           throw new Error("Recovery did not confirm the original result");
       } catch {
         await this.#assertCurrent(task, signal);
         throw this.#stop(task, attempt);
       }
-      attempt.result = result;
+      attempt.confirmedFailure = BLENDER_TOOLS.has(attempt.tool) &&
+        (result as Result & { isError?: boolean }).isError ? getToolConfirmedFailure(result) : undefined;
+      attempt.result = attempt.confirmedFailure ? undefined : result;
+      attempt.failure = undefined;
+      attempt.unconfirmed = false;
       attempt.retainedResult = result;
       try {
         await this.#assertCurrent(task, signal);
       } catch (cause) {
         try {
-          await this.#record(task, attempt, "completed", true, result);
+          await this.#record(task, attempt, this.#summary(task, attempt).state, true, result);
         } catch {
           attempt.result = undefined;
+          attempt.confirmedFailure = undefined;
           this.#unrecorded.set(attempt, this.#summary(task, attempt));
         }
         throw cause;
@@ -888,14 +921,16 @@ export class AutoContinueTools {
       try {
         await onRecovered?.(result, attempt.tool, attempt.call[0]);
         await this.#assertCurrent(task, signal);
-        await this.#record(task, attempt, "completed");
+        await this.#record(task, attempt, this.#summary(task, attempt).state);
       } catch {
         task.blocked =
           "The recovered original result could not be recorded for this task; no replacement was submitted.";
+        task.blockedKind = undefined;
         throw new Error(task.blocked);
       }
     }
     await this.#assertCurrent(task, signal);
+    if (task.blockedKind === "unknown") { task.blocked = undefined; task.blockedKind = undefined; }
     task.continuing = true;
   }
 
@@ -916,6 +951,7 @@ export class AutoContinueTools {
       callId: attempt.call[0],
       state: attempt.result
         ? "completed"
+        : attempt.confirmedFailure ? "failed_confirmed"
         : attempt.observation ? "observed"
         : attempt.effectsRecovered?.length ? "effects_recovered"
         : attempt.preflightFailure
@@ -929,6 +965,7 @@ export class AutoContinueTools {
       ...(attempt.preflightFailure
         ? { preflightFailure: attempt.preflightFailure }
         : {}),
+      ...(attempt.confirmedFailure ? { confirmedFailure: attempt.confirmedFailure } : {}),
       ...(attempt.isolatedOperations ? { isolatedOperations: attempt.isolatedOperations } : {}),
       ...(attempt.effectsRecovered?.length ? { effectsRecovered: attempt.effectsRecovered } : {}),
       ...(attempt.repairResolutions?.length ? { repairResolutions: attempt.repairResolutions } : {}),

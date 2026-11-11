@@ -653,7 +653,7 @@ def playback_samples():
     return results
 
 
-def export_roundtrip(output):
+def export_roundtrip(output, filename="model.glb"):
     before = geometry_report()
     arms = [obj for obj in bpy.context.scene.objects if obj.type == "ARMATURE"]
     expected_bones = {bone.name for arm in arms for bone in arm.data.bones if bone.use_deform}
@@ -665,11 +665,11 @@ def export_roundtrip(output):
             track.mute = False
     original_argv = sys.argv
     try:
-        sys.argv = ["export_glb.py", "--", "--output", str(output / "model.glb")]
+        sys.argv = ["export_glb.py", "--", "--output", str(output / filename)]
         runpy.run_path(str(Path(__file__).with_name("export_glb.py")), run_name="__main__")
     finally:
         sys.argv = original_argv
-    raw = (output / "model.glb").read_bytes()
+    raw = (output / filename).read_bytes()
     json_length, json_type = struct.unpack_from("<II", raw, 12)
     if json_type != 0x4E4F534A:
         raise ValueError("Export has no glTF JSON chunk")
@@ -677,11 +677,11 @@ def export_roundtrip(output):
     clip_names = {animation.get("name", "") for animation in document.get("animations", [])}
     joint_names = {document["nodes"][index].get("name", "") for skin in document.get("skins", []) for index in skin["joints"]}
     bpy.ops.wm.read_factory_settings(use_empty=True)
-    bpy.ops.import_scene.gltf(filepath=str(output / "model.glb"))
+    bpy.ops.import_scene.gltf(filepath=str(output / filename))
     after = geometry_report()
     playback = playback_samples()
     height_error = abs(before["bounds"]["size"][2] - after["bounds"]["size"][2])
-    return {"trianglesBefore": before["triangles"], "trianglesAfter": after["triangles"], "heightError": height_error, "expectedBones": sorted(expected_bones), "exportedJoints": sorted(joint_names), "expectedClips": sorted(expected_clips), "exportedClips": sorted(clip_names), "playback": playback, "passed": before["triangles"] == after["triangles"] and height_error < .001 and expected_bones.issubset(joint_names) and expected_clips == clip_names and (not expected_clips or len(playback) == len(expected_clips) and all(clip["passed"] for clip in playback)), "runtimeReview": "pending: load model.glb and play every clip in the target project"}
+    return {"trianglesBefore": before["triangles"], "trianglesAfter": after["triangles"], "heightError": height_error, "expectedBones": sorted(expected_bones), "exportedJoints": sorted(joint_names), "expectedClips": sorted(expected_clips), "exportedClips": sorted(clip_names), "playback": playback, "passed": before["triangles"] == after["triangles"] and height_error < .001 and expected_bones.issubset(joint_names) and expected_clips == clip_names and (not expected_clips or len(playback) == len(expected_clips) and all(clip["passed"] for clip in playback)), "runtimeReview": f"pending: load {filename} and play every clip in the target project"}
 
 
 def main():
@@ -740,6 +740,11 @@ def main():
             report["previews"] = render_reviews(output, config)
         if args.stage == "export":
             report["checks"]["roundtrip"] = export_roundtrip(output)
+        else:
+            # Render-only joint markers must not become geometry in the review model.
+            bpy.ops.wm.open_mainfile(filepath=str(output / "scene.blend"), load_ui=False, use_scripts=False)
+            report["checks"]["previewRoundtrip"] = export_roundtrip(output, "review.glb")
+            report["previewModel"] = "review.glb"
         report["technicalChecksPassed"] = all(check.get("passed", True) for check in report["checks"].values())
         report["outputs"] = ["report.json"] + [file.name for file in output.iterdir() if file.is_file() and file.name != "report.json"]
     except Exception as error:

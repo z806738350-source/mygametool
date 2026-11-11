@@ -442,6 +442,17 @@ describe("conversation handoff", () => {
     expect(summary).not.toContain("message 0\n");
     expect(summary).toContain("earlier turns omitted");
   });
+
+  it("keeps a recovered failed Blender stage failed in the next agent's handoff", () => {
+    const session = SessionManager.inMemory("/tmp/blender-recovery-handoff");
+    session.appendMessage({ role: "user", content: "Build the model", timestamp: 1 });
+    session.appendCustomMessageEntry("ohmygame-native-recovered-tool", [{ type: "text", text: "Confirmed the failed outcome. Inspect the retained diagnostic." }], false,
+      { tool: "run_blender", originalCallId: "failed-blender", isError: true, confirmedFailure: { reason: "blender_run_failed", runId: "3fc6a611-fb60-49ce-80fe-41ccba63f99a" } });
+    const summary = handoffSummary(session.getBranch());
+    expect(summary).toContain('"originalCallId":"failed-blender","tool":"run_blender","state":"failed_confirmed"');
+    expect(summary).not.toContain('"state":"completed"');
+    expect(summary).toContain("It is a failed stage, not successful modeling");
+  });
 });
 
 describe("OhMyGame tool bridge", () => {

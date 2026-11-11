@@ -8,7 +8,11 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
-import { defineTool } from "@earendil-works/pi-coding-agent";
+import { isDeepStrictEqual } from "node:util";
+import {
+  defineTool,
+  type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { Check } from "typebox/value";
 import {
@@ -21,6 +25,11 @@ import { readSafeProjectFile } from "./safe-project-file.js";
 import { inspectModel3D } from "./model3d-inspect.js";
 import { isFbxArtifact } from "./fbx-preview.js";
 import { validateRasterReturn } from "./isolated-raster-returns.js";
+import {
+  confirmBlenderRunFailure,
+  toolPreflightError,
+} from "./agent-tool-errors.js";
+import type { RecoverableTool } from "./agent-auto-continue.js";
 
 const UUID = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i;
 const stages = [
@@ -64,7 +73,7 @@ const runParameters = Type.Object(
       Type.String({
         maxLength: 240,
         description:
-          "Project Python script, only for the custom stage. Receives --input-dir and --output-dir.",
+          "Project Python script, only for custom. Parse arguments AFTER sys.argv's '--' separator: --input-dir, --output-dir, optional --input and --config. Input paths retain project subdirectories; open Path(args.input_dir) / args.input, not glob('*.blend').",
       }),
     ),
     inputs: Type.Optional(
@@ -75,6 +84,13 @@ const runParameters = Type.Object(
       }),
     ),
     timeoutSeconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })),
+    boardId: Type.Optional(
+      Type.String({
+        pattern: "^[a-zA-Z0-9_-]{1,100}$",
+        description:
+          "Canvas board for interactive review. Use the current board when known; otherwise the first project board is used.",
+      }),
+    ),
   },
   { additionalProperties: false },
 );
@@ -91,6 +107,13 @@ export interface BlenderToolsOptions {
   mutate: Mutate;
   bindModel: (relativePath: string) => Promise<string>;
   touch?: () => Promise<unknown>;
+  presentReview?: (review: {
+    runId: string;
+    workflow: string;
+    stage: string;
+    boardId?: string;
+    files: string[];
+  }) => Promise<{ boardId: string; nodeIds: string[] }>;
 }
 
 const result = (value: unknown) => ({
@@ -139,20 +162,80 @@ export class BlenderWorkflow {
           });
         },
       }),
-      defineTool({
-        name: "run_blender",
-        label: "Run Blender stage",
-        description:
-          "Run one reproducible local Blender stage in a private, network-disabled environment. Read blender-assets and its pipeline reference first. Use Tripo only for an initial organic mesh when needed; this tool never calls a paid provider. Review dimensions/views before modeling, joints before rigging, deformation before animation, and motion before final use. New output is retained with its editable .blend, reports and previews; previous files are preserved. Custom Python can import the bundled pipeline and export_glb helpers and has access only to declared input snapshots and the private output directory. Use recover_blender_run after interrupted delivery instead of rerunning.",
-        parameters: runParameters,
-        execute: async (_callId, input, signal) => {
-          if (!Check(runParameters, input))
-            throw new Error("Invalid Blender workflow arguments");
-          this.#assertEnabled();
-          // Session AutoContinueTools owns call replay; IDs may recur in other conversations.
-          return this.options.mutate(() => this.#run(input, signal));
-        },
-      }),
+      Object.assign(
+        defineTool<typeof runParameters, { blender: unknown }>({
+          name: "run_blender",
+          label: "Run Blender stage",
+          description:
+            "Run one reproducible local Blender stage in a private, network-disabled environment. Read blender-assets and its pipeline reference first. Use Tripo only for an initial organic mesh when needed; this tool never calls a paid provider. Review dimensions/views before modeling, joints before rigging, deformation before animation, and motion before final use. New output is retained with its editable .blend, reports and previews; previous files are preserved. Custom Python can import the bundled pipeline and export_glb helpers and has access only to declared input snapshots and the private output directory. Use recover_blender_run after interrupted delivery instead of rerunning.",
+          parameters: runParameters,
+          execute: async (callId, input, signal, _update, context) => {
+            if (!Check(runParameters, input))
+              throw toolPreflightError(
+                "Invalid Blender workflow arguments",
+                "invalid_blender_input",
+              );
+            this.#assertEnabled();
+            // Session AutoContinueTools owns call replay; IDs may recur in other conversations.
+            const sessionFile = context?.sessionManager?.getSessionFile?.();
+            return this.options.mutate(() =>
+              this.#run(
+                input,
+                signal,
+                sessionFile
+                  ? { callId, sessionFile, request: input }
+                  : undefined,
+              ),
+            );
+          },
+        }),
+        {
+          recoverAfterHttp500: async (
+            ...call: Parameters<ToolDefinition["execute"]>
+          ) => {
+            const [callId, input, signal, , context] = call;
+            signal?.throwIfAborted();
+            this.#assertEnabled();
+            const sessionFile = context?.sessionManager?.getSessionFile?.();
+            if (!sessionFile)
+              throw new Error(
+                "The original Blender conversation is unavailable; no replacement was started",
+              );
+            const matches: string[] = [];
+            for (const id of await readdir(this.options.privateRoot)) {
+              if (!UUID.test(id)) continue;
+              const file = path.join(
+                this.options.privateRoot,
+                id,
+                "invocation.json",
+              );
+              const bytes = await readSafeProjectFile(
+                this.options.privateRoot,
+                file,
+                64 * 1024,
+              ).catch((error: NodeJS.ErrnoException) => {
+                if (error.code === "ENOENT") return;
+                throw error;
+              });
+              if (!bytes) continue;
+              const saved = JSON.parse(bytes.toString("utf8"));
+              if (
+                saved.callId === callId &&
+                saved.sessionFile === sessionFile &&
+                isDeepStrictEqual(saved.request, input)
+              )
+                matches.push(id);
+            }
+            if (matches.length !== 1)
+              throw new Error(
+                "The exact original Blender run could not be identified; no replacement was started",
+              );
+            return this.options.mutate(() =>
+              this.#recover(matches[0], signal, true),
+            );
+          },
+        } satisfies Pick<RecoverableTool, "recoverAfterHttp500">,
+      ),
       defineTool({
         name: "recover_blender_run",
         label: "Recover Blender result",
@@ -168,12 +251,7 @@ export class BlenderWorkflow {
             this.#assertEnabled();
             if (!UUID.test(runId))
               throw new Error("Use a retained Blender run ID");
-            const diagnostic = await this.options.runner.inspectJob(runId);
-            if (diagnostic.status !== "completed")
-              return result({ runId, ...diagnostic, published: false });
-            const run = await this.options.runner.readJob(runId);
-            const request = await this.#request(run);
-            return this.#publish(run, request, signal);
+            return this.#recover(runId, signal);
           }),
       }),
     ].filter(
@@ -189,29 +267,65 @@ export class BlenderWorkflow {
       );
   }
 
-  async #run(input: RunRequest, signal?: AbortSignal) {
+  async #recover(runId: string, signal?: AbortSignal, requireTerminal = false) {
+    signal?.throwIfAborted();
+    const diagnostic = await this.options.runner.inspectJob(runId);
+    if (diagnostic.status === "failed")
+      return confirmBlenderRunFailure(
+        {
+          ...result({
+            runId,
+            ...diagnostic,
+            published: false,
+            next: "This local script has stopped. Inspect its retained log, correct the script or configuration, and use a new call for corrected work. Do not repeat the original call or regenerate the initial model.",
+          }),
+          isError: true,
+        },
+        runId,
+      );
+    if (diagnostic.status !== "completed") {
+      if (requireTerminal)
+        throw new Error(
+          "The original Blender run is still unconfirmed; no replacement was started",
+        );
+      return result({ runId, ...diagnostic, published: false });
+    }
+    const run = await this.options.runner.readJob(runId);
+    return this.#publish(run, await this.#request(run), signal);
+  }
+
+  async #run(
+    input: RunRequest,
+    signal?: AbortSignal,
+    invocation?: { callId: string; sessionFile: string; request: unknown },
+  ) {
     signal?.throwIfAborted();
     if (
       input.stage === "custom"
         ? !input.scriptPath
         : !!input.scriptPath || !input.configPath
     )
-      throw new Error(
+      throw toolPreflightError(
         "Custom stages require scriptPath; bundled stages require configPath and do not accept scriptPath",
+        "invalid_blender_input",
       );
     if (
       input.stage !== "parts" &&
       input.stage !== "custom" &&
       !input.sourcePath
     )
-      throw new Error("This stage requires the preceding sourcePath");
+      throw toolPreflightError(
+        "This stage requires the preceding sourcePath",
+        "invalid_blender_input",
+      );
     if (
       (input.configPath && !input.configPath.endsWith(".json")) ||
       (input.scriptPath && !input.scriptPath.endsWith(".py")) ||
       (input.sourcePath && !/\.(?:glb|blend)$/i.test(input.sourcePath))
     )
-      throw new Error(
+      throw toolPreflightError(
         "Use JSON configuration, a Python script, and a GLB or Blender source",
+        "invalid_blender_input",
       );
     const inputs = [
       ...new Set(
@@ -220,30 +334,37 @@ export class BlenderWorkflow {
         ),
       ),
     ];
-    for (const filename of [
-      ...inputs,
-      ...(input.scriptPath ? [input.scriptPath] : []),
-    ])
-      await localAgentPath(this.options.workspace, filename);
+    const files: Record<string, string> = {};
+    try {
+      for (const filename of [
+        ...inputs,
+        ...(input.scriptPath ? [input.scriptPath] : []),
+      ])
+        await localAgentPath(this.options.workspace, filename);
+      if (input.scriptPath)
+        files["script.py"] = (
+          await readSafeProjectFile(
+            this.options.workspace,
+            await localAgentPath(this.options.workspace, input.scriptPath),
+            512 * 1024,
+          )
+        ).toString("utf8");
+    } catch (error) {
+      // These reads precede job creation; missing input is correctable, not an unknown run.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT")
+        throw toolPreflightError((error as Error).message, "invalid_blender_input");
+      throw error;
+    }
     const args = [
       ...(input.stage === "custom" ? [] : ["--stage", input.stage]),
       ...(input.configPath ? ["--config", input.configPath] : []),
       ...(input.sourcePath ? ["--input", input.sourcePath] : []),
     ];
-    const files: Record<string, string> = {};
     for (const name of ["pipeline.py", "export_glb.py"])
       files[name] = (
         await readSafeProjectFile(
           this.options.bundledScriptsDirectory,
           path.join(this.options.bundledScriptsDirectory, name),
-          512 * 1024,
-        )
-      ).toString("utf8");
-    if (input.scriptPath)
-      files["script.py"] = (
-        await readSafeProjectFile(
-          this.options.workspace,
-          await localAgentPath(this.options.workspace, input.scriptPath),
           512 * 1024,
         )
       ).toString("utf8");
@@ -259,6 +380,7 @@ export class BlenderWorkflow {
           inputs,
           args,
           bundledScripts,
+          ...(invocation ? { invocation } : {}),
           ...(input.timeoutSeconds
             ? { timeoutMs: input.timeoutSeconds * 1000 }
             : {}),
@@ -266,10 +388,16 @@ export class BlenderWorkflow {
         signal,
       );
     } catch (error) {
-      if (error instanceof BlenderRunError && error.jobId)
+      if (error instanceof BlenderRunError && error.jobId) {
+        const diagnostic = await this.options.runner.inspectJob(error.jobId);
+        if (diagnostic.status === "failed")
+          return this.#recover(error.jobId, signal);
         throw new Error(
           `${error.message} Retained Blender run: ${error.jobId}. ${error.log}`,
         );
+      }
+      if (error instanceof BlenderRunError)
+        throw toolPreflightError(error.message, "invalid_blender_input");
       throw error;
     }
     try {
@@ -302,6 +430,20 @@ export class BlenderWorkflow {
       return request;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const invocation = await readSafeProjectFile(
+        run.directory,
+        path.join(run.directory, "invocation.json"),
+        64 * 1024,
+      ).catch((cause: NodeJS.ErrnoException) => {
+        if (cause.code === "ENOENT") return;
+        throw cause;
+      });
+      if (invocation) {
+        const saved = JSON.parse(invocation.toString("utf8"));
+        if (!Check(runParameters, saved.request))
+          throw new Error("The retained Blender invocation is invalid");
+        return saved.request;
+      }
       // A crash between completion and metadata persistence must not lose the local result.
       return { workflow: "recovered", stage: "custom" };
     }
@@ -411,6 +553,30 @@ export class BlenderWorkflow {
       });
     }
     await this.options.touch?.();
+    const reviewFiles = [...files.keys()]
+      .filter((file) => /\.(?:glb|png|jpe?g)$/i.test(file))
+      .sort(
+        (a, b) =>
+          Number(!a.endsWith(".glb")) - Number(!b.endsWith(".glb")) ||
+          a.localeCompare(b),
+      )
+      .map((file) => `${directory}/${file}`);
+    let canvas: { boardId: string; nodeIds: string[] } | undefined;
+    if (reviewFiles.length && this.options.presentReview) {
+      const receiptPath = path.join(run.directory, "canvas-review.json");
+      const retained = await readSafeProjectFile(run.directory, receiptPath, 4096)
+        .catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return; throw error; });
+      const selected: unknown = retained ? JSON.parse(retained.toString("utf8"))?.boardId : request.boardId;
+      if (selected !== undefined && (typeof selected !== "string" || !/^[a-zA-Z0-9_-]{1,100}$/.test(selected)))
+        throw new Error("The retained Blender review board is invalid");
+      if (retained && (!selected || request.boardId && request.boardId !== selected))
+        throw new Error("The original Blender review board changed; review its retained placement before recovery");
+      canvas = await this.options.presentReview({
+        runId: run.id, workflow: request.workflow, stage: request.stage,
+        boardId: selected as string | undefined, files: reviewFiles,
+      });
+      if (!retained) await writeFile(receiptPath, JSON.stringify({ boardId: canvas.boardId }), { flag: "wx", mode: 0o600 });
+    }
     return result({
       runId: run.id,
       workflow: request.workflow,
@@ -418,9 +584,10 @@ export class BlenderWorkflow {
       directory,
       files: [...files.keys()].map((file) => `${directory}/${file}`),
       models: bindings,
+      ...(canvas ? { canvas } : {}),
       review: "pending-human-review",
       technicalChecksPassed,
-      next: "Inspect the reports and review images. Resolve any failed technical checks before advancing. For a delivered GLB, use get_model_asset with its assetId to prepare game runtime resources, then load and play all clips in the target game. File/structure checks are not artistic or engine acceptance.",
+      next: "Inspect the reports. The returned Canvas nodes show the interactive stage GLB and auxiliary images; reuse them, do not add duplicates. Ask the user to rotate/zoom the model and play/switch every available animation before accepting the corresponding stage. Resolve failed technical checks before advancing. For custom modeling stages, include a review.glb from the saved scene; images alone are not a model review. For final delivery use get_model_asset, then load and play all clips in the target game. Preview and numeric checks do not imply human or engine acceptance.",
       log: run.log,
     });
   }
