@@ -1,5 +1,7 @@
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { SessionManager, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Check, Errors } from "typebox/value";
+import { inheritToolPreflightFailure } from "../agent-tool-errors.js";
+import { inheritIsolatedOperationReceipts, inheritIsolatedRepairResolutions, inheritIsolatedRepairPending } from "../isolated-tool-receipts.js";
 import type { NativeToolResult } from "./native-session.js";
 
 /** The MCP server name the agents know OhMyGame's tools under. */
@@ -36,10 +38,12 @@ export class ToolBridge {
   #tools: Map<string, ToolDefinition>;
   #active?: Set<string>;
 
-  constructor(tools: readonly ToolDefinition[]) {
+  constructor(tools: readonly ToolDefinition[], includeControlledFiles = false, includeImageRecall = false,
+    private readonly sessionManager?: Pick<SessionManager, "getBranch">,
+    private readonly model?: () => { id: string; provider: string; input: readonly string[] }) {
     this.#tools = new Map(
       tools
-        .filter((tool) => !AGENT_OWN_TOOLS.has(tool.name))
+        .filter((tool) => !AGENT_OWN_TOOLS.has(tool.name) || (includeControlledFiles && tool.name !== "bash" && tool.name !== "recall_image") || (includeImageRecall && tool.name === "recall_image"))
         .map((tool) => [tool.name, tool]),
     );
   }
@@ -99,17 +103,22 @@ export class ToolBridge {
         input as never,
         signal ?? new AbortController().signal,
         undefined,
-        undefined as never,
+        (this.sessionManager || this.model ? { ...(this.sessionManager ? { sessionManager: this.sessionManager } : {}), ...(this.model ? { model: this.model() } : {}) } : undefined) as never,
       );
+      // A saved review may take time to inspect; recheck the host catalog before releasing pixels.
+      if (name === "recover_isolated_changes" && (input as Record<string, unknown>).action === "read_image") {
+        signal?.throwIfAborted();
+        if (!this.model?.().input.includes("image")) return failure("The current model's image capability is unverified or changed; no retained image was delivered or visually inspected");
+      }
       return {
-        result: {
+        result: inheritIsolatedRepairPending(inheritIsolatedRepairResolutions(inheritIsolatedOperationReceipts(inheritToolPreflightFailure({
           content: output.content as NativeToolResult["content"],
           ...(output.details !== undefined ? { details: output.details } : {}),
-        },
-        isError: false,
+        }, output), output), output), output),
+        isError: (output as typeof output & { isError?: boolean }).isError === true,
       };
     } catch (cause) {
-      return failure(cause instanceof Error ? cause.message : String(cause));
+      return failure(cause instanceof Error ? cause.message : String(cause), cause);
     }
   }
 
@@ -194,8 +203,8 @@ export class ToolBridge {
   }
 }
 
-function failure(text: string): { result: NativeToolResult; isError: boolean } {
-  return { result: { content: [{ type: "text", text }] }, isError: true };
+function failure(text: string, cause?: unknown): { result: NativeToolResult; isError: boolean } {
+  return { result: inheritIsolatedRepairPending(inheritIsolatedRepairResolutions(inheritIsolatedOperationReceipts(inheritToolPreflightFailure({ content: [{ type: "text" as const, text }] }, cause), cause), cause), cause), isError: true };
 }
 
 /** TypeBox schemas are JSON Schema already; this drops the symbols TypeBox keeps on them. */

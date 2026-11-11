@@ -28,6 +28,7 @@ In `daemon.log` (`src/daemon/activity-log.ts`, `src/daemon/request-log.ts`,
   cancellation and failure, with the duration and the error. Model request
   failures add the provider, model, endpoint and status code from the
   [agent error diagnostics](agent-errors.md) to that same outcome line.
+- Provider HTTP requests and supported model streams: passive stage, timing, byte counts and terminal outcome records, including successful requests. See [passive request monitoring](#passive-request-monitoring) below. Failed HTTP requests also keep the bounded, filtered [error diagnostics](agent-errors.md#local-http-error-diagnostics).
 - Conversation model changes and model request retries.
 - Failed agent tools, with the tool, MCP server and the last 500 characters
   of their output, where the error usually is.
@@ -49,6 +50,60 @@ In `main.log` (`src/desktop/console-log.ts`):
 - Background service status changes, such as a crash and its recovery.
 - Update failures, with the details the About page shows.
 - Uncaught errors with their stack.
+
+## Passive request monitoring
+
+`src/daemon/provider-request-monitor.ts` emits JSON lines with `msg: "Provider request"`.
+Each request has a random `localRequestId`. Agent requests also carry UUID-only
+`projectId`, `conversationId` and the active `turnId`; queued or steered turns
+resolve their current ID when each request starts. Manual context compaction uses
+the same scope. Requests outside a turn omit missing scope fields. An existing
+image-size fallback has a new HTTP ID and a `modelRequestId` pointing to the
+original request; monitoring adds no retries or probe requests.
+
+Events are `started`, `response` (headers), `first_body_byte`, and `finished`.
+An unfinished request emits at most one `progress` per minute. Fields include:
+
+- `protocol`, `phase`, `statusCode`, and filtered `providerRequestId`/`errorCode`.
+- `prepareMs` before submission, `responseHeadersMs`, `firstBodyByteMs` and
+  `wireMs` from opening fetch, plus `totalMs` from local preparation to the
+  terminal result. Durations use the monotonic clock; `time` is wall-clock time.
+- `requestBytes` when the checked body has a known encoded size, and raw
+  `receivedBytes` read through the existing response boundary. Multipart encoded
+  size is omitted. These are application body bytes, not TCP/TLS traffic or
+  billing tokens; bounded error-body reads may count only a prefix.
+- `maxIdleMs` and progress-only `lastDataAgeMs`, measuring gaps between observed
+  response bytes (including the initial wait). `firstBodyByteMs` is observed
+  before SSE buffering/validation releases data to the SDK. A heartbeat is a body
+  byte, so this is not the model's first visible word.
+- `wireComplete` and `responseValidated`, separating EOF from completion of the
+  existing local response inspection.
+
+`completed` requires a supported model SDK's normal stop or tool-call result,
+validated transport and a protocol stop reason; credentialed Anthropic SSE also
+requires `message_stop` in the existing security parser. HTTP 200 and EOF alone
+never produce model completion. Output-limit stops are `incomplete`. Other outcomes
+are `http_error`, `transport_error`, `stream_interrupted`, `validation_error`,
+`cancelled`, `timeout`, and `protocol_error`. An SDK result without an observed
+guarded transport is `unobserved_transport`. Original caller cancellation is
+separate from the SDK's internal reader cleanup. Standard timeout signals are
+recorded as deadline timeouts. Monitoring observes results without changing the
+SDK response, agent execution, SSE release policy or cancellation behavior.
+
+Generic media/control requests end as `transport_complete` after the observed
+body and inspection finish. Their job outcome remains in the existing generation
+log: network completion does not prove successful generation or valid JSON.
+Artifact downloads, preview traffic, native processes and gateway-internal
+routes/retries are outside this boundary. A process crash can leave a start or
+progress record without a finish; rotation can remove older related lines.
+
+The monitor logs a fixed field allowlist, without provider/model names, URLs,
+prompts, replies, images, credentials, complete headers, response IDs or content
+fingerprints. It keeps counters and flags, reuses the existing readers and SSE
+parser, and never copies a body for monitoring. Short nonempty requests normally
+produce four stage lines; early failures produce fewer. There is one unreferenced
+progress timer per active request, cleared at its terminal outcome. The normal
+log rotation and export rules below still apply.
 
 ## Redaction and rotation
 

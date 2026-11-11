@@ -1,8 +1,8 @@
 import {
-  chmod,
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -12,571 +12,308 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { PreviewManager } from "../src/daemon/preview.js";
 import type { ProjectState } from "../src/shared/contracts.js";
 import { RuntimeEventBus } from "../src/shared/events.js";
-import * as projects from "../src/daemon/projects.js";
+import { isolatedPreviewFixture } from "./isolated-preview-fixture.js";
 
-const managers: PreviewManager[] = [];
-
+const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => {
-  await Promise.all(managers.splice(0).map((manager) => manager.stopAll()));
-  vi.unstubAllEnvs();
-  vi.restoreAllMocks();
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
-
-describe("PreviewManager", () => {
-  it("serves a web story's own page instead of running scripts the project carries", async () => {
-    const workspacePath = await createWorkspace(false);
-    await writeFile(path.join(workspacePath, "index.html"), "<p>story page</p>");
-    const project = { ...createProject(workspacePath), type: "interactive-story" as const };
-    const manager = new PreviewManager(new RuntimeEventBus());
-    managers.push(manager);
-
-    const url = await manager.start(project);
-    expect(project.preview.command).toBe("Serve static files");
-    // The project's dev script never ran.
-    await expect(readFile(path.join(workspacePath, "server.pid"))).rejects.toThrow();
-    expect(await (await fetch(url)).text()).toContain("story page");
-  });
-
-  it.skipIf(process.platform === "win32")("fails the start when the package manager is not installed and starts once it is", async () => {
-    const workspacePath = await createWorkspace(false);
-    const project = createProject(workspacePath);
-    const events = new RuntimeEventBus();
-    const manager = new PreviewManager(events, { readinessTimeoutMs: 2_000 });
-    managers.push(manager);
-    vi.stubEnv("PATH", await mkdtemp(path.join(tmpdir(), "ohmygame-preview-path-")));
-
-    await expect(manager.start(project)).rejects.toThrow("npm was not found");
-    expect(project.preview.status).toBe("error");
-    expect(project.preview.error).toContain("npm");
-    expect(events.since(project.id).filter((event) => event.type === "preview.updated" && event.data.preview.status === "error")).toHaveLength(1);
-    vi.unstubAllEnvs();
-    const url = await manager.start(project);
-    expect(await (await fetch(url)).text()).toBe("ready");
-  });
-
-  it("keeps missing managers local to the preview and preserves installed dependencies", async () => {
-    const workspacePath = await createWorkspace(false);
-    await writeFile(path.join(workspacePath, "bun.lock"), "{}");
-    vi.stubEnv("PATH", workspacePath);
-    const project = createProject(workspacePath);
-    const events = new RuntimeEventBus();
-    const manager = new PreviewManager(events);
-    managers.push(manager);
-    await expect(manager.start(project)).rejects.toThrow("bun was not found");
-    expect(project.preview.status).toBe("error");
-    expect(
-      events
-        .since(project.id)
-        .filter(
-          (event) =>
-            event.type === "preview.updated" &&
-            event.data.preview.status === "error",
-        ),
-    ).toHaveLength(1);
-    expect(
-      await readFile(
-        path.join(workspacePath, "node_modules", ".bin", "vite"),
-        "utf8",
-      ),
-    ).toBe("");
-  });
-
-  it.skipIf(process.platform === "win32")(
-    "contains a spawn failure even when the executable disappears after preflight",
-    async () => {
-      const workspacePath = await mkdtemp(
-        path.join(tmpdir(), "ohmygame-spawn-race-"),
-      );
-      const bin = path.join(workspacePath, "bin");
-      await mkdir(bin);
-      const executable = path.join(bin, "npm");
-      await writeFile(
-        path.join(workspacePath, "package.json"),
-        JSON.stringify({ scripts: { dev: "node server.mjs" } }),
-      );
-      await writeFile(
-        executable,
-        `#!${process.execPath}\nimport { mkdirSync, unlinkSync } from 'node:fs'; mkdirSync('node_modules'); unlinkSync(${JSON.stringify(executable)});`,
-      );
-      await chmod(executable, 0o755);
-      vi.stubEnv("PATH", `${bin}${path.delimiter}${process.env.PATH}`);
-      const project = createProject(workspacePath);
-      const events = new RuntimeEventBus();
-      const manager = new PreviewManager(events, { readinessTimeoutMs: 2_000 });
-      managers.push(manager);
-      const before = Date.now();
-      await expect(manager.start(project)).rejects.toThrow("ENOENT");
-      expect(Date.now() - before).toBeLessThan(1_500);
-      expect(project.preview.status).toBe("error");
-      expect(
-        events
-          .since(project.id)
-          .filter(
-            (event) =>
-              event.type === "preview.updated" &&
-              event.data.preview.status === "error",
-          ),
-      ).toHaveLength(1);
-    },
+async function fixture(isolated = true) {
+  const workspacePath = await realpath(
+    await mkdtemp(path.join(tmpdir(), "ohmygame-isolated-preview-")),
   );
+  cleanups.push(() => rm(workspacePath, { recursive: true, force: true }));
+  await writeFile(
+    path.join(workspacePath, "package.json"),
+    JSON.stringify({ scripts: { dev: "node server.mjs" } }),
+  );
+  await mkdir(path.join(workspacePath, "node_modules"));
+  const project: ProjectState = {
+    id: "preview-test",
+    name: "Game",
+    type: "web-game",
+    workspacePath,
+    updatedAt: new Date(0).toISOString(),
+    preview: { status: "stopped" },
+  };
+  const guest = await isolatedPreviewFixture();
+  cleanups.push(guest.close);
+  const events = new RuntimeEventBus();
+  const manager = new PreviewManager(
+    events,
+    isolated ? { execution: guest.execution } : {},
+  );
+  cleanups.push(() => manager.stopAll());
+  return { project, manager, guest, events, workspacePath };
+}
 
-  it("reports a running preview's exit once and can launch another project", async () => {
-    const workspacePath = await createWorkspace(false);
-    await writeFile(
-      path.join(workspacePath, "server.mjs"),
-      `
-      import { createServer } from 'node:http';
-      import { writeSync } from 'node:fs';
-      createServer((request, response) => { if (request.url === '/crash') { writeSync(1, 'preview is exiting'); process.exit(7); } response.end('ready'); })
-        .listen(Number(process.env.PORT || process.argv[process.argv.indexOf('--port') + 1]), '127.0.0.1');
-    `,
-    );
-    const project = createProject(workspacePath);
-    const events = new RuntimeEventBus();
-    const manager = new PreviewManager(events, { readinessTimeoutMs: 2_000 });
-    managers.push(manager);
+describe("PreviewManager source-edition execution contracts", () => {
+  it("refuses a capacity slot while a preview is live without stopping it or invoking the migration", async () => {
+    const { manager, project, guest } = await fixture();
+    await manager.start(project);
+    const original = { ...project.preview }, task = vi.fn();
+    await expect(manager.withExecutionSlot(project, task, false)).rejects.toThrow("Stop the preview yourself");
+    expect(task).not.toHaveBeenCalled();
+    expect(project.preview).toEqual(original);
+    expect(guest.start).toHaveBeenCalledOnce();
+    expect(await (await fetch(project.preview.url!)).text()).toBe("ready");
+  });
+  it("holds an idle capacity slot without launching a preview after completion", async () => {
+    const { manager, project, guest } = await fixture();
+    await manager.withExecutionSlot(project, async () => {
+      await expect(manager.ensureStarted(project)).rejects.toMatchObject({ statusCode: 409 });
+    }, false);
+    expect(project.preview.status).toBe("stopped");
+    expect(guest.start).not.toHaveBeenCalled();
+  });
+  it("lends the guest to a command or build and resumes an editor preview unless the user stopped it", async () => {
+    const { manager, project, guest } = await fixture();
+    manager.acquire(project, "editor:current");
+    await manager.start(project);
+    const borrow = (manualStop: boolean) => manager.withExecutionSlot(project, async () => {
+      expect(project.preview).toMatchObject({ status: "stopped", stopReason: "execution" });
+      await expect(manager.ensureStarted(project)).rejects.toMatchObject({ statusCode: 409 });
+      await expect(manager.withExecutionSlot(project, async () => true)).rejects.toMatchObject({ statusCode: 409 });
+      if (manualStop) await manager.stop(project);
+      return 7;
+    });
+    expect(await borrow(false)).toBe(7);
+    expect(await (await fetch(project.preview.url!)).text()).toBe("ready");
+    expect(guest.start).toHaveBeenCalledTimes(2);
+    await borrow(true);
+    expect(project.preview).toMatchObject({ status: "stopped", stopReason: "manual" });
+  });
+  it("preserves static previews and does not turn a first command into a manual preview pause", async () => {
+    const { manager, project, guest, workspacePath } = await fixture();
+    await manager.withExecutionSlot(project, async () => {});
+    expect(project.preview.stopReason).toBeUndefined();
+    project.previewMode = "static";
+    await writeFile(path.join(workspacePath, "index.html"), "static game");
     const url = await manager.start(project);
-    await fetch(`${url}/crash`).catch(() => {});
-    await vi.waitFor(() => expect(project.preview.status).toBe("error"));
-    // Let the log debounce expire: the failure snapshot must consume its pending flush.
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    expect(project.preview.logs).toContain("preview is exiting");
-    expect(
-      events
-        .since(project.id)
-        .filter(
-          (event) =>
-            event.type === "preview.updated" &&
-            event.data.preview.status === "error",
-        ),
-    ).toHaveLength(1);
-    const other = createProject(await createWorkspace(false));
-    expect(await (await fetch(await manager.start(other))).text()).toBe(
+    await manager.withExecutionSlot(project, async () => {
+      expect(await manager.ensureStarted(project)).toBe(url);
+      expect(await (await fetch(url)).text()).toContain("static game");
+    });
+    expect(guest.start).not.toHaveBeenCalled();
+    expect(project.preview.url).toBe(url);
+  });
+  it("refuses package scripts without an isolated executor before executing project code", async () => {
+    const { manager, project, guest, workspacePath } = await fixture(false);
+    await expect(manager.start(project)).rejects.toThrow(
+      "temporarily unavailable",
+    );
+    expect(guest.start).not.toHaveBeenCalled();
+    await expect(
+      readFile(path.join(workspacePath, "server.pid")),
+    ).rejects.toThrow();
+  });
+  it("serves a web story page without running its package scripts", async () => {
+    const { manager, project, guest, workspacePath } = await fixture();
+    project.type = "interactive-story";
+    await writeFile(
+      path.join(workspacePath, "index.html"),
+      "<p>story page</p>",
+    );
+    expect(await (await fetch(await manager.start(project))).text()).toContain(
+      "story page",
+    );
+    expect(guest.start).not.toHaveBeenCalled();
+  });
+  it("uses the isolated npm transport and never executes the project on the host", async () => {
+    const { manager, project, guest, workspacePath } = await fixture();
+    expect(await (await fetch(await manager.start(project))).text()).toBe(
       "ready",
     );
+    expect(guest.start).toHaveBeenCalledWith(
+      project,
+      "preview",
+      workspacePath,
+      ["run", "dev"],
+      expect.any(Number),
+    );
+    expect(guest.connection).toHaveBeenCalled();
+    await expect(
+      readFile(path.join(workspacePath, "server.pid")),
+    ).rejects.toThrow();
   });
-  it("isolates project binaries and the daemon token during install and preview, and retries failed installs", async () => {
-    vi.stubEnv("ESBUILD_BINARY_PATH", "/app/esbuild");
-    vi.stubEnv("OHMYGAME_DAEMON_TOKEN", "secret");
-    const workspacePath = await mkdtemp(
-      path.join(tmpdir(), "ohmygame-preview-retry-"),
-    );
-    await writeFile(
-      path.join(workspacePath, "package.json"),
-      JSON.stringify({
-        private: true,
-        scripts: { postinstall: "node install.mjs", dev: "node server.mjs" },
-      }),
-    );
-    await writeFile(
-      path.join(workspacePath, "install.mjs"),
-      `
-      import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-      if (process.env.ESBUILD_BINARY_PATH) throw new Error("app binary leaked into install");
-      if (process.env.OHMYGAME_DAEMON_TOKEN) throw new Error("daemon token leaked into install");
-      const attempts = existsSync("attempts") ? Number(readFileSync("attempts", "utf8")) + 1 : 1;
-      writeFileSync("attempts", String(attempts));
-      mkdirSync("node_modules", { recursive: true });
-      if (attempts === 1) throw new Error("interrupted postinstall");
-    `,
-    );
-    await writeFile(
-      path.join(workspacePath, "server.mjs"),
-      `
-      import { createServer } from "node:http";
-      if (process.env.ESBUILD_BINARY_PATH) throw new Error("app binary leaked into preview");
-      if (process.env.OHMYGAME_DAEMON_TOKEN) throw new Error("daemon token leaked into preview");
-      const port = Number(process.env.PORT || process.argv[process.argv.indexOf("--port") + 1]);
-      createServer((_request, response) => response.end("ready")).listen(port, "127.0.0.1");
-    `,
-    );
-    const project = createProject(workspacePath);
-    const manager = new PreviewManager(new RuntimeEventBus(), {
-      readinessTimeoutMs: 2_000,
-    });
-    managers.push(manager);
+  it.each(["bun", "pnpm"])(
+    "refuses %s projects before contacting the isolated executor",
+    async (managerName) => {
+      const { manager, project, guest } = await fixture();
+      project.packageManager = managerName as "bun" | "pnpm";
+      await expect(manager.start(project)).rejects.toThrow("npm projects only");
+      expect(guest.start).not.toHaveBeenCalled();
+    },
+  );
+  it("refuses arbitrary command previews even with an isolated executor", async () => {
+    const { manager, project, guest } = await fixture();
+    project.previewMode = "command";
+    project.previewCommand = "unreviewed-command";
     await expect(manager.start(project)).rejects.toThrow(
-      "interrupted postinstall",
+      "configure an isolated npm script",
     );
-    const url = await manager.start(project);
-    expect(await (await fetch(url)).text()).toBe("ready");
-    expect(await readFile(path.join(workspacePath, "attempts"), "utf8")).toBe(
-      "2",
-    );
-    expect(process.env.ESBUILD_BINARY_PATH).toBe("/app/esbuild");
-    expect(process.env.OHMYGAME_DAEMON_TOKEN).toBe("secret");
+    expect(guest.start).not.toHaveBeenCalled();
   });
-
-  it("reuses the same process for concurrent player and agent launches and subsequent opens", async () => {
-    const workspacePath = await createWorkspace(false);
-    const project = createProject(workspacePath);
-    const manager = new PreviewManager(new RuntimeEventBus(), {
-      readinessTimeoutMs: 2_000,
-    });
-    managers.push(manager);
+  it("shares the running isolated preview across concurrent and later opens", async () => {
+    const { manager, project, guest } = await fixture();
     const urls = await Promise.all([
       manager.ensureStarted(project),
       manager.ensureStarted(project),
     ]);
     expect(urls[0]).toBe(urls[1]);
-    const pid = await readFile(path.join(workspacePath, "server.pid"), "utf8");
     expect(await manager.ensureStarted(project)).toBe(urls[0]);
-    expect(await readFile(path.join(workspacePath, "server.pid"), "utf8")).toBe(
-      pid,
-    );
-    expect(isProcessRunning(Number(pid))).toBe(true);
-    await manager.stop(project);
-    await manager.ensureStarted(project);
+    expect(guest.start).toHaveBeenCalledOnce();
+  });
+  it("restarts the isolated job while preserving the saved preview origin", async () => {
+    const { manager, project, guest } = await fixture();
+    const first = await manager.start(project);
+    expect(await manager.start(project)).toBe(first);
+    expect(guest.start).toHaveBeenCalledTimes(2);
+  });
+  it("keeps the running copy and reports invalid replacement inputs on explicit reopen", async () => {
+    const { manager, project, guest } = await fixture();
+    const first = await manager.ensureStarted(project);
+    guest.previewSourceMatches.mockRejectedValue(new Error("Invalid replacement media"));
+    manager.acquire(project, "editor:reopened");
+    await manager.automatic(project);
+    await expect(manager.ensureStarted(project, false)).rejects.toThrow("Invalid replacement media");
+    expect(project.preview).toMatchObject({ status: "ready", url: first });
+    expect(await (await fetch(first)).text()).toBe("ready");
+    expect(guest.stop).not.toHaveBeenCalled();
+  });
+  it("contains executor launch failure and permits a later launch", async () => {
+    const { manager, project, guest, events } = await fixture();
+    guest.start.mockRejectedValueOnce(new Error("Guest unavailable"));
+    await expect(manager.start(project)).rejects.toThrow("Guest unavailable");
+    expect(project.preview.status).toBe("error");
     expect(
-      await readFile(path.join(workspacePath, "server.pid"), "utf8"),
-    ).not.toBe(pid);
+      events
+        .since(project.id)
+        .filter(
+          (event) =>
+            event.type === "preview.updated" &&
+            event.data.preview.status === "error",
+        ),
+    ).toHaveLength(1);
+    expect(await (await fetch(await manager.start(project))).text()).toBe(
+      "ready",
+    );
   });
-
-  it("rejects disabled General previews, including cached ready servers, and stops their process", async () => {
-    const workspacePath = await createWorkspace(false);
-    const project: ProjectState = {
-      ...createProject(workspacePath),
-      type: "general",
-      webPreviewEnabled: false,
-      preview: { status: "waiting" },
-    };
-    const events = new RuntimeEventBus();
-    const manager = new PreviewManager(events, { readinessTimeoutMs: 2_000 });
-    managers.push(manager);
-    await expect(manager.start(project)).rejects.toThrow("Enable Web preview");
-    expect(project.preview).toEqual({ status: "waiting" });
-    project.webPreviewEnabled = true;
-    const url = await manager.ensureStarted(project);
-    const pid = Number(
-      await readFile(path.join(workspacePath, "server.pid"), "utf8"),
+  it("reports a readiness failure instead of pretending a guest server is ready", async () => {
+    const { manager, project, guest } = await fixture();
+    guest.ready.mockRejectedValueOnce(new Error("Guest readiness failed"));
+    await expect(manager.start(project)).rejects.toThrow(
+      "Guest readiness failed",
     );
-    project.webPreviewEnabled = false;
-    await expect(manager.ensureStarted(project)).rejects.toThrow(
-      "Enable Web preview",
-    );
-    await expect(manager.start(project)).rejects.toThrow("Enable Web preview");
-    await manager.stop(project);
-    await vi.waitFor(() => expect(isProcessRunning(pid)).toBe(false));
-    await expect(
-      fetch(url, { signal: AbortSignal.timeout(200) }),
-    ).rejects.toThrow();
+    expect(project.preview.status).toBe("error");
   });
-
-  it("keeps a pending workspace waiting and preserves a ready server on preflight failure", async () => {
-    const workspacePath = await createWorkspace(false);
-    const project = createProject(workspacePath);
-    const manager = new PreviewManager(new RuntimeEventBus(), {
-      readinessTimeoutMs: 2_000,
-    });
-    managers.push(manager);
-    const url = await manager.start(project);
-    const pid = Number(
-      await readFile(path.join(workspacePath, "server.pid"), "utf8"),
-    );
-    await writeFile(
-      path.join(workspacePath, "package.json"),
-      JSON.stringify({ scripts: { dev: "bun format" } }),
-    );
-    await expect(manager.start(project)).rejects.toThrow("non-server task");
-    expect(project.preview).toMatchObject({ status: "ready", url });
-    expect(isProcessRunning(pid)).toBe(true);
-    process.kill(pid, "SIGTERM");
-    await vi.waitFor(() => expect(project.preview.status).toBe("error"));
-    await manager.stop(project);
-    project.preview = { status: "waiting" };
-    await expect(manager.start(project)).rejects.toThrow("non-server task");
-    expect(project.preview).toEqual({ status: "waiting" });
-  });
-
-  it("shares explicit restarts and cancels a startup during preflight without late errors", async () => {
-    const workspacePath = await createWorkspace(false);
-    const project = createProject(workspacePath);
-    const manager = new PreviewManager(new RuntimeEventBus(), {
-      readinessTimeoutMs: 2_000,
-    });
-    managers.push(manager);
+  it("reports a guest process exit exactly once without automatically respawning it", async () => {
+    const { manager, project, guest, events } = await fixture();
     await manager.start(project);
-    const originalPid = await readFile(
-      path.join(workspacePath, "server.pid"),
-      "utf8",
-    );
-    const restarting = manager.start(project);
-    expect(manager.ensureStarted(project)).toBe(restarting);
-    await restarting;
+    guest.children[0]!.emit("exit", 2, null);
+    guest.children[0]!.emit("exit", 2, null);
+    await vi.waitFor(() => expect(project.preview.status).toBe("error"));
     expect(
-      await readFile(path.join(workspacePath, "server.pid"), "utf8"),
-    ).not.toBe(originalPid);
+      events
+        .since(project.id)
+        .filter(
+          (event) =>
+            event.type === "preview.updated" &&
+            event.data.preview.status === "error",
+        ),
+    ).toHaveLength(1);
+    expect(guest.start).toHaveBeenCalledOnce();
+  });
+  it("keeps an explicit manual stop across automatic inspection", async () => {
+    const { manager, project, guest } = await fixture();
+    manager.acquire(project, "editor");
+    await manager.start(project);
     await manager.stop(project);
-    const cancelled = manager.start(project);
-    const rejection = expect(cancelled).rejects.toThrow("superseded");
-    await manager.stop(project);
-    await rejection;
+    await manager.automatic(project);
     expect(project.preview).toMatchObject({
       status: "stopped",
       stopReason: "manual",
-      url: undefined,
     });
+    expect(guest.start).toHaveBeenCalledOnce();
   });
-
-  it("cleans up a launch superseded by invalid configuration instead of leaving it starting", async () => {
-    const workspacePath = await createWorkspace(false);
-    const project = createProject(workspacePath);
-    const events = new RuntimeEventBus();
-    const manager = new PreviewManager(events, { readinessTimeoutMs: 2_000 });
-    managers.push(manager);
-    let replacement: Promise<string> | undefined;
+  it("refuses a disabled General preview even after a previous successful launch", async () => {
+    const { manager, project, guest } = await fixture();
+    project.type = "general";
+    project.webPreviewEnabled = true;
+    await manager.start(project);
+    project.webPreviewEnabled = false;
+    await expect(manager.ensureStarted(project)).rejects.toThrow();
+    expect(guest.start).toHaveBeenCalledOnce();
+  });
+  it("sends only the configured project startup directory to the isolated executor", async () => {
+    const { manager, project, guest, workspacePath } = await fixture();
+    const nested = path.join(workspacePath, "game");
+    await mkdir(nested);
+    await writeFile(
+      path.join(nested, "package.json"),
+      JSON.stringify({ scripts: { dev: "node game.mjs" } }),
+    );
+    project.startupDirectory = "game";
+    await manager.start(project);
+    expect(guest.start.mock.calls.at(-1)![2]).toBe(nested);
+  });
+  it("does not launch after a stop during the launching phase", async () => {
+    const { manager, project, guest, events } = await fixture();
+    let stopping: Promise<void> | undefined;
     const unsubscribe = events.subscribe(project.id, (event) => {
       if (
-        event.type !== "preview.updated" ||
-        event.data.preview.phase !== "checking"
+        event.type === "preview.updated" &&
+        event.data.preview.phase === "launching"
       )
-        return;
-      project.startupScript = "missing";
-      replacement = manager.start(project);
-      void replacement.catch(() => {});
+        stopping = manager.stop(project);
     });
-    await expect(manager.start(project)).rejects.toThrow("superseded");
-    await expect(replacement).rejects.toThrow("no missing script");
-    expect(project.preview.status).toBe("error");
-    unsubscribe();
-    await expect(
-      readFile(path.join(workspacePath, "server.pid")),
-    ).rejects.toThrow();
-  });
-
-  it("starts and stops a preview process tree", async () => {
-    const workspacePath = await createWorkspace(false);
-    const project = createProject(workspacePath);
-    const manager = new PreviewManager(new RuntimeEventBus(), {
-      readinessTimeoutMs: 2_000,
-    });
-    managers.push(manager);
-
-    const url = await manager.start(project);
-    expect(await (await fetch(url)).text()).toBe("ready");
-    await manager.stop(project);
-    expect(project.preview).toMatchObject({
-      status: "stopped",
-      stopReason: "manual",
-      url: undefined,
-    });
-    await expect(
-      fetch(url, { signal: AbortSignal.timeout(200) }),
-    ).rejects.toThrow();
-  });
-
-  it("waits for an in-flight stop before reopening instead of returning the closing server", async () => {
-    const workspacePath = await createWorkspace(false);
-    const project = createProject(workspacePath);
-    const manager = new PreviewManager(new RuntimeEventBus(), {
-      readinessTimeoutMs: 2_000,
-    });
-    managers.push(manager);
-    await manager.start(project);
-    const pid = await readFile(path.join(workspacePath, "server.pid"), "utf8");
-    const stopping = manager.stop(project);
-    const restarting = manager.ensureStarted(project);
-    await stopping;
-    const url = await restarting;
-    expect(project.preview).toMatchObject({ status: "ready", url });
-    expect(
-      await readFile(path.join(workspacePath, "server.pid"), "utf8"),
-    ).not.toBe(pid);
-    expect(await (await fetch(url)).text()).toBe("ready");
-    const finalStop = manager.stop(project);
-    project.startupScript = "missing";
-    await expect(manager.start(project)).rejects.toThrow("no missing script");
-    await finalStop;
-    expect(project.preview.status).toBe("stopped");
-  });
-
-  it("publishes stopped when a replacement is still being inspected and later fails", async () => {
-    const workspacePath = await createWorkspace(false);
-    const project = createProject(workspacePath);
-    const manager = new PreviewManager(new RuntimeEventBus(), {
-      readinessTimeoutMs: 2_000,
-    });
-    managers.push(manager);
-    const url = await manager.start(project);
-    type Workspace = Awaited<ReturnType<typeof projects.resolvePreviewWorkspace>>;
-    let resolveInspection!: (workspace: Workspace) => void;
-    const inspection = new Promise<Workspace>((resolve) => {
-      resolveInspection = resolve;
-    });
-    vi.spyOn(projects, "resolvePreviewWorkspace").mockReturnValueOnce(
-      inspection,
-    );
-    const stopping = manager.stop(project);
-    const replacement = manager.start(project);
-    const failed = expect(replacement).rejects.toThrow("no missing script");
     try {
+      await expect(manager.start(project)).rejects.toThrow("cancelled");
       await stopping;
-      expect(project.preview).toMatchObject({
-        status: "stopped",
-        url: undefined,
-        stopReason: "manual",
-      });
-      await expect(
-        fetch(url, { signal: AbortSignal.timeout(200) }),
-      ).rejects.toThrow();
+      expect(guest.start).not.toHaveBeenCalled();
     } finally {
-      resolveInspection({
-        absolutePath: workspacePath,
-        relativePath: ".",
-        mode: "script",
-        runnable: false,
-        error:
-          "This folder has no missing script that starts a preview server.",
-      });
-      await failed;
+      unsubscribe();
     }
+  });
+  it("discards readiness that arrives after a pending launch was stopped", async () => {
+    const { manager, project, guest } = await fixture();
+    let release!: () => void;
+    guest.ready.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const pending = manager.start(project);
+    const rejected = expect(pending).rejects.toThrow("cancelled");
+    await vi.waitFor(() => expect(guest.ready).toHaveBeenCalled());
+    const stopping = manager.stop(project);
+    release();
+    await rejected;
+    await stopping;
     expect(project.preview.status).toBe("stopped");
+    expect(project.preview.url).toBeUndefined();
   });
-
-  it("cleans up the process when readiness fails", async () => {
-    const workspacePath = await createWorkspace(true);
-    const project = createProject(workspacePath);
-    const manager = new PreviewManager(new RuntimeEventBus(), {
-      readinessTimeoutMs: 1_000,
-    });
-    managers.push(manager);
-
-    await expect(manager.start(project)).rejects.toThrow(
-      /did not become ready[\s\S]*server error/,
-    );
-    const pid = Number(
-      await readFile(path.join(workspacePath, "server.pid"), "utf8"),
-    );
-    await vi.waitFor(() => expect(isProcessRunning(pid)).toBe(false));
-    expect(project.preview.status).toBe("error");
-    expect(project.preview.error).toContain("server error");
+  it("keeps an empty automatically opened project waiting without launching a job", async () => {
+    const { manager, project, guest, workspacePath } = await fixture();
+    await rm(path.join(workspacePath, "package.json"));
+    project.type = "general";
+    project.webPreviewEnabled = true;
+    manager.acquire(project, "editor");
+    await manager.automatic(project);
+    expect(project.preview.status).toBe("waiting");
+    expect(guest.start).not.toHaveBeenCalled();
   });
-
-  it("keeps a listening server alive when its root page returns a content error", async () => {
-    const workspacePath = await createWorkspace(false);
-    await writeFile(path.join(workspacePath, "broken"), "");
-    await writeFile(
-      path.join(workspacePath, "server.mjs"),
-      `
-      import { createServer } from 'node:http';
-      import { existsSync, writeFileSync } from 'node:fs';
-      writeFileSync('server.pid', String(process.pid));
-      createServer((_request, response) => {
-        response.writeHead(existsSync('broken') ? 500 : 200, { 'content-type': 'text/html' });
-        response.end('<head></head><body>Project content</body>');
-      }).listen(Number(process.env.PORT || process.argv[process.argv.indexOf('--port') + 1]), '127.0.0.1');
-    `,
-    );
-    const project = createProject(workspacePath);
-    const manager = new PreviewManager(new RuntimeEventBus(), {
-      readinessTimeoutMs: 2_000,
-    });
-    managers.push(manager);
-    const url = await manager.start(project);
-    expect(project.preview.status).toBe("ready");
-    expect((await fetch(url)).status).toBe(500);
-    expect(project.preview.diagnostic?.kind).toBe("compile");
-    const pid = Number(
-      await readFile(path.join(workspacePath, "server.pid"), "utf8"),
-    );
-    expect(isProcessRunning(pid)).toBe(true);
-    await rm(path.join(workspacePath, "broken"));
-    expect((await fetch(url)).status).toBe(200);
-    expect(project.preview.diagnostic).toBeUndefined();
-    expect(isProcessRunning(pid)).toBe(true);
-  });
-
-  it("starts the preview from the configured startup directory", async () => {
-    const workspacePath = await mkdtemp(
-      path.join(tmpdir(), "ohmygame-preview-root-"),
-    );
-    const startupDirectory = path.join(workspacePath, "apps", "game");
-    await mkdir(path.join(startupDirectory, "node_modules", ".bin"), {
-      recursive: true,
-    });
-    await writeFile(
-      path.join(startupDirectory, "node_modules", ".bin", "vite"),
-      "",
-    );
-    await writeFile(
-      path.join(startupDirectory, "package.json"),
-      JSON.stringify({
-        private: true,
-        scripts: { start: "node server.mjs" },
-      }),
-    );
-    await writeFile(
-      path.join(startupDirectory, "server.mjs"),
-      `
-      import { createServer } from "node:http";
-      const portIndex = process.argv.indexOf("--port");
-      const port = Number(process.env.PORT || process.argv[portIndex + 1]);
-      createServer((_request, response) => response.end("nested ready")).listen(port, "127.0.0.1");
-    `,
-    );
-    const project = {
-      ...createProject(workspacePath),
-      startupDirectory: "apps/game",
-      startupScript: "start",
-    };
-    const manager = new PreviewManager(new RuntimeEventBus(), {
-      readinessTimeoutMs: 2_000,
-    });
-    managers.push(manager);
-
-    const url = await manager.start(project);
-    expect(await (await fetch(url)).text()).toBe("nested ready");
+  it("passes configured preview arguments without a host environment or shell command", async () => {
+    const { manager, project, guest } = await fixture();
+    project.previewArguments = ["--port", "{port}", "--host", "{host}"];
+    await manager.start(project);
+    expect(guest.start.mock.calls[0]).toEqual([
+      project,
+      "preview",
+      project.workspacePath,
+      ["run", "dev", "--", "--port", expect.any(String), "--host", "127.0.0.1"],
+      expect.any(Number),
+    ]);
   });
 });
-
-async function createWorkspace(fail: boolean): Promise<string> {
-  const workspacePath = await mkdtemp(path.join(tmpdir(), "ohmygame-preview-"));
-  await mkdir(path.join(workspacePath, "node_modules", ".bin"), {
-    recursive: true,
-  });
-  await writeFile(path.join(workspacePath, "node_modules", ".bin", "vite"), "");
-  await writeFile(
-    path.join(workspacePath, "package.json"),
-    JSON.stringify({
-      private: true,
-      scripts: { dev: "node server.mjs" },
-    }),
-  );
-  if (fail) await writeFile(path.join(workspacePath, "fail"), "");
-  await writeFile(
-    path.join(workspacePath, "server.mjs"),
-    `
-    import { existsSync, writeFileSync } from "node:fs";
-    import { createServer } from "node:http";
-    const portIndex = process.argv.indexOf("--port");
-    const port = Number(process.env.PORT || process.argv[portIndex + 1]);
-    writeFileSync("server.pid", String(process.pid));
-    console.log("server output 1");
-    console.log("server output 2");
-    console.error("server error");
-    if (existsSync("fail")) setInterval(() => {}, 1000);
-    else createServer((_request, response) => response.end("ready")).listen(port, "127.0.0.1");
-  `,
-  );
-  return workspacePath;
-}
-
-function createProject(workspacePath: string): ProjectState {
-  return {
-    id: path.basename(workspacePath),
-    name: "Preview",
-    type: "web-game",
-    updatedAt: new Date(0).toISOString(),
-    workspacePath,
-    preview: { status: "stopped" },
-  };
-}
-
-function isProcessRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
-  }
-}

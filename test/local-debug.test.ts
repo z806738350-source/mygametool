@@ -4,7 +4,7 @@ import path from "node:path";
 import type { FastifyInstance } from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/daemon/app.js";
-import type { ProjectState, PublishResult } from "../src/shared/contracts.js";
+import type { ProjectState } from "../src/shared/contracts.js";
 import { isLocalDebugEnabled, isLoopbackHostname, LOCAL_DEBUG_ACCESS_TOKEN, LOCAL_DEBUG_USER } from "../src/shared/local-debug.js";
 
 const apps: FastifyInstance[] = [];
@@ -33,139 +33,27 @@ describe("local debug mode", () => {
     for (const host of ["0.0.0.0", "192.168.1.10", "ohmygame.ai", "localhost.example"]) expect(isLoopbackHostname(host)).toBe(false);
   });
 
-  it("publishes a playable snapshot with cover and Community metadata without a cloud service", async () => {
-    const { app, project, cloudFetch } = await runtime();
-    await writeFile(path.join(project.workspacePath, "index.html"), '<h1>Local game</h1><script src="game.js"></script>');
-    await writeFile(path.join(project.workspacePath, "game.js"), "window.gameReady = true");
-    await writeFile(path.join(project.workspacePath, ".env"), "SECRET=private");
-    const cover = Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(4), Buffer.from("WEBPVP8 ")]);
-    expect((await app.inject({
-      method: "PUT", url: `/projects/${project.id}/cover`,
-      headers: { "content-type": "image/webp" }, payload: cover,
-    })).statusCode).toBe(204);
-
-    const response = await publish(app, project.id);
-    expect(response.statusCode).toBe(201);
-    const result = response.json<PublishResult>();
-    expect(result.game).toMatchObject({ title: "Local title", description: "Local description", deploymentId: result.deployment.id });
-    expect(new URL(result.game.playUrl).hostname).toBe("127.0.0.1");
-    expect(await (await fetch(result.game.playUrl)).text()).toContain("Local game");
-    expect(await (await fetch(new URL("game.js", result.game.playUrl))).text()).toContain("gameReady");
-    expect((await fetch(new URL(".env", result.game.playUrl))).status).toBe(404);
-    const community = { ...result.game, author: { id: LOCAL_DEBUG_USER.id, displayName: LOCAL_DEBUG_USER.name } };
-    expect((await app.inject({ method: "GET", url: "/community/games" })).json()).toEqual([community]);
-    expect((await app.inject({ method: "GET", url: `/community/games/${result.game.id}` })).json()).toEqual(community);
-    expect((await app.inject({ method: "GET", url: `/community/games?limit=1&excludeGameId=${result.game.id}` })).json()).toEqual([]);
-    expect((await app.inject({ method: "GET", url: "/community/games?limit=1" })).json()).toEqual([community]);
-    expect((await app.inject({ method: "GET", url: "/community/games?limit=51" })).statusCode).toBe(400);
-    const stored = (await app.inject({ method: "GET", url: `/projects/${project.id}` })).json<ProjectState>();
-    expect(stored.publication).toMatchObject({ gameId: result.game.id, playUrl: result.game.playUrl, title: "Local title" });
-    expect(result.game.coverUrl).toBe(result.deployment.coverUrl);
-    expect(Buffer.from(await (await fetch(result.game.coverUrl!)).arrayBuffer())).toEqual(cover);
-    const coverResponse = await app.inject({ method: "GET", url: `/community/games/${result.game.id}/deployments/${result.deployment.id}/cover` });
-    expect(coverResponse.rawPayload).toEqual(cover);
-    expect(coverResponse.headers["content-type"]).toBe("image/webp");
-    expect(cloudFetch).not.toHaveBeenCalled();
-
-    await app.close();
-    await expect(fetch(result.game.playUrl)).rejects.toThrow();
-  });
-
-  it("unpublishes local snapshots while keeping the project available to publish again", async () => {
-    const { app, project } = await runtime();
-    await writeFile(path.join(project.workspacePath, "index.html"), "Game");
-    const published = (await app.inject({ method: "POST", url: `/projects/${project.id}/publish`, payload: { accessToken: LOCAL_DEBUG_ACCESS_TOKEN, title: "Managed" } })).json();
-    const gameId = published.game.id;
-    const headers = { "x-publish-access-token": LOCAL_DEBUG_ACCESS_TOKEN };
-    const mine = (await app.inject({ method: "GET", url: "/community/me/games", headers })).json();
-    expect(mine.games[0]).toMatchObject({ id: gameId, listingStatus: "listed", stats: { viewCount: 0, likeCount: 0 } });
-    const firstListedAt = mine.games[0].firstListedAt;
-    expect((await app.inject({ method: "GET", url: "/community/me/games" })).statusCode).toBe(401);
-    expect((await app.inject({ method: "POST", url: `/community/games/${gameId}/view`, payload: { visitorId: "33333333-3333-4333-8333-333333333333" } })).statusCode).toBe(404);
-    for (let attempt = 0; attempt < 2; attempt++) {
-      expect((await fetch(published.game.playUrl)).status).toBe(200);
-      expect((await app.inject({ method: "PUT", url: `/community/games/${gameId}/like`, payload: { accessToken: LOCAL_DEBUG_ACCESS_TOKEN, liked: true } })).json().likeCount).toBe(1);
+  it.each([true, false])("does not restore publishing or Community through localDebug=%s", async (localDebug) => {
+    const { app, project, cloudFetch } = await runtime(localDebug);
+    const file = path.join(project.workspacePath, "index.html");
+    await writeFile(file, "Local game stays editable");
+    for (const [method, url, payload] of [
+      ["POST", `/projects/${project.id}/publish`, { accessToken: LOCAL_DEBUG_ACCESS_TOKEN, title: "Blocked publish" }],
+      ["GET", "/community/games", undefined],
+      ["GET", "/community/me/games", undefined],
+      ["PUT", "/community/games/old-game/like", { accessToken: LOCAL_DEBUG_ACCESS_TOKEN, liked: true }],
+      ["DELETE", "/community/games/old-game", { accessToken: LOCAL_DEBUG_ACCESS_TOKEN }],
+      ["PUT", "/cloud/session", { accessToken: LOCAL_DEBUG_ACCESS_TOKEN, userId: LOCAL_DEBUG_USER.id }],
+    ] as const) {
+      const result = await app.inject({ method, url, ...(payload ? { payload } : {}) });
+      expect(result.statusCode, result.body).toBe(410);
+      expect(result.json().error).toContain("not provided by the local secure edition");
     }
-    await app.inject({ method: "PUT", url: `/community/games/${gameId}`, payload: { accessToken: LOCAL_DEBUG_ACCESS_TOKEN, title: "Renamed", description: "Updated metadata" } });
-    expect((await app.inject({ method: "GET", url: `/projects/${project.id}` })).json().publication.title).toBe("Renamed");
-    await app.inject({ method: "POST", url: `/projects/${project.id}/publish`, payload: { accessToken: LOCAL_DEBUG_ACCESS_TOKEN, title: "Renamed" } });
-    const updated = (await app.inject({ method: "GET", url: "/community/me/games", headers })).json();
-    expect(updated.games[0]).toMatchObject({ stats: { viewCount: 2, likeCount: 1 } });
-    expect(updated.games[0].firstListedAt).toBe(firstListedAt);
-    expect((await app.inject({ method: "DELETE", url: `/community/games/${gameId}`, payload: { accessToken: "invalid" } })).statusCode).toBe(401);
-    expect((await app.inject({ method: "GET", url: "/community/me/games", headers })).json().games).toHaveLength(1);
-    expect((await app.inject({ method: "DELETE", url: `/community/games/${gameId}`, payload: { accessToken: LOCAL_DEBUG_ACCESS_TOKEN } })).statusCode).toBe(204);
-    expect((await fetch(published.game.playUrl)).status).toBe(404);
-    expect((await app.inject({ method: "GET", url: "/community/me/games", headers })).json().games).toEqual([]);
-    expect((await app.inject({ method: "GET", url: "/community/games" })).json()).toEqual([]);
     expect((await app.inject({ method: "GET", url: `/projects/${project.id}` })).json().publication).toBeUndefined();
-    expect(await readFile(path.join(project.workspacePath, "index.html"), "utf8")).toBe("Game");
-    const republished = await publish(app, project.id);
-    expect(republished.statusCode).toBe(201);
-    expect(republished.json().game.id).not.toBe(gameId);
-    expect((await app.inject({ method: "GET", url: "/community/me/games", headers })).json().games[0].stats).toMatchObject({ viewCount: 0, likeCount: 0 });
-  });
-
-  it("counts only game entries and keeps counts across publication updates", async () => {
-    const { app, project } = await runtime();
-    await writeFile(path.join(project.workspacePath, "index.html"), "Game");
-    await writeFile(path.join(project.workspacePath, "game.js"), "script");
-    const first = (await publish(app, project.id)).json<PublishResult>();
-    const count = async () => (await app.inject({ method: "GET", url: `/community/games/${first.game.id}?metrics=true` })).json().stats.viewCount;
-    await fetch(first.game.playUrl, { method: "HEAD" });
-    await fetch(new URL("game.js", first.game.playUrl));
-    await fetch(new URL("missing.html", first.game.playUrl));
-    await fetch(first.game.playUrl, { headers: { purpose: "prefetch" } });
-    expect(await count()).toBe(0);
-    await fetch(first.game.playUrl);
-    await fetch(new URL("./?source=shared", first.game.playUrl));
-    expect(await count()).toBe(2);
-    const second = (await publish(app, project.id)).json<PublishResult>();
-    await fetch(first.game.playUrl);
-    expect(await count()).toBe(2);
-    await fetch(second.game.playUrl);
-    expect(await count()).toBe(3);
-  });
-
-  it("updates one Community entry while preserving earlier snapshots", async () => {
-    const { app, project, cloudFetch } = await runtime();
-    await writeFile(path.join(project.workspacePath, "index.html"), "Version one");
-    const first = (await publish(app, project.id)).json<PublishResult>();
-    await writeFile(path.join(project.workspacePath, "index.html"), "Version two");
-    expect(await (await fetch(first.game.playUrl)).text()).toBe("Version one");
-    const second = (await publish(app, project.id, "Updated title")).json<PublishResult>();
-
-    expect(second.game.id).toBe(first.game.id);
-    expect(second.deployment.id).not.toBe(first.deployment.id);
-    expect(await (await fetch(second.game.playUrl)).text()).toBe("Version two");
-    expect(await (await fetch(first.game.playUrl)).text()).toBe("Version one");
-    const listed = (await app.inject({ method: "GET", url: "/community/games" })).json();
-    expect(listed).toHaveLength(1);
-    expect(listed[0]).toMatchObject({ title: "Updated title", deploymentId: second.deployment.id });
+    expect(await readFile(file, "utf8")).toBe("Local game stays editable");
     expect(cloudFetch).not.toHaveBeenCalled();
   });
 
-  it("preserves normal artifact validation and reports missing local games and covers", async () => {
-    const { app, project, cloudFetch } = await runtime();
-    expect((await app.inject({ method: "GET", url: "/community/games" })).json()).toEqual([]);
-    expect((await app.inject({ method: "GET", url: "/community/games/missing" })).statusCode).toBe(404);
-    expect((await app.inject({ method: "GET", url: "/community/games/missing/deployments/missing/cover" })).statusCode).toBe(404);
-    const invalid = await publish(app, project.id);
-    expect(invalid.statusCode).toBe(409);
-    await writeFile(path.join(project.workspacePath, "index.html"), "No cover");
-    const result = (await publish(app, project.id)).json<PublishResult>();
-    expect(result.game.coverUrl).toBeUndefined();
-    expect((await app.inject({ method: "GET", url: `/community/games/${result.game.id}/deployments/${result.deployment.id}/cover` })).statusCode).toBe(404);
-    expect(cloudFetch).not.toHaveBeenCalled();
-  });
-
-  it("rejects mock credentials outside debug mode before building or contacting the cloud", async () => {
-    const { app, project, cloudFetch } = await runtime(false);
-    const response = await publish(app, project.id);
-    expect(response.statusCode).toBe(401);
-    expect(response.json().error).toContain("outside local development");
-    expect(cloudFetch).not.toHaveBeenCalled();
-  });
 });
 
 async function runtime(localDebug = true) {
@@ -177,11 +65,4 @@ async function runtime(localDebug = true) {
   const created = await app.inject({ method: "POST", url: "/projects", payload: { name: "Debug game", type: "web-game" } });
   expect(created.statusCode).toBe(201);
   return { app, project: created.json<ProjectState>(), cloudFetch };
-}
-
-function publish(app: FastifyInstance, projectId: string, title = "Local title") {
-  return app.inject({
-    method: "POST", url: `/projects/${projectId}/publish`,
-    payload: { accessToken: LOCAL_DEBUG_ACCESS_TOKEN, title, description: "Local description" },
-  });
 }

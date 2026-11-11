@@ -25,28 +25,28 @@ files:
   - dist/story-web/resources.json
   - dist/renderer/**/*
   - dist/player/**/*
-  # Renderer source maps go to Sentry, not into the package, even if their upload failed.
+  # Local builds never ship source maps.
   - "!dist/renderer/**/*.map"
   - "!node_modules/typebox/build/**/*.mjs"
   - from: .runtime/typebox
     to: node_modules/typebox/build
+  # Dependency packaging skips top-level examples, including Three's official add-ons.
+  - from: node_modules/three/examples/jsm
+    to: node_modules/three/examples/jsm
+    filter:
+      - loaders/GLTFLoader.js
+      - utils/BufferGeometryUtils.js
 
 extraResources:
   - from: plugins
     to: plugins
   - from: integrations/skills
     to: integrations/skills
-  - from: .runtime/preinstalled-plugins
-    to: preinstalled-plugins
-  - from: .runtime/examples
-    to: examples
   # Match from the parent so electron-builder retains Node's root node_modules.
   - from: .runtime
     to: runtime
     filter:
       - node/**/*
-  - from: .runtime/desktop-config.json
-    to: desktop-config.json
 
 mac:
   icon: build/icon.icns
@@ -74,10 +74,7 @@ nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
 
-publish:
-  provider: generic
-  url: ${env.DESKTOP_UPDATE_URL}
-  channel: latest
+publish: null
 
 dmg:
   artifactName: OhMyGame-${version}-${arch}.${ext}

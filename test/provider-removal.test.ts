@@ -5,6 +5,7 @@ import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/daemon/app.js";
 import { ProviderModelSettingsStore } from "../src/daemon/provider-model-settings.js";
+import { SeedanceSettingsStore } from "../src/daemon/seedance-settings.js";
 
 const directories: string[] = [];
 const apps: ReturnType<typeof createApp>[] = [];
@@ -12,6 +13,7 @@ afterEach(async () => {
   await Promise.all(apps.splice(0).map((app) => app.close()));
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
@@ -44,7 +46,7 @@ async function connect(runtime: ModelRuntime, providerId: string) {
 }
 
 describe("provider deletion", () => {
-  it("clears an official API-key connection and its settings, retaining other providers and allowing reconnection", async () => {
+  it("clears a legacy API-key connection and settings while retaining unrelated data and hiding native connections", async () => {
     const { app, runtime, directory, restart } = await fixture({
       "auth.json": { openai: { type: "api_key", key: "openai-test-key" }, anthropic: otherCredential },
       "models.json": '{\n // Keep unrelated JSONC\n "providers": { "openai": { "baseUrl": "https://relay.example/v1", "models": [{ "id": "custom/test", "name": "Custom test" }] }, "anthropic": { "modelOverrides": { "claude-sonnet-4-5": { "name": "My Claude" } } } }\n}',
@@ -57,7 +59,7 @@ describe("provider deletion", () => {
     expect(runtime.hasConfiguredAuth("openai")).toBe(false);
     expect(await runtime.listCredentials()).toEqual([{ providerId: "anthropic", type: "api_key" }]);
     expect(runtime.getModel("openai", model.id)).toBeUndefined();
-    expect((await app.inject({ method: "GET", url: "/settings/providers" })).json()).toContainEqual(expect.objectContaining({ id: "openai", configured: false, enabled: true }));
+    expect((await app.inject({ method: "GET", url: "/settings/providers" })).json()).not.toContainEqual(expect.objectContaining({ id: "openai" }));
     expect((await app.inject({ method: "GET", url: "/settings/models/providers/openai/endpoint" })).json()).toEqual({ baseUrl: "https://api.openai.com/v1" });
     const contents = await readFile(path.join(directory, "models.json"), "utf8");
     expect(contents).toContain("// Keep unrelated JSONC");
@@ -72,10 +74,11 @@ describe("provider deletion", () => {
     const restored = await restart();
     expect(restored.runtime.hasConfiguredAuth("openai")).toBe(false);
     await connect(restored.runtime, "openai");
-    expect((await restored.app.inject({ method: "GET", url: "/settings/providers" })).json()).toContainEqual(expect.objectContaining({ id: "openai", configured: true, enabled: true }));
+    expect(restored.runtime.hasConfiguredAuth("openai")).toBe(true);
+    expect((await restored.app.inject({ method: "GET", url: "/settings/providers" })).json()).not.toContainEqual(expect.objectContaining({ id: "openai" }));
   });
 
-  it("removes persisted OAuth login locally and keeps the official subscription provider reconnectable after restart", async () => {
+  it("removes persisted legacy OAuth locally without exposing subscription login after restart", async () => {
     const { app, runtime, directory, restart } = await fixture({ "auth.json": { openai: { type: "oauth", access: "test-access-token", refresh: "test-refresh-token", expires: Date.now() + 3_600_000 }, anthropic: otherCredential } });
     expect(await runtime.listCredentials()).toContainEqual({ providerId: "openai", type: "oauth" });
     const removed = await app.inject({ method: "DELETE", url: "/settings/models/providers/openai" });
@@ -83,7 +86,7 @@ describe("provider deletion", () => {
     expect(JSON.parse(await readFile(path.join(directory, "auth.json"), "utf8"))).toEqual({ anthropic: otherCredential });
     const restored = await restart();
     expect(restored.runtime.hasConfiguredAuth("openai")).toBe(false);
-    expect((await restored.app.inject({ method: "GET", url: "/settings/providers" })).json()).toContainEqual(expect.objectContaining({ id: "openai", configured: false, methods: expect.arrayContaining([expect.objectContaining({ type: "oauth" })]) }));
+    expect((await restored.app.inject({ method: "GET", url: "/settings/providers" })).json()).not.toContainEqual(expect.objectContaining({ id: "openai" }));
   });
 
   it.each(["meshy", "tripo"])("clears %s's key, enable state and 3D default while preserving the other native connection", async (id) => {
@@ -97,11 +100,11 @@ describe("provider deletion", () => {
     await expect(readFile(path.join(directory, "models.json"))).rejects.toMatchObject({ code: "ENOENT" });
     expect((await preferences(directory)).defaultModel3D()).toBeUndefined();
     const restored = await restart();
-    expect((await restored.app.inject({ method: "GET", url: "/settings/providers" })).json()).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id, configured: false, enabled: true }), expect.objectContaining({ id: other, configured: true }),
-    ]));
-    expect((await restored.app.inject({ method: "PUT", url: `/settings/models/providers/${id}`, payload: { apiKey: "new-test-key" } })).statusCode).toBe(200);
-    expect((await restored.app.inject({ method: "GET", url: `/settings/models/providers/${id}` })).json()).toEqual({ configured: true });
+    expect((await preferences(directory)).isEnabled(id)).toBe(true);
+    expect(JSON.parse(await readFile(path.join(directory, `${other}.json`), "utf8"))).toMatchObject({ apiKey: `${other}-test-key` });
+    expect((await restored.app.inject({ method: "GET", url: "/settings/providers" })).json()).not.toContainEqual(expect.objectContaining({ id: other }));
+    expect((await restored.app.inject({ method: "PUT", url: `/settings/models/providers/${id}`, payload: { apiKey: "new-test-key" } })).statusCode).toBe(410);
+    expect((await restored.app.inject({ method: "GET", url: `/settings/models/providers/${id}` })).json()).toEqual({ configured: false, hasSavedKey: false });
   });
 
   it("clears only the selected Seedance connection and its global media defaults", async () => {
@@ -115,9 +118,8 @@ describe("provider deletion", () => {
     expect(saved.defaultImageModel()).toBeUndefined();
     expect(saved.defaultVideoModel()).toBeUndefined();
     const restored = await restart();
-    expect((await restored.app.inject({ method: "GET", url: "/settings/providers" })).json()).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: "volcengine-ark", configured: false }), expect.objectContaining({ id: "byteplus-modelark", configured: true }),
-    ]));
+    expect((await restored.app.inject({ method: "GET", url: "/settings/providers" })).json()).not.toContainEqual(expect.objectContaining({ id: "volcengine-ark" }));
+    expect(JSON.parse(await readFile(path.join(directory, "seedance.json"), "utf8"))).toEqual({ version: 1, byteplusApiKey: "byteplus-test-key" });
   });
 
   it("deletes custom providers through the shared endpoint, including keyless local services", async () => {
@@ -130,7 +132,7 @@ describe("provider deletion", () => {
       expect(runtime.getProvider(id)).toBeUndefined();
       expect(await runtime.listCredentials()).not.toContainEqual(expect.objectContaining({ providerId: id }));
     }
-    expect(await (await preferences(directory)).customProviderCatalog()).toEqual([]);
+    expect((await (await preferences(directory)).customProviderCatalog()).map(({ id }) => id)).toEqual(["kunpo"]);
     const restored = await restart();
     expect((await restored.app.inject({ method: "GET", url: "/settings/providers" })).json().some((provider: { custom: boolean }) => provider.custom)).toBe(false);
   });
@@ -164,11 +166,42 @@ describe("provider deletion", () => {
   });
 
   it.each(["meshy", "volcengine-ark"])("keeps %s configured when its credential file cannot be removed", async (id) => {
+    const seedance = vi.spyOn(SeedanceSettingsStore.prototype, "clear");
     const file = id === "meshy" ? "meshy.json" : "seedance.json";
     const { app, directory } = await fixture({ [file]: { version: 1, ...(id === "meshy" ? { apiKey: "test-key" } : { volcengineApiKey: "test-key" }) } });
     await rm(path.join(directory, file));
     await mkdir(path.join(directory, file));
     expect((await app.inject({ method: "DELETE", url: `/settings/models/providers/${id}` })).statusCode).toBe(500);
-    expect((await app.inject({ method: "GET", url: "/settings/providers" })).json()).toContainEqual(expect.objectContaining({ id, configured: true }));
+    if (id === "meshy") expect((await app.inject({ method: "GET", url: `/settings/models/providers/${id}` })).json()).toMatchObject({ configured: false, hasSavedKey: true });
+    expect((await app.inject({ method: "GET", url: "/settings/providers" })).json()).not.toContainEqual(expect.objectContaining({ id }));
+    if (id === "volcengine-ark") {
+      const last = seedance.mock.calls.findLastIndex(([provider]) => provider === id);
+      expect(last).toBeGreaterThanOrEqual(0);
+      const store = seedance.mock.contexts[last];
+      expect(store).toBeInstanceOf(SeedanceSettingsStore);
+      expect((store as SeedanceSettingsStore).get(id)).toEqual({ configured: true });
+    }
+  });
+
+  it("disconnects the unified Kunpo credential without deleting the reviewed catalog or consulting legacy keys", async () => {
+    const { directory } = await fixture();
+    const key = "sk-KUNPO_REMOVAL_FAKE_CANARY";
+    const localFile = path.join(directory, "local-api-keys.json");
+    await writeFile(localFile, JSON.stringify({ kunpo: { type: "api_key", key } }), { mode: 0o600 });
+    const request = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", request);
+    const app = createApp({ dataDirectory: directory, piAgentDirectory: directory });
+    apps.push(app);
+    const before = await app.inject({ method: "GET", url: "/settings/providers" });
+    expect(before.json()).toContainEqual(expect.objectContaining({ id: "kunpo", configured: true, custom: false }));
+    expect(before.body).not.toContain(key);
+    const removed = await app.inject({ method: "DELETE", url: "/settings/models/providers/kunpo" });
+    expect(removed.statusCode, removed.body).toBe(204);
+    expect(JSON.parse(await readFile(localFile, "utf8"))).toEqual({});
+    const after = await app.inject({ method: "GET", url: "/settings/providers" });
+    expect(after.json()).toContainEqual(expect.objectContaining({ id: "kunpo", configured: false, custom: false }));
+    expect(after.body).not.toContain(key);
+    expect((await (await preferences(directory)).customProviderCatalog()).map(({ id }) => id)).toEqual(["kunpo"]);
+    expect(request).not.toHaveBeenCalled();
   });
 });

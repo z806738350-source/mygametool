@@ -45,10 +45,30 @@ function runPreload(options: {
       module,
       module.exports,
     );
-  return { exposed, sendSync, run };
+  return { exposed, sendSync, run, invoke: electron.ipcRenderer.invoke };
 }
 
 describe("desktop preload", () => {
+  it("exposes only the storage cleanup scan, plan, confirmation and receipt IPC", async () => {
+    const preload = runPreload({ runtime: { url: "http://127.0.0.1:43110", token: "secret-token" } });
+    preload.run();
+    const storage = (preload.exposed.get("ohMyGameDesktop") as { storageCleanup: import("../src/shared/desktop-storage.js").DesktopStorageCleanup }).storageCleanup;
+    expect(Object.isFrozen(storage)).toBe(true);
+    const request = { scanId: "scan", itemIds: ["item"] };
+    const confirmation = { planId: "plan", confirmationToken: "token", confirmation: "PERMANENT_DELETE" as const };
+    await storage.scan(); await storage.plan(request); await storage.execute(confirmation); await storage.result("plan");
+    expect(preload.invoke.mock.calls).toEqual([["ohmygame:storage-scan"], ["ohmygame:storage-plan", request], ["ohmygame:storage-execute", confirmation], ["ohmygame:storage-result", "plan"]]);
+    expect(Object.keys(storage).sort()).toEqual(["execute", "plan", "result", "scan"]);
+  });
+
+  it("routes Codex sign-in separately from retired cloud authentication", async () => {
+    const preload = runPreload({ runtime: { url: "http://127.0.0.1:43110", token: "secret-token" } });
+    preload.run();
+    const desktop = preload.exposed.get("ohMyGameDesktop") as { openCodexLogin(url: string): Promise<void> };
+    await desktop.openCodexLogin("https://auth.openai.com/oauth/authorize?state=fixture");
+    expect(preload.invoke).toHaveBeenCalledWith("ohmygame:open-codex-login-url", "https://auth.openai.com/oauth/authorize?state=fixture");
+  });
+
   it("asks the main process for the daemon runtime instead of reading the command line", () => {
     const preload = runPreload({
       runtime: { url: "http://127.0.0.1:43110", token: "secret-token" },
@@ -90,5 +110,13 @@ describe("desktop preload", () => {
 
     expect(preload.sendSync).not.toHaveBeenCalled();
     expect(preload.exposed.size).toBe(0);
+  });
+
+  it.each([undefined, false, true, "true"])("exposes native media only for an exact trusted capability %j", nativeMedia => {
+    const preload = runPreload({ runtime: { url: "http://127.0.0.1:43110", token: "synthetic", nativeMedia } });
+    preload.run();
+    const desktop = preload.exposed.get("ohMyGameDesktop") as { nativeMedia: boolean; runtime: Record<string, unknown> };
+    expect(desktop.nativeMedia).toBe(nativeMedia === true);
+    expect(desktop.runtime).toEqual({ daemonUrl: "http://127.0.0.1:43110", token: "synthetic" });
   });
 });

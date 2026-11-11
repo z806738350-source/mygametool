@@ -51,7 +51,7 @@ cover was chosen by hand (`custom`) or captured automatically (`auto`).
 - Build output and caches at the workspace root: `dist`, `build`, `out` and
   `.godot`. A game's own `levels/build/` stays.
 - Agent data and the Canvas job queue at the workspace root: `.ohmygame`,
-  `.data/agent-attachments` and `canvas/jobs.json`.
+  `.data/agent-attachments`, `canvas/jobs.json` and private `canvas/.job-inputs`.
 - Environment files wherever they are: every name starting with `.env`.
 - Symbolic links.
 - Conversations, checkpoints and publish information, which live outside the
@@ -74,6 +74,8 @@ its actual bytes, including ZIP headers and compression overhead. Both size
 checks finish before a download starts. The completed file streams to the
 response and is removed after the download finishes or is cancelled. Export
 requires temporary disk space for the ZIP; it does not hold the archive in memory.
+Each file is opened without following links and its actual bytes are inspected
+for locally registered credentials as they enter the ZIP, including across chunks.
 The desktop app and browser still collect the download before saving it.
 
 ## Import
@@ -99,8 +101,8 @@ Extraction rejects paths with `..` segments, absolute paths, drive letters
 and symbolic links, and creates every file exclusively. An archive
 may hold up to 200,000 entries and 10 GB, counted for the upload and for the
 extracted files. Version control, dependencies and agent data inside an
-archive are skipped. Other files, such as a hand-made archive's `canvas/jobs.json`
-or `.env`, are imported as they are.
+archive are skipped, including private `canvas/.job-inputs`. Other files, such as
+a hand-made archive's `canvas/jobs.json` or `.env`, are imported as they are.
 
 ### Interactive Story project files
 

@@ -25,6 +25,7 @@ vi.doMock(path.resolve("src/renderer/api.ts"), async original => ({
   ...(await original<typeof import("../src/renderer/api.js")>()),
   listImageModelCatalog: async () => ({ models: [], providers: [] }),
   listVideoModelCatalog: async () => ({ models: [], providers: [] }),
+  listAudioModelCatalog: async () => ({ models: [], providers: [] }),
   listModel3DCatalog: async () => ({ models: [], providers: [] }),
   listModel3DOperations: async () => [],
 }));
@@ -46,6 +47,7 @@ beforeEach(async () => {
     refresh: async () => undefined, reconcile: (_submitted, current) => current,
     resolveConflict: async (_version, value) => value, jobs: async () => [],
     generate: vi.fn(), cancel: vi.fn(),
+    recoverImage: vi.fn(),
   };
   container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
   await act(async () => root.render(<CanvasBoardEditor

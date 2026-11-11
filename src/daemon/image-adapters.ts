@@ -3,6 +3,8 @@ import { withOpenRouterAttribution } from "./openrouter-attribution.js";
 import { ImageGenerationError, OpenAIImageGenerator, type GeneratedImage, type GeneratedImageMediaType, type ImageGenerationInput } from "./openai-image.js";
 import { seedreamModel } from "./seedream-models.js";
 import { SeedreamProvider } from "./seedream-provider.js";
+import { assertProviderBytes, providerCredentialValues, fetchProviderArtifact, providerControlUrl, providerRequest } from "./provider-network.js";
+import { containsKnownSensitiveValue } from "../shared/sensitive-values.js";
 
 export interface ImageSource {
   baseUrl: string;
@@ -19,9 +21,9 @@ export interface ImageProtocolAdapter {
 type Fetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 export function createImageProtocolAdapters(request: Fetch = fetch): Record<ImageProtocol, ImageProtocolAdapter> {
-  return {
+  const adapters: Record<ImageProtocol, ImageProtocolAdapter> = {
     "openai-images": {
-      generate: (source, model, input, signal) => new OpenAIImageGenerator(source.apiKey, source.baseUrl, request, source.headers, source.authentication).generate({ ...input, model }, signal),
+      generate: (source, model, input, signal, definition) => new OpenAIImageGenerator(source.apiKey, source.baseUrl, request, source.headers, source.authentication).generate({ ...input, model, ...(definition ? { imageModel: { provider: definition.provider, id: model } } : {}) }, signal),
     },
     "gemini-generate-content": {
       generate: (source, model, input, signal) => generateGemini(source, model, input, signal, request),
@@ -37,13 +39,26 @@ export function createImageProtocolAdapters(request: Fetch = fetch): Record<Imag
       },
     },
   };
+  for (const [protocol, adapter] of Object.entries(adapters)) {
+    const generate = adapter.generate;
+    adapter.generate = async (...args) => {
+      const input = args[2];
+      if (input.execution?.recoveryOnly && protocol !== "openai-images") throw new ImageGenerationError("Saved-result recovery is unavailable for this image protocol; no new generation was submitted.", 409);
+      const resources = [...(input.images ?? []), ...(input.mask ? [input.mask] : [])];
+      if (resources.some((image) => typeof image?.data !== "string" || !/^[A-Za-z0-9+/]*={0,2}$/.test(image.data))
+        || resources.reduce((total, image) => total + Buffer.byteLength(image.data, "base64"), 0) > 32 * 1024 * 1024) throw new ImageGenerationError("Image references exceed the local safe input limits", 400);
+      if (resources.some((image) => containsKnownSensitiveValue(Buffer.from(image.data, "base64").toString("utf8")))) throw new ImageGenerationError("Protected data cannot be included in image references or masks", 400);
+      return generate(...args);
+    };
+  }
+  return adapters;
 }
 
 async function generateOpenRouter(source: ImageSource, model: string, input: ImageGenerationInput, signal: AbortSignal | undefined, request: Fetch): Promise<GeneratedImage> {
   const timeout = AbortSignal.timeout(180_000);
   let response: Response;
   try {
-    response = await request(`${source.baseUrl.replace(/\/$/, "")}/images`, {
+    response = await providerRequest(request, `${source.baseUrl.replace(/\/$/, "")}/images`, {
       method: "POST",
       headers: { ...withOpenRouterAttribution(sourceHeaders(source)), "content-type": "application/json" },
       body: JSON.stringify({
@@ -68,15 +83,15 @@ async function generateOpenRouter(source: ImageSource, model: string, input: Ima
     error?: { message?: unknown };
     data?: Array<{ b64_json?: unknown; url?: unknown; media_type?: unknown }>;
   };
-  if (!response.ok) throw openRouterImageError(response.status, body.error?.message);
+  if (!response.ok) throw openRouterImageError(response.status);
   const result = body.data?.[0];
   if (!result) throw new ImageGenerationError("OpenRouter returned no generated image");
   const mediaType = imageMediaType(result.media_type) ?? "image/png";
   if (typeof result.b64_json === "string" && result.b64_json) {
-    return { bytes: Buffer.from(result.b64_json, "base64"), mediaType, requestId: response.headers.get("x-request-id") ?? undefined };
+    return { bytes: assertProviderBytes(Buffer.from(result.b64_json, "base64"), providerCredentialValues(source.apiKey, source.headers)), mediaType, requestId: response.headers.get("x-request-id") ?? undefined };
   }
   if (typeof result.url === "string" && /^https?:\/\//.test(result.url)) {
-    const imageResponse = await request(result.url, { signal });
+    const imageResponse = await fetchProviderArtifact(request, result.url, source.baseUrl, { signal, protectedSecrets: providerCredentialValues(source.apiKey, source.headers) });
     if (!imageResponse.ok) throw new ImageGenerationError("Could not download the generated image");
     const downloadedType = imageMediaType(imageResponse.headers.get("content-type")) ?? mediaType;
     return { bytes: Buffer.from(await imageResponse.arrayBuffer()), mediaType: downloadedType, requestId: response.headers.get("x-request-id") ?? undefined };
@@ -90,7 +105,7 @@ async function generateGemini(source: ImageSource, model: string, input: ImageGe
   const timeout = AbortSignal.timeout(130_000);
   let response: Response;
   try {
-    response = await request(endpoint, {
+    response = await providerRequest(request, endpoint, {
       method: "POST",
       headers: { ...sourceHeaders(source), "content-type": "application/json" },
       body: JSON.stringify({
@@ -113,13 +128,13 @@ async function generateGemini(source: ImageSource, model: string, input: ImageGe
     throw new ImageGenerationError(cause instanceof Error && cause.name === "TimeoutError" ? "Image generation timed out" : "Could not reach Gemini image generation");
   }
   const body = await response.json().catch(() => ({})) as GeminiResponse;
-  if (!response.ok) throw new ImageGenerationError(geminiError(response.status, body), geminiStatusCode(response.status));
+  if (!response.ok) throw new ImageGenerationError(geminiError(response.status), geminiStatusCode(response.status));
   const inlineData = body.candidates?.flatMap((candidate) => candidate.content?.parts ?? [])
     .map((part) => part.inlineData).find((data) => typeof data?.data === "string" && data.data);
   if (typeof inlineData?.data !== "string" || !inlineData.data) throw new ImageGenerationError("Gemini returned no generated image");
   const mediaType = imageMediaType(inlineData.mimeType);
   if (!mediaType) throw new ImageGenerationError("Gemini returned an unsupported image format");
-  return { bytes: Buffer.from(inlineData.data, "base64"), mediaType, requestId: body.responseId ?? response.headers.get("x-request-id") ?? undefined };
+  return { bytes: assertProviderBytes(Buffer.from(inlineData.data, "base64"), providerCredentialValues(source.apiKey, source.headers)), mediaType, requestId: body.responseId ?? response.headers.get("x-request-id") ?? undefined };
 }
 
 function sourceHeaders(source: ImageSource): Record<string, string> {
@@ -135,8 +150,7 @@ interface GeminiResponse {
 
 function geminiEndpoint(baseUrl: string, model: string): string {
   try {
-    const url = new URL(baseUrl);
-    if (url.search || url.hash) throw new Error();
+    const url = providerControlUrl(baseUrl, true);
     const pathname = url.pathname.replace(/\/$/, "");
     url.pathname = `${pathname.endsWith("/v1") ? `${pathname}beta` : pathname.endsWith("/v1beta") ? pathname : `${pathname}/v1beta`}/models/${encodeURIComponent(model)}:generateContent`;
     return url.toString();
@@ -155,10 +169,10 @@ function aspectRatio(size?: ImageGenerationInput["size"]): "1:1" | "16:9" | "9:1
   return "1:1";
 }
 
-function geminiError(status: number, body: GeminiResponse): string {
+function geminiError(status: number): string {
   if (status === 401 || status === 403) return "Gemini API key was rejected";
   if (status === 429) return "Gemini image generation is temporarily rate limited";
-  return typeof body.error?.message === "string" && body.error.message ? body.error.message : "Gemini image generation failed";
+  return "Gemini image generation failed";
 }
 
 function geminiStatusCode(status: number): number {
@@ -167,9 +181,8 @@ function geminiStatusCode(status: number): number {
   return status >= 500 ? 502 : 400;
 }
 
-function openRouterImageError(status: number, message: unknown): ImageGenerationError {
-  const detail = typeof message === "string" && message.trim() ? message : undefined;
+function openRouterImageError(status: number): ImageGenerationError {
   if (status === 401 || status === 403) return new ImageGenerationError("OpenRouter credentials were rejected", 503);
   if (status === 429) return new ImageGenerationError("OpenRouter image generation is temporarily rate limited", 429);
-  return new ImageGenerationError(detail ?? "OpenRouter image generation failed", status >= 500 ? 502 : 400);
+  return new ImageGenerationError("OpenRouter image generation failed", status >= 500 ? 502 : 400);
 }

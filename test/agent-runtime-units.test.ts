@@ -28,6 +28,7 @@ import {
 } from "node:fs/promises";
 import { existsSync, realpathSync } from "node:fs";
 import { handoffSummary } from "../src/daemon/agent-runtimes/handoff.js";
+import { SessionImages } from "../src/daemon/session-images.js";
 import {
   canonicalPath,
   judgeApproval,
@@ -444,6 +445,25 @@ describe("conversation handoff", () => {
 });
 
 describe("OhMyGame tool bridge", () => {
+  it("offers branch-scoped image recall to Codex without admitting ordinary host file tools", async () => {
+    const manager = SessionManager.inMemory("/tmp/controlled-image-bridge");
+    manager.appendMessage({ role: "user", content: "Before the attachment", timestamp: 1 });
+    const before = manager.getLeafId()!;
+    const image = { type: "image" as const, mimeType: "image/png", data: "iVBORw0KGgo=" };
+    manager.appendMessage({ role: "user", content: [image], timestamp: 2 });
+    const imageId = `${manager.getLeafId()}:0`;
+    const recall = new SessionImages(manager, "/tmp/unused-image-preview-cache").recallTool;
+    const file = (name: string) => defineTool({ name, label: name, description: name, parameters: Type.Object({}), execute: async () => ({ content: [], details: undefined }) });
+    const tools = [recall, file("read"), file("write"), file("bash")];
+    const bridge = new ToolBridge(tools, false, true);
+    expect(bridge.names).toEqual(["recall_image"]);
+    expect((await bridge.call("recall_image", { imageId }, "recall-1")).result.content).toContainEqual(image);
+    expect(new ToolBridge(tools, true, true).names).toEqual(["recall_image", "read", "write"]);
+    manager.branch(before);
+    const denied = await bridge.call("recall_image", { imageId }, "recall-after-branch");
+    expect(denied.isError).toBe(true);
+    expect(denied.result.content.every(part => part.type === "text")).toBe(true);
+  });
   const echo = defineTool({
     name: "echo_tool",
     label: "Echo",
@@ -491,6 +511,52 @@ describe("OhMyGame tool bridge", () => {
       "echo_tool",
       "fail_tool",
     ]);
+  });
+
+  it("supplies host-owned recovery history independently of model arguments", async () => {
+    const history = { getBranch: () => [] };
+    const inspect = defineTool({
+      name: "inspect_original", label: "Inspect", description: "Reads the original call history",
+      parameters: Type.Object({ sessionManager: Type.Optional(Type.String()) }),
+      execute: async (_id, _args, _signal, _update, context) => {
+        expect(context.sessionManager).toBe(history);
+        return { content: [{ type: "text" as const, text: "Original history inspected" }], details: {} };
+      },
+    });
+    const bridge = new ToolBridge([inspect] as never, false, false, history);
+    expect((await bridge.call("inspect_original", { sessionManager: "forged-model-value" }, "call")).isError).toBe(false);
+  });
+
+  it("binds retained-image vision to the host catalog and rechecks it after deferred reads", async () => {
+    let images = false, release: (() => void) | undefined;
+    const seen: unknown[] = [], pixel = { type: "image" as const, mimeType: "image/png", data: "aGVsbG8=" };
+    const image = defineTool({ name: "recover_isolated_changes", label: "Retained", description: "Synthetic capability fixture", parameters: Type.Object({ action: Type.String(), model: Type.Optional(Type.Unknown()) }),
+      execute: async (_id, _args, _signal, _update, context) => { seen.push(context?.model?.input); if (release === undefined && images) await new Promise<void>(resolve => { release = resolve; }); return { content: [pixel], details: undefined }; },
+    });
+    const bridge = new ToolBridge([image] as never, false, false, undefined, () => ({ id: "verified-model", provider: "controlled", input: images ? ["text", "image"] : ["text"] }));
+    const denied = await bridge.call(image.name, { action: "read_image", model: { input: ["image"] } }, "denied");
+    expect(denied.isError).toBe(true); expect(denied.result.content).not.toContainEqual(pixel); expect(seen).toEqual([["text"]]);
+    images = true; const pending = bridge.call(image.name, { action: "read_image" }, "changed");
+    await Promise.resolve(); images = false; release?.(); const changed = await pending;
+    expect(changed.isError).toBe(true); expect(changed.result.content).not.toContainEqual(pixel);
+    images = true; const delivered = await bridge.call(image.name, { action: "read_image" }, "allowed");
+    expect(delivered.isError).toBe(false); expect(delivered.result.content).toContainEqual(pixel);
+    const unknown = await new ToolBridge([image] as never).call(image.name, { action: "read_image" }, "unknown");
+    expect(unknown.isError).toBe(true); expect(unknown.result.content).not.toContainEqual(pixel);
+  });
+
+  it("retains an explicit tool error instead of recording it as a successful effect", async () => {
+    const rejected = defineTool({
+      name: "rejected_effect", label: "Rejected", description: "Returns an explicit error",
+      parameters: Type.Object({}),
+      execute: async () => ({ isError: true, content: [{ type: "text" as const, text: "Original operation is unconfirmed" }], details: { originalCallId: "original-call" } }),
+    });
+    const bridge = new ToolBridge([rejected] as never);
+    const outcome = await bridge.call("rejected_effect", {}, "new-call");
+    expect(outcome).toEqual({
+      isError: true,
+      result: { content: [{ type: "text", text: "Original operation is unconfirmed" }], details: { originalCallId: "original-call" } },
+    });
   });
 
   it("answers MCP, validates arguments and keeps the tool's own result for the record", async () => {

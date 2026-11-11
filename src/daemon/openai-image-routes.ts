@@ -8,6 +8,7 @@ import type {
 import type { ImageSource } from "./image-adapters.js";
 import { discoverProviderModels } from "./provider-model-discovery.js";
 import { OpenAIImageSettingsStore } from "./openai-image-settings.js";
+import { imageDownloadNetworkStatus } from "./provider-network.js";
 
 export function openAIImageConnection(
   store: OpenAIImageSettingsStore,
@@ -15,11 +16,11 @@ export function openAIImageConnection(
 ) {
   const chatSource = async (): Promise<ImageSource | undefined> => {
     const models = await runtime();
-    if (!models.hasConfiguredAuth("openai") || models.isUsingOAuth("openai"))
+    if (!models.hasConfiguredAuth("kunpo") || models.isUsingOAuth("kunpo"))
       return undefined;
-    const result = await models.getAuth("openai");
+    const result = await models.getAuth("kunpo");
     const baseUrl =
-      result?.auth.baseUrl ?? models.getProvider("openai")?.baseUrl;
+      result?.auth.baseUrl ?? models.getProvider("kunpo")?.baseUrl;
     if (!baseUrl || !result?.auth.apiKey) return undefined;
     return {
       baseUrl,
@@ -44,12 +45,12 @@ export function openAIImageConnection(
     async get(): Promise<OpenAIImageConnectionSettings> {
       const models = await runtime();
       const connectionAvailable =
-        models.hasConfiguredAuth("openai") && !models.isUsingOAuth("openai");
+        models.hasConfiguredAuth("kunpo") && !models.isUsingOAuth("kunpo");
       return {
         ...store.get(),
         connectionAvailable,
         ...(connectionAvailable
-          ? { connectionBaseUrl: models.getProvider("openai")?.baseUrl }
+          ? { connectionBaseUrl: models.getProvider("kunpo")?.baseUrl }
           : {}),
       };
     },
@@ -61,7 +62,7 @@ export function openAIImageConnection(
       const connected =
         Boolean(imageSource) ||
         (await runtime()
-          .then((models) => models.hasConfiguredAuth("openai"))
+          .then((models) => models.hasConfiguredAuth("kunpo"))
           .catch(() => false));
       return {
         source: imageSource,
@@ -72,7 +73,7 @@ export function openAIImageConnection(
               message:
                 settings.mode === "disabled"
                   ? "OpenAI image generation is disabled. Configure an image connection to enable it."
-                  : "Browser sign-in does not include image generation. Add an image API key and Base URL in OpenAI settings.",
+                  : "Connect KunpoAPI with an API key or configure a separate reviewed image endpoint. Legacy sign-in credentials are unavailable.",
             }
           : {}),
       };
@@ -87,6 +88,7 @@ export function registerOpenAIImageRoutes(
   request: typeof fetch = fetch,
 ) {
   const endpoint = "/settings/models/providers/openai/images";
+  app.get(`${endpoint}/download-status`, () => imageDownloadNetworkStatus());
   app.get(endpoint, () => connection.get());
   app.put(endpoint, async (request, reply) => {
     try {
@@ -95,7 +97,7 @@ export function registerOpenAIImageRoutes(
         !(await connection.get()).connectionAvailable
       )
         throw new Error(
-          "Connect OpenAI chat with an API key, or choose a separate image connection",
+          "Connect KunpoAPI with an API key, or choose a separate reviewed image connection",
         );
       await store.update(request.body);
       return connection.get();

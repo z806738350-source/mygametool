@@ -1,3 +1,4 @@
+import { registerSensitiveValue } from "../shared/sensitive-values.js";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -49,6 +50,7 @@ export class SeedanceSettingsStore {
   async update(providerId: SeedanceProviderId, value: string): Promise<{ configured: boolean }> {
     const normalized = value.trim();
     if (!normalized || !/^[\x21-\x7E]+$/.test(normalized)) throw new Error("API key must contain only printable ASCII characters");
+    registerSensitiveValue(normalized);
     await this.#mutate(async () => {
       const next = { ...this.#settings, [KEY_FIELDS[providerId]]: normalized };
       await this.#persist(next);
@@ -93,5 +95,6 @@ function apiKey<Key extends "volcengineApiKey" | "byteplusApiKey">(
   key: Key,
   value: unknown,
 ): Partial<Pick<StoredSeedanceSettings, Key>> {
+  if (typeof value === "string") registerSensitiveValue(value);
   return typeof value === "string" && value ? { [key]: value } as Pick<StoredSeedanceSettings, Key> : {};
 }

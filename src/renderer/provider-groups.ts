@@ -2,12 +2,12 @@ import type { ProviderSummary } from "../shared/contracts.js";
 
 /** Providers listed ahead of the rest in Settings and first-run setup, in display order. */
 const POPULAR_PROVIDER_IDS = [
+  "kunpo",
   "openai",
   "anthropic",
   "openrouter",
   "google",
   "deepseek",
-  "meshy",
   "tripo",
 ];
 

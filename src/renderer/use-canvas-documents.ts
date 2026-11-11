@@ -438,6 +438,10 @@ export function useCanvasDocuments(projectId: string) {
   };
   return {
     workspace,
+    hasDraft: () => Boolean(conflictRef.current) || Boolean(current.current?.documents.some((document) => {
+      const base = bases.current.get(document.id);
+      return !base || !equal(documentContent(document), documentContent(base.document));
+    })),
     update,
     create,
     insertImage,

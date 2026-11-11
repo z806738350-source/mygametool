@@ -5,6 +5,6 @@ const JPEG_SIGNATURE = Buffer.from([0xff, 0xd8, 0xff]);
 export function sniffImageType(bytes: Buffer): "image/png" | "image/jpeg" | "image/webp" | undefined {
   if (bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) return "image/png";
   if (bytes.subarray(0, JPEG_SIGNATURE.length).equals(JPEG_SIGNATURE)) return "image/jpeg";
-  if (bytes.length >= 12 && bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP") return "image/webp";
+  if (bytes.length >= 12 && bytes.toString("latin1", 0, 4) === "RIFF" && bytes.toString("latin1", 8, 12) === "WEBP") return "image/webp";
   return undefined;
 }

@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { LibraryAsset } from "../shared/contracts.js";
 import { uploadLibraryAsset } from "./api.js";
 import { LoaderCircle, Scissors } from "./icons.js";
 import { t } from "./i18n.js";
 import { trimVideo, trimmedVideoType, type VideoTrim } from "./video-trim.js";
 import { formatTime, VideoTrimEditor } from "./video-trim-editor.js";
+import { releaseMedia } from "./release-media.js";
 
 export { formatTime } from "./video-trim-editor.js";
 
@@ -17,11 +18,16 @@ export function VideoTrimmer({
 }: {
   url: string;
   label: string;
-  loadSource: () => Promise<Blob>;
+  loadSource: (signal?: AbortSignal, contentSha256?: string) => Promise<Blob>;
   onSave: (video: Blob, trim: VideoTrim) => Promise<void>;
 }) {
   const source = useRef<Promise<Blob> | undefined>(undefined);
+  const sourceUrl = useRef(url);
+  if (sourceUrl.current !== url) { sourceUrl.current = url; source.current = undefined; }
   const pending = useRef(false);
+  const [editing, setEditing] = useState(false);
+  const player = useRef<HTMLVideoElement>(null);
+  useLayoutEffect(() => { const element = player.current; return () => releaseMedia(element, url); }, [url, editing]);
   const [trim, setTrim] = useState<VideoTrim>();
   const [saving, setSaving] = useState<{
     progress: number;
@@ -29,10 +35,23 @@ export function VideoTrimmer({
     uploading?: boolean;
   }>();
   const [error, setError] = useState<string>();
-  const file = useCallback(
-    () => (source.current ??= loadSource()),
-    [loadSource],
-  );
+  const file = useCallback((signal?: AbortSignal) => {
+    if (source.current) return source.current;
+    const request = Promise.resolve().then(() => {
+      signal?.throwIfAborted();
+      if (window.ohMyGameDesktop?.nativeMedia === true && /^https?:/i.test(url)) {
+        let digests: string[];
+        try { digests = new URL(url).searchParams.getAll("sha256"); }
+        catch { throw new Error(t("api.mediaBindingMissing")); }
+        if (digests.length !== 1 || !/^[a-f0-9]{64}$/.test(digests[0]!)) throw new Error(t("api.mediaBindingMissing"));
+        return loadSource(signal, digests[0]);
+      }
+      return loadSource(signal);
+    });
+    source.current = request;
+    void request.catch(() => { if (source.current === request) source.current = undefined; });
+    return request;
+  }, [loadSource, url]);
 
   useEffect(() => () => saving?.controller.abort(), [saving?.controller]);
 
@@ -44,7 +63,7 @@ export function VideoTrimmer({
     setError(undefined);
     setSaving({ progress: 0, controller });
     try {
-      const video = await trimVideo(await file(), selected, {
+      const video = await trimVideo(await file(controller.signal), selected, {
         signal: controller.signal,
         onProgress: (progress) =>
           setSaving((current) =>
@@ -74,6 +93,11 @@ export function VideoTrimmer({
       );
     }
   };
+
+  if (!editing) return <div className="video-trimmer video-trimmer-preview">
+    <video ref={player} src={url} controls preload="metadata" aria-label={label} />
+    <div className="video-trimmer-footer"><button type="button" onClick={() => setEditing(true)}><Scissors size={14} />{t("videoTrim.edit")}</button></div>
+  </div>;
 
   return (
     <VideoTrimEditor

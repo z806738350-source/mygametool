@@ -1,10 +1,135 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { ProjectManager } from "../src/daemon/projects.js";
+import { KUNPO_DEFAULT_MODEL_REFS } from "../src/shared/kunpo-models.js";
+import { model3DFixture } from "./model3d-fixture.js";
 
 describe("Web Game project codebase", () => {
+  it("prepares the bundled Three.js files on demand inside the selected game directory without altering project dependencies", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-three-"));
+    try {
+      const manager = new ProjectManager(directory), project = await manager.create("Game");
+      const game = path.join(project.workspacePath, "client");
+      await mkdir(game);
+      const manifest = JSON.stringify({ type: "module", dependencies: { three: "0.128.0" } });
+      await writeFile(path.join(game, "package.json"), manifest);
+      await manager.setStartupDirectory(project.id, "client");
+      const reopened = new ProjectManager(directory);
+      await reopened.load();
+      expect(await readdir(game)).toEqual(["package.json"]);
+      const [runtime, same] = await Promise.all([manager.prepareThreeRuntime(project.id), reopened.prepareThreeRuntime(project.id)]);
+      const pin = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).dependencies.three;
+      expect(same).toEqual(runtime);
+      expect(runtime).toEqual({ version: pin, directory: `client/vendor/ohmygame-three-${pin}`, modulePath: `client/vendor/ohmygame-three-${pin}/three.module.js`, gltfLoaderPath: `client/vendor/ohmygame-three-${pin}/addons/GLTFLoader.js` });
+      const location = path.join(project.workspacePath, runtime.directory);
+      const provenance = JSON.parse(await readFile(path.join(location, "provenance.json"), "utf8"));
+      expect(provenance).toMatchObject({ name: "three", version: pin, license: "MIT", files: ["build/three.module.js", "build/three.core.js", "LICENSE"] });
+      for (const source of provenance.files) {
+        expect(await readFile(path.join(location, path.basename(source)))).toEqual(await readFile(new URL(`../node_modules/three/${source}`, import.meta.url)));
+      }
+      // Reproduce a core-only project created by the previous preparation tool.
+      await rm(path.join(location, "addons"), { recursive: true });
+      await Promise.all([manager.prepareThreeRuntime(project.id), reopened.prepareThreeRuntime(project.id)]);
+      const modules = (relative: string) => import(/* @vite-ignore */ pathToFileURL(path.join(project.workspacePath, relative)).href);
+      const { GLTFLoader } = await modules(runtime.gltfLoaderPath);
+      const { AnimationMixer, Bone } = await modules(runtime.modulePath);
+      const bytes = await model3DFixture({ textured: false, rigged: true, clips: ["idle", "run"] });
+      const gltf = await new GLTFLoader().parseAsync(Uint8Array.from(bytes).buffer, "");
+      const joint = gltf.scene.getObjectByName("Root");
+      expect(joint).toBeInstanceOf(Bone);
+      const mixer = new AnimationMixer(gltf.scene);
+      for (const name of ["idle", "run"]) {
+        const action = mixer.clipAction(gltf.animations.find((clip: { name: string }) => clip.name === name)).play();
+        mixer.update(0.5);
+        expect(action.isRunning()).toBe(true);
+        expect(joint.position.x).toBeCloseTo(0.5);
+        action.stop();
+      }
+      expect(await readFile(path.join(game, "package.json"), "utf8")).toBe(manifest);
+      await writeFile(path.join(location, "three.module.js"), "keep my version");
+      await expect(reopened.prepareThreeRuntime(project.id)).rejects.toThrow("Existing Three.js file differs");
+      expect(await readFile(path.join(location, "three.module.js"), "utf8")).toBe("keep my version");
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it("rejects foreign project types and a linked Three.js destination without writing outside the game", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-three-links-"));
+    try {
+      const manager = new ProjectManager(directory);
+      const story = await manager.create("Story", "interactive-story");
+      await expect(manager.prepareThreeRuntime(story.id)).rejects.toThrow("Web Game");
+      const game = await manager.create("Game"), outside = path.join(directory, "outside");
+      await mkdir(outside);
+      await symlink(outside, path.join(game.workspacePath, "vendor"));
+      await expect(manager.prepareThreeRuntime(game.id)).rejects.toThrow("Symbolic links");
+      expect(await readdir(outside)).toEqual([]);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it("rejects private application and agent roots, their parents and their children as external workspaces", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-private-workspace-"));
+    try {
+      const data = path.join(directory, "data"), agent = path.join(directory, "agent"), external = path.join(directory, "game");
+      for (const folder of [data, agent, external, path.join(data, "keys"), path.join(agent, "sessions")]) await mkdir(folder, { recursive: true });
+      await writeFile(path.join(agent, "auth.json"), "fake-key-canary-local-only");
+      const manager = new ProjectManager(data, undefined, [agent]);
+      for (const folder of [directory, data, agent, path.join(data, "keys"), path.join(agent, "sessions")]) {
+        await expect(manager.create("Unsafe", "general", folder)).rejects.toThrow("Private application or agent storage");
+      }
+      const project = await manager.create("External", "general", external);
+      const record = path.join(data, "projects", project.id, "project.json");
+      const original = JSON.parse(await readFile(record, "utf8"));
+      await writeFile(record, JSON.stringify({ ...original, workspacePath: agent }));
+      const restored = new ProjectManager(data, undefined, [agent]);
+      const failures: unknown[] = [];
+      await restored.load((_folder, cause) => failures.push(cause));
+      expect(restored.get(project.id)).toBeUndefined();
+      expect(failures).toHaveLength(1);
+      expect(await readFile(path.join(agent, "auth.json"), "utf8")).toBe("fake-key-canary-local-only");
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it("duplicates project assets and Canvas while excluding credential names and agent runtime data", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-private-duplicate-"));
+    try {
+      const manager = new ProjectManager(directory);
+      const project = await manager.create("Game", "general");
+      const contents = { ".gitignore": "dist", ".data/assets.json": "{}", ".data/asset-previews/hero.png": "preview", "canvas/board.json": "{}", "src/game.js": "game", "auth.json": "fake-key-canary-local-only", "config/api-key.json": "fake-key-canary-local-only", ".data/local-api-keys.json": "fake-key-canary-local-only", "pi-agent/models.json": "fake-key-canary-local-only", "agent-runtimes/session.txt": "fake-key-canary-local-only", "config/private.key.bak": "fake-key-canary-local-only" };
+      for (const [file, text] of Object.entries(contents)) {
+        await mkdir(path.dirname(path.join(project.workspacePath, file)), { recursive: true });
+        await writeFile(path.join(project.workspacePath, file), text);
+      }
+      const copy = await manager.duplicate(project.id);
+      for (const file of [".gitignore", ".data/assets.json", ".data/asset-previews/hero.png", "canvas/board.json", "src/game.js"]) {
+        expect(await readFile(path.join(copy.workspacePath, file), "utf8")).toBe(contents[file as keyof typeof contents]);
+      }
+      for (const [file, text] of Object.entries(contents).filter(([, text]) => text.includes("fake-key-canary"))) {
+        await expect(readFile(path.join(copy.workspacePath, file))).rejects.toThrow();
+        expect(text).toBe("fake-key-canary-local-only");
+      }
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it("rejects linked duplicate files before copying a canary", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-linked-duplicate-"));
+    try {
+      const manager = new ProjectManager(directory);
+      const project = await manager.create("Game", "general");
+      await writeFile(path.join(project.workspacePath, ".env"), "fake-key-canary-local-only");
+      await link(path.join(project.workspacePath, ".env"), path.join(project.workspacePath, "public.txt"));
+      await expect(manager.duplicate(project.id)).rejects.toThrow("Linked files");
+      await rm(path.join(project.workspacePath, "public.txt"));
+      if (process.platform !== "win32") {
+        await symlink(path.join(project.workspacePath, ".env"), path.join(project.workspacePath, "public.txt"));
+        await expect(manager.duplicate(project.id)).rejects.toThrow("Linked files");
+      }
+      expect(await readFile(path.join(project.workspacePath, ".env"), "utf8")).toBe("fake-key-canary-local-only");
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
   it("persists name ownership and leaves legacy projects unchanged", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-project-names-"));
     try {
@@ -44,6 +169,22 @@ describe("Web Game project codebase", () => {
       await restored.load();
       expect(restored.get(project.id)).toMatchObject({ name: "My title", nameSource: "manual" });
       expect(restored.get(removed.id)).toBeUndefined();
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+  it.skipIf(process.platform === "win32")("does not delete through an external workspace's replaced attachment directory", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-external-deletion-"));
+    try {
+      const workspace = path.join(directory, "game");
+      const outside = path.join(directory, "other");
+      await mkdir(workspace);
+      await mkdir(path.join(outside, "agent-attachments"), { recursive: true });
+      const retained = path.join(outside, "agent-attachments", "unrelated.txt");
+      await writeFile(retained, "keep this");
+      const manager = new ProjectManager(path.join(directory, "data"));
+      const project = await manager.create("External", "general", workspace);
+      await symlink(outside, path.join(workspace, ".data"));
+      await manager.delete(project.id);
+      expect(await readFile(retained, "utf8")).toBe("keep this");
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
   it("keeps an engine-independent General Game workspace through reload and duplication", async () => {
@@ -174,6 +315,40 @@ describe("Web Game project codebase", () => {
     await cleared.load();
     expect(cleared.get(project.id)?.mediaModelDefaults).toBeUndefined();
     expect(JSON.parse(await readFile(path.join(directory, "projects", project.id, "project.json"), "utf8"))).not.toHaveProperty("mediaModelDefaults");
+  });
+
+  it("snapshots new-project model choices and preserves explicit choices, pending candidates and legacy metadata", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-project-models-"));
+    try {
+      const manager = new ProjectManager(directory);
+      const project = await manager.create("Canvas", "asset-canvas");
+      expect(project.modelSelections).toEqual(KUNPO_DEFAULT_MODEL_REFS);
+      expect(project.modelSelections).not.toHaveProperty("music");
+      const selected = { agent: { provider: "kunpo", id: "gemini-3.8-flash" }, image: { provider: "openai", id: "gpt-image-2.5-flare" } };
+      await Promise.all([manager.rename(project.id, "Chosen"), manager.setModelSelections(project.id, selected)]);
+      const expected = { ...KUNPO_DEFAULT_MODEL_REFS, ...selected };
+      expect(project.modelSelections).toEqual(expected);
+      await Promise.all([manager.setModelSelections(project.id, { speech: { provider: "volcengine-tts", id: "seed-audio-1.0-multilingual" } }), manager.setModelSelections(project.id, { "sound-effect": { provider: "volcengine-seed-audio", id: "seed-audio-1.0-multilingual" } })]);
+      expect(project.modelSelections).toMatchObject({ speech: { id: "seed-audio-1.0-multilingual" }, "sound-effect": { id: "seed-audio-1.0-multilingual" } });
+      const duplicate = await manager.duplicate(project.id);
+      expect(duplicate.modelSelections).toEqual(project.modelSelections);
+      const record = path.join(directory, "projects", project.id, "project.json");
+      const saved = JSON.parse(await readFile(record, "utf8"));
+      delete saved.modelSelections;
+      saved.mediaModelDefaults = { image: { provider: "legacy-studio", id: "explicit-legacy" } };
+      await writeFile(record, JSON.stringify(saved));
+      const restored = new ProjectManager(directory);
+      await restored.load();
+      expect(restored.get(duplicate.id)?.modelSelections).toEqual(project.modelSelections);
+      expect(restored.get(project.id)?.modelSelections).toBeUndefined();
+      expect(restored.get(project.id)?.mediaModelDefaults).toEqual(saved.mediaModelDefaults);
+      await restored.rename(project.id, "Legacy name");
+      expect(JSON.parse(await readFile(record, "utf8"))).not.toHaveProperty("modelSelections");
+      await expect(restored.setModelSelections(project.id, { image: { provider: "kunpo", id: "gpt-5.6-sol" } })).rejects.toThrow("Invalid project model selection");
+      await expect(restored.setModelSelections(project.id, { image: { provider: "openai", id: "gpt-image-2.5-sunburst", apiKey: "fake-key-not-stored" } } as never)).rejects.toThrow("Invalid project model selection");
+      await restored.setModelSelections(duplicate.id, Object.fromEntries(Object.keys(project.modelSelections ?? {}).map((role) => [role, null])));
+      expect(restored.get(duplicate.id)?.modelSelections).toBeUndefined();
+    } finally { await rm(directory, { recursive: true, force: true }); }
   });
 
   it.each(["web-game", "general"] as const)("persists a runnable startup directory for %s below the workspace root", async (type) => {

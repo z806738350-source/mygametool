@@ -72,6 +72,7 @@ async function mountAsset() {
       />,
     ),
   );
+  await act(async () => button("Trim video").click());
   return metadata();
 }
 async function metadata() {
@@ -102,6 +103,100 @@ function handle(edge: "start" | "end") {
     `.video-trimmer-handle.is-${edge}`,
   )!;
 }
+
+it("waits for an explicit trim action before loading or decoding the source", async () => {
+  await act(async () => root.render(<VideoTrimmer url="blob:asset-trim" label="Original" loadSource={loadSource} onSave={save} />));
+  expect(document.querySelector("video")).not.toBeNull();
+  expect(loadSource).not.toHaveBeenCalled();
+  expect(videoFilmstrip).not.toHaveBeenCalled();
+  await act(async () => button("Trim video").click());
+  expect(loadSource).toHaveBeenCalledTimes(1);
+  expect(loadSource.mock.calls[0]).toHaveLength(1);
+  expect(videoFilmstrip).toHaveBeenCalledTimes(1);
+});
+
+it("binds a native preview's trim source to its inspected digest", async () => {
+  vi.stubGlobal("ohMyGameDesktop", { nativeMedia: true });
+  const sha256 = "a".repeat(64);
+  await act(async () => root.render(<VideoTrimmer url={`http://127.0.0.1:43110/projects/p/files/raw?path=video.mp4&sha256=${sha256}`} label="Original" loadSource={loadSource} onSave={save} />));
+  await act(async () => button("Trim video").click());
+  expect(loadSource).toHaveBeenCalledExactlyOnceWith(expect.any(AbortSignal), sha256);
+});
+
+it("keeps Blob previews on the unbound source path in native mode", async () => {
+  vi.stubGlobal("ohMyGameDesktop", { nativeMedia: true });
+  await act(async () => root.render(<VideoTrimmer url="blob:asset-trim" label="Original" loadSource={loadSource} onSave={save} />));
+  await act(async () => button("Trim video").click());
+  expect(loadSource.mock.calls[0]).toHaveLength(1);
+});
+
+it.each(["", "sha256=bad", `sha256=${"a".repeat(64)}&sha256=${"b".repeat(64)}`])("rejects an invalid native video binding %s without loading or encoding", async (query) => {
+  vi.stubGlobal("ohMyGameDesktop", { nativeMedia: true });
+  await act(async () => root.render(<VideoTrimmer url={`http://127.0.0.1:43110/library/assets/a/content?${query}`} label="Original" loadSource={loadSource} onSave={save} />));
+  await act(async () => button("Trim video").click());
+  expect(loadSource).not.toHaveBeenCalled();
+  expect(videoFilmstrip).not.toHaveBeenCalled(); expect(trimVideo).not.toHaveBeenCalled();
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain("integrity information is unavailable");
+});
+
+it("surfaces a changed native source without encoding or saving it", async () => {
+  vi.stubGlobal("ohMyGameDesktop", { nativeMedia: true });
+  loadSource.mockRejectedValue(new Error("Media changed (409)"));
+  const sha256 = "a".repeat(64);
+  await act(async () => root.render(<VideoTrimmer url={`http://127.0.0.1:43110/library/assets/a/content?sha256=${sha256}`} label="Original" loadSource={loadSource} onSave={save} />));
+  await act(async () => button("Trim video").click());
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain("Media changed (409)");
+  expect(trimVideo).not.toHaveBeenCalled(); expect(save).not.toHaveBeenCalled();
+});
+
+it("does not cache a failed bound read and retries with the same digest on explicit save", async () => {
+  vi.stubGlobal("ohMyGameDesktop", { nativeMedia: true });
+  loadSource.mockRejectedValueOnce(new Error("Media changed (409)"));
+  const sha256 = "a".repeat(64);
+  await act(async () => root.render(<VideoTrimmer url={`http://127.0.0.1:43110/library/assets/a/content?sha256=${sha256}`} label="Original" loadSource={loadSource} onSave={save} />));
+  await act(async () => button("Trim video").click());
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain("Media changed (409)");
+  await metadata(); await key(handle("start"), "ArrowRight");
+  await act(async () => button("Save as new video").click());
+  expect(loadSource).toHaveBeenCalledTimes(2);
+  expect(loadSource.mock.calls.map((call) => call[1])).toEqual([sha256, sha256]);
+  expect(trimVideo).toHaveBeenCalledOnce(); expect(save).toHaveBeenCalledOnce();
+});
+
+it("drops the cached trim source when the native preview URL changes", async () => {
+  vi.stubGlobal("ohMyGameDesktop", { nativeMedia: true });
+  const first = "a".repeat(64), second = "b".repeat(64);
+  const view = (sha256: string) => <VideoTrimmer url={`http://127.0.0.1:43110/library/assets/a/content?sha256=${sha256}`} label="Original" loadSource={loadSource} onSave={save} />;
+  await act(async () => root.render(view(first)));
+  await act(async () => button("Trim video").click());
+  await act(async () => root.render(view(second)));
+  expect(loadSource.mock.calls.map((call) => call[1])).toEqual([first, second]);
+});
+
+it("aborts a pending trim-source request when the editor unmounts", async () => {
+  let signal: AbortSignal | undefined;
+  loadSource.mockImplementationOnce((value: AbortSignal) => new Promise((_resolve, reject) => {
+    signal = value;
+    value.addEventListener("abort", () => reject(value.reason), { once: true });
+  }));
+  await act(async () => root.render(<VideoTrimmer url="blob:asset-trim" label="Original" loadSource={loadSource} onSave={save} />));
+  await act(async () => button("Trim video").click());
+  await act(async () => root.render(<div />));
+  expect(signal?.aborted).toBe(true);
+  expect(videoFilmstrip).not.toHaveBeenCalled();
+});
+
+it("stops both the ordinary player and the trim player when they are removed", async () => {
+  const load = vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+  await act(async () => root.render(<VideoTrimmer url="http://127.0.0.1/media" label="Original" loadSource={loadSource} onSave={save} />));
+  const original = container.querySelector("video")!;
+  await act(async () => button("Trim video").click());
+  expect(original.getAttribute("src")).toBeNull();
+  const editor = container.querySelector("video")!;
+  await act(async () => root.render(<div />));
+  expect(editor.getAttribute("src")).toBeNull();
+  expect(load).toHaveBeenCalledTimes(2);
+});
 
 it.each([
   ".video-trimmer-track",

@@ -1,7 +1,9 @@
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ExampleStore } from "../src/daemon/examples.js";
+import { ProjectManager } from "../src/daemon/projects.js";
 import { createApp } from "../src/daemon/app.js";
 import { createNodeCodebase } from "../src/daemon/playable-codebase.js";
 import { createStarterCodebaseWithScene } from "./playable-fixture.js";
@@ -10,13 +12,16 @@ import { isPreparedExampleCatalog } from "../src/shared/examples.js";
 import { createCanvasBoard } from "../src/shared/canvas-workspace.js";
 
 const apps: Array<ReturnType<typeof createApp>> = [];
+const directories: string[] = [];
 
 afterEach(async () => {
   await Promise.all(apps.splice(0).map((app) => app.close()));
+  await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+  vi.unstubAllGlobals();
 });
 
 async function writeExamples(): Promise<string> {
-  const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-examples-"));
+  const directory = await temporary("ohmygame-examples-");
   const files = path.join(directory, "pond", "files");
   await mkdir(path.join(files, "src"), { recursive: true });
   await writeFile(path.join(files, "package.json"), JSON.stringify({ scripts: { dev: "vite", build: "vite build" } }));
@@ -58,7 +63,7 @@ async function writeExamples(): Promise<string> {
 }
 
 async function writePlayer(): Promise<string> {
-  const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-examples-player-"));
+  const directory = await temporary("ohmygame-examples-player-");
   await mkdir(path.join(directory, "assets"), { recursive: true });
   await writeFile(path.join(directory, "index.html"), "<h1>Published player</h1>");
   await writeFile(path.join(directory, "player.js"), "window.player = true");
@@ -69,7 +74,7 @@ async function writePlayer(): Promise<string> {
 
 async function startApp(examplesDirectory?: string, interactiveStoryPlayerDirectory?: string) {
   const app = createApp({
-    dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-examples-data-")),
+    dataDirectory: await temporary("ohmygame-examples-data-"),
     examplesDirectory,
     ...(interactiveStoryPlayerDirectory ? { interactiveStoryPlayerDirectory } : {}),
   });
@@ -78,7 +83,25 @@ async function startApp(examplesDirectory?: string, interactiveStoryPlayerDirect
   return app;
 }
 
-describe("examples", () => {
+async function localCatalog(directory: string) {
+  const dataDirectory = await temporary("ohmygame-local-example-data-");
+  const projects = new ProjectManager(dataDirectory);
+  await projects.load();
+  const store = new ExampleStore(directory);
+  await store.load();
+  return { store, projects, dataDirectory };
+}
+async function localRemix(directory: string, id: string, type: "web-game" | "interactive-story") {
+  const { store, projects, dataDirectory } = await localCatalog(directory);
+  const project = await store.createProject(projects, id, { type });
+  await store.close();
+  const app = createApp({ dataDirectory });
+  apps.push(app);
+  await app.ready();
+  return { app, project };
+}
+
+describe("examples: retained local data and retired startup routes", () => {
   it("preserves remixed node positions and the original viewport until explicitly edited", async () => {
     const directory = await writeExamples();
     const canvas = path.join(directory, "pond/files/canvas");
@@ -90,8 +113,7 @@ describe("examples", () => {
       await writeFile(path.join(canvas, `boards/${id}.json`), JSON.stringify({ ...board, id, nodes: [{ id: "note", type: "text", data: { text: "Example", instruction: "" } }] }));
       await writeFile(path.join(canvas, `editor/${id}.json`), JSON.stringify(layout));
     }
-    const app = await startApp(directory);
-    const project = (await app.inject({ method: "POST", url: "/projects", payload: { type: "web-game", exampleId: "pond" } })).json();
+    const { app, project } = await localRemix(directory, "pond", "web-game");
     for (const id of ["design", "art"]) {
       const url = `/projects/${project.id}/canvas/boards/${id}`;
       const detail = (await app.inject({ method: "GET", url })).json();
@@ -127,15 +149,13 @@ describe("examples", () => {
       ...(status === "succeeded" ? { run: { id: "original-run", assetIds: ["original-asset"] } } : { error: "Original error" }),
     }));
     await writeFile(path.join(canvas, "jobs.json"), JSON.stringify(history));
-    const app = await startApp(directory);
-    const created = await app.inject({ method: "POST", url: "/projects", payload: { type: "web-game", exampleId: "pond" } });
-    expect(created.statusCode).toBe(201);
-    const project = created.json();
+    const { app, project } = await localRemix(directory, "pond", "web-game");
+    expect(project.type).toBe("web-game");
     const expected = history.map((job) => ({ ...job, context: { ...job.context, projectId: project.id } }));
     expect(JSON.parse(await readFile(path.join(project.workspacePath, "canvas/jobs.json"), "utf8"))).toEqual(expected);
     const response = await app.inject({ method: "GET", url: `/projects/${project.id}/canvas/jobs` });
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual(expected.map(({ input: _input, ...job }) => job));
+    expect(response.json()).toEqual(expected.map(({ input: _input, ...job }) => ({ ...job, canRecoverImage: false })));
     expect(JSON.parse(await readFile(path.join(canvas, "jobs.json"), "utf8"))).toEqual(history);
   });
 
@@ -144,123 +164,54 @@ describe("examples", () => {
     const canvas = path.join(directory, "pond/files/canvas");
     await mkdir(canvas, { recursive: true });
     await writeFile(path.join(canvas, "jobs.json"), JSON.stringify({ jobs: [] }));
-    const app = await startApp(directory);
-    const response = await app.inject({ method: "POST", url: "/projects", payload: { type: "web-game", exampleId: "pond" } });
-    expect(response.statusCode).toBe(400);
-    expect((await app.inject({ method: "GET", url: "/projects" })).json()).toEqual([]);
+    const { store, projects } = await localCatalog(directory);
+    await expect(store.createProject(projects, "pond", { type: "web-game" })).rejects.toThrow("invalid Canvas generation history");
+    expect(projects.list()).toEqual([]);
   });
 
-  it("lists packaged examples and serves their covers", async () => {
-    const app = await startApp(await writeExamples());
-
-    expect((await app.inject({ method: "GET", url: "/examples" })).json()).toEqual([
+  it("retains explicit local catalog reading and cover data without enabling startup seeding", async () => {
+    const directory = await writeExamples();
+    const { store } = await localCatalog(directory);
+    expect(store.list()).toEqual([
       { id: "pond", type: "web-game", name: "Pond", description: "A small pond." },
       { id: "train", type: "interactive-story", name: "Night Train", description: "A short story." },
     ]);
-    const cover = await app.inject({ method: "GET", url: "/examples/pond/cover" });
-    expect(cover.statusCode).toBe(200);
-    expect(cover.headers["content-type"]).toBe("image/webp");
-    expect(cover.body).toBe("RIFF-cover");
-    expect((await app.inject({ method: "GET", url: "/examples/missing/cover" })).statusCode).toBe(404);
+    expect((await store.cover("pond"))?.toString()).toBe("RIFF-cover");
+    expect(await store.cover("missing")).toBeUndefined();
+    await store.close();
   });
 
-  it("serves an example's static build on loopback for playing", async () => {
-    const app = await startApp(await writeExamples());
-
-    const response = await app.inject({ method: "POST", url: "/examples/pond/play" });
-
-    expect(response.statusCode).toBe(200);
-    const { url } = response.json() as { url: string };
-    expect(url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/[\w-]{20,}\/$/);
-    expect(await (await fetch(url)).text()).toBe("<title>Pond</title>");
-    const script = await fetch(`${url}assets/game.js`);
-    expect(script.headers.get("content-type")).toBe("text/javascript; charset=utf-8");
-    expect(await script.text()).toBe("play();");
-    expect((await fetch(`${url}../cover.webp`)).status).toBe(404);
-    expect((await fetch(new URL("/not-a-token/index.html", url))).status).toBe(404);
-    expect((await app.inject({ method: "POST", url: "/examples/pond/play" })).json()).toEqual({ url });
-    expect((await app.inject({ method: "POST", url: "/examples/lake/play" })).statusCode).toBe(404);
-  });
-
-  it("compiles an interactive story example with the Published Player when played", async () => {
+  it.each(["pond", "train"])("does not expose prepared %s downloads, covers or play servers through the application", async (id) => {
+    const request = vi.fn<typeof fetch>(async () => { throw new Error("Examples must not contact author services"); });
+    vi.stubGlobal("fetch", request);
     const app = await startApp(await writeExamples(), await writePlayer());
-
-    const response = await app.inject({ method: "POST", url: "/examples/train/play" });
-
-    expect(response.statusCode).toBe(200);
-    const { url } = response.json() as { url: string };
-    expect(await (await fetch(url)).text()).toBe("<h1>Published player</h1>");
-    const definition = await (await fetch(`${url}playable.json`)).json() as { graph: { title: string } };
-    expect(definition.graph.title).toBe("Night Train");
-    expect(await (await fetch(`${url}manifest.json`)).json()).toMatchObject({ scope: "example:train" });
-    expect((await app.inject({ method: "POST", url: "/examples/train/play" })).json()).toEqual({ url });
-  });
-
-  it("creates an interactive story from an example with this version's agent contract", async () => {
-    const app = await startApp(await writeExamples());
-
-    const response = await app.inject({ method: "POST", url: "/projects", payload: { type: "interactive-story", exampleId: "train" } });
-
-    expect(response.statusCode).toBe(201);
-    const project = response.json();
-    expect(project).toMatchObject({ name: "Night Train", type: "interactive-story" });
-    for (const owned of ["AGENTS.md", "README.md", "schemas/graph.schema.json"]) {
-      expect((await stat(path.join(project.workspacePath, owned))).isFile()).toBe(true);
-    }
-    const codebase = (await app.inject({ method: "GET", url: `/projects/${project.id}/playable/codebase` })).json();
-    expect(codebase.graph.nodes.map((node: { id: string }) => node.id)).toEqual(["start"]);
-    expect((await app.inject({ method: "GET", url: `/projects/${project.id}/cover` })).body).toBe("RIFF-train");
-    expect((await app.inject({ method: "POST", url: "/projects", payload: { type: "interactive-story", exampleId: "train", viewport: { width: 720, height: 1280 } } })).statusCode).toBe(400);
-  });
-
-  it("has no examples when none were prepared", async () => {
-    const app = await startApp(path.join(tmpdir(), "ohmygame-no-examples-here"));
     expect((await app.inject({ method: "GET", url: "/examples" })).json()).toEqual([]);
+    expect((await app.inject({ method: "GET", url: `/examples/${id}/cover` })).statusCode).toBe(404);
+    expect((await app.inject({ method: "POST", url: `/examples/${id}/play` })).statusCode).toBe(404);
+    expect(request).not.toHaveBeenCalled();
   });
 
-  it("creates a runnable web game from an example", async () => {
+  it.each([
+    { type: "web-game", exampleId: "pond" },
+    { type: "interactive-story", exampleId: "train" },
+    { type: "web-game", exampleId: "pond", name: "My pond" },
+    { type: "godot-game", exampleId: "pond" },
+  ])("refuses retired example creation without copying source files: %j", async (payload) => {
+    const workspacePath = await temporary("ohmygame-no-example-copy-");
     const app = await startApp(await writeExamples());
-
-    const response = await app.inject({ method: "POST", url: "/projects", payload: { type: "web-game", exampleId: "pond" } });
-
-    expect(response.statusCode).toBe(201);
-    const project = response.json();
-    expect(project).toMatchObject({ name: "Pond", type: "web-game", preview: { status: "stopped" } });
-    expect(await readFile(path.join(project.workspacePath, "src", "main.ts"), "utf8")).toBe("console.log('pond');\n");
-    expect((await app.inject({ method: "GET", url: `/projects/${project.id}/cover` })).body).toBe("RIFF-cover");
-  });
-
-  it("keeps a custom project name", async () => {
-    const app = await startApp(await writeExamples());
-    const project = (await app.inject({ method: "POST", url: "/projects", payload: { type: "web-game", exampleId: "pond", name: "My pond" } })).json();
-    expect(project.name).toBe("My pond");
-  });
-
-  it("rejects unknown examples and mismatched project types", async () => {
-    const app = await startApp(await writeExamples());
-
-    expect((await app.inject({ method: "POST", url: "/projects", payload: { type: "web-game", exampleId: "lake" } })).statusCode).toBe(404);
-    expect((await app.inject({ method: "POST", url: "/projects", payload: { type: "godot-game", exampleId: "pond" } })).statusCode).toBe(400);
-    expect((await app.inject({ method: "POST", url: "/projects", payload: { type: "web-game", exampleId: "../pond" } })).statusCode).toBe(400);
+    const response = await app.inject({ method: "POST", url: "/projects", payload: { ...payload, workspacePath } });
+    expect(response.statusCode, response.body).toBe(404);
+    expect(response.json().error).toContain("Example not found");
     expect((await app.inject({ method: "GET", url: "/projects" })).json()).toEqual([]);
+    expect(await readdir(workspacePath)).toEqual([]);
   });
 
-  it("only copies an example into an empty chosen folder", async () => {
-    const app = await startApp(await writeExamples());
-    const workspace = await mkdtemp(path.join(tmpdir(), "ohmygame-example-workspace-"));
-    await writeFile(path.join(workspace, "notes.txt"), "mine");
-
-    const rejected = await app.inject({ method: "POST", url: "/projects", payload: { type: "web-game", exampleId: "pond", workspacePath: workspace } });
-
-    expect(rejected.statusCode).toBe(400);
-    expect(await readdir(workspace)).toEqual(["notes.txt"]);
-    expect((await app.inject({ method: "GET", url: "/projects" })).json()).toEqual([]);
-
-    const empty = await mkdtemp(path.join(tmpdir(), "ohmygame-example-empty-"));
-    await writeFile(path.join(empty, ".DS_Store"), "");
-    const created = await app.inject({ method: "POST", url: "/projects", payload: { type: "web-game", exampleId: "pond", workspacePath: empty } });
-    expect(created.statusCode).toBe(201);
-    expect((await readdir(empty)).sort()).toEqual([".DS_Store", "package.json", "src"]);
+  it("keeps blank local projects available without prepared examples", async () => {
+    const app = await startApp();
+    expect((await app.inject({ method: "GET", url: "/examples" })).json()).toEqual([]);
+    const created = await app.inject({ method: "POST", url: "/projects", payload: { name: "Local project" } });
+    expect(created.statusCode, created.body).toBe(201);
+    expect(created.json().name).toBe("Local project");
   });
 
   it("validates prepared catalogs", () => {
@@ -279,3 +230,9 @@ describe("examples", () => {
     expect(isPreparedExampleCatalog({ ...valid, examples: [{ ...valid.examples[0], type: "interactive-story" }] })).toBe(false);
   });
 });
+
+async function temporary(prefix: string) {
+  const directory = await mkdtemp(path.join(tmpdir(), prefix));
+  directories.push(directory);
+  return directory;
+}

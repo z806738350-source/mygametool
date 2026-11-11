@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { object, wireImages, type Json, type WireImage } from "./session-images.js";
+import { guardedProviderFetch } from "./provider-network.js";
 
 const FILE_TTL_SECONDS = 7 * 24 * 60 * 60;
 const VERIFICATION_MS = 5 * 60 * 1000;
@@ -24,6 +25,7 @@ export class OpenAISessionFiles {
   constructor(private readonly directory: string) {}
 
   async replace(payload: Json, headers: Headers, delegate: typeof fetch, signal: AbortSignal): Promise<UsedOpenAIFile[]> {
+    delegate = guardedProviderFetch(delegate);
     const images = wireImages(payload).filter((image) => image.file);
     if (images.length > 1500 || images.reduce((total, image) => total + Buffer.byteLength(image.data, "base64"), 0) > 512 * 1024 * 1024) {
       throw new Error("OpenAI image files exceed the request image limit");

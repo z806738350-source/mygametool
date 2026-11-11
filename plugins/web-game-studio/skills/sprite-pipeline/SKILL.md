@@ -36,4 +36,14 @@ Use `generate_canvas_media` with saved image nodes and references when working o
 - timing matches the gameplay event
 - manifest, preload, and runtime animation names agree
 
+Transparent output, including Sunburst and Flare PNGs, may contain low-alpha
+transitions. Neither an alpha flag nor a few residual pixels is a rejection
+criterion. Inspect location, area and alpha distribution, then compare light,
+dark, checkerboard and game backgrounds at gameplay scale. Protect normal
+antialiasing, hair, shadows and translucent effects. A single alpha threshold
+cannot decide every asset's quality. For a verified visible defect, prefer
+reversible local cleanup in a separate derivative, keeping the original and
+frame geometry. Another paid generation requires actual quality evidence and
+an explanation of why suitable local repair cannot meet the intended use.
+
 Use `../phaser-2d-game/SKILL.md` for runtime integration and `../game-playtest/SKILL.md` for in-game verification.

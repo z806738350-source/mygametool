@@ -1,9 +1,10 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
   Background,
   BackgroundVariant,
   MarkerType,
+  MiniMap,
   Panel,
   ReactFlow,
   ViewportPortal,
@@ -23,7 +24,7 @@ import {
   type CanvasAlignmentGuides,
   type CanvasAlignmentNode,
 } from "./canvas-alignment.js";
-import { Hand, Maximize, Minus, MousePointer2, Plus } from "./icons.js";
+import { ChevronDown, Hand, Map as MapIcon, Maximize, Minus, MousePointer2, Plus } from "./icons.js";
 // React Flow's own layout rules, loaded with the one canvas both editors use,
 // since either editor may be the first to load.
 import "@xyflow/react/dist/style.css";
@@ -51,6 +52,8 @@ const SELECTED_EDGE_OPTIONS = {
   markerEnd: { ...EDGE_OPTIONS.markerEnd, color: SELECTED_EDGE_COLOR },
 };
 const SNAP_GRID: [number, number] = [CANVAS_GRID_SIZE, CANVAS_GRID_SIZE];
+const CANVAS_KEYBOARD_CONTENT = "button, a, input, textarea, select, [contenteditable], .nokey, .nowheel, video, audio, iframe, model-viewer, .model-preview";
+const CANVAS_KEYBOARD_OVERLAYS = 'dialog[open], [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]';
 
 type EditorCanvasProps<N extends Node> = Omit<ReactFlowProps<N, Edge>, "onPaneContextMenu" | "onNodeDrag"> & {
   nodes: N[];
@@ -60,12 +63,13 @@ type EditorCanvasProps<N extends Node> = Omit<ReactFlowProps<N, Edge>, "onPaneCo
   /** Open the menu as "add" on a double-click on empty canvas in pointer mode. */
   addOnDoubleClick?: boolean;
   fitViewOnLoad?: boolean;
+  revealNodeIds?: string[];
   onInitialFit?: (viewport: { x: number; y: number; zoom: number }) => void;
 };
 
 /**
  * The canvas both editors share: pan and zoom, pointer and pan modes, grid
- * snapping, alignment guides while dragging, the zoom controls, and the tool
+ * snapping, alignment guides while dragging, the overview, zoom controls, and the tool
  * bar. Nodes, edges, and what they mean belong to each editor.
  */
 export function EditorCanvas<N extends Node>({
@@ -79,12 +83,14 @@ export function EditorCanvas<N extends Node>({
   onNodeDragStop,
   onNodeContextMenu,
   fitViewOnLoad = false,
+  revealNodeIds,
   onInitialFit,
   style,
   children,
   ...props
 }: EditorCanvasProps<N>) {
   const [mode, setMode] = useState<InteractionMode>("pointer");
+  const [keyboardFocus, setKeyboardFocus] = useState(false);
   const [guides, setGuides] = useState<CanvasAlignmentGuides>();
   const instance = useRef<ReactFlowInstance<N, Edge>>(null);
   // React Flow applies defaultViewport in an effect. Keep measuring the canvas,
@@ -106,7 +112,7 @@ export function EditorCanvas<N extends Node>({
 
   return (
     <ReactFlow<N, Edge>
-      className={`story-canvas story-canvas-${mode}`}
+      className={`story-canvas story-canvas-${mode}${keyboardFocus ? " is-keyboard-focused" : ""}`}
       nodes={nodes}
       edges={edges?.map((edge) => edge.selected ? { ...edge, ...SELECTED_EDGE_OPTIONS } : edge)}
       defaultEdgeOptions={EDGE_OPTIONS}
@@ -125,7 +131,43 @@ export function EditorCanvas<N extends Node>({
       zoomOnDoubleClick={false}
       proOptions={{ hideAttribution: true }}
       {...props}
+      tabIndex={props.tabIndex ?? 0}
       style={{ ...style, ...(!viewportReady ? { opacity: 0, pointerEvents: "none" as const } : {}) }}
+      onFocus={(event) => {
+        props.onFocus?.(event);
+        if (event.target === event.currentTarget) setKeyboardFocus(event.currentTarget.matches(":focus-visible"));
+      }}
+      onBlur={(event) => {
+        props.onBlur?.(event);
+        if (event.target === event.currentTarget) setKeyboardFocus(false);
+      }}
+      onPointerDownCapture={(event) => {
+        props.onPointerDownCapture?.(event);
+        if (!event.defaultPrevented && event.target instanceof Element && event.target.closest(".react-flow") === event.currentTarget) {
+          if (!event.target.closest(CANVAS_KEYBOARD_CONTENT)) event.currentTarget.focus({ preventScroll: true });
+          setKeyboardFocus(false);
+        }
+      }}
+      onKeyDown={(event) => {
+        props.onKeyDown?.(event);
+        if (event.defaultPrevented || !viewportReady || event.nativeEvent.isComposing || event.keyCode === 229 || event.repeat || event.metaKey || event.ctrlKey || event.altKey) return;
+        const key = event.key.toLowerCase();
+        if (!["+", "=", "-", "0", "f"].includes(key) || (event.shiftKey && key !== "+" && key !== "=")) return;
+        const target = event.target;
+        const root = event.currentTarget;
+        if (!(target instanceof Element) || !root.contains(target) || !root.contains(document.activeElement) || target.closest(".react-flow") !== root || target.closest(CANVAS_KEYBOARD_CONTENT)) return;
+        if (root.closest('[hidden], [inert], [aria-hidden="true"]') || !root.checkVisibility({ visibilityProperty: true })) return;
+        // Portalled menus can leave focus on the canvas while their overlay is open.
+        if ([...document.querySelectorAll<HTMLElement>(CANVAS_KEYBOARD_OVERLAYS)].some((overlay) => !overlay.closest('[inert], [aria-hidden="true"]') && overlay.checkVisibility({ visibilityProperty: true }))) return;
+        const flow = instance.current;
+        if (!flow) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (key === "+" || key === "=") void flow.zoomIn();
+        else if (key === "-") void flow.zoomOut();
+        else if (key === "0") void flow.zoomTo(1);
+        else void fitCanvas(flow);
+      }}
       onInit={(value) => {
         instance.current = value;
         if (!needsInitialFit) setViewportReady(true);
@@ -146,8 +188,10 @@ export function EditorCanvas<N extends Node>({
       <Background variant={BackgroundVariant.Dots} gap={24} size={1} color="var(--interactive-story-grid)" />
       <AlignmentGuides guides={guides} />
       <ZoomControls />
+      <CanvasMiniMap />
       <PinchZoomOverScrollingContent />
       {needsInitialFit ? <InitialCanvasView onReady={onInitialFit} onVisible={setViewportReady} /> : null}
+      {revealNodeIds?.length ? <RevealCanvasNodes ids={revealNodeIds} /> : null}
       <Panel className="story-canvas-toolbar" position="bottom-center">
         {addControl}
         <button className={mode === "pointer" ? "is-active" : undefined} type="button" title={t("editorCanvas.select")} aria-label={t("editorCanvas.select")} aria-pressed={mode === "pointer"} onClick={() => setMode("pointer")}>
@@ -161,6 +205,54 @@ export function EditorCanvas<N extends Node>({
       {children}
     </ReactFlow>
   );
+}
+
+function RevealCanvasNodes({ ids }: { ids: string[] }) {
+  const initialized = useNodesInitialized();
+  const width = useStore(state => state.width);
+  const height = useStore(state => state.height);
+  const { fitView } = useReactFlow();
+  const revealed = useRef("");
+  const key = JSON.stringify(ids);
+  useEffect(() => {
+    if (!initialized || width <= 0 || height <= 0 || revealed.current === key) return;
+    revealed.current = key;
+    void fitView({ nodes: ids.map(id => ({ id })), padding: 0.2, maxZoom: 1, duration: 200 });
+  }, [initialized, width, height, fitView, ids, key]);
+  return null;
+}
+
+function CanvasMiniMap() {
+  const compact = useStore((state) => state.width < 640);
+  const { getViewport, setCenter } = useReactFlow();
+  const mapId = useId();
+  const [collapsed, setCollapsed] = useState(() => {
+    try { return localStorage.getItem("ohmygame:canvas-minimap-collapsed") === "true"; } catch { return false; }
+  });
+  const label = t(collapsed ? "editorCanvas.showMinimap" : "editorCanvas.hideMinimap");
+  return <Panel className={`story-canvas-overview nodrag nopan nowheel${collapsed ? " is-collapsed" : ""}`} position={compact ? "top-right" : "bottom-right"}>
+    <button className="story-canvas-minimap-toggle" type="button" title={label} aria-label={label} aria-expanded={!collapsed} aria-controls={mapId} onClick={(event) => {
+      event.stopPropagation();
+      const next = !collapsed;
+      setCollapsed(next);
+      try { localStorage.setItem("ohmygame:canvas-minimap-collapsed", String(next)); } catch { /* The overview remains usable without saved preferences. */ }
+    }}>{collapsed ? <MapIcon size={18} /> : <ChevronDown size={16} />}</button>
+    <div id={mapId} hidden={collapsed}>{!collapsed ? <MiniMap
+      className="story-canvas-minimap nowheel"
+      position={compact ? "top-right" : "bottom-right"}
+      style={{ width: compact ? 120 : 180, height: compact ? 80 : 120 }}
+      ariaLabel={t("editorCanvas.minimap")}
+      pannable
+      nodeColor={(node) => node.selected ? "var(--theme-accent)" : "var(--text-muted)"}
+      nodeStrokeColor="var(--border-strong)"
+      nodeBorderRadius={2}
+      bgColor="var(--surface-raised)"
+      maskColor="color-mix(in srgb, var(--surface) 75%, transparent)"
+      maskStrokeColor="var(--theme-accent)"
+      maskStrokeWidth={1}
+      onClick={(_event, point) => void setCenter(point.x, point.y, { zoom: getViewport().zoom })}
+    /> : null}</div>
+  </Panel>;
 }
 
 /**
@@ -314,15 +406,16 @@ export function isTextEntry(target: EventTarget | null): boolean {
 }
 
 function FitViewButton() {
-  const { fitView, getNodes, setViewport } = useReactFlow();
-  async function fitCanvas(): Promise<void> {
-    if (getNodes().length === 0) {
-      await setViewport({ x: 0, y: 0, zoom: 1 }, { duration: 200 });
-      return;
-    }
-    await fitView({ padding: 0.2, duration: 200 });
+  const flow = useReactFlow();
+  return <button type="button" title={`${t("editorCanvas.fit")} (F)`} aria-label={t("editorCanvas.fit")} onClick={() => void fitCanvas(flow)}><Maximize size={18} /></button>;
+}
+
+async function fitCanvas<N extends Node>({ fitView, getNodes, setViewport }: Pick<ReactFlowInstance<N>, "fitView" | "getNodes" | "setViewport">): Promise<void> {
+  if (getNodes().length === 0) {
+    await setViewport({ x: 0, y: 0, zoom: 1 }, { duration: 200 });
+    return;
   }
-  return <button type="button" title={t("editorCanvas.fit")} aria-label={t("editorCanvas.fit")} onClick={() => void fitCanvas()}><Maximize size={18} /></button>;
+  await fitView({ padding: 0.2, duration: 200 });
 }
 
 function AlignmentGuides({ guides }: { guides?: CanvasAlignmentGuides }) {
@@ -384,9 +477,9 @@ function ZoomControls() {
   const { zoom } = useViewport();
   return (
     <Panel className="story-canvas-zoom" position="bottom-left">
-      <button type="button" title={t("editorCanvas.zoomOut")} aria-label={t("editorCanvas.zoomOut")} onClick={() => void zoomOut()}><Minus size={14} /></button>
-      <button className="story-canvas-zoom-value" type="button" title={t("editorCanvas.resetZoom")} onClick={() => void zoomTo(1)}>{Math.round(zoom * 100)}%</button>
-      <button type="button" title={t("editorCanvas.zoomIn")} aria-label={t("editorCanvas.zoomIn")} onClick={() => void zoomIn()}><Plus size={14} /></button>
+      <button type="button" title={`${t("editorCanvas.zoomOut")} (-)`} aria-label={t("editorCanvas.zoomOut")} onClick={() => void zoomOut()}><Minus size={14} /></button>
+      <button className="story-canvas-zoom-value" type="button" title={`${t("editorCanvas.resetZoom")} (0)`} onClick={() => void zoomTo(1)}>{Math.round(zoom * 100)}%</button>
+      <button type="button" title={`${t("editorCanvas.zoomIn")} (+ / =)`} aria-label={t("editorCanvas.zoomIn")} onClick={() => void zoomIn()}><Plus size={14} /></button>
     </Panel>
   );
 }

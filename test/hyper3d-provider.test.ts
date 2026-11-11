@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { Hyper3DProvider } from "../src/daemon/hyper3d-provider.js";
+import { Hyper3DProvider } from "./local-secure-provider-fixtures.js";
 import { model3DModel } from "../src/shared/custom-models.js";
 import { MODEL_3D_PRESETS } from "../src/shared/model3d-presets.js";
 
@@ -10,7 +10,7 @@ function fixture(options: { submitted?: Response; artifact?: string } = {}) {
   const request = vi.fn<typeof fetch>(async (url) => {
     if (String(url).endsWith("/rodin")) return options.submitted ?? Response.json({ uuid: "task", jobs: { subscription_key: "task-secret" } }, { status: 201 });
     if (String(url).endsWith("/status")) return Response.json({ jobs: [{ status: "Done" }] });
-    if (String(url).endsWith("/download")) return Response.json({ list: [{ name: "result.glb", url: options.artifact ?? "https://files.test/result.glb" }] });
+    if (String(url).endsWith("/download")) return Response.json({ list: [{ name: "result.glb", url: options.artifact ?? "http://127.0.0.1:43199/result.glb" }] });
     return new Response(Buffer.from("glb"));
   });
   return { request, provider: new Hyper3DProvider(() => "own-test-key", request, 0) };
@@ -68,7 +68,7 @@ describe("Hyper3D own-key generation", () => {
     const { request, provider } = fixture();
     const original = request.getMockImplementation()!;
     request.mockImplementation(async (url, init) => {
-      if (String(url).startsWith("https://files.test/")) throw new Error("private-download-signature");
+      if (String(url).endsWith("/result.glb")) throw new Error("private-download-signature");
       return original(url, init);
     });
     await expect(provider.generate(input)).rejects.toThrow("Hyper3D GLB download failed");

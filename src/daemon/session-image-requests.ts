@@ -1,21 +1,9 @@
-import path from "node:path";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
-import { createGrammarToolInputProperties } from "@earendil-works/pi-ai/api/constrained-sampling";
-import { getDeclaredTools, normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
-import { isDeepSeekFileModel } from "./deepseek-image-files.js";
-import { isOfficialOpenAIResponses, prefersResponsesWebSocket, OpenAISessionTransport } from "./openai-session-transport.js";
 import type { ResponsesTransportMode } from "../shared/contracts.js";
-import { OpenAISessionFiles } from "./openai-session-files.js";
+import type { OpenAISessionTransport } from "./openai-session-transport.js";
+import { assertModelImageInput, localModelFetch } from "./model-network-policy.js";
 import { SessionImages, localImageError, ImageBudgetError, MODEL_REQUEST_HIGH_BYTES } from "./session-images.js";
-
-// These Pi adapters send through options.fetch. Other SDKs need the onPayload guard;
-// Google's adapters explicitly reject a custom fetch, and Bedrock ignores it.
-const FETCH_APIS = new Set([
-  "openai-responses", "openai-completions", "openai-codex-responses", "azure-openai-responses",
-  "anthropic-messages", "pi-messages", "mistral-conversations",
-]);
-const ASSISTANT_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
+import { monitorModelRequest } from "./provider-request-monitor.js";
 
 /** Reapply persisted decisions on HTTP retries and shrink a 413 at most once. */
 function wrapInlineImageFetch(delegate: typeof fetch, images: SessionImages): typeof fetch {
@@ -50,62 +38,24 @@ function wrapInlineImageFetch(delegate: typeof fetch, images: SessionImages): ty
   };
 }
 
-/** Install outside Pi's extension runner: preparation failures must stop the provider request. */
-export function installSessionImageRequests(session: AgentSession, images: SessionImages, agentDir: string,
+/** All supported session requests use the reviewed HTTP fetch boundary, including retries. */
+export function installSessionImageRequests(session: AgentSession, images: SessionImages, _agentDir: string,
   options: { transport?: OpenAISessionTransport; transportMode?: (provider: string) => ResponsesTransportMode } = {}): void {
-  const transport = options.transport ?? new OpenAISessionTransport(images, new OpenAISessionFiles(path.join(agentDir, "openai-image-files")));
-  const transportMode = options.transportMode ?? (() => "auto");
   const lifetime = new AbortController();
   const stream = session.agent.streamFunction;
   const dispose = session.dispose.bind(session);
-  session.dispose = () => { lifetime.abort(new Error("Session disposed")); transport.dispose(); dispose(); };
-  const warmingMode = session.settingsManager.getCacheWarmingMode.bind(session.settingsManager);
-  // A warming response would advance the connection-local lineage independently of the agent.
-  // WS already retains request state; suppress full-history background replay on this route.
-  session.settingsManager.getCacheWarmingMode = () => session.model?.api === "openai-responses"
-    && prefersResponsesWebSocket(`${session.model.baseUrl.replace(/\/$/, "")}/responses`, { mode: transportMode(session.model.provider), transport: session.agent.transport }) ? "off" : warmingMode();
-  session.agent.streamFunction = async (model, context, options) => {
-    options = { ...options, signal: options?.signal ? AbortSignal.any([options.signal, lifetime.signal]) : lifetime.signal };
-    const openai = model.api === "openai-responses";
-    const endpoint = `${model.baseUrl.replace(/\/$/, "")}/responses`;
-    const mode = transportMode(model.provider);
-    const useTransport = openai && (isOfficialOpenAIResponses(endpoint)
-      || prefersResponsesWebSocket(endpoint, { mode, transport: options?.transport }));
-    // Relay SSE retains Pi's existing redirect and encoded-body handling.
-    if (openai && !useTransport) transport.dispose();
-    if (isDeepSeekFileModel(model)) return stream(model, context, options);
+  session.dispose = () => { lifetime.abort(new Error("Session disposed")); options.transport?.dispose(); dispose(); };
+  // Cache warming and WebSocket adapters can create requests outside the guarded HTTP path.
+  session.settingsManager.getCacheWarmingMode = () => "off";
+  session.agent.streamFunction = (model, context, requestOptions) => monitorModelRequest(model.api, async () => {
+    assertModelImageInput(model, context);
+    const delegate = localModelFetch(model, requestOptions?.fetch ?? globalThis.fetch);
     const prepared = await images.prepare(context, model, session.settingsManager.getImageAutoResize());
-    const delegate = options?.fetch ?? globalThis.fetch;
-    const fetch = useTransport ? transport.wrapFetch(delegate, {
-      endpoint, mode,
-      transport: options?.transport,
-      cacheRetention: options?.cacheRetention,
-      connectTimeoutMs: options?.websocketConnectTimeoutMs ?? session.settingsManager.getWebSocketConnectTimeoutMs(),
-      timeoutMs: options?.timeoutMs ?? session.settingsManager.getProviderRetrySettings().timeoutMs ?? session.settingsManager.getHttpIdleTimeoutMs(),
-    }) : FETCH_APIS.has(model.api) ? wrapInlineImageFetch(delegate, images) : options?.fetch;
-    // Legacy Codex may use a native WebSocket without fetch. Keep its conservative
-    // full-input check; normal HTTP adapters only budget at the final boundary.
-    const onPayload = !openai && (!FETCH_APIS.has(model.api) || model.api === "openai-codex-responses")
-      ? async (payload: unknown, requestModel: typeof model) => {
-        const replacement = await options?.onPayload?.(payload, requestModel);
-        const final = replacement ?? payload;
-        images.budget(final, "inline"); return final;
-      } : options?.onPayload;
-    const events = await stream(model, prepared, {
-      ...options, fetch, onPayload,
+    return stream(model, prepared, {
+      ...requestOptions,
+      transport: "sse",
+      signal: requestOptions?.signal ? AbortSignal.any([requestOptions.signal, lifetime.signal]) : lifetime.signal,
+      fetch: wrapInlineImageFetch(delegate, images),
     });
-    if (useTransport) {
-      // Use exactly Pi's assistant serialization, including signatures, IDs and grammar tools.
-      // Only a successfully parsed terminal message becomes a continuation baseline.
-      void events.result().then((message) => {
-        if (message.stopReason === "error" || message.stopReason === "aborted") { transport.dispose(); return; }
-        const output = convertResponsesMessages(model, normalizeContext({ messages: [message] }), ASSISTANT_PROVIDERS, {
-          includeSystemPrompt: false,
-          grammarToolInputProperties: createGrammarToolInputProperties(getDeclaredTools(prepared.messages), model.compat && "supportsOpenAIGrammarTools" in model.compat ? model.compat.supportsOpenAIGrammarTools ?? false : false),
-        });
-        transport.complete(message.responseId, output);
-      }).catch(() => transport.dispose());
-    }
-    return events;
-  };
+  }, requestOptions?.signal ? AbortSignal.any([requestOptions.signal, lifetime.signal]) : lifetime.signal);
 }

@@ -6,12 +6,12 @@ import {
   FileText,
   LoaderCircle,
   PanelToggle,
-  Share2,
   Settings,
 } from "./icons.js";
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -70,7 +70,6 @@ import {
 } from "./api.js";
 import { CanvasNotice } from "./canvas-notice.js";
 import type { StoryUpgradeStatus } from "../shared/story-web.js";
-import { PublishDialog, type PublishDetails } from "./publish-dialog.js";
 import { WorkspaceCodeView } from "./coding-workspace.js";
 import { playtestHash } from "./routes.js";
 import { PlayableNodeWorkbench, type PlayableAssetRequest } from "./playable-node-workbench.js";
@@ -84,6 +83,8 @@ import { WorkspaceTabs, type WorkspaceTabOption } from "./workspace-tabs.js";
 import { useDesktopSave } from "./desktop-close-guard.js";
 import { t } from "./i18n.js";
 import { WorkspaceBackButton } from "./workspace-shell.js";
+import { registerCanvasDraftReader, type CanvasDraftStatus } from "./canvas-draft-safety.js";
+import { Equal as equal } from "typebox/value";
 
 const DEFAULT_CANVAS_VIEWPORT = { x: 64, y: 32, zoom: 1 };
 const CanvasWorkspace = lazy(() => import("./canvas-workspace.js").then((module) => ({ default: module.CanvasWorkspace })));
@@ -113,20 +114,15 @@ interface CopiedPlayableNode {
  * It speaks the editor's words (Scene, Exit, Variables); code and
  * graph.json keep the engine's (Node, Signal, State).
  */
-export function PlayableEditorWorkspace({ project, agentBusy, publishing, workspaceRevision = 0, openFileRequest, showStoryMap = false, onStoryMapShown, onPublish, publishDialog, onOpenPublish, onClosePublish, chatOnRight = false, chatCollapsed = false, onHome, homeLabel = t("navigation.backTo", { page: t("sidebar.projects") }), onToggleChat, onChatContextChange, onAskAgent, onSendToAgent, designOpen = false, onDesignOpenChange, onDesignSaveReady, onDesignContextChange, onProjectUpdated }: {
+export function PlayableEditorWorkspace({ project, agentBusy, workspaceRevision = 0, openFileRequest, showStoryMap = false, onStoryMapShown, chatOnRight = false, chatCollapsed = false, onHome, homeLabel = t("navigation.backTo", { page: t("sidebar.projects") }), onToggleChat, onChatContextChange, onAskAgent, onSendToAgent, designOpen = false, onDesignOpenChange, onDesignSaveReady, onDesignContextChange, onProjectUpdated }: {
   project: ProjectState;
   onProjectUpdated?: (project: ProjectState) => void;
   agentBusy: boolean;
-  publishing: boolean;
   workspaceRevision?: number;
   openFileRequest?: { path: string; id: number };
   /** A Playtest navigation request, kept until the saved editor layout has loaded. */
   showStoryMap?: boolean;
   onStoryMapShown?: () => void;
-  onPublish: (details: PublishDetails) => Promise<boolean>;
-  publishDialog?: "open" | "success";
-  onOpenPublish: () => void;
-  onClosePublish: () => void;
   chatOnRight?: boolean;
   chatCollapsed?: boolean;
   onHome?: () => void;
@@ -192,6 +188,7 @@ export function PlayableEditorWorkspace({ project, agentBusy, publishing, worksp
   const diskGeneration = useRef(0);
   const queuedCodebase = useRef<string | undefined>(undefined);
   const saveChain = useRef(Promise.resolve());
+  const pendingWrites = useRef(0);
   const undoHistory = useRef<HistoryEntry[]>([]);
   const redoHistory = useRef<HistoryEntry[]>([]);
   /** What the editor last wrote to each source file it changed, for undo to swap back. */
@@ -208,6 +205,19 @@ export function PlayableEditorWorkspace({ project, agentBusy, publishing, worksp
     [graphMeta, nodes, edges, editorLayout, workspaceView],
   );
   latestCodebase.current = codebase;
+  const draftPhase = useRef<CanvasDraftStatus>("unknown");
+  draftPhase.current = phase === "ready" ? writing ? "pending" : "clear" : "unknown";
+  const draftView = useRef({ workspaceView, designOpen });
+  draftView.current = { workspaceView, designOpen };
+  useLayoutEffect(() => registerCanvasDraftReader(projectId, () => {
+    if (draftPhase.current !== "clear") return draftPhase.current;
+    if (pendingWrites.current) return "pending";
+    const latest = latestCodebase.current, disk = diskCodebase.current;
+    if (!latest || !disk) return "unknown";
+    const viewport = draftView.current.workspaceView === "canvas" && !draftView.current.designOpen ? canvas.current?.getViewport() : undefined;
+    const shown = viewport ? { ...latest, editorLayout: { ...latest.editorLayout, viewport } } : latest;
+    return equal(shown, disk.codebase) ? "clear" : "pending";
+  }), [projectId]);
   const playerViewport = graphMeta?.viewport ?? { width: 1280, height: 720 };
   const playerViewportAspect = playerViewport.width / playerViewport.height;
   const canvasStage = playableCanvasStageSize(playerViewport);
@@ -641,6 +651,7 @@ export function PlayableEditorWorkspace({ project, agentBusy, publishing, worksp
     if (serialized === queuedCodebase.current) return saveChain.current;
     queuedCodebase.current = serialized;
     const generation = diskGeneration.current;
+    pendingWrites.current++;
     const written = saveChain.current
       .catch(() => undefined)
       .then(() => writeCodebase(next, generation));
@@ -648,12 +659,14 @@ export function PlayableEditorWorkspace({ project, agentBusy, publishing, worksp
     saveChain.current = operation;
     void written.then(
       (saved) => {
+        pendingWrites.current--;
         // A save let go for a newer version on disk leaves that version's notice in place.
         if (!saved) return;
         setNotice(undefined);
         setCodeRevision((revision) => revision + 1);
       },
       (error) => {
+        pendingWrites.current--;
         if (queuedCodebase.current === serialized) queuedCodebase.current = undefined;
         setNotice(t("storyEditor.saveFailed", { error: errorMessage(error) }));
       },
@@ -1048,12 +1061,6 @@ export function PlayableEditorWorkspace({ project, agentBusy, publishing, worksp
     }
   }
 
-  async function publishGame(details: PublishDetails): Promise<boolean> {
-    if (!codebase) throw new Error(t("storyEditor.stillLoading"));
-    await save(codebase);
-    return onPublish(details);
-  }
-
   // A navigation Exit's line is hidden; its Exit row names the target.
   const renderedEdges = useMemo(() => {
     const navigation = new Set(nodes.flatMap((node) => node.data.node.signals
@@ -1149,10 +1156,6 @@ export function PlayableEditorWorkspace({ project, agentBusy, publishing, worksp
             <Settings size={14} />
           </button>
           <PlaytestControls disabled={phase !== "ready" || building} busy={playtesting} onOpen={() => void startPlaytest()} onAction={(action) => void startPlaytest({ action })} />
-          <button className="publish-button workspace-publish-button" type="button" title={publishing ? t("workspace.publishing") : t("workspace.publish")} aria-label={publishing ? t("workspace.publishing") : t("workspace.publish")} disabled={agentBusy || publishing || building} onClick={onOpenPublish}>
-            {publishing ? <LoaderCircle className="spin" size={14} /> : <Share2 size={14} />}
-            <span>{t("workspace.publish")}</span>
-          </button>
           {chatOnRight && chatCollapsed && onToggleChat ? (
             <button className="icon-button pane-header-action" type="button" title={t("workspace.showChat")} aria-label={t("workspace.showChat")} onClick={onToggleChat}>
               <PanelToggle size={14} />
@@ -1286,7 +1289,7 @@ export function PlayableEditorWorkspace({ project, agentBusy, publishing, worksp
         project={project}
         graph={codebase.graph}
         exporting={building}
-        canExport={!agentBusy && !publishing && !building}
+        canExport={!agentBusy && !building}
         onSave={async (viewport) => {
           const graph = { ...codebase.graph, viewport };
           await save({ graph, editorLayout: codebase.editorLayout });
@@ -1295,7 +1298,6 @@ export function PlayableEditorWorkspace({ project, agentBusy, publishing, worksp
         onExport={exportGame}
         onClose={() => setProjectSettingsOpen(false)}
       /> : null}
-      {publishDialog ? <PublishDialog project={project} publishing={publishing || building} justPublished={publishDialog === "success"} onClose={onClosePublish} onPublish={publishGame} /> : null}
     </section>
   );
 }

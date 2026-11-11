@@ -1,6 +1,10 @@
 import { defineTool, SessionManager } from "@earendil-works/pi-coding-agent";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { spawn as spawnFixtureProcess } from "node:child_process";
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -9,10 +13,21 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ApprovalRequestDetails } from "../src/shared/agent-runtimes.js";
 import { ClaudeCodeDriver } from "../src/daemon/agent-runtimes/claude-code.js";
+import * as controlledCodex from "../src/daemon/agent-runtimes/controlled-codex.js";
+import { CODEX_CONTROLLED_CONFIG, CODEX_TOOL_NAMESPACE, controlledCodexEnvironment } from "../src/daemon/agent-runtimes/controlled-codex.js";
+import { createLocalAgentFileTools } from "../src/daemon/agent-local-files.js";
+import { controlledQoderEnvironment } from "../src/daemon/agent-runtimes/controlled-qoder.js";
+import { createIsolatedRecoveryTool } from "../src/daemon/isolated-shell-tool.js";
 import { CodexDriver } from "../src/daemon/agent-runtimes/codex.js";
 import * as discovery from "../src/daemon/agent-runtimes/discovery.js";
 import { AgentRuntimeService } from "../src/daemon/agent-runtimes/service.js";
 import { OpenCodeDriver } from "../src/daemon/agent-runtimes/opencode.js";
+import { QoderDriver, type QoderHostConnection } from "../src/daemon/agent-runtimes/qoder.js";
+import {
+  QoderSdkHost,
+  runQoderSdkHost,
+  type QoderSdkHostDependencies,
+} from "../src/daemon/agent-runtimes/qoder-sdk-host.js";
 import { createServer, type ServerResponse } from "node:http";
 import type { DriverContext } from "../src/daemon/agent-runtimes/driver-context.js";
 import type {
@@ -25,7 +40,11 @@ import {
   neverTouchPaths,
 } from "../src/daemon/agent-runtimes/policy.js";
 import { ToolBridge } from "../src/daemon/agent-runtimes/tool-bridge.js";
+import { AutoContinueTools } from "../src/daemon/agent-auto-continue.js";
+import { toolPreflightError } from "../src/daemon/agent-tool-errors.js";
 import { conversationItems } from "../src/daemon/agent.js";
+import { handoffSummary } from "../src/daemon/agent-runtimes/handoff.js";
+import { replayNativeMessages } from "../src/daemon/agent-runtimes/replay.js";
 import {
   NativeCodingSession,
   NativeSessionExpiredError,
@@ -36,6 +55,7 @@ afterEach(async () => {
   setAgentProcessSpawner(undefined);
   for (const close of cleanup.splice(0).reverse()) await close();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 interface FakeCli {
@@ -180,7 +200,8 @@ async function context(
   };
 }
 
-describe("Claude Code adapter", () => {
+// Legacy execution is retained for future OS-isolated support; agent-local-files.test.ts covers current refusal.
+describe.skip("Claude Code adapter", () => {
   it("reports a missing resumed session returned as a terminal CLI error", async () => {
     fakeCli((message, cli) => {
       if (message.type === "control_request")
@@ -995,7 +1016,8 @@ async function codexProfiles(
   return Object.values(profiles).map(({ filesystem }) => filesystem);
 }
 
-describe("Codex adapter", () => {
+// Legacy execution is retained for future OS-isolated support; agent-local-files.test.ts covers current refusal.
+describe.skip("Codex adapter", () => {
   const generatedPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=";
 
   function imageCli(item: Record<string, unknown>, options: { started?: boolean; duplicate?: boolean } = {}) {
@@ -1974,7 +1996,8 @@ describe("Codex adapter", () => {
   });
 });
 
-describe("OpenCode adapter", () => {
+// Legacy execution is retained for future OS-isolated support; agent-local-files.test.ts covers current refusal.
+describe.skip("OpenCode adapter", () => {
   it("cancels startup before OpenCode announces its listening address", async () => {
     let spawned!: () => void;
     const ready = new Promise<void>((resolve) => {
@@ -2433,4 +2456,2068 @@ describe("OpenCode adapter", () => {
       expect(f.sent.some((r) => r.route.endsWith("/prompt"))).toBe(false);
     },
   );
+});
+
+
+describe("controlled Codex adapter", () => {
+  function config() {
+    const value: Record<string, any> = {};
+    for (const [key, entry] of Object.entries(CODEX_CONTROLLED_CONFIG)) {
+      const parts = key.split(".");
+      let target = value;
+      for (const part of parts.slice(0, -1)) target = target[part] ??= {};
+      target[parts.at(-1)!] = entry;
+    }
+    return value;
+  }
+
+  async function setup(onTurn: (cli: FakeCli, params: any) => void, onRequest?: (m: any, cli: FakeCli) => boolean) {
+    const calls: any[] = [];
+    const children = fakeCli((m, cli) => {
+      calls.push(m);
+      if (onRequest?.(m, cli)) return;
+      if (typeof m.method !== "string" || m.id === undefined) return;
+      const p = m.params as any;
+      const result = m.method === "config/read" ? { config: config() }
+        : m.method === "thread/start" || m.method === "thread/resume" ? { thread: { id: "controlled-thread" }, activePermissionProfile: { id: p.permissions } }
+        : m.method === "turn/start" ? { turn: { id: "controlled-turn" } } : {};
+      cli.send({ id: m.id, result });
+      if (m.method === "turn/start") setTimeout(() => onTurn(cli, p));
+      if (m.method === "turn/interrupt") cli.send({ method: "turn/completed", params: { threadId: "controlled-thread", turn: { status: "interrupted" } } });
+    });
+    const c = await context();
+    c.env = await controlledCodexEnvironment(c.privateDirectory);
+    c.workspacePath = path.join(c.privateDirectory, "project");
+    await (await import("node:fs/promises")).mkdir(c.workspacePath);
+    return { c, calls, children };
+  }
+
+  const tool = (cli: FakeCli, id: number, name: string, args: any, callId = `call-${id}`, namespace = CODEX_TOOL_NAMESPACE) => cli.send({
+    id, method: "item/tool/call", params: { threadId: "controlled-thread", turnId: "controlled-turn", callId, namespace, tool: `ohmygame_${name}`, arguments: args },
+  });
+  const done = (cli: FakeCli, status = "completed") => cli.send({ method: "turn/completed", params: { threadId: "controlled-thread", turn: { status } } });
+
+  it.each(["interrupted", "completed", "unknown-status"])("classifies a Codex terminal %s without inventing a user cancellation", async status => {
+    const f = await setup(cli => done(cli, status));
+    const driver = new CodexDriver(f.c); cleanup.push(() => driver.dispose());
+    const result = await driver.runTurn({ text: "Inspect retained state", images: [], readOnly: true }, recordingSink().sink, new AbortController().signal);
+    expect(result).toMatchObject(status === "completed" ? { status: "completed" } : { status: "failed", interruption: { kind: status === "interrupted" ? "runtime_interrupted" : "unknown", source: "codex" } });
+  });
+
+  it("does not complete Codex with an outstanding effect and retains its late settlement under the original ID", async () => {
+    let cli!: FakeCli, complete!: () => void;
+    const gate = new Promise<void>(resolve => { complete = resolve; });
+    const execute = vi.fn(async () => { await gate; return { content: [{ type: "text" as const, text: "Existing effect receipt" }], details: {} }; });
+    const f = await setup(child => { cli = child; tool(child, 777, "write", { path: "game.txt", content: "saved" }, "original-effect"); });
+    f.c.bridge = new ToolBridge([defineTool({ name: "write", label: "Write", description: "Local effect fixture", parameters: Type.Object({ path: Type.String(), content: Type.String() }), execute })] as never, true);
+    const driver = new CodexDriver(f.c); cleanup.push(() => driver.dispose());
+    const late = vi.fn();
+    const run = driver.runTurn({ text: "Save once", images: [], readOnly: false }, { ...recordingSink().sink, toolSettled: late }, new AbortController().signal);
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+    done(cli);
+    expect(await run).toMatchObject({ status: "failed", interruption: { code: "codex_pending_tool_result", phase: "tools" } });
+    complete();
+    await vi.waitFor(() => expect(late).toHaveBeenCalledWith("original-effect", expect.objectContaining({ content: [{ type: "text", text: "Existing effect receipt" }] }), false));
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it("retains correctable preflight failures through the Codex protocol and one safe continuation", async () => {
+    let segment = 0;
+    const f = await setup(cli => {
+      segment++;
+      tool(cli, 990, "edit", { path: "fixture.txt", oldText: "absent", newText: "after" }, "rejected-edit");
+    }, (message, cli) => {
+      if (message.id === 990 && message.result) {
+        expect(message.result.success).toBe(false);
+        tool(cli, 991, "edit", { path: "fixture.txt", oldText: "before", newText: "after" }, segment === 1 ? "corrected-edit" : "continuation-edit");
+        return true;
+      }
+      if (message.id === 991 && message.result) {
+        expect(message.result.success).toBe(true);
+        done(cli, segment === 1 ? "interrupted" : "completed");
+        return true;
+      }
+      return false;
+    });
+    await writeFile(path.join(f.c.workspacePath, "fixture.txt"), "before");
+    const edit = createLocalAgentFileTools(f.c.workspacePath).find(tool => tool.name === "edit")!;
+    const execute = vi.fn(edit.execute);
+    const manager = SessionManager.create(f.c.workspacePath, path.join(f.c.privateDirectory, "sessions"));
+    const guard = new AutoContinueTools([{ ...edit, execute }], { sessionManager: manager });
+    f.c.bridge = new ToolBridge(guard.wrap(), true);
+    const snapshot = vi.fn(async () => "1".repeat(40));
+    const session = new NativeCodingSession({ runtime: "codex-cli", model: f.c.model!, sessionManager: manager, continuationTools: guard,
+      snapshotBeforeMessage: snapshot, toolNames: ["edit"], requestApproval: async () => "deny", createDriver: () => new CodexDriver(f.c) });
+    cleanup.push(() => session.dispose());
+    await session.prompt("Correct the edit arguments and retain all original results");
+    expect(session.interruption).toMatchObject({ kind: "runtime_interrupted", source: "codex" });
+    expect(handoffSummary(manager.getBranch())).toContain('"state":"not_executed","reason":"edit_text_not_unique"');
+    await session.prepareContinuation(new AbortController().signal);
+    await session.resumeAfterInterruption();
+    expect(session.interruption).toBeUndefined();
+    expect(await readFile(path.join(f.c.workspacePath, "fixture.txt"), "utf8")).toBe("after");
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(snapshot).toHaveBeenCalledOnce();
+    const branch = SessionManager.open(manager.getSessionFile()!).getBranch();
+    expect(branch.filter(entry => entry.type === "message" && entry.message.role === "user")).toHaveLength(1);
+    expect(branch.filter(entry => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === "rejected-edit")).toEqual([
+      expect.objectContaining({ message: expect.objectContaining({ isError: true, preflightFailure: { effect: "none", reason: "edit_text_not_unique", disposition: "correctable" } }) }),
+      expect.objectContaining({ message: expect.objectContaining({ isError: true, preflightFailure: { effect: "none", reason: "edit_text_not_unique", disposition: "correctable" } }) }),
+    ]);
+    expect(f.calls.filter(call => call.method === "turn/start")[1]!.params.input[0].text).toContain("rejected-edit");
+  });
+
+  it("keeps normal tool ownership checks lightweight across catalog refresh and refuses continuation after disable", async () => {
+    let sequence = 0, service!: AgentRuntimeService, readsAfterRefresh = 0;
+    const next = (cli: FakeCli) => tool(cli, 880 + ++sequence, "list_media_capabilities", {}, `catalog-read-${sequence}`);
+    const f = await setup(cli => { sequence = 0; next(cli); }, (message, cli) => {
+      if (message.method === "model/list") { cli.send({ id: message.id, result: { data: [{ id: "fixture-model", displayName: "Fixture", inputModalities: ["text"] }] } }); return true; }
+      if (typeof message.id === "number" && message.id >= 881 && message.id <= 883 && message.result) {
+        if (sequence < 3) next(cli); else done(cli, "interrupted");
+        return true;
+      }
+      return false;
+    });
+    const resolve = vi.spyOn(discovery, "resolveBinary").mockResolvedValue({ path: "/fixture/codex", signature: "fixed-service-fixture", source: "manual" });
+    vi.spyOn(discovery, "probeVersion").mockResolvedValue(controlledCodex.CONTROLLED_CODEX_VERSION);
+    vi.spyOn(discovery, "probeAuth").mockResolvedValue({ status: "signed-in", billing: "subscription" });
+    vi.spyOn(controlledCodex, "verifyControlledCodexBinary").mockResolvedValue();
+    service = new AgentRuntimeService(f.c.privateDirectory, () => undefined);
+    await service.load(); cleanup.push(() => service.close());
+    await service.update("codex-cli", { enabled: true });
+    await service.status("codex-cli", true);
+    const execute = vi.fn(async () => {
+      if (execute.mock.calls.length === 1) {
+        await service.status("codex-cli", true);
+        readsAfterRefresh = resolve.mock.calls.length;
+      }
+      return { content: [{ type: "text" as const, text: "Local metadata fixture" }], details: {} };
+    });
+    const session = await service.createSession({ runtime: "codex-cli", model: "fixture-model", workspacePath: f.c.workspacePath,
+      sessionManager: SessionManager.inMemory(f.c.workspacePath), tools: [defineTool({ name: "list_media_capabilities", label: "Metadata", description: "Local metadata", parameters: Type.Object({}), execute })] as never,
+      instructions: "Local fixture", skillDirectories: [], policy: { workspacePath: f.c.workspacePath, neverTouch: [] }, requestApproval: async () => "deny" });
+    cleanup.push(() => session.dispose());
+    await session.prompt("Inspect metadata only");
+    expect(execute).toHaveBeenCalledTimes(3);
+    expect(resolve).toHaveBeenCalledTimes(readsAfterRefresh);
+    expect(session.interruption).toMatchObject({ kind: "runtime_interrupted" });
+    await expect(session.prepareContinuation(new AbortController().signal)).rejects.toThrow("connection changed");
+    // A new explicit user task may bind the refreshed account epoch; no old task is resumed.
+    await session.prompt("Inspect metadata for this new task");
+    expect(execute).toHaveBeenCalledTimes(6);
+    await session.prepareContinuation(new AbortController().signal);
+    await service.update("codex-cli", { enabled: false });
+    await expect(session.prepareContinuation(new AbortController().signal)).rejects.toThrow("connection changed");
+    expect(f.calls.filter(call => call.method === "turn/start")).toHaveLength(2);
+  });
+
+  it("preserves built-in authentication routing instead of forcing ChatGPT credentials onto the API endpoint", async () => {
+    const f = await setup((cli) => done(cli), (m, cli) => {
+      if (m.method !== "config/read") return false;
+      cli.send({ id: m.id, result: { config: { ...config(), openai_base_url: null } } }); return true;
+    });
+    vi.stubEnv("OPENAI_BASE_URL", "https://unexpected.invalid/v1");
+    vi.stubEnv("OPENAI_API_KEY", "fake-ambient-key");
+    const env = await controlledCodexEnvironment(f.c.privateDirectory);
+    expect(env).not.toHaveProperty("OPENAI_BASE_URL");
+    expect(env).not.toHaveProperty("OPENAI_API_KEY");
+    const driver = new CodexDriver({ ...f.c, env }); cleanup.push(() => driver.dispose());
+    expect(await driver.runTurn({ text: "fixture", images: [], readOnly: false }, recordingSink().sink, new AbortController().signal)).toEqual({ status: "completed" });
+    expect(CODEX_CONTROLLED_CONFIG).not.toHaveProperty("openai_base_url");
+    expect(f.children[0].args.some(arg => arg.startsWith("openai_base_url="))).toBe(false);
+    expect(f.calls.find(m => m.method === "thread/start").params.config).not.toHaveProperty("openai_base_url");
+  });
+
+  it.each(["https://api.openai.com/v1", "https://chatgpt.com/backend-api/codex", "https://unexpected.invalid/v1", ""])("rejects inherited endpoint override %s before a model turn", async (base) => {
+    const f = await setup(() => {}, (m, cli) => {
+      if (m.method !== "config/read") return false;
+      cli.send({ id: m.id, result: { config: { ...config(), openai_base_url: base } } }); return true;
+    });
+    const driver = new CodexDriver(f.c); cleanup.push(() => driver.dispose());
+    expect(await driver.runTurn({ text: "fixture", images: [], readOnly: false }, recordingSink().sink, new AbortController().signal)).toMatchObject({ status: "failed", error: expect.stringContaining("active authentication method") });
+    expect(f.calls.some(m => m.method === "turn/start")).toBe(false);
+  });
+
+  it("rejects an inherited replacement for the built-in OpenAI provider before a model turn", async () => {
+    const f = await setup(() => {}, (m, cli) => {
+      if (m.method !== "config/read") return false;
+      cli.send({ id: m.id, result: { config: { ...config(), model_providers: { openai: { base_url: "https://unexpected.invalid/v1" } } } } }); return true;
+    });
+    const driver = new CodexDriver(f.c); cleanup.push(() => driver.dispose());
+    expect(await driver.runTurn({ text: "fixture", images: [], readOnly: false }, recordingSink().sink, new AbortController().signal)).toMatchObject({ status: "failed", error: expect.stringContaining("Custom OpenAI routing") });
+    expect(f.calls.some(m => m.method === "turn/start")).toBe(false);
+  });
+
+  it("edits through safe files, delivers Kunpo artifacts once, and resumes the same thread", async () => {
+    const replies: any[] = [];
+    let cli!: FakeCli;
+    const f = await setup((child) => { cli = child; tool(child, 101, "write", { path: "index.html", content: "<p>game</p>" }); }, (m) => {
+      if (m.id >= 100 && !m.method) { replies.push(m); return true; } return false;
+    });
+    const generate = vi.fn(async () => ({ content: [{ type: "text", text: "Kunpo task existing-1" }], details: { artifact: { type: "image", path: "art.png", mediaType: "image/png" } } }));
+    const media = defineTool({ name: "generate_image", label: "Kunpo image", description: "Mock Kunpo", parameters: Type.Object({ prompt: Type.String() }), execute: generate as never });
+    f.c.bridge = new ToolBridge([...createLocalAgentFileTools(f.c.workspacePath), media], true);
+    const driver = new CodexDriver(f.c);
+    cleanup.push(() => driver.dispose());
+    const recorded = recordingSink();
+    const run = driver.runTurn({ text: "game and art", images: [], readOnly: false }, recorded.sink, new AbortController().signal);
+    await vi.waitFor(() => expect(replies).toHaveLength(1));
+    expect(await readFile(path.join(f.c.workspacePath, "index.html"), "utf8")).toBe("<p>game</p>");
+    tool(cli, 102, "generate_image", { prompt: "sprite" }, "paid-call");
+    tool(cli, 103, "generate_image", { prompt: "sprite" }, "paid-call");
+    cli.send({ method: "item/started", params: { threadId: "controlled-thread", turnId: "controlled-turn", item: { id: "paid-call", type: "dynamicToolCall", namespace: "ohmygame", tool: "ohmygame_generate_image", arguments: { prompt: "sprite" } } } });
+    await vi.waitFor(() => expect(replies).toHaveLength(3));
+    cli.send({ method: "item/completed", params: { threadId: "controlled-thread", turnId: "controlled-turn", item: { id: "paid-call", type: "dynamicToolCall", success: true, contentItems: [{ type: "inputText", text: "Native text without artifact details" }] } } });
+    expect(generate).toHaveBeenCalledOnce();
+    expect(recorded.calls.filter(c => c.startsWith("toolCall:paid-call:"))).toHaveLength(1);
+    expect(recorded.calls.filter(c => c.startsWith("toolResult:paid-call:"))).toHaveLength(1);
+    expect(recorded.results.get("paid-call")).toMatchObject({ isError: false, result: { details: { artifact: { path: "art.png" } } } });
+    done(cli);
+    expect(await run).toEqual({ status: "completed" });
+    const start = f.calls.find(m => m.method === "thread/start").params;
+    expect(start.cwd).toBe(f.c.privateDirectory);
+    expect(start.dynamicTools).toHaveLength(1);
+    expect(start.dynamicTools[0]).toMatchObject({ type: "namespace", name: "ohmygame" });
+    expect(start.dynamicTools[0].tools.map((t: any) => t.name)).toContain("ohmygame_write");
+    expect(Object.values(start.config.permissions).every((p: any) => p.network.enabled === false)).toBe(true);
+    expect(f.children[0].args).toContain("features.image_generation=false");
+    expect(f.children[0].env).not.toHaveProperty("OPENAI_API_KEY");
+    await driver.dispose();
+    const resumed = new CodexDriver({ ...f.c, resume: recorded.sessionId() });
+    cleanup.push(() => resumed.dispose());
+    const second = resumed.runTurn({ text: "continue", images: [], readOnly: false }, recordingSink().sink, new AbortController().signal);
+    await vi.waitFor(() => expect(f.calls.some(m => m.method === "thread/resume")).toBe(true));
+    await vi.waitFor(() => expect(replies).toHaveLength(4));
+    done(cli);
+    expect(await second).toEqual({ status: "completed" });
+  });
+
+  it("fails before the turn if the CLI ignores a security setting", async () => {
+    const f = await setup(() => {}, (m, cli) => {
+      if (m.method !== "config/read") return false;
+      cli.send({ id: m.id, result: { config: { ...config(), features: { ...config().features, image_generation: true } } } }); return true;
+    });
+    const driver = new CodexDriver(f.c); cleanup.push(() => driver.dispose());
+    expect(await driver.runTurn({ text: "no model", images: [], readOnly: false }, recordingSink().sink, new AbortController().signal)).toMatchObject({ status: "failed", error: expect.stringContaining("image_generation") });
+    expect(f.calls.some(m => m.method === "turn/start")).toBe(false);
+  });
+
+  it.each(["enabled", "disable_in_process_fallback"])("fails closed if the CLI ignores Code Mode host %s", async (setting) => {
+    const f = await setup(() => {}, (m, cli) => {
+      if (m.method !== "config/read") return false;
+      const current = config();
+      current.features.code_mode_host[setting] = false;
+      cli.send({ id: m.id, result: { config: current } }); return true;
+    });
+    const driver = new CodexDriver(f.c); cleanup.push(() => driver.dispose());
+    expect(await driver.runTurn({ text: "fixture", images: [], readOnly: false }, recordingSink().sink, new AbortController().signal)).toMatchObject({ status: "failed", error: expect.stringContaining(`code_mode_host.${setting}`) });
+    expect(f.calls.some(m => m.method === "turn/start")).toBe(false);
+  });
+
+  it("refuses a tool call from another namespace without running the project bridge", async () => {
+    const replies: any[] = [];
+    const f = await setup((cli) => tool(cli, 101, "echo_tool", { value: "blocked" }, "wrong-namespace", "functions"), (m) => {
+      if (m.id === 101 && !m.method) { replies.push(m); return true; } return false;
+    });
+    const execute = vi.spyOn(f.c.bridge, "call");
+    const driver = new CodexDriver(f.c); cleanup.push(() => driver.dispose());
+    const run = driver.runTurn({ text: "fixture", images: [], readOnly: false }, recordingSink().sink, new AbortController().signal);
+    await vi.waitFor(() => expect(replies).toHaveLength(1));
+    expect(replies[0].error.message).toContain("Invalid OhMyGame tool call");
+    expect(execute).not.toHaveBeenCalled();
+    done(f.children[0]);
+    expect(await run).toEqual({ status: "completed" });
+  });
+
+  it("rejects planning writes, wrong threads, permissions, and tools arriving after cancellation", async () => {
+    const replies: any[] = []; let cli!: FakeCli;
+    const f = await setup((child) => { cli = child; tool(child, 201, "write", { path: "blocked.txt", content: "bad" }); }, (m) => {
+      if (m.id >= 200 && !m.method) { replies.push(m); return true; } return false;
+    });
+    f.c.bridge = new ToolBridge(createLocalAgentFileTools(f.c.workspacePath), true);
+    f.c.bridge.setActive(["read", "ls"]);
+    const driver = new CodexDriver(f.c); cleanup.push(() => driver.dispose());
+    const recorded = recordingSink(() => "allow");
+    const controller = new AbortController();
+    const run = driver.runTurn({ text: "plan", images: [], readOnly: true }, recorded.sink, controller.signal);
+    await vi.waitFor(() => expect(replies).toHaveLength(1));
+    expect(replies[0].result.success).toBe(false);
+    cli.send({ id: 202, method: "item/tool/call", params: { threadId: "other", turnId: "controlled-turn", callId: "wrong", tool: "ohmygame_read", arguments: { path: "a" } } });
+    cli.send({ id: 203, method: "item/permissions/requestApproval", params: { permissions: { network: { enabled: true } } } });
+    await vi.waitFor(() => expect(replies).toHaveLength(3));
+    expect(replies[1].error.message).toContain("No conversation is waiting");
+    expect(replies[2].result).toEqual({ permissions: {}, scope: "turn" });
+    expect(recorded.asked).toEqual([]);
+    controller.abort(); await driver.interrupt();
+    expect(await run).toEqual({ status: "aborted" });
+    tool(cli, 204, "write", { path: "late.txt", content: "bad" });
+    await vi.waitFor(() => expect(replies).toHaveLength(4));
+    expect(replies[3].error.message).toContain("No turn");
+    await expect(readFile(path.join(f.c.workspacePath, "blocked.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([undefined, "controlled-codex-v1", "controlled-codex-v2", "controlled-codex-v3", "controlled-codex-v4", "controlled-codex-v5", "controlled-codex-v6"])("keeps account and media selections separate while rebuilding legacy context %s", async (contextVersion) => {
+    const f = await setup((cli) => {
+      cli.send({ method: "item/completed", params: { threadId: "controlled-thread", item: { id: "answer", type: "agentMessage", text: "Ready" } } });
+      done(cli);
+    }, (m, cli) => {
+      if (m.method !== "model/list") return false;
+      cli.send({ id: m.id, result: { data: [{ id: "fixture-model", displayName: "Fixture", inputModalities: ["text"] }] } }); return true;
+    });
+    vi.spyOn(discovery, "resolveBinary").mockResolvedValue({ path: "/fixture/codex", signature: "fake", source: "manual" });
+    vi.spyOn(discovery, "probeVersion").mockResolvedValue(controlledCodex.CONTROLLED_CODEX_VERSION);
+    const auth = vi.spyOn(discovery, "probeAuth").mockResolvedValue({ status: "signed-out", billing: "unknown" });
+    vi.spyOn(controlledCodex, "verifyControlledCodexBinary").mockResolvedValue();
+    const service = new AgentRuntimeService(f.c.privateDirectory, () => undefined);
+    await service.load(); cleanup.push(() => service.close());
+    expect(await service.models()).toEqual({ models: [], loading: [] });
+    await service.update("codex-cli", { enabled: true });
+    expect(await service.models()).toEqual({ models: [], loading: [] });
+    expect(f.children).toHaveLength(0);
+    expect(await service.codexImageConnection()).toBeUndefined();
+    await expect(service.update("codex-cli", { permissionMode: "full" })).rejects.toThrow("Full access");
+    auth.mockResolvedValue({ status: "signed-in", billing: "subscription" });
+    await service.status("codex-cli", true);
+    expect((await service.models()).models).toMatchObject([{ provider: "codex-cli", id: "fixture-model" }]);
+    expect(service.settings.defaultModel()).toBeUndefined();
+    const pluginTool = vi.fn();
+    const manager = SessionManager.inMemory(f.c.workspacePath);
+    manager.appendMessage({ role: "user", content: "Preserve the existing game and artwork", timestamp: 1 });
+    manager.appendCustomEntry("ohmygame-native-session", { version: 2, runtime: "codex-cli", state: "ready", sessionId: "legacy-unsafe-tools", contextVersion });
+    const session = await service.createSession({ runtime: "codex-cli", model: "fixture-model", workspacePath: f.c.workspacePath,
+      sessionManager: manager, tools: [...createLocalAgentFileTools(f.c.workspacePath), createIsolatedRecoveryTool(async () => ({ state: "resident", dirty: false, recoverable: false }), async () => ({ changed: [] }))], instructions: "Fixture",
+      skillDirectories: [], policy: { workspacePath: f.c.workspacePath, neverTouch: [] },
+      pluginMcp: { config: { mcpServers: { forbidden: { command: "/never" } } }, host: { tool: pluginTool } as never, agentDir: "/never" },
+      requestApproval: async () => "deny",
+    }); cleanup.push(() => session.dispose());
+    session.setActiveToolsByName(["read", "write", "edit", "ls"]);
+    await session.prompt("Inspect the game");
+    expect(pluginTool).not.toHaveBeenCalled();
+    expect(f.calls.some(m => m.method === "thread/resume" && m.params.threadId === "legacy-unsafe-tools")).toBe(false);
+    const recovery = f.calls.filter(m => m.method === "thread/start").at(-1)!.params.dynamicTools[0].tools.find((tool: any) => tool.name === "ohmygame_recover_isolated_changes");
+    expect(recovery).toBeDefined();
+    expect(JSON.stringify(recovery.inputSchema)).toContain('"const":"review"');
+    expect(JSON.stringify(recovery.inputSchema)).toContain('"const":"adopt"');
+    expect(JSON.stringify(recovery.inputSchema)).toContain('"const":"capacity"');
+    expect(recovery.inputSchema.properties).toHaveProperty("reviewId");
+    expect(recovery.inputSchema.properties).not.toHaveProperty("approved");
+    expect(manager.getBranch().some(e => e.type === "custom" && e.customType === "ohmygame-native-session" && (e.data as any).contextVersion === "controlled-codex-v15")).toBe(true);
+    expect(f.calls.find(m => m.method === "turn/start").params.input[0].text).toContain("Preserve the existing game and artwork");
+    expect(manager.getBranch().some(e => e.type === "message" && e.message.role === "assistant")).toBe(true);
+    const launches = f.children.map(c => c.env);
+    expect(launches.every(env => env.HOME !== process.env.HOME && !env.OPENAI_API_KEY && !env.KUNPO_API_KEY)).toBe(true);
+    expect(f.calls.some(m => m.method === "account/login/start")).toBe(false);
+  });
+});
+
+describe("native capacity context contract", () => {
+  it.each([
+    { runtime: "codex-cli" as const, old: "controlled-codex-v14", current: "controlled-codex-v15" },
+    { runtime: "qoder-cli" as const, old: "controlled-qoder-v13", current: "controlled-qoder-v14" },
+  ])("rebuilds $runtime's previous tool schema and retains only capacity's read-only arguments", async ({ runtime, old, current }) => {
+    const manager = SessionManager.inMemory("/tmp/native-capacity-context");
+    manager.appendMessage({ role: "user", content: "Preserve the existing retained work", timestamp: 1 });
+    manager.appendCustomEntry("ohmygame-native-session", { version: 2, runtime, state: "ready", sessionId: "legacy-tools", contextVersion: old });
+    const recover = vi.fn(async () => ({ changed: [] }));
+    const bridge = new ToolBridge([createIsolatedRecoveryTool(async () => ({ state: "resident", dirty: false, recoverable: false }), recover)], true);
+    const resumes: Array<string | undefined> = [], texts: string[] = [];
+    const session = new NativeCodingSession({ runtime, model: "fixture", contextVersion: current, sessionManager: manager, toolNames: bridge.names, requestApproval: async () => "deny",
+      createDriver: resume => { resumes.push(resume); return { interrupt: async () => {}, dispose: async () => {}, runTurn: async (input, sink) => {
+        texts.push(input.text); sink.nativeSession("capacity-context"); sink.textDone("answer", "Capacity checks remain read-only"); return { status: "completed" };
+      } }; },
+    });
+    cleanup.push(() => session.dispose());
+    await session.prompt("Check capacity before proposing recovery");
+    expect(resumes).toEqual([undefined]); expect(texts[0]).toContain("Preserve the existing retained work");
+    const schemas = bridge.list(); expect(JSON.stringify(schemas)).toContain('"const":"capacity"');
+    expect(JSON.stringify(schemas)).toContain('"const":"plan_capacity"');
+    expect(JSON.stringify(schemas)).toContain('"const":"plan_first_allocation"');
+    expect(await bridge.call("recover_isolated_changes", { action: "plan_first_allocation", profileId: "capacity-64-v1" }, "invalid-first-allocation")).toMatchObject({ isError: true });
+    expect(await bridge.call("recover_isolated_changes", { action: "plan_capacity", profileId: "unknown" }, "invalid-profile")).toMatchObject({ isError: true });
+    for (const extra of [{ generation: "4" }, { reviewId: "a".repeat(64) }, { approved: true }]) {
+      expect(await bridge.call("recover_isolated_changes", { action: "capacity", ...extra }, "invalid-capacity")).toMatchObject({ isError: true, result: { content: [{ type: "text", text: expect.stringContaining("approved" in extra ? "Invalid arguments" : "Capacity accepts only action") }] } });
+    }
+    expect(recover).not.toHaveBeenCalled();
+    expect(manager.getBranch().some(entry => entry.type === "custom" && entry.customType === "ohmygame-native-session" && (entry.data as { contextVersion?: string }).contextVersion === current)).toBe(true);
+    expect(manager.getBranch().filter(entry => entry.type === "message" && entry.message.role === "user")).toHaveLength(2);
+  });
+});
+
+describe("Qoder driver text projection into persisted sessions", () => {
+  type Frame = Record<string, unknown>;
+  const stream = (event: Frame): Frame => ({ type: "stream_event", event });
+  const start = (id: string): Frame => stream({ type: "message_start", message: { id, role: "assistant", content: [] } });
+  const block = (index: number, type = "text"): Frame => stream({ type: "content_block_start", index, content_block: type === "text" ? { type, text: "" } : { type, thinking: "" } });
+  const delta = (index: number, text: string): Frame => stream({ type: "content_block_delta", index, delta: { type: "text_delta", text } });
+  const stop = (index: number): Frame => stream({ type: "content_block_stop", index });
+  const final = (id: string | undefined, uuid: string, texts: string[]): Frame => ({ type: "assistant", uuid, message: { ...(id ? { id } : {}), role: "assistant", content: texts.map(text => ({ type: "text", text })) } });
+
+  it.each([
+    [{ subtype: "error_max_turns", num_turns: 64 }, "turn_limit", "qoder_max_turns"],
+    [{ subtype: "error_max_budget_usd" }, "blocked", "qoder_budget_limit"],
+    [{ subtype: "error_during_execution", terminal_reason: "aborted_streaming" }, "runtime_interrupted", "qoder_runtime_interrupted"],
+    [{ subtype: "error_during_execution", terminal_reason: "hook_stopped" }, "blocked", "qoder_hook_stopped"],
+    [{ subtype: "error_max_turns", terminal_reason: "hook_stopped" }, "blocked", "qoder_hook_stopped"],
+    [{ subtype: "error_during_execution", error_code: 500 }, "unknown", "qoder_execution_error"],
+    [{ subtype: "unexpected-subtype" }, "unknown", "qoder_execution_error"],
+    [{ subtype: "success", is_error: false, terminal_reason: "PRIVATE_TERMINAL_CANARY" }, "unknown", "qoder_unknown_terminal"],
+    [{ subtype: "success", is_error: false, stop_reason: "max_tokens" }, "runtime_interrupted", "qoder_output_limit"],
+    [{ subtype: "success", is_error: false, stop_reason: "tool_use", terminal_reason: "hook_stopped" }, "blocked", "qoder_hook_stopped"],
+    [{ subtype: "success", is_error: false, terminal_reason: "max_turns" }, "unknown", "qoder_unknown_terminal"],
+    [{ subtype: "success", is_error: false, stop_reason: "end_turn", terminal_reason: "completed" }, undefined, undefined],
+  ] as const)("preserves the safe Qoder result category %j", async (result, kind, code) => {
+    const ctx = await context({ model: "gmodel" });
+    const driver = new QoderDriver(ctx, receive => ({ start: async () => {}, stop: async () => {}, respond: () => {}, request: async (method, params = {}) => {
+      if (method === "turn/start") queueMicrotask(() => {
+        const message = { method: "sdk/message", params: { turnId: params.turnId, message: { type: "result", is_error: true, errors: ["PRIVATE_TERMINAL_CANARY"], ...result } } };
+        receive(message); receive(message);
+      });
+      return { sessionId: "result-fixture" };
+    } }));
+    cleanup.push(() => driver.dispose());
+    const outcome = await driver.runTurn({ text: "Continue existing work", images: [], readOnly: true }, recordingSink().sink, new AbortController().signal);
+    expect(outcome).toMatchObject(kind ? { status: "failed", interruption: { kind, source: "qoder", code } } : { status: "completed" });
+    if ("num_turns" in result) expect(outcome).toHaveProperty("modelTurns", 64);
+    if ("terminal_reason" in result) expect(outcome).toHaveProperty("terminalReason", result.terminal_reason === "PRIVATE_TERMINAL_CANARY" ? "unknown" : result.terminal_reason);
+    expect(JSON.stringify(outcome)).not.toContain("PRIVATE_TERMINAL_CANARY");
+  });
+
+  it("continues one native logical task without duplicate user messages, checkpoints or completed effects", async () => {
+    const ctx = await context();
+    const manager = SessionManager.create(ctx.privateDirectory, path.join(ctx.privateDirectory, "sessions"));
+    const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "Original effect complete, receipt original-receipt" }], details: {} }));
+    const write = defineTool({ name: "write", label: "Write", description: "Local effect fixture", parameters: Type.Object({ path: Type.String(), content: Type.String() }), execute });
+    const guard = new AutoContinueTools([write] as never, { sessionManager: manager });
+    const bridge = new ToolBridge(guard.wrap(), true);
+    const snapshot = vi.fn(async () => "1".repeat(40));
+    const inputs: string[] = [], resumes: Array<string | undefined> = [];
+    let attempt = 0;
+    const session = new NativeCodingSession({ runtime: "qoder-cli", model: "gmodel", sessionManager: manager, continuationTools: guard, snapshotBeforeMessage: snapshot,
+      toolNames: ["write"], requestApproval: async () => "deny", createDriver: resume => {
+        resumes.push(resume);
+        return { dispose: async () => {}, interrupt: async () => {}, runTurn: async (input, sink, signal) => {
+          inputs.push(input.text);
+          const current = attempt++, callId = current === 0 ? "original-effect" : `continuation-effect-${current}`;
+          const args = { path: "game.txt", content: "saved" };
+          sink.nativeSession(`native-${current}`); sink.toolCall(callId, "write", args); sink.toolStarted(callId);
+          const outcome = await bridge.call("write", args, callId, signal); sink.toolResult(callId, outcome.result, outcome.isError);
+          sink.textDone("answer", current === 0 ? "Partial work retained" : "The requested task is complete");
+          return current === 0 ? { status: "failed", error: "Qoder reached its native turn limit", modelTurns: 64, interruption: { kind: "turn_limit", source: "qoder", code: "qoder_max_turns", phase: "result", terminalReason: "max_turns" } } : { status: "completed", modelTurns: 2 };
+        } };
+      } });
+    cleanup.push(() => session.dispose());
+    await session.prompt("Perform the original task once");
+    expect(session.interruption).toMatchObject({ kind: "turn_limit" });
+    await session.prepareContinuation(new AbortController().signal);
+    await session.resumeAfterInterruption();
+    expect(execute).toHaveBeenCalledOnce();
+    expect(snapshot).toHaveBeenCalledOnce();
+    expect(manager.getBranch().filter(entry => entry.type === "message" && entry.message.role === "user")).toHaveLength(1);
+    expect(inputs[1]).toContain("original-effect"); expect(inputs[1]).toContain("original-receipt");
+    expect(manager.getBranch().filter(entry => entry.type === "custom" && entry.customType === "ohmygame-native-outcome").at(-1)).toMatchObject({ data: { status: "completed", segment: 2, sdkNumTurns: 2 } });
+    expect(session.interruption).toBeUndefined();
+    expect(resumes).toEqual([undefined, undefined]);
+    await session.prompt("Perform the newly requested task");
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(snapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["user", "host"] as const)("records %s cancellation without offering continuation", async origin => {
+    const manager = SessionManager.inMemory("/tmp/native-cancellation-origin");
+    let started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    const session = new NativeCodingSession({ runtime: "qoder-cli", model: "gmodel", sessionManager: manager, toolNames: [], requestApproval: async () => "deny",
+      createDriver: () => ({ dispose: async () => {}, interrupt: async () => {}, runTurn: async (_input, _sink, signal) => {
+        started();
+        return new Promise(resolve => signal.addEventListener("abort", () => resolve({ status: "aborted" }), { once: true }));
+      } }),
+    });
+    cleanup.push(() => session.dispose());
+    const run = session.prompt("Keep the original user task");
+    await ready;
+    const cancelled = session.abort(origin === "user" ? undefined : "host");
+    if (origin === "user") await session.abort("host");
+    await cancelled; await run;
+    expect(session.interruption).toBeUndefined();
+    expect(manager.getBranch().findLast(entry => entry.type === "custom" && entry.customType === "ohmygame-native-outcome")).toMatchObject({ data: { status: "aborted", cancelOrigin: origin } });
+    await expect(session.prepareContinuation(new AbortController().signal)).rejects.toThrow("no longer eligible");
+  });
+
+  it.each(["qoder-cli", "codex-cli"] as const)("records a rejected read before stopping the %s native loop", async runtime => {
+    const manager = SessionManager.inMemory("/tmp/native-rejected-read");
+    const rejected = "This attachment reference is unavailable in the current conversation branch";
+    const read = defineTool({ name: "read_attachment", label: "Read", description: "Read fixture", parameters: Type.Object({ path: Type.String() }),
+      execute: async () => { throw toolPreflightError(rejected, "authorization_denied"); } });
+    const guard = new AutoContinueTools([read], { sessionManager: manager });
+    const bridge = new ToolBridge(guard.wrap());
+    let branchAtInterrupt: unknown;
+    const interrupt = vi.fn(async () => { branchAtInterrupt = manager.getBranch(); });
+    const session = new NativeCodingSession({ runtime, model: "fixture", sessionManager: manager, continuationTools: guard, toolNames: bridge.names, requestApproval: async () => "deny",
+      createDriver: () => ({ dispose: async () => {}, interrupt, runTurn: async (_input, sink) => {
+        sink.toolCall("rejected-read", "read_attachment", { path: "attachment:mistyped" });
+        sink.toolStarted("rejected-read");
+        const outcome = await bridge.call("read_attachment", { path: "attachment:mistyped" }, "rejected-read");
+        sink.toolResult("rejected-read", outcome.result, outcome.isError);
+        return { status: "completed" };
+      } }),
+    });
+    cleanup.push(() => session.dispose());
+    await session.prompt("Read the existing attachment");
+    expect(interrupt).toHaveBeenCalledOnce();
+    expect(branchAtInterrupt).toContainEqual(expect.objectContaining({ type: "message", message: expect.objectContaining({
+      role: "toolResult", toolCallId: "rejected-read", isError: true, content: [{ type: "text", text: rejected }],
+      preflightFailure: { effect: "none", reason: "authorization_denied", disposition: "blocked" },
+    }) }));
+    expect(guard.stopRequested).toBe(true);
+    const errors = manager.getBranch().flatMap(entry => entry.type === "message" && entry.message.role === "assistant" ? [entry.message.errorMessage] : []);
+    expect(errors).toContain("Automatic continuation stopped: read_attachment (rejected-read) was rejected by a protected tool boundary. Review the original rejection before continuing.");
+    expect(errors.some(error => error?.includes("unconfirmed outcome"))).toBe(false);
+    await expect(session.prepareContinuation(new AbortController().signal)).rejects.toThrow("no longer eligible");
+  });
+
+  it("stops a native loop immediately for an unconfirmed effect without treating its internal interrupt as user cancellation", async () => {
+    const manager = SessionManager.inMemory("/tmp/native-blocked-effect");
+    let started!: () => void, terminal!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    const interrupt = vi.fn(async () => { terminal(); });
+    const session = new NativeCodingSession({ runtime: "qoder-cli", model: "gmodel", sessionManager: manager, toolNames: [], requestApproval: async () => "deny",
+      createDriver: () => ({ dispose: async () => {}, interrupt, runTurn: async () => new Promise(resolve => {
+        terminal = () => resolve({ status: "aborted" }); started();
+      }) }),
+    });
+    cleanup.push(() => session.dispose());
+    const run = session.prompt("Keep the original operation");
+    await ready; await session.stopForUnconfirmedEffect(); await run;
+    expect(interrupt).toHaveBeenCalledOnce();
+    expect(session.interruption).toMatchObject({ kind: "blocked", cancelOrigin: "host", code: "unconfirmed_tool_effect" });
+    expect(manager.getBranch().findLast(entry => entry.type === "custom" && entry.customType === "ohmygame-native-outcome")).toMatchObject({ data: { status: "failed", cancelOrigin: "host" } });
+    await expect(session.prepareContinuation(new AbortController().signal)).rejects.toThrow("no longer eligible");
+  });
+
+  it.each([false, true])("delivers queued user input after an automatic continuation and propagates its checkpoint failure: %s", async checkpointFails => {
+    const manager = SessionManager.inMemory("/tmp/native-queued-continuation");
+    const guard = new AutoContinueTools([], { sessionManager: manager });
+    const inputs: string[] = [];
+    let started!: () => void, release!: () => void;
+    const startedContinuation = new Promise<void>(resolve => { started = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const snapshot = vi.fn(async () => {
+      if (checkpointFails && snapshot.mock.calls.length === 2) throw new Error("Queued checkpoint unavailable");
+      return "2".repeat(40);
+    });
+    let attempt = 0;
+    const session = new NativeCodingSession({ runtime: "qoder-cli", model: "gmodel", sessionManager: manager, continuationTools: guard, toolNames: [], snapshotBeforeMessage: snapshot, requestApproval: async () => "deny",
+      createDriver: () => ({ dispose: async () => {}, interrupt: async () => {}, runTurn: async (input, sink) => {
+        const index = attempt++; inputs.push(input.text);
+        if (index === 0) return { status: "failed", error: "Turn limit", interruption: { kind: "turn_limit", source: "qoder", code: "qoder_max_turns" } };
+        if (index === 1) { started(); await gate; }
+        sink.textDone("done", "The requested work completed");
+        return { status: "completed" };
+      } }),
+    });
+    cleanup.push(() => session.dispose());
+    await session.prompt("Original task");
+    await session.prepareContinuation(new AbortController().signal);
+    const resumed = session.resumeAfterInterruption();
+    await startedContinuation;
+    await session.followUp("A newly queued user task");
+    release();
+    if (checkpointFails) await expect(resumed).rejects.toThrow("Queued checkpoint unavailable");
+    else await resumed;
+    expect(inputs).toHaveLength(checkpointFails ? 2 : 3);
+    if (!checkpointFails) expect(inputs[2]).toBe("A newly queued user task");
+    expect(snapshot).toHaveBeenCalledTimes(2);
+    expect(manager.getBranch().filter(entry => entry.type === "message" && entry.message.role === "user")).toHaveLength(checkpointFails ? 1 : 2);
+  });
+
+  it("passes visual history requirements to the helper and projects only the fixed image failure", async () => {
+    const ctx = await context({ model: "gmodel" });
+    let input: Frame | undefined;
+    const driver = new QoderDriver(ctx, receive => ({
+      start: async () => {}, stop: async () => {}, respond: () => {},
+      request: async (method, params = {}) => {
+        if (method === "turn/start") {
+          input = params;
+          queueMicrotask(() => receive({ method: "sdk/error", params: { turnId: params.turnId, code: "QODER_IMAGE_INPUT", message: "PRIVATE_IMAGE_ERROR_CANARY" } }));
+        }
+        return { sessionId: "visual-driver-session" };
+      },
+    }));
+    cleanup.push(() => driver.dispose());
+    const result = await driver.runTurn({ text: "Recall the retained reference", images: [], requiresImageInput: true, readOnly: true }, recordingSink().sink, new AbortController().signal);
+    expect(input).toMatchObject({ requiresImageInput: true, images: [] });
+    expect(result).toMatchObject({ status: "failed", error: expect.stringContaining("valid PNG, JPEG or WebP") });
+    expect(JSON.stringify(result)).not.toContain("PRIVATE_IMAGE_ERROR_CANARY");
+  });
+  const cases = [
+    {
+      name: "thinking index zero followed by an early single-block text snapshot",
+      frames: [start("message-a"), block(0, "thinking"), stream({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Local fixture reasoning" } }), stop(0), block(1), delta(1, "One "), delta(1, "answer."), final("message-a", "block-a", ["One answer."]), stop(1)],
+      expected: ["One answer."],
+    },
+    {
+      name: "identical text in separate streamed blocks and separate messages",
+      frames: [start("message-a"), block(0), delta(0, "Same."), final("message-a", "block-a", ["Same."]), stop(0), block(1), delta(1, "Same."), final("message-a", "block-b", ["Same."]), stop(1), start("message-b"), block(0), delta(0, "Same."), final("message-b", "block-c", ["Same."]), stop(0), start("message-a"), block(0), delta(0, "Same."), final("message-a", "block-d", ["Same."]), stop(0)],
+      expected: ["Same.", "Same.", "Same.", "Same."],
+    },
+    {
+      name: "unstreamed single-block snapshots sharing a message id with distinct envelope ids",
+      frames: [final("message-a", "block-a", ["First."]), final("message-a", "block-b", ["Second."]), final("message-a", "block-c", ["Same."]), final("message-a", "block-d", ["Same."])],
+      expected: ["First.", "Second.", "Same.", "Same."],
+    },
+    {
+      name: "several text blocks in one completed message",
+      frames: [final("message-a", "block-a", ["First paragraph.", "Repeated paragraph.", "Repeated paragraph."])],
+      expected: ["First paragraph.", "Repeated paragraph.", "Repeated paragraph."],
+    },
+    {
+      name: "completed text longer than the streamed prefix before block stop",
+      frames: [start("message-a"), block(0), delta(0, "Partial"), final("message-a", "block-a", ["Partial completed answer."]), stop(0)],
+      expected: ["Partial completed answer."],
+    },
+    {
+      name: "a completed single-block snapshot after the original stream block stops",
+      frames: [start("message-a"), block(0, "thinking"), stop(0), block(1), delta(1, "After stop."), stop(1), final("message-a", "block-a", ["After stop."])],
+      expected: ["After stop."],
+    },
+    {
+      name: "missing message ids without borrowing the preceding streamed message",
+      frames: [start("message-a"), block(0), delta(0, "Same."), final("message-a", "block-a", ["Same."]), stop(0), final(undefined, "block-b", ["Same."]), final(undefined, "block-c", ["Same."])],
+      expected: ["Same.", "Same.", "Same."],
+    },
+    {
+      name: "an identical completed envelope replay with the same uuid",
+      frames: [start("message-a"), block(0), delta(0, "Idempotent."), final("message-a", "block-a", ["Idempotent."]), final("message-a", "block-a", ["Idempotent."]), stop(0)],
+      expected: ["Idempotent."],
+    },
+    {
+      name: "a completed multi-block snapshot after both original stream blocks stop",
+      frames: [start("message-a"), block(0), delta(0, "First."), stop(0), block(1), delta(1, "Second."), stop(1), final("message-a", "block-a", ["First.", "Second."])],
+      expected: ["First.", "Second."],
+    },
+  ];
+
+  it.each(cases)("stores and displays $name once per native block", async ({ frames, expected }) => {
+    const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "Local tool result" }], details: {} }));
+    const echo = defineTool({ name: "echo_tool", label: "Echo", description: "Local fixture", parameters: Type.Object({ value: Type.String() }), execute });
+    const ctx = await context({ model: "gmodel", bridge: new ToolBridge([echo] as never) });
+    ctx.workspacePath = ctx.privateDirectory;
+    ctx.policy = { workspacePath: ctx.privateDirectory, neverTouch: [] };
+    const manager = SessionManager.create(ctx.privateDirectory, path.join(ctx.privateDirectory, "sessions"));
+    const events: Frame[] = [];
+    const replies = new Map<string, (value: unknown) => void>();
+    let sequence = 0;
+    const sessionId = "native-projection-session";
+    const driver = new QoderDriver(ctx, (receive) => {
+      const connection: QoderHostConnection = {
+        start: async () => {},
+        stop: async () => {},
+        respond: (id, value) => { replies.get(String(id))?.(value); replies.delete(String(id)); },
+        request: async (method, params = {}) => {
+          if (method !== "turn/start") return {};
+          queueMicrotask(() => { void (async () => {
+            const emit = (message: Frame) => receive({ method: "sdk/message", params: { turnId: params.turnId, message: { session_id: sessionId, parent_tool_use_id: null, ...message } } });
+            emit({ type: "system", subtype: "init" });
+            for (const frame of frames) emit(frame);
+            // A genuine tool ID replay must not execute or record a second tool call.
+            for (let replay = 0; replay < 2; replay++) {
+              const id = `fixture-tool-${++sequence}`;
+              const reply = new Promise<unknown>(resolve => replies.set(id, resolve));
+              receive({ id, method: "tool/call", params: { turnId: params.turnId, sessionId, name: "echo_tool", callId: "genuine-call-id", arguments: { value: "fixture" } } });
+              expect(await reply).toMatchObject({ isError: false });
+            }
+            emit({ type: "result", subtype: "success", is_error: false });
+          })(); });
+          return { sessionId };
+        },
+      };
+      return connection;
+    });
+    const session = new NativeCodingSession({ runtime: "qoder-cli", model: "gmodel", sessionManager: manager, toolNames: ["echo_tool"], createDriver: () => driver, requestApproval: async () => "deny" });
+    cleanup.push(() => session.dispose());
+    session.subscribe(event => events.push(event as unknown as Frame));
+    await session.prompt("Use only the local fixture messages and tool.");
+    const reopened = SessionManager.open(manager.getSessionFile()!);
+    const texts = reopened.getBranch().flatMap(entry => entry.type === "message" && entry.message.role === "assistant" ? entry.message.content.filter(part => part.type === "text").map(part => part.text) : []);
+    expect(texts).toEqual(expected);
+    expect(conversationItems(reopened.getBranch()).filter(item => item.type === "agentMessage").map(item => item.text)).toEqual(expected);
+    const handoff = handoffSummary(reopened.getBranch())!;
+    const replayed = JSON.stringify(replayNativeMessages(reopened.getBranch().flatMap(entry => entry.type === "message" ? [entry.message] : [])));
+    for (const text of new Set(expected)) {
+      const copies = expected.filter(value => value === text).length;
+      expect(handoff.split(`Assistant: ${text}`).length - 1).toBe(copies);
+      expect(replayed.split(text).length - 1).toBe(copies);
+    }
+    const displayed = events.flatMap(event => event.type === "message_end" && (event.message as Frame)?.role === "assistant" ? ((event.message as Frame).content as Frame[]).filter(part => part.type === "text").map(part => part.text) : []);
+    expect(displayed).toEqual(expected);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(reopened.getBranch().filter(entry => entry.type === "message" && entry.message.role === "toolResult")).toHaveLength(1);
+    expect(events.filter(event => event.type === "tool_execution_start")).toHaveLength(1);
+    expect(events.filter(event => event.type === "tool_execution_end")).toHaveLength(1);
+  });
+});
+
+describe("Qoder SDK host controlled bridge", () => {
+  type Data = Record<string, unknown>;
+  type Tool = { name: string; description: string; inputSchema: Data };
+  type Handler = (request: unknown, extra: { signal?: AbortSignal }) => unknown;
+  type QueryOptions = Data & {
+    canUseTool(name: string, input: Data, context: Data): Promise<Data>;
+    hooks: {
+      PreToolUse: Array<{
+        hooks: Array<(input: Data, callId?: string) => Promise<Data>>;
+      }>;
+    };
+    resolveModel?: (context?: Data) => Promise<Data>;
+  };
+  const builtinAgentNames = ["general-purpose", "Explore", "Plan"];
+  const readTool: Tool = {
+    name: "read",
+    description: "Read a controlled project file",
+    inputSchema: { type: "object", properties: { path: { type: "string" } } },
+  };
+  const initialize = {
+    binaryPath: "/audited/qoder",
+    privateDirectory: "/tmp/qoder-fixture-session",
+    configurationRoot: "/tmp/qoder-fixture-persistent",
+    env: {
+      HOME: "/tmp/qoder-fixture-persistent/home",
+      QODER_CONFIG_DIR: "/tmp/qoder-fixture-persistent/config",
+      TMPDIR: "/tmp/qoder-fixture-session/tmp",
+      PATH: "/usr/bin:/bin",
+      ELECTRON_RUN_AS_NODE: "1",
+      OTEL_SDK_DISABLED: "true",
+      QODER_DISABLE_MALFORMED_TOOL_USE_RETRY: "1",
+      QODER_MAX_REASONING_ONLY_RETRIES: "0",
+    },
+  };
+
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((done) => {
+      resolve = done;
+    });
+    return { promise, resolve };
+  }
+
+  function fixture(
+    options: {
+      tools?: Tool[];
+      init?: Data | null;
+      mcpStatus?: unknown;
+      handshake?: Promise<unknown>;
+      statusGate?: Promise<unknown>;
+      sdkVersion?: string;
+      runtimeVersion?: string;
+    } = {},
+  ) {
+    const sent: Data[] = [];
+    const prompts: unknown[] = [];
+    const registered: Array<Map<unknown, Handler>> = [];
+    const queries: Array<{
+      options: QueryOptions;
+      emit(message: unknown): void;
+      close: ReturnType<typeof vi.fn>;
+      interrupt: ReturnType<typeof vi.fn>;
+    }> = [];
+    const tools = options.tools ?? [readTool];
+    const accountInfo = vi.fn(async () => ({ userId: "fixture-user" }));
+    const getModels = vi.fn(
+      async (input: { fetchStrategy: "live" | "cache" }) => [
+        { value: input.fetchStrategy },
+      ],
+    );
+    const stop = vi.fn(async () => {});
+    const startDaemon = vi.fn(async (_options: Data) => ({
+      accountInfo,
+      getModels,
+      stop,
+    }));
+    const auth = vi.fn(() => ({ type: "qodercli" }));
+    const sdkQuery = vi.fn(
+      ({
+        prompt,
+        options: configuration,
+      }: {
+        prompt: AsyncIterable<unknown>;
+        options: Data;
+      }) => {
+        const sessionId = `qoder-fixture-session-${queries.length + 1}`;
+        const events: unknown[] = [];
+        let ended = false;
+        let wake: (() => void) | undefined;
+        const emit = (message: unknown) => {
+          events.push(message);
+          wake?.();
+        };
+        const query = {
+          options: configuration as QueryOptions,
+          emit,
+          close: vi.fn(async () => {
+            ended = true;
+            wake?.();
+          }),
+          interrupt: vi.fn(async () => ({})),
+          initializationResult: vi.fn(async () =>
+            options.handshake
+              ? await options.handshake
+              : {
+                  commands: [],
+                  permissionPolicy: { disabledModes: [] },
+                  agents: builtinAgentNames.map((name) => ({
+                    name,
+                    description: "Native built-in",
+                  })),
+                  skills: [],
+                  output_style: "default",
+                  available_output_styles: ["default"],
+                  models: [{ value: configuration.model }],
+                  account: {},
+                  capabilities: [],
+                  permissionMode: "default",
+                },
+          ),
+          mcpServerStatus: vi.fn(async () =>
+            options.statusGate
+              ? await options.statusGate
+              : (options.mcpStatus ?? [
+                  {
+                    name: "ohmygame",
+                    status: "connected",
+                    tools: tools.map(({ name }) => ({ name: `mcp__ohmygame__${name}` })),
+                  },
+                ]),
+          ),
+          async *[Symbol.asyncIterator]() {
+            while (!ended) {
+              if (events.length) yield events.shift();
+              else
+                await new Promise<void>((resolve) => {
+                  wake = resolve;
+                });
+            }
+          },
+        };
+        queries.push(query);
+        if (options.init !== null)
+          emit({
+            type: "system",
+            subtype: "init",
+            qodercli_version: "1.1.83",
+            cwd: initialize.privateDirectory,
+            tools: tools.map(({ name }) => `mcp__ohmygame__${name}`),
+            skills: [],
+            plugins: [],
+            // Native 1.1.83 Rne/Rv reports registry entries, not invocation permissions.
+            agents: [...builtinAgentNames],
+            model: configuration.model,
+            mcp_servers: [{ name: "ohmygame", status: "connected" }],
+            permissionMode: "default",
+            session_id: sessionId,
+            ...options.init,
+          });
+        void (async () => {
+          for await (const message of prompt) prompts.push(message);
+        })();
+        return query;
+      },
+    );
+    const dependencies: QoderSdkHostDependencies = {
+      sdkVersion: options.sdkVersion ?? "1.0.59",
+      runtimeVersion: options.runtimeVersion ?? "1.1.83",
+      schemas: { listTools: "tools/list", callTool: "tools/call" },
+      sdk: {
+        qodercliAuth: auth,
+        startDaemon,
+        query: sdkQuery,
+        createSdkMcpServer: vi.fn(() => {
+          const handlers = new Map<unknown, Handler>();
+          registered.push(handlers);
+          return {
+            type: "sdk",
+            name: "ohmygame",
+            instance: {
+              server: {
+                registerCapabilities: vi.fn(),
+                setRequestHandler: (schema: unknown, handler: Handler) => {
+                  handlers.set(schema, handler);
+                },
+              },
+            },
+          };
+        }),
+      },
+    };
+    const host = new QoderSdkHost(dependencies, (message) =>
+      sent.push(message),
+    );
+    cleanup.push(() => host.close());
+    const initializeHost = async (params: Data = initialize) => {
+      await host.handle({ id: "initialize", method: "initialize", params });
+    };
+    const start = async (params: Data = {}) => {
+      const id = `start-${queries.length + 1}`;
+      await host.handle({
+        id,
+        method: "turn/start",
+        params: {
+          turnId: `turn-${queries.length + 1}`,
+          model: "gmodel",
+          text: "Inspect this project",
+          tools,
+          instructions: "Only use OhMyGame's controlled project tools.",
+          ...params,
+        },
+      });
+      return sent.find((message) => message.id === id)!;
+    };
+    const toolCalls = () =>
+      sent.filter((message) => message.method === "tool/call");
+    const hook = (input: Data, callId?: string, index = queries.length - 1) =>
+      queries[index].options.hooks.PreToolUse[0].hooks[0](input, callId);
+    const call = (
+      name: string,
+      args: Data = {},
+      index = registered.length - 1,
+      signal?: AbortSignal,
+    ) =>
+      registered[index].get("tools/call")!(
+        { params: { name, arguments: args } },
+        { signal },
+      ) as Promise<Data>;
+    return {
+      host,
+      dependencies,
+      sent,
+      prompts,
+      queries,
+      registered,
+      startDaemon,
+      auth,
+      accountInfo,
+      getModels,
+      stop,
+      sdkQuery,
+      initializeHost,
+      start,
+      toolCalls,
+      hook,
+      call,
+    };
+  }
+
+  it("starts the serialized helper with native metadata and returns a controlled tool result over stdio", async () => {
+    const f = fixture();
+    const input = new PassThrough(), output = new PassThrough();
+    const frames: Data[] = [];
+    let pending = "";
+    output.on("data", (chunk: Buffer) => {
+      pending += chunk.toString("utf8");
+      let end: number;
+      while ((end = pending.indexOf("\n")) !== -1) {
+        frames.push(JSON.parse(pending.slice(0, end)) as Data);
+        pending = pending.slice(end + 1);
+      }
+    });
+    const run = runQoderSdkHost(input, output, async () => f.dependencies);
+    cleanup.push(async () => { input.end(); await run; output.destroy(); });
+    const send = (value: Data) => input.write(`${JSON.stringify(value)}\n`);
+    send({ id: "initialize", method: "initialize", params: initialize });
+    await vi.waitFor(() => expect(frames.find(frame => frame.id === "initialize")).toHaveProperty("result"));
+    const frame = Buffer.from(`${JSON.stringify({ id: "start", method: "turn/start", params: {
+      turnId: "stdio-turn", model: "gmodel", text: "Inspect 项目", tools: [readTool],
+    } })}\n`);
+    const split = frame.indexOf(Buffer.from("项目")) + 1;
+    input.write(frame.subarray(0, split)); input.write(frame.subarray(split));
+    await vi.waitFor(() => expect(frames.find(message => message.id === "start")).toHaveProperty("result.sessionId"));
+    expect(JSON.stringify(f.prompts)).toContain("Inspect 项目");
+    expect(f.queries[0].options.model).toBe("gmodel");
+    await f.hook({ tool_name: "mcp__ohmygame__read", tool_input: { path: "game.ts" } }, "stdio-read");
+    const result = f.call("read", { path: "game.ts" });
+    await vi.waitFor(() => expect(frames.filter(message => message.method === "tool/call")).toHaveLength(1));
+    const request = frames.find(message => message.method === "tool/call")!;
+    expect(request.params).toMatchObject({ turnId: "stdio-turn", callId: "stdio-read", name: "read" });
+    send({ id: request.id, result: { content: [{ type: "text", text: "controlled project content" }], isError: false } });
+    expect(await result).toMatchObject({ content: [{ text: "controlled project content" }], isError: false });
+    expect(f.accountInfo).not.toHaveBeenCalled();
+    expect(f.getModels).not.toHaveBeenCalled();
+    send({ id: "close", method: "session/close" });
+    await vi.waitFor(() => expect(frames.find(message => message.id === "close")).toHaveProperty("result"));
+    expect(f.stop).toHaveBeenCalledOnce();
+  });
+
+  it("withholds the first prompt until the exact inventory and MCP handshake pass", async () => {
+    const status = deferred<unknown>();
+    const f = fixture({ init: null, statusGate: status.promise });
+    const fetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(new Error("No network in the fixture"));
+    await f.initializeHost();
+    const run = f.start({ reasoningLevel: "high", contextWindow: 200_000 });
+    await vi.waitFor(() => expect(f.queries).toHaveLength(1));
+    expect(f.prompts).toEqual([]);
+    f.queries[0].emit({
+      type: "system",
+      subtype: "init",
+      qodercli_version: "1.1.83",
+      cwd: initialize.privateDirectory,
+      tools: ["mcp__ohmygame__read"],
+      skills: [],
+      plugins: [],
+      mcp_servers: [{ name: "ohmygame", status: "connected" }],
+      permissionMode: "default",
+      session_id: "gated-session",
+    });
+    await vi.waitFor(() =>
+      expect(f.sent.some((message) => message.method === "sdk/message")).toBe(
+        true,
+      ),
+    );
+    expect(f.prompts).toEqual([]);
+    status.resolve([
+      { name: "ohmygame", status: "connected", tools: [{ name: "mcp__ohmygame__read" }] },
+    ]);
+    expect(await run).toMatchObject({ result: { sessionId: "gated-session" } });
+    await vi.waitFor(() => expect(f.prompts).toHaveLength(1));
+    expect(f.startDaemon).toHaveBeenCalledWith(
+      expect.objectContaining({
+        launchMode: "process",
+        pathToQoderCLIExecutable: initialize.binaryPath,
+        auth: { type: "qodercli" },
+        env: initialize.env,
+      }),
+    );
+    const config = f.queries[0].options;
+    expect(config).toMatchObject({
+      cwd: initialize.privateDirectory,
+      tools: ["mcp__ohmygame__read"],
+      allowedTools: [],
+      disallowedTools: ["mcp_list", "mcp_get", "mcp_call"],
+      permissionMode: "default",
+      settingSources: [],
+      strictMcpConfig: true,
+      skills: [],
+      agents: {},
+      plugins: [],
+      memory: {},
+      evolution: {},
+      securityScan: {
+        l1StaticCheck: false,
+        l2LightweightScan: false,
+        l3DeepScan: false,
+      },
+      promptSuggestions: false,
+      maxTurns: 64,
+      allowDangerouslySkipPermissions: false,
+      enableFileCheckpointing: false,
+      settings: {
+        general: { enableAutoUpdate: false },
+        skills: { enabled: false },
+        mcp: { lazyLoad: false },
+      },
+    });
+    expect(config.mcpServers).toHaveProperty("ohmygame");
+    expect(Object.keys(config.mcpServers as Data)).toEqual(["ohmygame"]);
+    expect(config).not.toHaveProperty("additionalDirectories");
+    expect(config).not.toHaveProperty("experimentalCloudAgent");
+    for (const field of [
+      "auth",
+      "env",
+      "transport",
+      "pathToQoderCLIExecutable",
+      "executable",
+      "executableArgs",
+      "proxy",
+      "vpcEndpoint",
+      "spawnQoderCLIProcess",
+      "closeGraceMs",
+    ])
+      expect(config).not.toHaveProperty(field);
+    expect(await config.resolveModel!()).toEqual({
+      model: "gmodel",
+      parameters: { reasoningEffort: "high", contextWindow: 200_000 },
+    });
+    expect(f.accountInfo).not.toHaveBeenCalled();
+    expect(f.getModels).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each([false, undefined, "true"])("rejects unverified live vision metadata %s despite caller capability claims", async (isVl) => {
+    const f = fixture();
+    await f.initializeHost();
+    await f.start({ requiresImageInput: true, supportsImages: true, vision: true, isVl: true });
+    await expect(f.queries[0].options.resolveModel!({
+      sessionId: "qoder-fixture-session-1",
+      availableModels: [{ value: "gmodel", isVl, description: "PRIVATE_VISION_POLICY_CANARY" }],
+    })).rejects.toMatchObject({ code: "QODER_IMAGE_INPUT" });
+    expect(f.sent.find(message => message.method === "sdk/error")).toMatchObject({ params: { code: "QODER_IMAGE_INPUT" } });
+    expect(JSON.stringify(f.sent)).not.toContain("PRIVATE_VISION_POLICY_CANARY");
+    expect(f.queries[0].close).toHaveBeenCalled();
+    expect(f.toolCalls()).toEqual([]);
+  });
+
+  it.each([
+    { type: "image", mimeType: "image/gif", data: "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" },
+    { type: "image", mimeType: "image/png", data: "PRIVATE_INVALID_IMAGE_CANARY" },
+    { type: "image", mimeType: "image/jpeg", data: "aW52YWxpZA==" },
+  ])("rejects unsupported or damaged image envelopes before constructing a query: $mimeType", async (image) => {
+    const f = fixture();
+    await f.initializeHost();
+    expect(await f.start({ images: [image] })).toMatchObject({ error: { code: "QODER_IMAGE_INPUT", message: expect.stringContaining("valid PNG, JPEG or WebP") } });
+    expect(f.sdkQuery).not.toHaveBeenCalled();
+    expect(JSON.stringify(f.sent)).not.toContain("PRIVATE_INVALID_IMAGE_CANARY");
+  });
+
+  it("requires fresh vision metadata after a tool image and on a resumed visual session", async () => {
+    const f = fixture();
+    await f.initializeHost();
+    await f.start();
+    expect(await f.queries[0].options.resolveModel!({ availableModels: [] })).toMatchObject({ model: "gmodel" });
+    await f.hook({ tool_name: "mcp__ohmygame__read", tool_input: { path: "reference.png" }, tool_use_id: "visual-read" });
+    const result = f.call("read", { path: "reference.png" });
+    await vi.waitFor(() => expect(f.toolCalls()).toHaveLength(1));
+    const image = { type: "image", mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=" };
+    await f.host.handle({ id: f.toolCalls()[0].id, result: { content: [image] } });
+    expect(await result).toEqual({ content: [image] });
+    expect(await f.queries[0].options.resolveModel!({ sessionId: "qoder-fixture-session-1", availableModels: [{ value: "gmodel", isVl: true }] })).toMatchObject({ model: "gmodel" });
+    f.queries[0].emit({ type: "result", session_id: "qoder-fixture-session-1" });
+    await vi.waitFor(() => expect(f.sent.some(message => message.method === "sdk/message" && (message.params as Data).message && ((message.params as Data).message as Data).type === "result")).toBe(true));
+    await f.start({ resume: "qoder-fixture-session-1" });
+    await expect(f.queries[1].options.resolveModel!({ sessionId: "qoder-fixture-session-2", availableModels: [] })).rejects.toMatchObject({ code: "QODER_IMAGE_INPUT" });
+  });
+
+  it.each([
+    ["missing tools", { tools: undefined }],
+    ["extra native tool", { tools: ["mcp__ohmygame__read", "Bash"] }],
+    [
+      "duplicate tool",
+      { tools: ["mcp__ohmygame__read", "mcp__ohmygame__read"] },
+    ],
+    ["missing controlled tool", { tools: [] }],
+    ["wrong runtime", { qodercli_version: "1.1.85" }],
+    ["project cwd", { cwd: "/tmp/a-user-project" }],
+    ["user skill", { skills: ["local-shell"] }],
+    ["plugin", { plugins: [{ name: "external" }] }],
+    ["unknown agent metadata", { agents: ["writer"] }],
+    ["duplicate agent metadata", { agents: ["Plan", "Plan"] }],
+    ["mixed agent metadata", { agents: ["general-purpose", 7] }],
+    ["malformed agents", { agents: "writer" }],
+    ["bypass mode", { permissionMode: "bypassPermissions" }],
+    ["native Agent tool", { tools: ["mcp__ohmygame__read", "Agent"] }],
+    [
+      "foreign MCP server",
+      { mcp_servers: [{ name: "external", status: "connected" }] },
+    ],
+  ])("rejects %s before releasing any prompt", async (_label, init) => {
+    const f = fixture({ init });
+    await f.initializeHost();
+    expect(await f.start()).toMatchObject({
+      error: { code: "QODER_INVENTORY" },
+    });
+    expect(
+      f.sent.find((message) => message.method === "sdk/error"),
+    ).toMatchObject({ params: { code: "QODER_INVENTORY" } });
+    expect(f.prompts).toEqual([]);
+    expect(f.toolCalls()).toEqual([]);
+    expect(f.queries[0].close).toHaveBeenCalled();
+  });
+
+  it.each([[], ["general-purpose"], ["Explore", "Plan"]])(
+    "accepts only audited built-in registry subsets %j",
+    async (...agents) => {
+      const f = fixture({ init: { agents } });
+      await f.initializeHost();
+      expect(await f.start()).toHaveProperty("result");
+      await vi.waitFor(() => expect(f.prompts).toHaveLength(1));
+      expect(f.toolCalls()).toEqual([]);
+    },
+  );
+
+  it("starts gmodel with the native built-in metadata and permits only the controlled project tool", async () => {
+    const f = fixture();
+    await f.initializeHost();
+    expect(await f.start()).toMatchObject({
+      result: { sessionId: "qoder-fixture-session-1" },
+    });
+    await vi.waitFor(() => expect(f.prompts).toHaveLength(1));
+    expect(f.queries[0].options.model).toBe("gmodel");
+    const initialized = f.sent.find(
+      (entry) =>
+        entry.method === "sdk/message" &&
+        ((entry.params as Data)?.message as Data)?.subtype === "init",
+    );
+    expect((initialized?.params as Data).message).toMatchObject({
+      agents: builtinAgentNames,
+      model: "gmodel",
+      tools: ["mcp__ohmygame__read"],
+    });
+    const delegation = {
+      subagent_type: "general-purpose",
+      prompt: "Do not run",
+    };
+    expect(
+      await f.queries[0].options.canUseTool("Agent", delegation, {
+        toolUseID: "forbidden-agent",
+      }),
+    ).toMatchObject({ behavior: "deny" });
+    expect(
+      await f.hook({
+        tool_name: "Agent",
+        tool_input: delegation,
+        tool_use_id: "forbidden-agent",
+      }),
+    ).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    expect(await f.call("Agent", delegation)).toMatchObject({ isError: true });
+    expect(f.toolCalls()).toEqual([]);
+    await f.hook({
+      tool_name: "mcp__ohmygame__read",
+      tool_input: { path: "index.html" },
+      tool_use_id: "controlled-read",
+    });
+    const read = f.call("read", { path: "index.html" });
+    await vi.waitFor(() => expect(f.toolCalls()).toHaveLength(1));
+    const request = f.toolCalls()[0];
+    expect(request.params).toMatchObject({
+      callId: "controlled-read",
+      name: "read",
+    });
+    await f.host.handle({
+      id: request.id,
+      result: { content: [{ type: "text", text: "fixture project" }] },
+    });
+    expect(await read).toEqual({
+      content: [{ type: "text", text: "fixture project" }],
+    });
+    f.queries[0].emit({
+      type: "result",
+      subtype: "success",
+      session_id: "qoder-fixture-session-1",
+    });
+    await vi.waitFor(() =>
+      expect(
+        f.sent.some(
+          (entry) =>
+            entry.method === "sdk/message" &&
+            ((entry.params as Data)?.message as Data)?.type === "result",
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("emits fixed protocol and SDK error codes without exposing third-party diagnostics", async () => {
+    const f = fixture();
+    f.startDaemon.mockRejectedValueOnce(
+      new Error("private SDK diagnostic must stay private"),
+    );
+    await f.initializeHost();
+    expect(f.sent[0]).toMatchObject({
+      error: { code: "QODER_SDK", message: "The Qoder SDK operation failed" },
+    });
+    await f.host.handle({ id: "unknown", method: "unknown/method" });
+    expect(f.sent.find((entry) => entry.id === "unknown")).toMatchObject({
+      error: { code: "QODER_PROTOCOL" },
+    });
+    expect(JSON.stringify(f.sent)).not.toContain("private SDK diagnostic");
+  });
+
+  it("preserves a safe SDK failure category and the local startup phase", async () => {
+    const f = fixture();
+    f.sdkQuery.mockImplementationOnce(() => { throw Object.assign(new Error("PRIVATE_SDK_CANARY"), { code: "DAEMON_PROTOCOL_ERROR" }); });
+    await f.initializeHost();
+    expect(await f.start()).toMatchObject({ error: { code: "QODER_SDK_DAEMON_PROTOCOL", phase: "query-start" } });
+    expect(f.prompts).toEqual([]);
+    expect(JSON.stringify(f.sent)).not.toContain("PRIVATE_SDK_CANARY");
+  });
+
+  it("keeps the primary boundary failure when SDK query cleanup also fails", async () => {
+    const status = deferred<unknown>();
+    const f = fixture({ statusGate: status.promise });
+    await f.initializeHost();
+    const start = f.start();
+    await vi.waitFor(() => expect(f.queries).toHaveLength(1));
+    f.queries[0].close.mockRejectedValueOnce(new Error("PRIVATE_CLOSE_CANARY"));
+    status.resolve([]);
+    expect(await start).toMatchObject({ error: { code: "QODER_MCP" } });
+    expect(f.prompts).toEqual([]);
+    expect(JSON.stringify(f.sent)).not.toContain("PRIVATE_CLOSE_CANARY");
+  });
+
+  it("times out without a complete initialization inventory and never starts inference", async () => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture({ init: null });
+      await f.initializeHost();
+      const run = f.start();
+      await vi.advanceTimersByTimeAsync(30_001);
+      expect(await run).toMatchObject({
+        error: { message: expect.stringContaining("before any prompt") },
+      });
+      expect(f.prompts).toEqual([]);
+      expect(f.queries[0].close).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    { memory: { enabled: true } },
+    { evolution: { enabled: true } },
+    { permissionMode: "acceptEdits" },
+  ])(
+    "rejects an unexpected effective SDK policy %j before releasing a prompt",
+    async (effective) => {
+      const f = fixture({ handshake: Promise.resolve(effective) });
+      await f.initializeHost();
+      expect(await f.start()).toMatchObject({
+        error: {
+          code: "QODER_POLICY",
+          message: expect.stringContaining("runtime policy"),
+        },
+      });
+      expect(f.prompts).toEqual([]);
+      expect(f.toolCalls()).toEqual([]);
+    },
+  );
+
+  it.each([
+    [],
+    [{ name: "ohmygame", status: "connected", tools: [{ name: "read" }] }],
+    [{ name: "ohmygame", status: "connected", tools: [{ name: "mcp__ohmygame__read" }, { name: "mcp__ohmygame__read" }] }],
+    [{ name: "external", status: "connected", tools: [{ name: "read" }] }],
+    [
+      {
+        name: "ohmygame",
+        status: "connected",
+        tools: [{ name: "read" }, { name: "Bash" }],
+      },
+    ],
+    [{ name: "ohmygame", status: "failed", tools: [{ name: "read" }] }],
+  ])(
+    "rejects MCP status that disagrees with the controlled inventory: %j",
+    async (...status) => {
+      const f = fixture({ mcpStatus: status });
+      await f.initializeHost();
+      expect(await f.start()).toMatchObject({ error: { code: "QODER_MCP" } });
+      expect(f.prompts).toEqual([]);
+      expect(f.toolCalls()).toEqual([]);
+    },
+  );
+
+  it.each([
+    [
+      "ambient credential",
+      { env: { ...initialize.env, KUNPO_API_KEY: "fixture-not-a-key" } },
+    ],
+    [
+      "inherited HOME",
+      { env: { ...initialize.env, HOME: "/Users/other/home" } },
+    ],
+    [
+      "inherited configuration",
+      { env: { ...initialize.env, QODER_CONFIG_DIR: "/Users/other/.qoder" } },
+    ],
+    [
+      "overlapping workspace",
+      { privateDirectory: initialize.configurationRoot },
+    ],
+    [
+      "Electron override",
+      { env: { ...initialize.env, ELECTRON_RUN_AS_NODE: "0" } },
+    ],
+    [
+      "telemetry override",
+      { env: { ...initialize.env, OTEL_SDK_DISABLED: "false" } },
+    ],
+    [
+      "tool retry override",
+      {
+        env: { ...initialize.env, QODER_DISABLE_MALFORMED_TOOL_USE_RETRY: "0" },
+      },
+    ],
+    [
+      "reasoning retry override",
+      { env: { ...initialize.env, QODER_MAX_REASONING_ONLY_RETRIES: "2" } },
+    ],
+  ])(
+    "rejects unsafe %s before starting the SDK daemon",
+    async (_label, params) => {
+      const f = fixture();
+      await f.initializeHost({ ...initialize, ...params });
+      expect(f.sent[0]).toHaveProperty("error");
+      expect(f.startDaemon).not.toHaveBeenCalled();
+      expect(f.auth).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([{ sdkVersion: "1.0.60" }, { runtimeVersion: "1.1.85" }])(
+    "rejects unaudited package versions %j before runtime startup",
+    async (versions) => {
+      const f = fixture(versions);
+      await f.initializeHost();
+      expect(f.sent[0]).toHaveProperty("error");
+      expect(f.startDaemon).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not import local account state or list live models implicitly", async () => {
+    vi.stubEnv("HOME", "/fixture/host-home");
+    vi.stubEnv("QODER_CONFIG_DIR", "/fixture/host-home/.qoder");
+    vi.stubEnv("KUNPO_API_KEY", "fixture-never-inherit");
+    const f = fixture();
+    await f.initializeHost();
+    expect(f.auth).toHaveBeenCalledOnce();
+    expect(f.startDaemon.mock.calls[0][0]).toMatchObject({
+      env: initialize.env,
+    });
+    expect(f.accountInfo).not.toHaveBeenCalled();
+    expect(f.getModels).not.toHaveBeenCalled();
+    await f.host.handle({ id: "cached", method: "models/list" });
+    expect(f.getModels).toHaveBeenLastCalledWith({ fetchStrategy: "cache" });
+    expect(f.accountInfo).not.toHaveBeenCalled();
+    await f.host.handle({
+      id: "live",
+      method: "models/list",
+      params: { live: true },
+    });
+    expect(f.getModels).toHaveBeenLastCalledWith({ fetchStrategy: "live" });
+    await f.host.handle({ id: "account", method: "account/read" });
+    expect(f.accountInfo).toHaveBeenCalledOnce();
+    expect(f.sdkQuery).not.toHaveBeenCalled();
+  });
+
+  it("denies native tools, foreign MCP tools and missing call IDs in both permission paths", async () => {
+    const f = fixture();
+    await f.initializeHost();
+    await f.start();
+    for (const name of [
+      "Bash",
+      "Read",
+      "Agent",
+      "WebFetch",
+      "mcp__external__read",
+    ]) {
+      expect(
+        await f.queries[0].options.canUseTool(
+          name,
+          {},
+          { toolUseID: "native" },
+        ),
+      ).toMatchObject({ behavior: "deny" });
+      expect(
+        await f.hook({
+          tool_name: name,
+          tool_input: {},
+          tool_use_id: "native",
+        }),
+      ).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    }
+    expect(
+      await f.queries[0].options.canUseTool("mcp__ohmygame__read", {}, {}),
+    ).toMatchObject({ behavior: "deny" });
+    expect(
+      await f.hook({ tool_name: "mcp__ohmygame__read", tool_input: {} }),
+    ).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    expect(await f.call("read")).toMatchObject({ isError: true });
+    expect(f.toolCalls()).toEqual([]);
+    expect(
+      await f.queries[0].options.canUseTool(
+        "mcp__ohmygame__read",
+        {},
+        { toolUseID: "real-id" },
+      ),
+    ).toMatchObject({ behavior: "allow", toolUseID: "real-id" });
+  });
+
+  it("reuses pending and completed paid results for the same genuine call ID and arguments", async () => {
+    const f = fixture({
+      tools: [
+        {
+          name: "generate_image",
+          description: "Mock Kunpo image",
+          inputSchema: {
+            type: "object",
+            properties: { prompt: { type: "string" } },
+          },
+        },
+      ],
+    });
+    await f.initializeHost();
+    await f.start();
+    const args = { prompt: "sprite" };
+    for (let duplicate = 0; duplicate < 2; duplicate++)
+      await f.hook({
+        tool_name: "mcp__ohmygame__generate_image",
+        tool_input: args,
+        tool_use_id: "paid-call",
+      });
+    const result = f.call("generate_image", args);
+    const pendingDuplicate = f.call("generate_image", args);
+    await vi.waitFor(() => expect(f.toolCalls()).toHaveLength(1));
+    const request = f.toolCalls()[0];
+    expect(request.params).toEqual({
+      name: "generate_image",
+      arguments: args,
+      callId: "paid-call",
+      turnId: "turn-1",
+      sessionId: "qoder-fixture-session-1",
+    });
+    const artifact = {
+      content: [{ type: "text", text: "Kunpo existing-task" }],
+      details: { artifact: { path: "art.png" } },
+    };
+    await f.host.handle({ id: request.id, result: artifact });
+    expect(await result).toEqual(artifact);
+    expect(await pendingDuplicate).toEqual(artifact);
+    await f.hook({
+      tool_name: "mcp__ohmygame__generate_image",
+      tool_input: args,
+      tool_use_id: "paid-call",
+    });
+    expect(await f.call("generate_image", args)).toEqual(artifact);
+    expect(f.toolCalls()).toHaveLength(1);
+    expect(await f.call("generate_image", args)).toMatchObject({
+      isError: true,
+    });
+    expect(f.toolCalls()).toHaveLength(1);
+  });
+
+  it("rejects reuse of a genuine call ID with changed arguments without forwarding again", async () => {
+    const f = fixture();
+    await f.initializeHost();
+    await f.start();
+    await f.hook({
+      tool_name: "mcp__ohmygame__read",
+      tool_input: { path: "first.js" },
+      tool_use_id: "same-call",
+    });
+    const first = f.call("read", { path: "first.js" });
+    await vi.waitFor(() => expect(f.toolCalls()).toHaveLength(1));
+    await f.host.handle({
+      id: f.toolCalls()[0].id,
+      result: { content: [{ type: "text", text: "first file" }] },
+    });
+    expect(await first).not.toHaveProperty("isError");
+    await f.hook({
+      tool_name: "mcp__ohmygame__read",
+      tool_input: { path: "changed.js" },
+      tool_use_id: "same-call",
+    });
+    expect(await f.call("read", { path: "changed.js" })).toMatchObject({
+      isError: true,
+      content: [{ text: expect.stringContaining("different arguments") }],
+    });
+    expect(f.toolCalls()).toHaveLength(1);
+  });
+
+  it("refuses indistinguishable concurrent hook IDs instead of inventing an effectful call ID", async () => {
+    const f = fixture();
+    await f.initializeHost();
+    await f.start();
+    for (const callId of ["first", "second"])
+      await f.hook({
+        tool_name: "mcp__ohmygame__read",
+        tool_input: { path: "game.js" },
+        tool_use_id: callId,
+      });
+    expect(await f.call("read", { path: "game.js" })).toMatchObject({
+      isError: true,
+      content: [{ text: expect.stringContaining("unambiguous") }],
+    });
+    expect(f.toolCalls()).toEqual([]);
+  });
+
+  it("fails a premature Qoder completion without claiming an unsettled tool succeeded", async () => {
+    const f = fixture();
+    await f.initializeHost();
+    await f.start();
+    await f.hook({
+      tool_name: "mcp__ohmygame__read",
+      tool_input: {},
+      tool_use_id: "pending-result",
+    });
+    const pending = f.call("read");
+    await vi.waitFor(() => expect(f.toolCalls()).toHaveLength(1));
+    f.queries[0].emit({ type: "result", subtype: "success" });
+    await vi.waitFor(() =>
+      expect(f.sent.some((message) => message.method === "sdk/error")).toBe(
+        true,
+      ),
+    );
+    expect(await pending).toMatchObject({ isError: true });
+    expect(
+      f.sent.some(
+        (message) =>
+          message.method === "sdk/message" &&
+          (message.params as Data)?.message &&
+          ((message.params as Data).message as Data).type === "result",
+      ),
+    ).toBe(false);
+    expect(f.toolCalls()).toHaveLength(1);
+  });
+
+  it("revokes dispatch before interruption and ignores late replies and cancelled callbacks", async () => {
+    const f = fixture();
+    await f.initializeHost();
+    await f.start();
+    await f.hook({
+      tool_name: "mcp__ohmygame__read",
+      tool_input: {},
+      tool_use_id: "pending",
+    });
+    const pending = f.call("read");
+    await vi.waitFor(() => expect(f.toolCalls()).toHaveLength(1));
+    await f.host.handle({
+      id: "wrong-turn",
+      method: "turn/interrupt",
+      params: { turnId: "other" },
+    });
+    expect(f.queries[0].interrupt).not.toHaveBeenCalled();
+    await f.host.handle({
+      id: "cancel",
+      method: "turn/interrupt",
+      params: { turnId: "turn-1" },
+    });
+    expect(await pending).toMatchObject({ isError: true });
+    expect(f.queries[0].interrupt).toHaveBeenCalledOnce();
+    expect(f.queries[0].close).toHaveBeenCalled();
+    await f.host.handle({
+      id: f.toolCalls()[0].id,
+      result: { content: [{ type: "text", text: "late" }] },
+    });
+    expect(
+      await f.hook({
+        tool_name: "mcp__ohmygame__read",
+        tool_input: {},
+        tool_use_id: "late",
+      }),
+    ).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    expect(await f.call("read")).toMatchObject({ isError: true });
+    expect(f.toolCalls()).toHaveLength(1);
+    await f.host.close();
+    await f.host.close();
+    expect(f.stop).toHaveBeenCalledOnce();
+  });
+
+  it("resumes only the supplied session and refuses callbacks from the preceding turn", async () => {
+    const f = fixture();
+    await f.initializeHost();
+    await f.start();
+    f.queries[0].emit({
+      type: "result",
+      subtype: "success",
+      session_id: "qoder-fixture-session-1",
+    });
+    await vi.waitFor(() =>
+      expect(
+        f.sent.some(
+          (message) =>
+            (message.params as Data)?.message &&
+            ((message.params as Data).message as Data).type === "result",
+        ),
+      ).toBe(true),
+    );
+    expect(await f.start({ resume: "qoder-fixture-session-1" })).toHaveProperty(
+      "result",
+    );
+    expect(f.queries[1].options.resume).toBe("qoder-fixture-session-1");
+    expect(f.queries[1].options).not.toHaveProperty("continue");
+    expect(
+      await f.hook(
+        {
+          tool_name: "mcp__ohmygame__read",
+          tool_input: {},
+          tool_use_id: "stale",
+        },
+        undefined,
+        0,
+      ),
+    ).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    expect(await f.call("read", {}, 0)).toMatchObject({ isError: true });
+    expect(f.toolCalls()).toEqual([]);
+  });
+
+  it.each(["foreign message", "replacement session init"])(
+    "fails closed on %s after binding the runtime session",
+    async (kind) => {
+      const f = fixture();
+      await f.initializeHost();
+      await f.start();
+      f.queries[0].emit(
+        kind === "foreign message"
+          ? {
+              type: "assistant",
+              session_id: "another-session",
+              message: { content: [{ type: "text", text: "must not appear" }] },
+            }
+          : { type: "system", subtype: "init", session_id: "replaced-session" },
+      );
+      await vi.waitFor(() =>
+        expect(f.sent.some((message) => message.method === "sdk/error")).toBe(
+          true,
+        ),
+      );
+      expect(JSON.stringify(f.sent)).not.toContain("must not appear");
+      expect(await f.call("read")).toMatchObject({ isError: true });
+      expect(f.toolCalls()).toEqual([]);
+    },
+  );
+});
+
+const installedQoderSdk = fileURLToPath(new URL("../.runtime/qoder-sdk/1.0.59/node_modules/@qoder-ai/qoder-agent-sdk/dist/index.js", import.meta.url));
+describe.skipIf(!existsSync(installedQoderSdk) || !!process.versions.bun || process.platform === "win32")("installed Qoder SDK through real host stdio and a local protocol daemon", () => {
+  it("reads the local account and catalog again after restarting the helper without creating a session", async () => {
+    expect(createHash("sha256").update(await readFile(installedQoderSdk)).digest("hex")).toBe("d7b28e41087eafe2913affdfbf37cf72825ff4d1c458debf3fc1490481bf895f");
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "ohmygame-real-qoder-probe-")));
+    cleanup.push(() => rm(root, { recursive: true, force: true }));
+    const env = await controlledQoderEnvironment(root);
+    const directory = path.join(root, "probe");
+    const temporary = path.join(directory, "tmp");
+    await mkdir(temporary, { recursive: true, mode: 0o700 });
+    const privateEnv = { ...env, TMPDIR: temporary, TMP: temporary, TEMP: temporary, ELECTRON_RUN_AS_NODE: "1" };
+    const account = { userId: "local-fixture-user" };
+    const models = [{ value: "local-fixture-model", displayName: "Local fixture model", description: "Public synthetic catalog data" }];
+    await writeFile(path.join(env.QODER_CONFIG_DIR!, "fixture-account-catalog.json"), JSON.stringify({ account, models }), { mode: 0o600 });
+    await expect(access(path.join(env.QODER_CONFIG_DIR!, ".auth", "user"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(Object.keys(privateEnv).filter(key => /token|secret|auth/i.test(key))).toEqual([]);
+    const fake = path.join(root, "fake-cli.mjs");
+    await copyFile(fileURLToPath(new URL("./fixtures/qoder-sdk-daemon.mjs", import.meta.url)), fake);
+    const ts = await import("typescript");
+    const host = path.join(root, "qoder-host.mjs");
+    await writeFile(host, ts.transpileModule(await readFile(fileURLToPath(new URL("../src/daemon/agent-runtimes/qoder-sdk-host.ts", import.meta.url)), "utf8"), {
+      compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 },
+    }).outputText, { mode: 0o600 });
+    type Frame = Record<string, unknown>;
+    for (let restart = 0; restart < 2; restart++) {
+      // Each helper imports the pinned SDK anew, with every network API and extra process denied.
+      const child = spawnFixtureProcess(process.execPath, ["--import", fileURLToPath(new URL("./fixtures/qoder-sdk-network-guard.mjs", import.meta.url)), host, installedQoderSdk], {
+        cwd: directory, env: { ...privateEnv, OHMYGAME_QODER_FIXTURE_ROOT: root }, stdio: ["pipe", "pipe", "pipe"], detached: true,
+      });
+      let stderr = "";
+      child.stderr.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-8000); });
+      const exited = new Promise<void>(resolve => child.once("close", () => resolve()));
+      cleanup.push(async () => {
+        child.stdin.end();
+        if (child.exitCode === null && child.signalCode === null && child.pid) {
+          try { process.kill(-child.pid, "SIGKILL"); } catch { /* Already exited. */ }
+        }
+        await exited;
+      });
+      const sent: Frame[] = [];
+      const pending = new Map<string, { resolve(value: Frame): void; reject(error: Error): void }>();
+      readline.createInterface({ input: child.stdout }).on("line", line => {
+        const message = JSON.parse(line) as Frame;
+        sent.push(message);
+        const request = pending.get(String(message.id));
+        pending.delete(String(message.id));
+        request?.resolve(message);
+      });
+      child.on("error", error => { for (const request of pending.values()) request.reject(error); pending.clear(); });
+      child.on("close", () => {
+        for (const request of pending.values()) request.reject(new Error(`Isolated host closed: ${stderr}`));
+        pending.clear();
+      });
+      let nextId = 0;
+      const request = (method: string, params: Frame = {}) => {
+        const id = String(++nextId);
+        return new Promise<Frame>((resolve, reject) => {
+          const timeout = setTimeout(() => { pending.delete(id); reject(new Error(`Isolated host timed out for ${method}: ${stderr}`)); }, 6000);
+          pending.set(id, { resolve: value => { clearTimeout(timeout); resolve(value); }, reject: error => { clearTimeout(timeout); reject(error); } });
+          child.stdin.write(JSON.stringify({ id, method, params }) + "\n");
+        });
+      };
+      expect(await request("initialize", { binaryPath: fake, privateDirectory: directory, configurationRoot: path.dirname(env.QODER_CONFIG_DIR!), env: privateEnv }), stderr).toMatchObject({ result: { sdkVersion: "1.0.59", runtimeVersion: "1.1.83" } });
+      expect(await request("account/read")).toMatchObject({ result: account });
+      expect(await request("models/list")).toMatchObject({ result: models });
+      expect(await request("models/list", { live: true })).toMatchObject({ result: models });
+      expect(await request("session/close")).toMatchObject({ result: {} });
+      child.stdin.end();
+      await exited;
+      expect(child.exitCode, stderr).toBe(0);
+      expect(child.signalCode).toBeNull();
+      expect(sent).toHaveLength(5);
+      expect(sent.every(message => message.id !== undefined && message.method === undefined)).toBe(true);
+    }
+    const frames = (await readFile(path.join(env.QODER_CONFIG_DIR!, "fixture-frames.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line) as Frame);
+    const received = frames.map(frame => frame.received as Frame);
+    expect(received.every(frame => frame.type === "control_request" && frame.session_id === undefined)).toBe(true);
+    expect(received.map(frame => (frame.request as Frame).type)).toEqual(Array.from({ length: 2 }, () => ["daemon.initialize", "daemon.account_info", "daemon.get_models", "daemon.get_models", "daemon.shutdown"]).flat());
+    expect(received.filter(frame => (frame.request as Frame).type === "daemon.get_models").map(frame => (frame.request as Frame).fetchStrategy)).toEqual(["cache", "live", "cache", "live"]);
+    const guards = (await readFile(path.join(root, "guard.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line) as Frame);
+    expect(guards).toHaveLength(2);
+    for (const guard of guards) {
+      expect(guard).toMatchObject({ spawned: "local-fake-cli", args: [fake, "--sdk"] });
+      try { process.kill(guard.pid as number, 0); expect.fail("The fixture daemon must exit with its SDK host"); }
+      catch (error) { expect(error).toMatchObject({ code: "ESRCH" }); }
+    }
+    await expect(access(path.join(env.QODER_CONFIG_DIR!, ".auth", "user"))).rejects.toMatchObject({ code: "ENOENT" });
+  }, 15000);
+
+  it.each(["safe", "unsafe-inventory", "ignored-skills", "ignored-meta-deny", "malformed-control", "changed-snapshot-tools", "changed-snapshot-session", "snapshot-after-hook", "vision-initial", "vision-tool", "vision-resume", "vision-false", "vision-missing", "vision-drift", "vision-tool-false", "vision-resume-missing", "vision-tool-gif", "vision-tool-malformed", "result-turn-limit", "result-turn-limit-recover", "edit-preflight-recover"] as const)("checks actual SDK startup, control frames and tools with %s output", async (scenario) => {
+    const preflightRecovery = scenario === "edit-preflight-recover";
+    const recovers = scenario === "result-turn-limit-recover" || preflightRecovery;
+    const toolName = preflightRecovery ? "edit" : "write";
+    const invalidToolImage = scenario === "vision-tool-gif" || scenario === "vision-tool-malformed";
+    const structuredFailure = scenario === "result-turn-limit";
+    const usesSession = scenario === "safe" || scenario === "snapshot-after-hook" || scenario === "vision-initial" || scenario === "vision-tool" || invalidToolImage || structuredFailure || recovers;
+    const visual = scenario.startsWith("vision-");
+    const completes = usesSession && !invalidToolImage && !structuredFailure || ["vision-initial", "vision-tool", "vision-resume"].includes(scenario);
+    const afterToolFailure = scenario === "vision-drift" || scenario === "vision-tool-false" || invalidToolImage;
+    const hasToolImage = scenario === "vision-tool" || scenario === "vision-tool-false" || invalidToolImage;
+    const images = visual && !scenario.startsWith("vision-tool") && !scenario.startsWith("vision-resume") ? [
+      { type: "image" as const, mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=" },
+      { type: "image" as const, mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVQIHWP4z8AAAAMBAQAY3Y2wAAAAAElFTkSuQmCC" },
+    ] : [];
+    const toolImage = { type: "image" as const, mimeType: scenario === "vision-tool-gif" ? "image/gif" : "image/png", data: scenario === "vision-tool-gif" ? "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" : scenario === "vision-tool-malformed" ? "INVALID_TOOL_IMAGE_CANARY" : "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=" };
+    const changesSnapshot = scenario === "changed-snapshot-tools" || scenario === "changed-snapshot-session";
+    const selectedModel = scenario === "safe" ? "gmodel" : `fixture-${scenario}`;
+    expect(createHash("sha256").update(await readFile(installedQoderSdk)).digest("hex")).toBe("d7b28e41087eafe2913affdfbf37cf72825ff4d1c458debf3fc1490481bf895f");
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "ohmygame-real-qoder-sdk-")));
+    cleanup.push(() => rm(root, { recursive: true, force: true }));
+    const env = await controlledQoderEnvironment(root);
+    const directory = path.join(root, "session");
+    const temporary = path.join(directory, "tmp");
+    await mkdir(temporary, { recursive: true, mode: 0o700 });
+    const privateEnv = { ...env, TMPDIR: temporary, TMP: temporary, TEMP: temporary, ELECTRON_RUN_AS_NODE: "1" };
+    await expect(access(path.join(env.QODER_CONFIG_DIR!, ".auth", "user"))).rejects.toMatchObject({ code: "ENOENT" });
+    const fake = path.join(root, "fake-cli.mjs");
+    await copyFile(fileURLToPath(new URL("./fixtures/qoder-sdk-daemon.mjs", import.meta.url)), fake);
+    const ts = await import("typescript");
+    const host = path.join(root, "qoder-host.mjs");
+    await writeFile(host, ts.transpileModule(await readFile(fileURLToPath(new URL("../src/daemon/agent-runtimes/qoder-sdk-host.ts", import.meta.url)), "utf8"), {
+      compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 },
+    }).outputText, { mode: 0o600 });
+    // The real SDK may spawn only our local daemon. Networking is denied before SDK import.
+    const child = spawnFixtureProcess(process.execPath, ["--import", fileURLToPath(new URL("./fixtures/qoder-sdk-network-guard.mjs", import.meta.url)), host, installedQoderSdk], {
+      cwd: directory, env: { ...privateEnv, OHMYGAME_QODER_FIXTURE_ROOT: root }, stdio: ["pipe", "pipe", "pipe"], detached: true,
+    });
+    let stderr = "", stdout = "";
+    child.stderr.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-8000); });
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    const exited = new Promise<void>((resolve) => child.once("close", () => resolve()));
+    cleanup.push(async () => {
+      child.stdin.end();
+      if (child.exitCode === null && child.signalCode === null && child.pid) {
+        try { process.kill(-child.pid, "SIGKILL"); } catch { /* Already exited. */ }
+      }
+      await exited;
+    });
+    type Frame = Record<string, unknown>;
+    const sent: Frame[] = [], toolCalls: Frame[] = [];
+    let driverReceive: ((message: Frame) => void) | undefined;
+    const pending = new Map<string, { resolve(value: Frame): void; reject(error: Error): void }>();
+    const reader = readline.createInterface({ input: child.stdout });
+    reader.on("line", line => {
+      const message = JSON.parse(line) as Frame;
+      sent.push(message);
+      if (message.method === "tool/call") {
+        toolCalls.push(message);
+        if (driverReceive) driverReceive(message);
+        else child.stdin.write(JSON.stringify({ id: message.id, result: { content: hasToolImage ? [toolImage] : [{ type: "text", text: "Local controlled tool completed" }], isError: false } }) + "\n");
+      } else if (message.id !== undefined) {
+        const request = pending.get(String(message.id));
+        pending.delete(String(message.id));
+        request?.resolve(message);
+      } else driverReceive?.(message);
+    });
+    child.on("error", error => { for (const request of pending.values()) request.reject(error); pending.clear(); });
+    child.on("close", () => {
+      for (const request of pending.values()) request.reject(new Error(`Isolated host closed: ${stderr}`));
+      pending.clear();
+    });
+    let nextId = 0;
+    const request = (method: string, params: Frame = {}) => {
+      const id = String(++nextId);
+      return new Promise<Frame>((resolve, reject) => {
+        const timeout = setTimeout(() => { pending.delete(id); reject(new Error(`Isolated host timed out for ${method}: ${stderr}`)); }, 6000);
+        pending.set(id, { resolve: value => { clearTimeout(timeout); resolve(value); }, reject: error => { clearTimeout(timeout); reject(error); } });
+        child.stdin.write(JSON.stringify({ id, method, params }) + "\n");
+      });
+    };
+    const initialized = await request("initialize", { binaryPath: fake, privateDirectory: directory, configurationRoot: path.dirname(env.QODER_CONFIG_DIR!), env: privateEnv });
+    const startupDiagnostics = initialized.error ? `${stderr}\n${await readFile(path.join(root, "guard.jsonl"), "utf8").catch(() => "No guard events")}\n${await readFile(path.join(env.QODER_CONFIG_DIR!, "fixture-frames.jsonl"), "utf8").catch(() => "No daemon frames")}` : "";
+    expect(initialized, startupDiagnostics).toMatchObject({ result: { sdkVersion: "1.0.59", runtimeVersion: "1.1.83" } });
+    let started!: Frame;
+    if (usesSession) {
+      const workspace = path.join(root, "project");
+      await mkdir(workspace, { mode: 0o700 });
+      const edit = createLocalAgentFileTools(workspace).find(tool => tool.name === "edit")!;
+      if (preflightRecovery) await writeFile(path.join(workspace, "fixture.txt"), "before");
+      const execute = vi.fn(async (...call: unknown[]) => preflightRecovery ? edit.execute(...call as Parameters<typeof edit.execute>) : ({ content: hasToolImage ? [toolImage] : [{ type: "text" as const, text: "Local controlled tool completed" }], details: {} }));
+      const write = preflightRecovery ? { ...edit, execute } : defineTool({ name: "write", label: "Local write fixture", description: "Controlled local fixture", parameters: Type.Object({ path: Type.String(), content: Type.String() }), execute });
+      const manager = SessionManager.create(workspace, path.join(root, "persisted-session"));
+      const guard = new AutoContinueTools([write] as never, { sessionManager: manager });
+      const bridge = new ToolBridge(guard.wrap(), true, false, { getBranch: () => manager.getBranch() });
+      const drivers: QoderDriver[] = [];
+      const createDriver = () => {
+        const driver = new QoderDriver({ binaryPath: fake, workspacePath: workspace, privateDirectory: directory, env: privateEnv, instructions: "Use only the provided local fixture tool.", bridge, policy: { workspacePath: workspace, neverTouch: [] }, skillDirectories: [], model: selectedModel, reasoningLevel: "high", contextWindow: 128000 }, receive => {
+        driverReceive = receive;
+        return {
+          start: async () => {}, stop: async () => { driverReceive = undefined; },
+          respond: (id, result) => { child.stdin.write(JSON.stringify({ id, result }) + "\n"); },
+          request: async (method, params) => {
+            const reply = await request(method, params);
+            if (method === "turn/start") started = reply;
+            if (reply.error) throw new Error("The local fixture host rejected a request");
+            return reply.result;
+          },
+        };
+        });
+        drivers.push(driver); return driver;
+      };
+      const snapshot = vi.fn(async () => "1".repeat(40));
+      const session = new NativeCodingSession({ runtime: "qoder-cli", model: selectedModel, sessionManager: manager, continuationTools: guard, ...(recovers ? { snapshotBeforeMessage: snapshot } : {}), toolNames: [toolName], setActiveTools: names => bridge.setActive(names), createDriver, requestApproval: async () => "deny" });
+      cleanup.push(() => session.dispose());
+      const events: Frame[] = [];
+      session.subscribe(event => events.push(event as unknown as Frame));
+      await session.prompt("Exercise only the local SDK protocol fixture.", images.length ? { images } : undefined);
+      if (recovers) {
+        expect(session.interruption).toMatchObject({ kind: "turn_limit", source: "qoder", code: "qoder_max_turns" });
+        if (preflightRecovery) {
+          expect(await readFile(path.join(workspace, "fixture.txt"), "utf8")).toBe("after");
+          expect(guard.recoverySummary).toContain("not_executed");
+          expect(handoffSummary(manager.getBranch())).toContain('"state":"not_executed","reason":"edit_text_not_unique"');
+        }
+        await session.prepareContinuation(new AbortController().signal);
+        await session.resumeAfterInterruption();
+        expect(session.interruption).toBeUndefined();
+        expect(snapshot).toHaveBeenCalledOnce();
+        expect(drivers).toHaveLength(2);
+        const trustedContext = execute.mock.calls[0]?.[4] as { sessionManager?: { getBranch(): unknown[] } } | undefined;
+        expect(Object.keys(trustedContext?.sessionManager ?? {})).toEqual(["getBranch"]);
+        expect(trustedContext?.sessionManager?.getBranch().length).toBeGreaterThan(0);
+      }
+      const reopened = SessionManager.open(manager.getSessionFile()!);
+      if (recovers) {
+        expect(reopened.getBranch().filter(entry => entry.type === "message" && entry.message.role === "user")).toHaveLength(1);
+        expect(reopened.getBranch().filter(entry => entry.type === "custom" && entry.customType === "ohmygame-native-outcome").map(entry => entry.type === "custom" ? entry.data : undefined)).toEqual([
+          expect.objectContaining({ status: "failed", segment: 1, sdkNumTurns: 64, resultSubtype: "error_max_turns" }), expect.objectContaining({ status: "completed", segment: 2, sdkNumTurns: 1, resultSubtype: "success" }),
+        ]);
+        expect(await readFile(manager.getSessionFile()!, "utf8")).not.toContain("PRIVATE_TERMINAL_CANARY");
+      } else if (!invalidToolImage && !structuredFailure) {
+        expect(conversationItems(reopened.getBranch()).filter(item => item.type === "agentMessage").map(item => item.text)).toEqual(["Local SDK protocol completed."]);
+        expect(handoffSummary(reopened.getBranch())!.split("Assistant: Local SDK protocol completed.").length - 1).toBe(1);
+        expect(JSON.stringify(replayNativeMessages(reopened.getBranch().flatMap(entry => entry.type === "message" ? [entry.message] : []))).split("Local SDK protocol completed.").length - 1).toBe(1);
+      } else if (invalidToolImage) {
+        expect(reopened.getBranch().find(entry => entry.type === "message" && entry.message.role === "toolResult")).toMatchObject({ message: { content: [toolImage], isError: false } });
+      } else {
+        expect(session.interruption).toMatchObject({ kind: "turn_limit", source: "qoder", code: "qoder_max_turns" });
+        expect(reopened.getBranch().filter(entry => entry.type === "custom" && entry.customType === "ohmygame-native-outcome").at(-1)).toMatchObject({ data: { segment: 1, sdkNumTurns: 64 } });
+        expect(await readFile(manager.getSessionFile()!, "utf8")).not.toContain("PRIVATE_TERMINAL_CANARY");
+      }
+      expect(execute).toHaveBeenCalledTimes(preflightRecovery ? 2 : 1);
+      const retainedResults = reopened.getBranch().filter(entry => entry.type === "message" && entry.message.role === "toolResult");
+      expect(retainedResults).toHaveLength(preflightRecovery ? 4 : recovers ? 2 : 1);
+      if (preflightRecovery) {
+        expect(await readFile(path.join(workspace, "fixture.txt"), "utf8")).toBe("after");
+        expect(retainedResults.filter(entry => entry.type === "message" && (entry.message as { toolCallId?: string }).toolCallId === "rejected-edit")).toEqual([
+          expect.objectContaining({ message: expect.objectContaining({ isError: true, preflightFailure: { effect: "none", reason: "edit_text_not_unique", disposition: "correctable" } }) }),
+          expect.objectContaining({ message: expect.objectContaining({ isError: true, preflightFailure: { effect: "none", reason: "edit_text_not_unique", disposition: "correctable" } }) }),
+        ]);
+        expect(handoffSummary(reopened.getBranch())).toContain('"originalCallId":"corrected-edit","tool":"edit","state":"completed"');
+      }
+      expect(events.filter(event => event.type === "tool_execution_start")).toHaveLength(preflightRecovery ? 4 : recovers ? 2 : 1);
+      expect(events.filter(event => event.type === "tool_execution_end")).toHaveLength(preflightRecovery ? 4 : recovers ? 2 : 1);
+    } else {
+      started = await request("turn/start", { turnId: "sdk-wire-turn", model: selectedModel, reasoningLevel: "high", contextWindow: 128000, text: "Exercise only the local SDK protocol fixture.", images, ...(scenario.startsWith("vision-resume") ? { resume: "11111111-1111-4111-8111-111111111111", requiresImageInput: true } : {}), instructions: "Use only the provided local fixture tool.",
+        tools: [{ name: "write", description: "Controlled local fixture", inputSchema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"], additionalProperties: false } }] });
+    }
+    if (completes) {
+      expect(started, JSON.stringify(sent)).toMatchObject({ result: { sessionId: "11111111-1111-4111-8111-111111111111" } });
+      await vi.waitFor(() => expect(sent.some(message => message.method === "sdk/message" && ((message.params as Frame).message as Frame).type === "result"), JSON.stringify(sent)).toBe(true));
+      expect(toolCalls).toHaveLength(preflightRecovery ? 4 : recovers ? 2 : 1);
+      expect(toolCalls[0]!.params).toMatchObject(preflightRecovery ? { name: "edit", callId: "rejected-edit", arguments: { path: "fixture.txt", oldText: "absent", newText: "after" } } : { name: "write", callId: "runtime-call-1", arguments: { path: "fixture.txt", content: "SDK transport result" } });
+      const emitted = sent.filter(message => message.method === "sdk/message").map(message => (message.params as Frame).message as Frame);
+      const completedIndex = emitted.findIndex(message => message.type === "assistant");
+      expect(emitted[completedIndex]!.message).toMatchObject({ id: "fixture-assistant", content: [{ type: "text", text: "Local SDK protocol completed." }] });
+      expect(emitted.slice(0, completedIndex).some(message => (message.event as Frame | undefined)?.type === "content_block_start" && (message.event as Frame).index === 1)).toBe(true);
+      expect(emitted.slice(completedIndex + 1).some(message => (message.event as Frame | undefined)?.type === "content_block_stop" && (message.event as Frame).index === 1)).toBe(true);
+    } else if (structuredFailure) {
+      expect(started).toHaveProperty("result.sessionId");
+      expect(sent.find(message => message.method === "sdk/message" && ((message.params as Frame).message as Frame).type === "result")).toMatchObject({ params: { message: { subtype: "error_max_turns", num_turns: 64 } } });
+      expect(toolCalls).toHaveLength(1);
+    } else if (changesSnapshot || visual) {
+      expect(started, JSON.stringify(sent)).toMatchObject({ result: { sessionId: "11111111-1111-4111-8111-111111111111" } });
+      await vi.waitFor(() => expect(sent.some(message => message.method === "sdk/error"), JSON.stringify(sent)).toBe(true));
+      const failed = sent.find(message => message.method === "sdk/error")!;
+      expect(failed.params).toMatchObject({ code: visual ? "QODER_IMAGE_INPUT" : scenario === "changed-snapshot-tools" ? "QODER_RUNTIME_INVENTORY" : "QODER_SDK_DAEMON_PROTOCOL" });
+      if (scenario === "changed-snapshot-tools") expect(failed.params).toMatchObject({ boundary: "active-tools" });
+      expect(String((failed.params as Frame).message)).not.toMatch(/no prompt|未发送/i);
+      expect(toolCalls).toHaveLength(afterToolFailure ? 1 : 0);
+    } else {
+      expect(started, JSON.stringify(sent)).toMatchObject({ error: { code: scenario === "malformed-control" ? "QODER_SDK_DAEMON_PROTOCOL" : "QODER_INVENTORY" } });
+      if (scenario !== "malformed-control") expect(started).toMatchObject({ error: { boundary: scenario === "ignored-skills" ? "skills" : "active-tools" } });
+      if (scenario === "malformed-control") expect(started).toMatchObject({ error: { phase: "session-initialize" } });
+      expect(toolCalls).toEqual([]);
+    }
+    await request("session/close");
+    child.stdin.end();
+    await exited;
+    expect(stdout).not.toContain("PRIVATE_SDK_PROTOCOL_CANARY");
+    expect(stderr).not.toContain("PRIVATE_SDK_PROTOCOL_CANARY");
+    expect(stdout).not.toContain("PRIVATE_VISION_POLICY_CANARY");
+    expect(stderr).not.toContain("PRIVATE_VISION_POLICY_CANARY");
+    expect(stdout).not.toContain("INVALID_TOOL_IMAGE_CANARY");
+    expect(stderr).not.toContain("INVALID_TOOL_IMAGE_CANARY");
+    expect(stdout).not.toContain("PRIVATE_TERMINAL_CANARY");
+    expect(stderr).not.toContain("PRIVATE_TERMINAL_CANARY");
+    if (completes) expect(child.exitCode).toBe(0);
+    expect(child.signalCode).toBeNull();
+    const frames = (await readFile(path.join(env.QODER_CONFIG_DIR!, "fixture-frames.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line) as Frame);
+    const received = frames.filter(frame => frame.received).map(frame => frame.received as Frame);
+    expect(received.some(frame => String((frame.request as Frame | undefined)?.type).match(/account|authenticate|get_models/))).toBe(false);
+    const userFrames = received.filter(frame => frame.type === "user");
+    expect(userFrames).toHaveLength(recovers ? 2 : completes || changesSnapshot || visual || structuredFailure ? 1 : 0);
+    if (visual) {
+      expect((userFrames[0]!.message as Frame).content).toEqual([{ type: "text", text: "Exercise only the local SDK protocol fixture." }, ...images.map(image => ({ type: "image", source: { type: "base64", media_type: image.mimeType, data: image.data } }))]);
+      expect(frames.filter(frame => frame.modelRequest)).toHaveLength(completes ? 2 : afterToolFailure ? 1 : 0);
+      if (hasToolImage && !invalidToolImage) expect(frames.find(frame => frame.toolResult)).toMatchObject({ toolResult: { mcp_response: { result: { content: [toolImage] } } } });
+      if (scenario.startsWith("vision-resume")) {
+        const opened = received.find(frame => (frame.request as Frame | undefined)?.type === "daemon.open_session")!.request as Frame;
+        expect(opened.worker_args).toEqual(expect.arrayContaining(["--resume", "11111111-1111-4111-8111-111111111111"]));
+      }
+    }
+    if (scenario !== "malformed-control") {
+      const metaTools = ["mcp_list", "mcp_get", "mcp_call"];
+      const inventory = frames.find(frame => frame.inventory)!.inventory as Frame;
+      expect(inventory.registered).toEqual(expect.arrayContaining(metaTools));
+      expect(inventory.explicitDeny).toEqual(metaTools);
+      expect(inventory.active).toEqual(scenario === "ignored-meta-deny" ? ["mcp__ohmygame__write", ...metaTools] : [`mcp__ohmygame__${toolName}`]);
+    }
+    if (completes) {
+      expect(frames.filter(frame => frame.snapshot).map(frame => (frame.snapshot as Frame).stage)).toEqual(recovers ? ["initialize", "turn-start", "initialize", "turn-start"] : scenario === "snapshot-after-hook" ? ["initialize", "turn-start", "after-hook", "after-tool-result"] : ["initialize", "turn-start"]);
+      expect(sent.filter(message => message.method === "sdk/message" && ((message.params as Frame).message as Frame).subtype === "init")).toHaveLength(recovers ? 2 : 1);
+      expect(received.some(frame => (frame.request as Frame | undefined)?.subtype === "set_plan_mode")).toBe(true);
+      const opened = received.find(frame => (frame.request as Frame | undefined)?.type === "daemon.open_session")!.request as Frame;
+      expect(opened.worker_args).toEqual(expect.arrayContaining(["--model", selectedModel, "--strict-mcp-config"]));
+      const workerArgs = opened.worker_args as string[];
+      expect(workerArgs[workerArgs.indexOf("--tools") + 1]).toBe(`mcp__ohmygame__${toolName}`);
+      expect(workerArgs.flatMap((value, index) => value === "--disallowed-tools" ? [workerArgs[index + 1]] : [])).toEqual(["mcp_list", "mcp_get", "mcp_call"]);
+      expect(workerArgs[workerArgs.indexOf("--setting-sources") + 1]).toBe("");
+      expect(workerArgs[workerArgs.indexOf("--max-turns") + 1]).toBe("64");
+      expect(JSON.parse(workerArgs[workerArgs.indexOf("--settings") + 1]!)).toHaveProperty("skills.enabled", false);
+      expect(workerArgs).not.toContain("--dangerously-skip-permissions");
+      const queryInitialize = received.find(frame => (frame.request as Frame | undefined)?.type === "initialize")!.request as Frame;
+      expect(queryInitialize).toMatchObject({ sdkMcpServers: ["ohmygame"], skills: [], agents: {}, enableFileCheckpointing: false, promptSuggestions: false, independentPlanModeControls: true, permissionMode: "default" });
+      expect(frames.find(frame => frame.modelPolicy)).toMatchObject({ modelPolicy: { model: selectedModel, parameters: { reasoningEffort: "high", contextWindow: 128000 } } });
+      expect(frames.find(frame => frame.permission === "native")).toMatchObject({ response: { behavior: "deny" } });
+      expect(frames.find(frame => frame.permission === "controlled")).toMatchObject({ response: { behavior: "allow", toolUseID: preflightRecovery ? "rejected-edit" : "runtime-call-1" } });
+      if (preflightRecovery) {
+        expect(frames.filter(frame => frame.toolResult && frame.callId === "rejected-edit")).toEqual([
+          expect.objectContaining({ toolResult: { mcp_response: { jsonrpc: "2.0", id: expect.any(Number), result: { isError: true, content: [{ type: "text", text: "oldText must match exactly once" }] } } } }),
+          expect.objectContaining({ toolResult: { mcp_response: { jsonrpc: "2.0", id: expect.any(Number), result: { isError: true, content: [{ type: "text", text: "oldText must match exactly once" }] } } } }),
+        ]);
+        const continuationText = JSON.stringify((userFrames[1]!.message as Frame).content);
+        expect(continuationText).toContain("rejected-edit");
+        expect(continuationText).toContain("not_executed");
+        expect(continuationText).toContain("corrected-edit");
+      } else if (!hasToolImage) expect(frames.find(frame => frame.toolResult)).toMatchObject({ toolResult: { mcp_response: { result: { content: [{ type: "text", text: "Local controlled tool completed" }] } } } });
+      if (scenario === "snapshot-after-hook") expect(frames.find(frame => frame.replayedToolResult)).toMatchObject({ replayedToolResult: { mcp_response: { result: { content: [{ type: "text", text: "Local controlled tool completed" }] } } } });
+    }
+    const guards = (await readFile(path.join(root, "guard.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line) as Frame);
+    expect(guards).toHaveLength(1);
+    expect(guards[0]).toMatchObject({ spawned: "local-fake-cli", args: [fake, "--sdk"] });
+    try { process.kill(guards[0]!.pid as number, 0); expect.fail("The fixture daemon must exit with its SDK host"); }
+    catch (error) { expect(error).toMatchObject({ code: "ESRCH" }); }
+    await expect(access(path.join(env.QODER_CONFIG_DIR!, ".auth", "user"))).rejects.toMatchObject({ code: "ENOENT" });
+  }, 15000);
 });

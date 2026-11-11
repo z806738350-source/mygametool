@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   clampVideoTrim,
   isWholeVideo,
   MIN_TRIM_SECONDS,
   trimmedVideoType,
+  videoFilmstrip,
 } from "../src/renderer/video-trim.js";
 import { formatTime } from "../src/renderer/video-trimmer.js";
 
@@ -60,5 +61,26 @@ describe("video trimming", () => {
     expect(formatTime(59.97)).toBe("1:00.0");
     expect(formatTime(64.2)).toBe("1:04.2");
     expect(formatTime(-1)).toBe("0:00.0");
+  });
+
+  it("disposes an in-progress filmstrip when cancelled", async () => {
+    let rejectRead: ((error: Error) => void) | undefined;
+    const dispose = vi.fn(() => rejectRead?.(new Error("input disposed")));
+    vi.doMock("mediabunny", () => ({
+      ALL_FORMATS: [], BlobSource: class {}, CanvasSink: class {},
+      Input: class {
+        getPrimaryVideoTrack() { return new Promise((_resolve, reject) => { rejectRead = reject; }); }
+        dispose() { dispose(); }
+      },
+    }));
+    try {
+      const controller = new AbortController();
+      const pending = videoFilmstrip(new Blob(["fixture"]), 3, 44, controller.signal);
+      const rejected = expect(pending).rejects.toMatchObject({ name: "AbortError" });
+      await vi.waitFor(() => expect(rejectRead).toBeDefined());
+      controller.abort();
+      await rejected;
+      expect(dispose).toHaveBeenCalledOnce();
+    } finally { vi.doUnmock("mediabunny"); }
   });
 });

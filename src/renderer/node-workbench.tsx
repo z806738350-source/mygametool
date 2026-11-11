@@ -93,7 +93,7 @@ export function WorkbenchPreview({ ariaLabel, viewport, stageClassName, overlay,
   </section>;
 }
 
-export function LibraryAssetPicker({ title, assets, projectId, project, uploading, includeReferences = false, onUpload, onClose, onSelect }: {
+export function LibraryAssetPicker({ title, assets, projectId, project, uploading, includeReferences = false, onReload, onUpload, onClose, onSelect }: {
   title: string;
   assets: readonly LibraryAsset[];
   /** Limits the initial view to assets associated with the current project. */
@@ -104,15 +104,35 @@ export function LibraryAssetPicker({ title, assets, projectId, project, uploadin
   onUpload?: () => void;
   uploading?: boolean;
   includeReferences?: boolean;
+  onReload?: () => Promise<void>;
   onClose: () => void;
   onSelect: (asset: LibraryAsset) => void;
 }) {
   const [query, setQuery] = useState("");
   const [filters, setFilters] = useState<LibraryAssetFilters>({ includeReferences, ...(projectId ? { projectId } : {}) });
+  const [loading, setLoading] = useState(Boolean(onReload));
+  const [loadError, setLoadError] = useState<string>();
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const onReloadRef = useRef(onReload);
+  onReloadRef.current = onReload;
   const dialog = useRef<HTMLElement>(null);
   // Parents may pass a fresh onClose each render; depending on it would re-run this effect and steal focus from search.
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
+
+  useEffect(() => {
+    const reload = onReloadRef.current;
+    if (!reload) return;
+    let disposed = false;
+    setLoading(true);
+    setLoadError(undefined);
+    void Promise.resolve().then(reload).then(() => {
+      if (!disposed) setLoading(false);
+    }, (cause) => {
+      if (!disposed) { setLoading(false); setLoadError(cause instanceof Error ? cause.message : String(cause)); }
+    });
+    return () => { disposed = true; };
+  }, [loadAttempt]);
 
   useEffect(() => {
     dialog.current?.focus();
@@ -128,15 +148,17 @@ export function LibraryAssetPicker({ title, assets, projectId, project, uploadin
       <section className="story-video-picker" ref={dialog} role="dialog" aria-modal="true" aria-labelledby="story-video-picker-title" tabIndex={-1}>
         <header>
           <h2 id="story-video-picker-title">{title}</h2>
-          {onUpload ? <button type="button" className="story-video-picker-upload" disabled={uploading} onClick={onUpload}>{uploading ? <LoaderCircle className="spin" size={14} /> : <Upload size={14} />}<span>{t("assetCanvas.upload")}</span></button> : null}
+          {onUpload ? <button type="button" className="story-video-picker-upload" disabled={uploading || loading} onClick={onUpload}>{uploading ? <LoaderCircle className="spin" size={14} /> : <Upload size={14} />}<span>{t("assetCanvas.upload")}</span></button> : null}
           <button type="button" aria-label={t("nodeWorkbench.closePicker")} onClick={onClose}><X size={16} /></button>
         </header>
         <div className="library-picker-toolbar"><label><Search size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("nodeWorkbench.searchLibrary")} /></label>
           <LibraryCollectionFilters assets={assets} filters={filters} onChange={setFilters} defaultIncludeReferences={includeReferences} defaultProjectId={projectId} defaultProject={project} />
         </div>
         <div className="story-video-picker-list">
-          {visibleAssets.length === 0 ? <p>{assets.length ? t("nodeWorkbench.noMatch") : t("nodeWorkbench.empty")}</p> : null}
-          {visibleAssets.map((asset) => <LibraryPickerItem key={asset.id} asset={asset} onSelect={() => onSelect(asset)} />)}
+          {loading ? <p role="status"><LoaderCircle className="spin" size={14} />{t("library.loading")}</p> : loadError !== undefined ? <p role="alert">{loadError}<button type="button" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>{t("common.retry")}</button></p> : <>
+            {visibleAssets.length === 0 ? <p>{assets.length ? t("nodeWorkbench.noMatch") : t("nodeWorkbench.empty")}</p> : null}
+            {visibleAssets.map((asset) => <LibraryPickerItem key={asset.id} asset={asset} onSelect={() => onSelect(asset)} />)}
+          </>}
         </div>
       </section>
     </div>,

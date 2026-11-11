@@ -9,11 +9,27 @@ import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import { describe, expect, it } from "vitest";
 import { assistantMessageError } from "../src/daemon/agent-errors.js";
+import { guardedProviderFetch } from "../src/daemon/provider-network.js";
 
 const model = Object.values(DEEPSEEK_MODELS)[0];
 const context = normalizeContext({ messages: [{ role: "user", content: [{ type: "text", text: "probe" }], timestamp: 1 }] });
 
 describe("patched Pi provider failures", () => {
+  it.each(["anthropic-messages", "openai-responses", "openai-completions"] as const)("preserves sanitized HTTP diagnostics through the real %s adapter", async (api) => {
+    let calls = 0;
+    const transport = guardedProviderFetch(async () => {
+      calls++;
+      return Response.json({ error: { type: "api_error", message: "private prompt and response" } }, { status: 500, headers: { "x-request-id": "req_guarded_failure" } });
+    });
+    const current = { ...model, compat: undefined, provider: "kunpo", baseUrl: api === "anthropic-messages" ? "https://llm.ziy.cc" : "https://llm.ziy.cc/v1" };
+    const options = { apiKey: "test-only", maxRetries: 0, fetch: transport };
+    const stream = api === "anthropic-messages" ? anthropic({ ...current, api }, context, options)
+      : api === "openai-responses" ? responses({ ...current, api }, context, options) : completions({ ...current, api }, context, options);
+    const message = await stream.result();
+    expect(assistantMessageError(message)).toMatchObject({ code: "provider_unavailable", diagnostics: { statusCode: 500, requestId: "req_guarded_failure", errorCode: "api_error" } });
+    expect(JSON.stringify(message)).not.toContain("private prompt");
+    expect(calls).toBe(1);
+  });
   it.each([
     [401, "invalid_api_key"], [400, "invalid_request_error"], [429, "insufficient_quota"],
   ])("does not retry an authoritative WebSocket rejection %s even if its wording suggests retry", async (status, code) => {
@@ -64,7 +80,7 @@ describe("patched Pi provider failures", () => {
   it("captures stream failures after a successful HTTP response", async () => {
     const message = await completions(model, context, { apiKey: "test-only", fetch: async () => new Response("data: [DONE]\n\n", { headers: { "content-type": "text/event-stream", "x-request-id": "req-stream" } }) }).result();
     expect(message.errorMessage).toBe("Stream ended without finish_reason");
-    expect(assistantMessageError(message)).toMatchObject({ code: "stream_error", diagnostics: { statusCode: 200, requestId: "req-stream" } });
+    expect(assistantMessageError(message)).toMatchObject({ code: "sse_connection_interrupted", diagnostics: { statusCode: 200, requestId: "req-stream" } });
   });
 
   it("also preserves connection causes in the Responses adapter", async () => {

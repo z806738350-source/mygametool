@@ -10,7 +10,8 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ensureProjectDependencies } from "../src/daemon/project-dependencies.js";
+import { ensureProjectDependencies as ensureDependencies } from "../src/daemon/project-dependencies.js";
+import type { IsolatedProjectExecution } from "../src/daemon/isolated-project-execution.js";
 import { projectProcessEnvironment } from "../src/daemon/project-process.js";
 
 const directories: string[] = [];
@@ -50,7 +51,26 @@ async function installed(directory: string) {
   );
 }
 
-describe("project dependencies", () => {
+// These callbacks only create fixture files; real npm execution is tested in the dedicated VM.
+const ensureProjectDependencies: typeof ensureDependencies = (...args) => {
+  args[5] = {} as IsolatedProjectExecution;
+  return ensureDependencies(...args);
+};
+
+describe("project dependencies with an isolated executor", () => {
+  it("prepares dependencies in the guest even when a foreign host installation exists, preserving it across failure and reinstall", async () => {
+    const directory = await workspace();
+    await installed(directory);
+    const original = path.join(directory, "node_modules/host-only");
+    await writeFile(original, "native host dependency");
+    const execution = { dependenciesInGuest: true } as IsolatedProjectExecution;
+    const run = vi.fn().mockRejectedValueOnce(new Error("guest install failed")).mockResolvedValue(undefined);
+    await expect(ensureDependencies(directory, "npm", run, false, undefined, execution)).rejects.toThrow("guest install failed");
+    await ensureDependencies(directory, "npm", run, true, undefined, execution);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(await readFile(original, "utf8")).toBe("native host dependency");
+    await expect(access(path.join(directory, "node_modules/.ohmygame-dependencies.json"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
   it.skipIf(process.platform === "win32")(
     "ignores unreadable folders outside declared workspaces, including excluded packages",
     async () => {
@@ -281,12 +301,11 @@ describe("project process environment", () => {
     };
     expect(projectProcessEnvironment(environment)).toEqual({
       PATH: "/runtime/bin",
-      HTTPS_PROXY: "http://localhost:8080",
     });
     expect(environment.ESBUILD_BINARY_PATH).toBe("/app/esbuild");
   });
 
-  it("removes the daemon's own settings and keeps everything else", () => {
+  it("keeps only the minimal project execution environment", () => {
     const environment = {
       OHMYGAME_DAEMON_TOKEN: "secret",
       OHMYGAME_DATA_DIR: "/data",
@@ -300,7 +319,7 @@ describe("project process environment", () => {
       HOME: "/home/player",
       MY_OHMYGAME_LEVEL: "3",
     };
-    expect(projectProcessEnvironment(environment)).toEqual({ PATH: "/runtime/bin", HOME: "/home/player", MY_OHMYGAME_LEVEL: "3" });
+    expect(projectProcessEnvironment(environment)).toEqual({ PATH: "/runtime/bin" });
     expect(environment.OHMYGAME_DAEMON_TOKEN).toBe("secret");
   });
 });

@@ -32,20 +32,22 @@ async function fixture() {
   directories.push(directory);
   const auth = { configured: false };
   const model = {
-    provider: "test",
-    id: "test-model",
+    provider: "kunpo",
+    id: "gpt-5.6-sol",
     name: "Test model",
     reasoning: false,
   };
   const runtime = {
     getProviders: () => [
       {
-        id: "test",
+        id: "kunpo",
         name: "Test",
         auth: { apiKey: { name: "API key", login: vi.fn() } },
       },
     ],
     getProviderAuthStatus: () => auth,
+    hasConfiguredAuth: (provider: string) => provider === "kunpo" && auth.configured,
+    getAuth: async () => auth.configured ? { auth: { apiKey: "sk-onboarding-fake-fixture-key-only" } } : undefined,
     listCredentials: async () => [],
     getAvailable: async () => (auth.configured ? [model] : []),
   } as unknown as ModelRuntime;
@@ -189,12 +191,12 @@ describe("onboarding API", () => {
     expect((await complete(create())).statusCode).toBe(409);
     auth.configured = true;
     const preferences = new ProviderModelSettingsStore(directory, directory);
-    await preferences.setEnabled("test", false);
+    await preferences.setEnabled("kunpo", false);
     expect((await complete(create())).statusCode).toBe(409);
-    await preferences.setEnabled("test", true);
-    await preferences.setVisibility("test", [model.id], false);
+    await preferences.setEnabled("kunpo", true);
+    await preferences.setVisibility("kunpo", [model.id], false);
     expect((await complete(create())).statusCode).toBe(409);
-    await preferences.setVisibility("test", [model.id], true);
+    await preferences.setVisibility("kunpo", [model.id], true);
     expect((await complete(create())).json().status).toBe("completed");
   });
 

@@ -41,6 +41,10 @@ initial window. First-run setup shares this window with the home screen, so
 finishing setup does not resize it. Playtest and capture windows keep their
 explicit content dimensions.
 
+On macOS, the main window keeps its sidebar controls inset and uses an opaque
+themed background to reduce continuous desktop backdrop composition by
+WindowServer. Game previews retain hardware-accelerated rendering.
+
 Bun 1.4.2 installs dependencies and executes builds, tests, and most preparation
 scripts. Pinned Plugin archives are prepared with Node and store their entries
 uncompressed, so their locked ZIP checksums do not depend on the zlib build;
@@ -134,9 +138,9 @@ indicators.
 Settings → Providers and the setup list share one grouping. Every working
 connection, including free cloud and local services, is under **Connected
 providers**. Unconnected providers follow as **Free cloud**, **Popular
-providers** (OpenAI, Anthropic, OpenRouter, Google, DeepSeek, Meshy, Tripo,
+providers** (OpenAI, Anthropic, OpenRouter, Google, DeepSeek, Tripo,
 filtered by capability), **Local providers**, and the collapsed **More
-providers**.
+providers**. Meshy is disabled in this local edition; historical references do not enable it.
 
 The connection step lists language providers only. Without a search, connected and
 popular providers come first, and the rest, including local services, stay
@@ -330,26 +334,56 @@ The desktop runtime exposes game interaction and verification as the Pi custom
 tool `game_use`. This is an OhMyGame core capability rather than a Plugin:
 
 1. The current Web adapter starts or reuses the project's local Preview and
-   accepts only a path, query, or hash on that Preview origin.
+   accepts only a path, query, or hash on that Preview origin. On opening an
+   isolated script preview, it compares the current project inputs with the
+   copy already running and starts a fresh copy if source files or media changed.
 2. A private child-process IPC channel forwards typed requests from the daemon
    to Electron main. It is not part of the renderer API.
 3. Electron main owns hidden, per-playtest `BrowserWindow` sessions using the
    bundled Chromium runtime.
-4. The custom tool returns bounded DOM, canvas, console, failed-request, and
+4. The custom tool returns bounded DOM, canvas, media playback, console, failed-request, and
    optional game-state data. Captures are scaled from device pixels to the
    page's CSS pixels, keeping their aspect ratio so image pixels match input
    coordinates, and returned to the model as JPEG image content. Every later
    request resends them, so they stay small.
+
+Web snapshots include up to 16 audio and video elements from the page and its
+frames. Each entry reports its source path, readiness, playback time, duration,
+paused/ended state and media error code. Videos also report total frames.
+Compare snapshots after the game's playback trigger to check whether playback
+advances. The separate failed-request log can include an aborted preload even
+while the video plays.
 
 The tool supports `open`, `inspect`, `act`, `capture`, and `close`. Runtime
 adapters receive a typed open target; the Web adapter uses a Preview URL while
 other adapters can use their project or process identity. Actions
 cover semantic or coordinate clicks, text input, instant or held key presses,
 touch, bounded waits, viewport resizing, and the optional game bridge below.
-Calls are sequential, abort with the Agent turn, and time out after 30 seconds.
+Single letter and digit key presses include their physical `KeyW`/`Digit2`
+codes, so games that read `KeyboardEvent.code` receive normal movement inputs.
+For Web display tests, `viewport.deviceScaleFactor` accepts 1 through 2 on
+`open` or a `resize` action. Keep the same session and CSS width and height
+to switch between 1× and 2× without reloading the game. Omit the ratio to use
+the native display on open or keep the current ratio on resize. Snapshots report
+the page's actual pixel ratio alongside the viewport dimensions.
+An `open` call can include the same ordered actions as `act`. It waits for the
+initial page snapshot, applies the batch once to that session, and returns the
+updated snapshot. If an action fails, inspect the reported session before
+continuing, since earlier inputs may already have changed the game.
+Tool requests are sequential, abort with the Agent turn, and time out after 30 seconds each.
 Sessions are destroyed when explicitly closed, when the daemon or Electron app
-shuts down, or after an open failure. At most four sessions may remain open at
-once, which bounds hidden-window resource use if an Agent misses cleanup.
+shuts down, after an open failure, at the end of their Agent turn, or after ten
+minutes without a request. At most four sessions may remain open at once.
+
+Hidden Agent sessions freeze their page between requests, preserving the loaded
+document and its in-memory state. A tool request resumes that session for input,
+animation, media playback checks or capture, then freezes it again even after
+failure or cancellation. Use an `act` wait to measure elapsed gameplay; time
+between separate model requests does not advance animation or timers. Wall clocks
+still advance, as with a background browser tab, so games should clamp the first
+frame's elapsed time after resuming. Overlapping driver requests keep the
+session active until the last request finishes. Hidden sessions are muted,
+including while tools run; media snapshots still report playback state.
 
 The Preview toolbar can reveal the same isolated windows in a watch mode. These
 are independent, movable, resizable native windows with the normal macOS title
@@ -358,7 +392,11 @@ they accept normal window interaction after the user clicks them. They do not
 stay above unrelated applications. This does not reuse the user Preview or
 mirror screenshots: the user sees the exact Chromium surface receiving Agent
 input. Closing the watch surface hides it without terminating the playtest
-session.
+session. A visible watch window runs normally and can be heard. Hiding or
+minimizing it freezes idle gameplay and mutes it; revealing it resumes the same
+document without stealing focus. Normal Chromium occlusion throttling remains
+enabled while watching. Human Preview and Play also mute and throttle when
+hidden or minimized; switching between them preserves the same game document.
 
 Playtest windows use an isolated partition with sandboxing, context isolation,
 and Node integration disabled. Main-frame navigation stays on the original

@@ -1,7 +1,9 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { useWorkspaceAssetUrl } from "./use-workspace-asset-url.js";
 import { submitCanvasPrompt } from "./canvas-text-composer.js";
 import { t } from "./i18n.js";
+import { useNearViewport } from "./asset-gallery.js";
+import { releaseImage } from "./release-media.js";
 
 export interface VideoMentionOption {
   alias: string;
@@ -87,6 +89,9 @@ export function VideoReferencePrompt({ value, disabled, options, onChange, onSub
 }
 
 function MentionThumbnail({ assetId }: { assetId?: string }) {
-  const preview = useWorkspaceAssetUrl(undefined, "", 0, assetId);
-  return preview.url ? <img src={preview.url} alt="" /> : <span className="video-mention-placeholder" />;
+  const [element, visible] = useNearViewport<HTMLSpanElement>(true);
+  const preview = useWorkspaceAssetUrl(undefined, "", 0, visible ? assetId : undefined);
+  const image = useRef<HTMLImageElement>(null);
+  useLayoutEffect(() => { const current = image.current; return () => releaseImage(current, preview.url); }, [preview.url]);
+  return <span className="video-mention-thumbnail" ref={element}>{preview.url ? <img ref={image} src={preview.url} alt="" /> : <span className="video-mention-placeholder" />}</span>;
 }

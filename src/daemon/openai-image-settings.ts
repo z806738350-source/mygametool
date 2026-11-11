@@ -1,3 +1,4 @@
+import { registerSensitiveValue } from "../shared/sensitive-values.js";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -11,7 +12,7 @@ import { normalizeEndpoint } from "../shared/custom-models.js";
 import { imageModelDefinition } from "./image-models.js";
 import type { ImageSource } from "./image-adapters.js";
 
-export const OPENAI_IMAGE_BASE_URL = "https://api.openai.com/v1";
+export const OPENAI_IMAGE_BASE_URL = "https://llm.ziy.cc/v1";
 
 interface StoredSettings {
   version: 1;
@@ -68,6 +69,7 @@ export class OpenAIImageSettingsStore {
       throw new Error(
         "Image API key must contain only printable ASCII characters",
       );
+    registerSensitiveValue(key);
     return { baseUrl: endpoint, apiKey: key };
   }
 
@@ -127,6 +129,7 @@ export class OpenAIImageSettingsStore {
     const models = input.models.map(normalizeOpenAIImageModel);
     if (new Set(models.map((model) => model.id)).size !== models.length)
       throw new Error("Image model IDs must be unique");
+    registerSensitiveValue(apiKey);
     return {
       version: 1,
       mode: input.mode,

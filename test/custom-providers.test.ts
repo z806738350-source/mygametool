@@ -19,8 +19,10 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
+// Explicit loopback transport mocks preserve custom-provider support without reopening arbitrary remote destinations.
+const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==", "base64");
 const firstModel = { id: "local-model", name: "Local model", api: "openai-completions", contextWindow: 32_000, maxTokens: 4_000, reasoning: false, supportsImages: false };
-const gateway = { name: "My gateway", baseUrl: "https://gateway.example/v1", api: "openai-completions", authentication: "api_key" as const, apiKey: "test-secret-key", models: [firstModel] };
+const gateway = { name: "My gateway", baseUrl: "http://127.0.0.1:43199/v1", api: "openai-completions", authentication: "api_key" as const, apiKey: "test-secret-key", models: [firstModel] };
 
 async function fixture(prompt = vi.fn(async () => {}), modelDiscoveryFetch?: typeof fetch, imageFetch?: typeof fetch) {
   const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-custom-providers-"));
@@ -81,7 +83,7 @@ describe("custom providers", () => {
     expect(results.map((result) => result.statusCode).sort()).toEqual([201, 400]);
     const store = new ProviderModelSettingsStore(directory, directory);
     await store.load();
-    expect(await store.customProviderCatalog()).toHaveLength(1);
+    expect((await store.customProviderCatalog()).filter((provider) => provider.id !== "kunpo")).toHaveLength(1);
   });
 
   it("keeps existing duplicate names editable until the user chooses distinct names", async () => {
@@ -93,9 +95,9 @@ describe("custom providers", () => {
     await writeFile(path.join(directory, "model-visibility.json"), JSON.stringify({ version: 1, hidden: {}, customProviders: Object.fromEntries(ids.map((id) => [id, { authentication: "api_key" }])) }));
     await runtime.refresh({ allowNetwork: false });
     for (const id of ids) await runtime.setRuntimeApiKey(id, gateway.apiKey);
-    const update = await app.inject({ method: "PUT", url: `/settings/models/providers/${ids[1]}/custom`, payload: { ...gateway, apiKey: undefined, baseUrl: "https://new-gateway.example/v1" } });
+    const update = await app.inject({ method: "PUT", url: `/settings/models/providers/${ids[1]}/custom`, payload: { ...gateway, apiKey: undefined, baseUrl: "http://127.0.0.1:43200/v1" } });
     expect(update.statusCode, update.body).toBe(200);
-    expect(update.json()).toMatchObject({ name: gateway.name, baseUrl: "https://new-gateway.example/v1" });
+    expect(update.json()).toMatchObject({ name: gateway.name, baseUrl: "http://127.0.0.1:43200/v1" });
     const rename = await app.inject({ method: "PUT", url: `/settings/models/providers/${ids[1]}/custom`, payload: { ...gateway, apiKey: undefined, name: "Distinct gateway" } });
     expect(rename.statusCode, rename.body).toBe(200);
     const names = await Promise.all(ids.map(async (id) => (await app.inject({ method: "GET", url: `/settings/models/providers/${id}/custom` })).json().name));
@@ -196,7 +198,7 @@ describe("custom providers", () => {
     const changed = invalidateCustomModelCapabilities(discovered as CustomProviderModel);
     const custom = { ...changed, thinkingLevelMap: initialCustomThinkingLevelMap(changed) };
     expect(modelError(custom)).toBeUndefined();
-    const saved = await app.inject({ method: "PUT", url: `/settings/models/providers/${id}/custom`, payload: { ...gateway, apiKey: undefined, baseUrl: "https://other-gateway.example/v1", models: [custom] } });
+    const saved = await app.inject({ method: "PUT", url: `/settings/models/providers/${id}/custom`, payload: { ...gateway, apiKey: undefined, baseUrl: "http://127.0.0.1:43201/v1", models: [custom] } });
     expect(saved.statusCode, saved.body).toBe(200);
     const catalog = (await app.inject({ method: "GET", url: "/models" })).json();
     expect(catalog.models).toContainEqual(expect.objectContaining({ provider: id, id: custom.id, reasoningLevels: ["low", "medium", "high", "xhigh", "max"] }));
@@ -294,7 +296,7 @@ describe("custom providers", () => {
     expect(await readFile(path.join(directory, "models.json"), "utf8")).not.toContain("thinkingLevelMap");
     expect((await restored.inject({ method: "GET", url: "/models" })).json().models).toContainEqual(expect.objectContaining({ provider: id, reasoningLevels: ["low", "high", "max"] }));
     expect(runtime.getModel(id, manual.id)?.thinkingLevelMap).toBeUndefined();
-    const changedEndpoint = await restored.inject({ method: "PUT", url, payload: { ...gateway, apiKey: undefined, models: undefined, baseUrl: "https://other-gateway.example/v1" } });
+    const changedEndpoint = await restored.inject({ method: "PUT", url, payload: { ...gateway, apiKey: undefined, models: undefined, baseUrl: "http://127.0.0.1:43201/v1" } });
     expect(changedEndpoint.statusCode, changedEndpoint.body).toBe(200);
     expect(changedEndpoint.json().models[0].reasoningCapabilities).toMatchObject({ source: "catalog", thinkingLevelMap: { xhigh: "xhigh", max: "max" } });
   });
@@ -303,7 +305,7 @@ describe("custom providers", () => {
     const request = vi.fn<typeof fetch>(async (input) => String(input) === `${gateway.baseUrl}/models`
       ? Response.json({ data: [{ id: "gpt-image-1" }, { id: "gpt-image-2.5-flare" }, { id: "gpt-5.4" }] })
       : String(input).startsWith(`${gateway.baseUrl}/images/`)
-        ? Response.json({ data: [{ b64_json: Buffer.from("relay image").toString("base64") }] })
+        ? Response.json({ data: [{ b64_json: png.toString("base64") }] })
         : Response.json({ data: [] }));
     const { directory, runtime, app, create } = await fixture(undefined, undefined, request);
     const { id } = await create();
@@ -343,21 +345,22 @@ describe("custom providers", () => {
     const request = vi.fn<typeof fetch>(async (input) => String(input) === `${gateway.baseUrl}/models`
       ? Response.json({ data: [{ id: "gpt-image-2.5-flare" }] })
       : String(input).endsWith("/images/edits")
-        ? Response.json({ data: [{ b64_json: Buffer.from("cover").toString("base64") }] })
+        ? Response.json({ data: [{ b64_json: png.toString("base64") }] })
         : Response.json({ data: [] }));
     const { runtime, app, create } = await fixture();
     const { id } = await create();
     const store = new ProviderModelSettingsStore(directories.at(-1)!, directories.at(-1)!);
     await store.load();
     const images = new ProviderImages(async () => runtime, request, undefined, (provider) => store.isEnabled(provider), { customProviders: () => store.customProviderCatalog() });
-    const input = { prompt: "Cover", imageModel: { provider: id, id: "gpt-image-2.5-flare" }, resolution: "2K" as const, aspectRatio: "16:9" as const, images: [{ mediaType: "image/png" as const, data: Buffer.from("reference").toString("base64") }] };
-    await expect(images.generate(input)).resolves.toMatchObject({ bytes: Buffer.from("cover") });
+    const input = { prompt: "Cover", imageModel: { provider: id, id: "gpt-image-2.5-flare" }, resolution: "2K" as const, aspectRatio: "16:9" as const, images: [{ mediaType: "image/png" as const, data: png.toString("base64") }] };
+    await expect(images.generate(input)).resolves.toMatchObject({ bytes: png });
     const generated = request.mock.calls.find(([url]) => String(url).endsWith("/images/edits"));
     expect(generated?.[0]).toBe(`${gateway.baseUrl}/images/edits`);
     const form = generated?.[1]?.body as FormData;
     expect(form.get("model")).toBe("gpt-image-2.5-flare");
     expect(form.get("size")).toBe("2048x1152");
-    expect(form.getAll("image[]")).toHaveLength(1);
+    expect(form.getAll("image")).toHaveLength(1);
+    expect(Buffer.from(await (form.get("image") as File).arrayBuffer())).toEqual(png);
     await expect(images.generate({ ...input, imageModel: { provider: "openai", id: input.imageModel.id } })).rejects.toThrow("selected image model is unavailable");
     await store.setEnabled(id, false);
     request.mockClear();
@@ -458,7 +461,7 @@ describe("custom providers", () => {
   it("preserves identity, models and key when editing; protects builtins and deletes custom settings", async () => {
     const { runtime, app, create } = await fixture();
     const { id } = await create();
-    const changed = { name: "Renamed gateway", api: "openai-responses", baseUrl: "https://new.example/v1", authentication: "api_key" };
+    const changed = { name: "Renamed gateway", api: "openai-responses", baseUrl: "http://127.0.0.1:43202/v1", authentication: "api_key" };
     const update = await app.inject({ method: "PUT", url: `/settings/models/providers/${id}/custom`, payload: changed });
     expect(update.statusCode, update.body).toBe(200);
     expect(update.json()).toEqual({ id, ...changed, models: [{ ...firstModel, api: changed.api }], hiddenModelIds: [] });
@@ -539,6 +542,9 @@ describe("custom providers", () => {
     const invalid = { ...gateway, baseUrl: "https://user:secret@example.com/v1" };
     const app = apps.at(-1)!;
     expect((await app.inject({ method: "POST", url: "/settings/models/providers/custom", payload: invalid })).statusCode).toBe(400);
+    for (const baseUrl of ["https://gateway.example/v1", "https://api.openai.com/v1", "https://api.ohmygame.ai/v1"]) {
+      expect((await app.inject({ method: "POST", url: "/settings/models/providers/custom", payload: { ...gateway, name: "Blocked remote", baseUrl } })).statusCode).toBe(400);
+    }
   });
 
   it("lets an in-flight request finish while refusing subsequent prompts", async () => {
@@ -570,7 +576,7 @@ describe("custom providers", () => {
     await expect(videos.generate({ prompt: "Video", model: { provider: "openrouter", id: "video" } })).rejects.toThrow("disabled");
     await expect(images.generate({ prompt: "Image", imageModel: { provider: "volcengine-ark", id: "seedream" } })).rejects.toThrow("disabled");
     await expect(videos.generate({ prompt: "Video", model: { provider: "byteplus-modelark", id: "seedance" } })).rejects.toThrow("disabled");
-    const meshy = new MeshyProvider(() => "test-key", request, undefined, () => false);
+    const meshy = new MeshyProvider(() => "test-key", request, undefined, () => false, { baseUrl: "http://127.0.0.1:43199/v1" });
     await expect(meshy.animations()).rejects.toThrow("disabled");
     expect(request).not.toHaveBeenCalled();
   });

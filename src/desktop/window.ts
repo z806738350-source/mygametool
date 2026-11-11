@@ -23,7 +23,10 @@ interface CreateWindowOptions {
   rendererUrl?: string;
   rendererFile?: string;
   rendererHash?: string;
-  sidebarVibrancy?: boolean;
+  /** Only the main editor installs native authenticated media requests. */
+  nativeMedia?: boolean;
+  /** Insets macOS window controls to align with the sidebar. */
+  sidebarInset?: boolean;
   /** Hosts the application menu in a single custom Windows title bar. */
   integratedMenuBar?: boolean;
   contentSize?: { width: number; height: number };
@@ -80,12 +83,8 @@ export async function createDesktopWindow(options: CreateWindowOptions): Promise
   const platformWindowOptions = process.platform === "darwin" && !options.nativeTitleBar
     ? {
         titleBarStyle: "hiddenInset" as const,
-        ...(options.sidebarVibrancy ? {
+        ...(options.sidebarInset ? {
           trafficLightPosition: { x: 24, y: 18 },
-          backgroundColor: "#00000000",
-          transparent: true,
-          vibrancy: "sidebar" as const,
-          visualEffectState: "active" as const,
         } : {}),
       }
     : process.platform === "win32" && options.integratedMenuBar
@@ -113,6 +112,13 @@ export async function createDesktopWindow(options: CreateWindowOptions): Promise
       ...(options.hidden ? { backgroundThrottling: false } : {}),
     },
   });
+  if (process.platform === "darwin" && options.sidebarInset && !options.nativeTitleBar) {
+    const updateBackground = () => {
+      if (!window.isDestroyed()) window.setBackgroundColor(nativeTheme.shouldUseDarkColors ? "#171717" : "#ffffff");
+    };
+    nativeTheme.on("updated", updateBackground);
+    window.once("closed", () => nativeTheme.off("updated", updateBackground));
+  }
   if (options.aspectRatio) window.setAspectRatio(options.aspectRatio);
   // The preload asks for the daemon address and token instead of reading them
   // from its command line, which other processes of the same user can read.
@@ -121,7 +127,7 @@ export async function createDesktopWindow(options: CreateWindowOptions): Promise
   window.webContents.ipc.on("ohmygame:desktop-runtime", (event) => {
     const frame = event.senderFrame;
     event.returnValue = frame && frame === window.webContents.mainFrame && isRendererPage(frame.url, rendererTarget)
-      ? { url: options.runtime.url, token: options.runtime.token }
+      ? { url: options.runtime.url, token: options.runtime.token, nativeMedia: options.nativeMedia === true }
       : null;
   });
 
@@ -143,7 +149,7 @@ export async function createDesktopWindow(options: CreateWindowOptions): Promise
   return window;
 }
 
-function isRendererPage(value: string, rendererTarget: string): boolean {
+export function isRendererPage(value: string, rendererTarget: string): boolean {
   try {
     const url = new URL(value);
     url.hash = "";

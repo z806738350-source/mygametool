@@ -1,5 +1,7 @@
 import { previewPagePath, previewPageUrl } from "../shared/preview-page.js";
-import { BrowserWindow, WebContentsView, shell, type BaseWindow } from "electron";
+import { BrowserWindow, WebContentsView, type BaseWindow } from "electron";
+import { randomUUID } from "node:crypto";
+import { restrictLocalGameNetwork } from "./game-network.js";
 import type { WebGamePlayerRequest, WebGamePlayerState, WebGamePreviewLayout } from "../shared/web-game-player.js";
 import { webGamePlayerUrl } from "../shared/web-game-player.js";
 
@@ -108,6 +110,8 @@ export class WebGamePlayerWindows {
         });
         game.window = window;
         window.on("resize", () => this.#place(game));
+        window.on("show", () => this.#place(game));
+        window.on("hide", () => this.#place(game));
         window.on("minimize", () => this.#place(game));
         window.on("restore", () => this.#place(game));
         // Detach before the native window closes; its game survives in Preview.
@@ -187,14 +191,19 @@ export class WebGamePlayerWindows {
         game.origin = new URL(url).origin;
         game.client = new URL(url).searchParams.get("__ohmygame_client")!;
         game.title = target.title;
-        const view = new WebContentsView({ webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } });
+        const view = new WebContentsView({ webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, partition: `ohmygame-player-${randomUUID()}` } });
         game.view = view;
         view.setBackgroundColor("#000000");
         const contents = view.webContents;
-        contents.setWindowOpenHandler(({ url: destination }) => {
-          if (/^https?:\/\//.test(destination)) void shell.openExternal(destination);
-          return { action: "deny" };
+        restrictLocalGameNetwork(contents, () => game.origin, this.hostUrl);
+        contents.setWindowOpenHandler(() => ({ action: "deny" }));
+        contents.session.setPermissionCheckHandler((_source, permission, requestingOrigin) => permission === "pointerLock" && requestingOrigin === game.origin);
+        contents.session.setPermissionRequestHandler((_source, permission, callback, details) => {
+          let sameOrigin = false;
+          try { sameOrigin = new URL(details.requestingUrl).origin === game.origin; } catch { /* Invalid request. */ }
+          callback(sameOrigin && (permission === "pointerLock" || permission === "keyboardLock"));
         });
+        contents.session.on("will-download", (event) => event.preventDefault());
         contents.on("will-frame-navigate", (event) => {
           if (event.isMainFrame || new URL(event.url).origin !== game.origin) event.preventDefault();
         });

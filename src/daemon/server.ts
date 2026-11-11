@@ -1,28 +1,39 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { takeAccessToken } from "./access-token.js";
+import { IsolatedProjectExecution } from "./isolated-project-execution.js";
 import { createApp } from "./app.js";
 import { ensureOhMyGamePiEnvironment } from "./pi-agent.js";
 import { activateNetworkProxy } from "./proxy.js";
-import { loadEnvironmentFiles } from "./environment.js";
+import { loadDaemonLocalEnv, localEnvFileArgument, reuseLocalEnvArgument } from "./local-env.js";
 import { NetworkSettingsService } from "./network-settings.js";
 import { requestSystemProxy } from "./system-proxy-resolver.js";
 import { ProcessPlaytestDriver } from "./playtest-driver.js";
-import { isLocalDebugEnabled, isLoopbackHostname } from "../shared/local-debug.js";
-import type { ExternalMcpLauncher } from "../shared/external-mcp.js";
+import { isLoopbackHostname } from "../shared/local-debug.js";
+import { publishLocalDaemonRuntime } from "./runtime-descriptor.js";
+import { isAllowedLocalOrigin } from "../shared/local-security.js";
+import { bindDesktopDaemonOwner } from "./desktop-owner.js";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-const development = process.argv.includes("--dev");
-const mode = development ? "development" : "production";
-loadEnvironmentFiles(repositoryRoot, mode);
+const localEnvFile = localEnvFileArgument(process.argv.slice(2));
+// Credentials are daemon-owned file data, never a subprocess environment variable.
+delete process.env.KUNPO_API_KEY;
 // Processes the daemon starts inherit its environment, and none of them may call the daemon as the app.
+const desktopOwned = process.env.OHMYGAME_DAEMON_TOKEN_STDIN === "1";
+if (desktopOwned && !process.connected) throw new Error("The desktop-owned daemon requires its private parent IPC connection");
+const reuseLocalEnv = reuseLocalEnvArgument(process.argv.slice(2), Boolean(desktopOwned));
 const accessToken = await takeAccessToken(process.env, process.stdin);
-const host = process.env.DAEMON_HOST ?? "127.0.0.1";
-const dataDirectory = process.env.OHMYGAME_DATA_DIR ?? path.join(repositoryRoot, ".data");
+delete process.env.OHMYGAME_EXTERNAL_MCP_LAUNCHER;
+delete process.env.OHMYGAME_EXTERNAL_SKILL_DIR;
+if (process.env.DAEMON_HOST && !isLoopbackHostname(process.env.DAEMON_HOST)) throw new Error("The daemon must listen on loopback");
+const host = "127.0.0.1";
+const dataDirectory = path.resolve(process.env.OHMYGAME_DATA_DIR ?? path.join(repositoryRoot, ".data"));
 const piAgentDirectory = process.env.PI_CODING_AGENT_DIR ?? path.join(dataDirectory, "pi-agent");
+const localApiKeyFile = localEnvFile || reuseLocalEnv ? path.join(dataDirectory, "local-env-api-keys.json") : undefined;
 process.env.PI_CODING_AGENT_DIR = piAgentDirectory;
 let app: ReturnType<typeof createApp> | undefined;
 let shuttingDown = false;
+let removeRuntimeDescriptor: (() => Promise<void>) | undefined;
 const playtestDriver = process.env.OHMYGAME_PLAYTEST_IPC === "1" && process.connected
   ? new ProcessPlaytestDriver()
   : undefined;
@@ -30,6 +41,7 @@ const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
   try {
+    await removeRuntimeDescriptor?.();
     await app?.close();
     process.exit(0);
   } catch (error) {
@@ -39,16 +51,18 @@ const shutdown = async () => {
 };
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
+if (desktopOwned) bindDesktopDaemonOwner(process, shutdown);
 process.on("message", (value: unknown) => {
   if ((value as { channel?: string } | null)?.channel === "ohmygame:shutdown")
     void shutdown();
 });
 
 try {
+  if (localEnvFile && localApiKeyFile) await loadDaemonLocalEnv(localEnvFile, localApiKeyFile);
   const networkSettings = new NetworkSettingsService(dataDirectory, {
     environment: process.env,
     initialSystemProxy: process.env.OHMYGAME_SYSTEM_PROXY,
-    resolveSystemProxy: process.connected ? requestSystemProxy : undefined,
+    resolveSystemProxy: desktopOwned ? requestSystemProxy : undefined,
   });
   await networkSettings.load();
   activateNetworkProxy(networkSettings.runtime());
@@ -58,45 +72,34 @@ try {
     console.warn("Could not initialize the OhMyGame Pi environment; continuing without managed MCP configuration.", error);
   }
   app = createApp({
+    projectExecution: await IsolatedProjectExecution.load(dataDirectory),
     dataDirectory,
     networkSettings,
     piAgentDirectory,
+    localApiKeyFile,
     bundledPluginsDirectory: process.env.OHMYGAME_BUNDLED_PLUGINS_DIR,
-    preinstalledPluginsDirectory: process.env.OHMYGAME_PREINSTALLED_PLUGINS_DIR
-      ?? path.join(repositoryRoot, ".runtime", "preinstalled-plugins"),
-    examplesDirectory: process.env.OHMYGAME_EXAMPLES_DIR ?? path.join(repositoryRoot, ".runtime", "examples"),
+    preinstalledPluginsDirectory: undefined,
+    examplesDirectory: undefined,
     interactiveStoryPlayerDirectory: process.env.OHMYGAME_PLAYER_DIR,
     accessToken,
-    allowedOrigins: (process.env.OHMYGAME_ALLOWED_ORIGINS ?? "")
+    allowedOrigins: (desktopOwned ? process.env.OHMYGAME_ALLOWED_ORIGINS ?? "" : "")
       .split(",")
       .map((origin) => origin.trim())
-      .filter(Boolean),
+      .filter((origin) => !!origin && isAllowedLocalOrigin(origin, "127.0.0.1", new Set([origin]))),
     logger: true,
     logDirectory: process.env.OHMYGAME_LOG_DIR,
-    publishApiUrl: process.env.CLOUD_API_URL ?? process.env.PUBLISH_API_URL,
-    localDebug: isLocalDebugEnabled(
-      development && isLoopbackHostname(host),
-      process.env.VITE_SUPABASE_URL,
-      process.env.VITE_SUPABASE_PUBLISHABLE_KEY,
-    ),
+    localDebug: false,
     playtestDriver,
-    ...externalAgentOptions(),
   });
   await app.listen({ host, port: Number(process.env.DAEMON_PORT ?? 43110) });
+  if (!desktopOwned) {
+    const address = app.server.address();
+    if (!address || typeof address === "string") throw new Error("Invalid daemon listener");
+    removeRuntimeDescriptor = await publishLocalDaemonRuntime(dataDirectory, { url: `http://127.0.0.1:${address.port}`, token: accessToken, pid: process.pid });
+  }
 } catch (error) {
   if (app) app.log.error(error); else console.error(error);
   await app?.close();
+  await removeRuntimeDescriptor?.();
   process.exit(1);
-}
-
-/** The launcher and Skill the desktop app ships, read once and kept from the processes the daemon starts. */
-function externalAgentOptions(): { externalMcpLauncher?: ExternalMcpLauncher; externalAgentSkillDirectory?: string } {
-  const launcher = process.env.OHMYGAME_EXTERNAL_MCP_LAUNCHER;
-  const skill = process.env.OHMYGAME_EXTERNAL_SKILL_DIR;
-  delete process.env.OHMYGAME_EXTERNAL_MCP_LAUNCHER;
-  delete process.env.OHMYGAME_EXTERNAL_SKILL_DIR;
-  return {
-    ...(launcher ? { externalMcpLauncher: JSON.parse(launcher) as ExternalMcpLauncher } : {}),
-    ...(skill ? { externalAgentSkillDirectory: skill } : {}),
-  };
 }

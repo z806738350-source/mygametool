@@ -44,6 +44,27 @@ describe("workspace inspection", () => {
     ]);
   });
 
+  it("includes only registered retained model originals in the assets catalog, without exposing hidden code files", async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "ohmygame-workspace-"));
+    const sha = "a".repeat(64), folder = `.data/model-assets/${sha}`, original = `${folder}/original.fbx`, glb = `${folder}/${sha}.glb`;
+    await mkdir(path.join(workspace, folder), { recursive: true });
+    await mkdir(path.join(workspace, "assets"));
+    for (const file of [original, glb, ".data/private.png", "assets/picture.png", "assets/music.mp3", "assets/video.mp4", "assets/model.glb"]) await writeFile(path.join(workspace, file), "bytes");
+    const linked = `${folder}/${"b".repeat(64)}.glb`, missing = `${folder}/${"c".repeat(64)}.glb`;
+    await symlink(path.join(workspace, "assets/model.glb"), path.join(workspace, linked));
+    await writeFile(path.join(workspace, ".data/assets.json"), JSON.stringify({ version: 1, prompts: {}, previews: { [original]: glb }, libraryAssets: { [original]: "fbx", [glb]: "glb", [linked]: "linked", [missing]: "missing", ".data/private.png": "private", "../outside.glb": "outside" } }));
+    const code = await listWorkspaceFiles(workspace);
+    expect(code.some(file => file.path.startsWith(".data/"))).toBe(false);
+    const assets = await listWorkspaceFiles(workspace, { assets: true });
+    expect(assets.filter(file => file.path.startsWith(".data/"))).toEqual([
+      expect.objectContaining({ path: glb, mediaType: "model", size: 5, libraryAssetId: "glb" }),
+      expect.objectContaining({ path: missing, mediaType: "model", size: 0 }),
+      expect.objectContaining({ path: original, mediaType: "model", size: 5, previewPath: glb }),
+    ]);
+    expect(assets.filter(file => file.mediaType).map(file => file.mediaType)).toEqual(expect.arrayContaining(["image", "audio", "video", "model"]));
+    expect(assets.some(file => file.path === linked || file.path === ".data/private.png")).toBe(false);
+  });
+
   it("reads bounded text and reports binary files", async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), "ohmygame-workspace-"));
     await writeFile(path.join(workspace, "large.txt"), "x".repeat(300 * 1024));

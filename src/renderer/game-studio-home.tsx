@@ -19,7 +19,7 @@ import { Plus, RefreshCw } from "./icons.js";
 import { AppSidebar } from "./app-sidebar.js";
 import { ProjectCard } from "./project-card.js";
 import { ProjectCreateDialog } from "./project-create-dialog.js";
-import { projectDeletionConfirmation } from "./project-deletion.js";
+import { confirmProjectDeletion } from "./project-deletion.js";
 import { ProjectPromptCreator } from "./project-prompt-creator.js";
 import { ProjectRenameDialog } from "./project-rename-dialog.js";
 import { createdProjectView, projectsHash, type AppNavigationTarget } from "./routes.js";
@@ -99,9 +99,9 @@ export function GameStudioHome({
     }
   }
 
-  function remove(project: ProjectState): void {
-    if (window.confirm(projectDeletionConfirmation(project)))
-      void runAction(() => deleteProject(project.id));
+  async function remove(project: ProjectState): Promise<void> {
+    if (confirmProjectDeletion(project))
+      await runAction(() => deleteProject(project.id));
   }
 
   return (

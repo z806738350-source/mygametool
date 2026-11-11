@@ -3,9 +3,10 @@ import type { RuntimeModel } from "./agent.js";
 import type { AgentReasoningLevel, PromptImage } from "../shared/contracts.js";
 import type { CanvasDocumentGenerationResult, CanvasMarkdownDocument } from "../shared/canvas-document.js";
 import { isCanvasTable, type CanvasTable, type CanvasTableGenerationResult } from "../shared/canvas-table.js";
-import { isOpenRouterModel, withOpenRouterAttribution } from "./openrouter-attribution.js";
+import { localModelFetch } from "./model-network-policy.js";
 import { normalizeAssistantText } from "./assistant-thinking.js";
 import { clampReasoningLevel, supportedReasoningLevels } from "../shared/reasoning.js";
+import { copyProviderImageSource } from "./provider-image-source.js";
 
 export type TextGenerationReference = { type: "text"; label: string; text: string } | { type: "image"; label: string; image: PromptImage };
 
@@ -69,7 +70,7 @@ function referenceContent(model: RuntimeModel, prompt: string, references: reado
   if (!model.input.includes("image")) throw new Error("The selected language model does not support image references. Choose a model that accepts images.");
   return [{ type: "text" as const, text: prompt }, ...images.flatMap((reference) => [
     { type: "text" as const, text: `Reference image: ${reference.label}` },
-    { type: "image" as const, data: reference.image.data, mimeType: reference.image.mediaType },
+    copyProviderImageSource(reference.image, { type: "image" as const, data: reference.image.data, mimeType: reference.image.mediaType }),
   ])];
 }
 
@@ -112,7 +113,7 @@ async function generateDraft(runtime: ModelRuntime, model: RuntimeModel, { promp
     }
     return failed(partialText(), `The model connection ended before the ${kind} was complete. Try again.`);
   } catch (cause) {
-    return failed(partialText(), signal.aborted ? `${kind === "document" ? "Document" : "Table"} generation timed out. Try again or choose another model.` : cause instanceof Error ? cause.message : String(cause));
+    return failed(partialText(), signal.aborted ? `${kind === "document" ? "Document" : "Table"} generation timed out. Try again or choose another model.` : "The configured model could not complete the request.");
   }
 }
 
@@ -123,7 +124,7 @@ function responseText(response: Awaited<ReturnType<ModelRuntime["completeSimple"
 function draftFailure(response: Awaited<ReturnType<ModelRuntime["completeSimple"]>>, kind: "document" | "table", timedOut: boolean): string {
   const label = kind === "document" ? "Document" : "Table";
   if (timedOut) return `${label} generation timed out. Try again or choose another model.`;
-  if (response.errorMessage?.trim()) return response.errorMessage.trim();
+  if (response.errorMessage?.trim()) return "The configured model could not complete the request.";
   switch (response.stopReason) {
     case "length": return `The ${kind} reached the output limit. Request a smaller change and try again.`;
     case "aborted": return `${label} generation was interrupted. Try again.`;
@@ -136,7 +137,8 @@ function draftFailure(response: Awaited<ReturnType<ModelRuntime["completeSimple"
 function modelOptions(model: RuntimeModel, reasoningLevel?: AgentReasoningLevel) {
   return {
     ...(reasoningLevel && reasoningLevel !== "off" ? { reasoning: reasoningLevel } : {}),
-    ...(isOpenRouterModel(model) ? { transformHeaders: (headers: Record<string, string | null>) => withOpenRouterAttribution(stringHeaders(headers)) } : {}),
+    fetch: localModelFetch(model),
+    transport: "sse" as const,
   };
 }
 
@@ -150,8 +152,4 @@ function boundedText(value: string, maxBytes: number): string {
     result += character;
   }
   return result;
-}
-
-function stringHeaders(headers: Record<string, string | null>): Record<string, string> {
-  return Object.fromEntries(Object.entries(headers).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
 }

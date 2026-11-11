@@ -1,8 +1,10 @@
 import { randomBytes } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
+import { isAllowedLocalOrigin, isLoopbackHostHeader, localPreviewCsp } from "../shared/local-security.js";
+import { readSafeProjectFile, SafeProjectFileError } from "./safe-project-file.js";
 
 const CONTENT_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -62,6 +64,9 @@ export class LoopbackFileServer {
   #listen(): Promise<{ server: Server; port: number }> {
     this.#server ??= new Promise((resolve, reject) => {
       const server = createServer((request, response) => {
+        if (!isLoopbackHostHeader(request.headers.host) || !isAllowedLocalOrigin(request.headers.origin, request.headers.host)) {
+          request.resume(); response.writeHead(403).end(); return;
+        }
         const destination = request.headers["sec-fetch-dest"];
         const speculative = `${request.headers.purpose ?? ""} ${request.headers["sec-purpose"] ?? ""}`;
         const navigation = (!destination || ["document", "iframe", "frame"].includes(String(destination)))
@@ -71,6 +76,8 @@ export class LoopbackFileServer {
             "content-type": type,
             "cache-control": "no-store",
             "x-content-type-options": "nosniff",
+            "referrer-policy": "no-referrer",
+            "content-security-policy": localPreviewCsp(`http://${request.headers.host}`),
           });
           response.end(request.method === "HEAD" ? undefined : body);
         });
@@ -96,15 +103,20 @@ export class LoopbackFileServer {
     // A directory URL (".../") serves its index.html.
     const segments = rest.length && rest[rest.length - 1] === "" ? [...rest.slice(0, -1), "index.html"] : rest;
     if (!directory || !segments.length || segments.some((segment) => !segment || segment === "." || segment === "..")) return notFound;
-    const file = path.join(directory, ...segments);
+    let file = path.join(directory, ...segments);
     if (path.relative(directory, file).startsWith("..")) return notFound;
     try {
-      const body = await readFile(file);
+      const root = await realpath(directory);
+      file = await realpath(file);
+      const relative = path.relative(root, file);
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative) || relative.split(path.sep).some((part) => part.startsWith(".") || part === "node_modules")) return notFound;
+      const body = await readSafeProjectFile(root, file);
       if (method === "GET" && navigation && segments.length === 1 && segments[0] === "index.html") {
         try { mount?.onEntry?.(); } catch { /* Counting must not prevent serving the file. */ }
       }
       return { status: 200, type: CONTENT_TYPES[path.extname(file).toLowerCase()] ?? "application/octet-stream", body };
-    } catch {
+    } catch (cause) {
+      if (cause instanceof SafeProjectFileError) return { status: cause.statusCode, type: "text/plain; charset=utf-8", body: cause.message };
       return notFound;
     }
   }

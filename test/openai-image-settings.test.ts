@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { LocalApiKeyStore, createLocalModelRuntime } from "../src/daemon/local-model-runtime.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/daemon/app.js";
 import { ProviderImages } from "../src/daemon/provider-images.js";
@@ -12,7 +12,7 @@ import type { SaveOpenAIImageConnectionRequest } from "../src/shared/contracts.j
 const endpoint = "/settings/models/providers/openai/images";
 const config: SaveOpenAIImageConnectionRequest = {
   mode: "separate",
-  baseUrl: "https://relay.test/v1",
+  baseUrl: "http://127.0.0.1:43199/v1",
   apiKey: "image-test-key",
   models: [
     {
@@ -23,6 +23,7 @@ const config: SaveOpenAIImageConnectionRequest = {
     },
   ],
 };
+const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==", "base64");
 const directories: string[] = [];
 const apps: ReturnType<typeof createApp>[] = [];
 afterEach(async () => {
@@ -35,11 +36,42 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
+describe("Kunpo image credential binding", () => {
+  it("does not reuse a legacy OpenAI key for a Kunpo connection", async () => {
+    const { app, generation, discovery, runtime, directory } = await fixture({ type: "api_key", key: "old-openai-fake-key-only" });
+    const before = await readFile(path.join(directory, "auth.json"), "utf8");
+    const store = new OpenAIImageSettingsStore(directory);
+    const connection = openAIImageConnection(store, async () => runtime);
+    expect(await connection.source({ mode: "connection", baseUrl: "https://llm.ziy.cc/v1" })).toBeUndefined();
+    expect(await connection.get()).toMatchObject({ connectionAvailable: false });
+    const response = await app.inject({ method: "PUT", url: endpoint, payload: { ...config, mode: "connection", apiKey: undefined } });
+    expect(response.statusCode).toBe(400);
+    expect(response.body).not.toContain("old-openai-fake-key-only");
+    expect(generation).not.toHaveBeenCalled(); expect(discovery).not.toHaveBeenCalled();
+    expect(await readFile(path.join(directory, "auth.json"), "utf8")).toBe(before);
+  });
+  it("uses the gateway only as an unset default and never transfers a different endpoint's saved key", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-image-key-binding-"));
+    directories.push(directory);
+    const store = new OpenAIImageSettingsStore(directory);
+    expect(store.get()).toMatchObject({ baseUrl: "https://llm.ziy.cc/v1", configured: false });
+    await store.update({ mode: "separate", baseUrl: "http://127.0.0.1:43199/v1", apiKey: "previous-endpoint-test-key", models: [] });
+    const restored = new OpenAIImageSettingsStore(directory);
+    await restored.load();
+    expect(restored.get()).toMatchObject({ baseUrl: "http://127.0.0.1:43199/v1", configured: true });
+    expect(restored.get()).not.toHaveProperty("apiKey");
+    expect(() => restored.source("https://llm.ziy.cc/v1")).toThrow("Enter an image API key");
+    await expect(restored.update({ mode: "separate", baseUrl: "https://llm.ziy.cc/v1", models: [] })).rejects.toThrow("Enter an image API key");
+    expect(restored.get().baseUrl).toBe("http://127.0.0.1:43199/v1");
+  });
+});
+
 async function fixture(
   credential?: unknown,
   discovery = vi.fn<typeof fetch>(async () =>
     Response.json({ data: [{ id: "gpt-image-2" }, { id: "text-model" }] }),
   ),
+  kunpoKey?: string,
 ) {
   vi.stubEnv("OPENAI_API_KEY", "");
   const directory = await mkdtemp(
@@ -53,15 +85,12 @@ async function fixture(
       path.join(directory, "auth.json"),
       JSON.stringify({ openai: credential }),
     );
-  const runtime = await ModelRuntime.create({
-    authPath: path.join(directory, "auth.json"),
-    modelsPath: path.join(directory, "models.json"),
-    modelsStorePath: path.join(directory, "catalog.json"),
-    allowModelNetwork: false,
-  });
+  const credentialFile = path.join(directory, "local-api-keys.json");
+  if (kunpoKey) await new LocalApiKeyStore(credentialFile).replace({ kunpo: { type: "api_key", key: kunpoKey } });
+  const runtime = await createLocalModelRuntime(credentialFile, async () => [{ id: "kunpo", config: { name: "KunpoAPI", api: "openai-completions", baseUrl: "http://127.0.0.1:43199/v1", models: [] } }]);
   const generation = vi.fn<typeof fetch>(async () =>
     Response.json({
-      data: [{ b64_json: Buffer.from("image").toString("base64") }],
+      data: [{ b64_json: PNG.toString("base64") }],
     }),
   );
   const app = createApp({
@@ -107,7 +136,7 @@ async function fixture(
 }
 
 describe("OpenAI image connections", () => {
-  it("keeps ChatGPT sign-in intact while generating and editing through a separate relay", async () => {
+  it("ignores legacy ChatGPT sign-in while generating and editing through an explicit loopback relay", async () => {
     const { app, runtime, directory, save, images, generation } = await fixture(
       {
         type: "oauth",
@@ -116,7 +145,7 @@ describe("OpenAI image connections", () => {
         expires: Date.now() + 3_600_000,
       },
     );
-    expect(runtime.isUsingOAuth("openai")).toBe(true);
+    expect(runtime.isUsingOAuth("openai")).toBe(false);
     const before = await readFile(path.join(directory, "auth.json"), "utf8");
     const settings = await save();
     expect(settings).toMatchObject({
@@ -129,10 +158,8 @@ describe("OpenAI image connections", () => {
       (await app.inject({ method: "GET", url: "/settings/providers" })).json(),
     ).toContainEqual(
       expect.objectContaining({
-        id: "openai",
-        credentialType: "oauth",
-        languageConfigured: true,
-        imageConfigured: true,
+        id: "kunpo",
+        configured: false,
       }),
     );
     expect(await readFile(path.join(directory, "auth.json"), "utf8")).toBe(
@@ -164,10 +191,10 @@ describe("OpenAI image connections", () => {
       ],
     });
     expect(generation.mock.calls.map(([url]) => url)).toEqual([
-      "https://relay.test/v1/images/generations",
-      "https://relay.test/v1/images/edits",
+      "http://127.0.0.1:43199/v1/images/generations",
+      "http://127.0.0.1:43199/v1/images/edits",
     ]);
-    expect(generation.mock.calls[0]?.[1]?.headers).toMatchObject({
+    expect(Object.fromEntries(new Headers(generation.mock.calls[0]?.[1]?.headers))).toMatchObject({
       authorization: "Bearer image-test-key",
     });
     expect(
@@ -176,7 +203,7 @@ describe("OpenAI image connections", () => {
     expect((generation.mock.calls[1]?.[1]?.body as FormData).get("model")).toBe(
       "my-image-alias",
     );
-    expect(runtime.isUsingOAuth("openai")).toBe(true);
+    expect(runtime.isUsingOAuth("openai")).toBe(false);
   });
 
   it("fetches with the draft key and URL without saving, filtering out text models", async () => {
@@ -186,7 +213,7 @@ describe("OpenAI image connections", () => {
       url: `${endpoint}/discover`,
       payload: {
         mode: "separate",
-        baseUrl: "https://draft.test/v1/",
+        baseUrl: "http://127.0.0.1:43200/v1/",
         apiKey: "draft-key",
       },
     });
@@ -200,9 +227,9 @@ describe("OpenAI image connections", () => {
       },
     ]);
     expect(String(discovery.mock.calls[0]?.[0])).toBe(
-      "https://draft.test/v1/models",
+      "http://127.0.0.1:43200/v1/models",
     );
-    expect(discovery.mock.calls[0]?.[1]?.headers).toMatchObject({
+    expect(Object.fromEntries(new Headers(discovery.mock.calls[0]?.[1]?.headers))).toMatchObject({
       authorization: "Bearer draft-key",
     });
     await expect(
@@ -211,7 +238,7 @@ describe("OpenAI image connections", () => {
     expect(
       (await app.inject({ method: "GET", url: "/settings/providers" })).json(),
     ).toContainEqual(
-      expect.objectContaining({ id: "openai", configured: false }),
+      expect.objectContaining({ id: "kunpo", configured: false }),
     );
     expect(
       (await app.inject({ method: "GET", url: "/image-models/catalog" })).json()
@@ -224,12 +251,7 @@ describe("OpenAI image connections", () => {
     const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-openai-images-"));
     directories.push(directory);
     await writeFile(path.join(directory, "openai-images.json"), JSON.stringify({ version: 2, mode: "future" }));
-    const runtime = await ModelRuntime.create({
-      authPath: path.join(directory, "auth.json"),
-      modelsPath: path.join(directory, "models.json"),
-      modelsStorePath: path.join(directory, "catalog.json"),
-      allowModelNetwork: false,
-    });
+    const runtime = await createLocalModelRuntime(path.join(directory, "local-api-keys.json"), async () => []);
     const app = createApp({ dataDirectory: directory, piAgentDirectory: directory, createModelRuntime: async () => runtime });
     apps.push(app);
     await app.ready();
@@ -283,12 +305,11 @@ describe("OpenAI image connections", () => {
       (await app.inject({ method: "GET", url: "/settings/providers" })).json(),
     ).toContainEqual(
       expect.objectContaining({
-        id: "openai",
-        configured: true,
-        languageConfigured: false,
-        imageConfigured: true,
+        id: "kunpo",
+        configured: false,
       }),
     );
+    expect((await app.inject({ method: "GET", url: endpoint })).json()).toMatchObject({ mode: "separate", configured: true });
     if (process.platform !== "win32")
       expect(
         (await stat(path.join(directory, "openai-images.json"))).mode & 0o777,
@@ -329,7 +350,7 @@ describe("OpenAI image connections", () => {
     });
     expect(generation).toHaveBeenCalledTimes(1);
     expect(generation.mock.calls[0]?.[0]).toBe(
-      "https://relay.test/v1/images/generations",
+      "http://127.0.0.1:43199/v1/images/generations",
     );
   });
 
@@ -350,7 +371,7 @@ describe("OpenAI image connections", () => {
         })
       ).statusCode,
     ).toBe(200);
-    expect(discovery.mock.calls[0]?.[1]?.headers).toMatchObject({
+    expect(Object.fromEntries(new Headers(discovery.mock.calls[0]?.[1]?.headers))).toMatchObject({
       authorization: "Bearer image-test-key",
     });
     discovery.mockResolvedValueOnce(new Response("{}", { status: 401 }));
@@ -371,7 +392,7 @@ describe("OpenAI image connections", () => {
           payload: {
             ...config,
             apiKey: undefined,
-            baseUrl: "https://other.test/v1",
+            baseUrl: "http://127.0.0.1:43201/v1",
           },
         })
       ).statusCode,
@@ -382,7 +403,7 @@ describe("OpenAI image connections", () => {
         await app.inject({
           method: "POST",
           url: `${endpoint}/discover`,
-          payload: { ...draft, baseUrl: "https://other.test/v1" },
+          payload: { ...draft, baseUrl: "http://127.0.0.1:43201/v1" },
         })
       ).statusCode,
     ).toBe(400);
@@ -392,11 +413,8 @@ describe("OpenAI image connections", () => {
     ).toBe(original);
   });
 
-  it("supports explicit chat-key reuse without fetching again during generation", async () => {
-    const { images, generation, save, runtime, directory } = await fixture({
-      type: "api_key",
-      key: "chat-key",
-    });
+  it("reuses only an explicitly configured Kunpo key without fetching again during generation", async () => {
+    const { images, generation, save, runtime, directory } = await fixture(undefined, undefined, "kunpo-chat-key");
     await save({ ...config, mode: "connection", apiKey: undefined });
     const restored = new OpenAIImageSettingsStore(directory);
     await restored.load();
@@ -409,10 +427,10 @@ describe("OpenAI image connections", () => {
     });
     expect(generation).toHaveBeenCalledTimes(1);
     expect(generation.mock.calls[0]?.[0]).toBe(
-      "https://api.openai.com/v1/images/generations",
+      "http://127.0.0.1:43199/v1/images/generations",
     );
-    expect(generation.mock.calls[0]?.[1]?.headers).toMatchObject({
-      authorization: "Bearer chat-key",
+    expect(Object.fromEntries(new Headers(generation.mock.calls[0]?.[1]?.headers))).toMatchObject({
+      authorization: "Bearer kunpo-chat-key",
     });
     expect(runtime.isUsingOAuth("openai")).toBe(false);
   });
@@ -462,7 +480,7 @@ describe("OpenAI image connections", () => {
       images.generate({ prompt: "Icon", resolution: "1K", aspectRatio: "1:1" }),
     ).rejects.toThrow("API key was rejected");
     expect(generation).toHaveBeenCalledTimes(1);
-    expect(generation.mock.calls[0]?.[1]?.headers).toMatchObject({
+    expect(Object.fromEntries(new Headers(generation.mock.calls[0]?.[1]?.headers))).toMatchObject({
       authorization: "Bearer image-test-key",
     });
   });

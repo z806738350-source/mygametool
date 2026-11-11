@@ -1,3 +1,4 @@
+import { isLocalImageSource } from "./local-resources.js";
 import { useCallback, useLayoutEffect, useRef, useState } from "react";
 import { Handle, Position } from "@xyflow/react";
 import type { CanvasWorkspaceDetail } from "../shared/canvas-workspace.js";
@@ -11,6 +12,8 @@ import { useAgentModels } from "./model-selector.js";
 import type { DocumentGenerationState } from "./use-canvas-documents.js";
 import { MarkdownContent } from "./markdown-content.js";
 import { useWorkspaceAssetUrl } from "./use-workspace-asset-url.js";
+import { useNearViewport } from "./asset-gallery.js";
+import { releaseImage } from "./release-media.js";
 import { CanvasNodeResizer, CanvasNodeSizeActions, type CanvasNodeResizeRuntime } from "./canvas-node-resizer.js";
 import { CanvasNodeReferenceStrip, type CanvasNodeReferencesRuntime } from "./canvas-node-references.js";
 import { t } from "./i18n.js";
@@ -114,9 +117,13 @@ export function canvasImagePath(documentId: string, src?: string): string | unde
 }
 function CanvasImage({ projectId, documentId, src, alt }: { projectId: string; documentId: string; src?: string; alt?: string }) {
   const file = canvasImagePath(documentId, src);
-  const { url, error, loading, retry } = useWorkspaceAssetUrl(file ? projectId : undefined, file ?? "");
-  const remote = src && /^https?:\/\//i.test(src) ? src : undefined;
-  return url || remote ? <img src={url ?? remote} alt={alt ?? ""} loading="lazy" draggable={false} /> : <span className="design-image-placeholder" title={error}>{error ? t("canvasDoc.imageUnavailable", { file }) : alt || t("canvasDoc.image")}{error ? <button className="nodrag" type="button" disabled={loading} onClick={retry}>{t("canvasDoc.checkAgain")}</button> : null}</span>;
+  const [element, visible] = useNearViewport<HTMLSpanElement>(true);
+  const { url, error, loading, retry } = useWorkspaceAssetUrl(file && visible ? projectId : undefined, file ?? "");
+  const inline = src && /^(blob:|data:image\/)/i.test(src) ? src : undefined;
+  const image = useRef<HTMLImageElement>(null);
+  useLayoutEffect(() => { const current = image.current; return () => releaseImage(current, url ?? inline); }, [url, inline]);
+  if (src && !isLocalImageSource(src)) return <span className="design-image-placeholder" title={t("localEdition.remoteResourceBlocked")}>{t("localEdition.remoteResourceBlocked")}</span>;
+  return <span ref={element}>{url || inline ? <img ref={image} src={url ?? inline} alt={alt ?? ""} loading="lazy" draggable={false} /> : <span className="design-image-placeholder" title={error}>{error ? t("canvasDoc.imageUnavailable", { file }) : alt || t("canvasDoc.image")}{error ? <button className="nodrag" type="button" disabled={loading} onClick={retry}>{t("canvasDoc.checkAgain")}</button> : null}</span>}</span>;
 }
 export function CanvasDocumentAI({ design, document, textModels, references, referenceSource }: { design: CanvasDocuments; document: CanvasMarkdownDocument; textModels: CanvasTextModels; references?: CanvasNodeReferencesRuntime; referenceSource?: AssetCanvasTextGenerationSource }) {
   const state = design.generations[document.id];

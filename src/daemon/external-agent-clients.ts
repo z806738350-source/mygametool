@@ -1,3 +1,4 @@
+import { assertLocalExecutionAllowed, LOCAL_EXECUTION_ENABLED } from "./local-execution-policy.js";
 import {
   cp,
   lstat,
@@ -101,6 +102,7 @@ export class ExternalAgentClients {
    * moved, is connected again.
    */
   async refresh(): Promise<void> {
+    if (!LOCAL_EXECUTION_ENABLED) return;
     for (const id of EXTERNAL_AGENT_CLIENT_IDS) {
       const used = this.#stored.connected[id];
       if (!used) continue;
@@ -118,6 +120,7 @@ export class ExternalAgentClients {
   }
 
   async states(): Promise<ExternalAgentClientState[]> {
+    if (!LOCAL_EXECUTION_ENABLED) return EXTERNAL_AGENT_CLIENT_IDS.map((id) => ({ id, available: false, connected: false }));
     return Promise.all(
       EXTERNAL_AGENT_CLIENT_IDS.map(async (id) => ({
         id,
@@ -128,6 +131,7 @@ export class ExternalAgentClients {
   }
 
   connect(id: ExternalAgentClientId): Promise<void> {
+    assertLocalExecutionAllowed("External agent configuration");
     return this.#serial(async () => {
       const launcher = this.#options.launcher;
       if (!launcher)
@@ -156,6 +160,7 @@ export class ExternalAgentClients {
   }
 
   disconnect(id: ExternalAgentClientId): Promise<void> {
+    assertLocalExecutionAllowed("External agent configuration");
     return this.#serial(async () => {
       const cli = await this.#options.resolve(CLIENT_RUNTIMES[id]);
       if (cli) {

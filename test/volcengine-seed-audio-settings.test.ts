@@ -1,4 +1,4 @@
-import { access, mkdtemp, readFile } from "node:fs/promises";
+import { access, chmod, link, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -14,6 +14,7 @@ describe("Volcengine Seed Audio settings", () => {
     expect(settings.get()).toEqual({ configured: false });
 
     await settings.update("  seed-secret  ");
+    if (process.platform !== "win32") expect((await stat(path.join(directory, "volcengine-seed-audio.json"))).mode & 0o077).toBe(0);
     expect(settings.get()).toEqual({ configured: true });
     expect(
       JSON.parse(
@@ -44,5 +45,23 @@ describe("Volcengine Seed Audio settings", () => {
     await expect(settings.update("key\nvalue")).rejects.toThrow(
       "printable ASCII",
     );
+  });
+
+  it.skipIf(process.platform === "win32")("rejects symlink, hard-link and non-private legacy credential files", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-audio-private-file-"));
+    const file = path.join(directory, "volcengine-seed-audio.json"), target = path.join(directory, "fixture.json");
+    try {
+      await writeFile(target, JSON.stringify({ version: 1, apiKey: "sk-legacy-private-audio-canary" }), { mode: 0o600 });
+      await symlink(target, file);
+      await expect(new VolcengineSeedAudioSettingsStore(directory).load()).rejects.toThrow();
+      await rm(file);
+      await link(target, file);
+      await expect(new VolcengineSeedAudioSettingsStore(directory).load()).rejects.toThrow("not private");
+      await rm(file);
+      await writeFile(file, JSON.stringify({ version: 1, apiKey: "sk-legacy-private-audio-canary" }), { mode: 0o644 });
+      await chmod(file, 0o644);
+      await expect(new VolcengineSeedAudioSettingsStore(directory).load()).rejects.toThrow("not private");
+      expect(await readFile(target, "utf8")).toContain("sk-legacy-private-audio-canary");
+    } finally { await rm(directory, { recursive: true, force: true }); }
   });
 });

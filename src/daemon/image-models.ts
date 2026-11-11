@@ -18,6 +18,7 @@ interface ImageModelFamily {
 }
 
 const FAMILIES: readonly ImageModelFamily[] = [
+  { pattern: /^Image-GI2\.1$/, protocol: "openai-images", vendor: "google", resolutions: ["1K", "2K", "4K"], aspectRatios: IMAGE_ASPECT_RATIOS },
   // GPT Image 1 only renders three fixed sizes.
   { pattern: /^gpt-image-1(?:-|$)/, protocol: "openai-images", vendor: "openai", resolutions: ["1K"], aspectRatios: ["1:1", "3:2", "2:3"] },
   { pattern: /^gpt-image-/, protocol: "openai-images", vendor: "openai", resolutions: ["1K", "2K", "4K"], aspectRatios: ["1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16", "21:9"] },
@@ -26,7 +27,7 @@ const FAMILIES: readonly ImageModelFamily[] = [
 ];
 
 /** Listed first, and used when no model is requested. */
-const PREFERRED_IDS = ["gpt-image-2.5-flare", "gemini-3.1-flash-image"];
+const PREFERRED_IDS = ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare", "Image-GI2.1", "gemini-3.1-flash-image"];
 
 /** Image models a provider offers, from its `/models` IDs and the public catalog's capabilities. */
 export function imageModelsForProvider(
@@ -57,10 +58,17 @@ export function imageModelDefinition(id: string, catalog: readonly ImageModel[] 
     sizes: ["1024x1024", "1536x1024", "1024x1536"],
     generationOptions: resolutions.flatMap((resolution) => aspectRatios.map((aspectRatio) => ({ resolution, aspectRatio }))),
     supportsReferenceImage: known ? known.supportsReferenceImage : true,
-    maxReferenceImages: known?.supportsReferenceImage === false ? 0 : known?.maxReferenceImages ?? knownImageReferenceLimit(id) ?? 1,
+    maxReferenceImages: id === "Image-GI2.1" ? 14 : known?.supportsReferenceImage === false ? 0 : known?.maxReferenceImages ?? knownImageReferenceLimit(id) ?? 1,
     maxOutputs: known?.maxOutputs ?? (1 satisfies ImageOutputCount),
     protocol: family.protocol,
+    ...imageModelCapabilities(id),
   };
+}
+
+export function imageModelCapabilities(id: string): Pick<ImageModel, "qualities" | "outputFormats" | "supportsTransparency" | "supportsMask"> {
+  if (/^gpt-image-2\.5-(?:sunburst|flare)$/.test(id)) return { qualities: ["auto", "low", "medium", "high", "xhigh", "max"], outputFormats: ["png", "jpeg"], supportsTransparency: true, supportsMask: true };
+  if (id === "Image-GI2.1") return { qualities: [], outputFormats: [], supportsTransparency: false, supportsMask: false };
+  return {};
 }
 
 export function preferredImageModelId(ids: readonly string[]): string | undefined {

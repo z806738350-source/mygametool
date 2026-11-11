@@ -4,6 +4,7 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  realpath,
   rm,
   stat,
   writeFile,
@@ -77,7 +78,7 @@ function hold(method: "snapshot" | "undo" | "restore", nth = 1) {
 
 type Step =
   | { write: Record<string, string> }
-  | { run: string }
+  | { removeDuringTurn: string[] }
   | { say: string; delayMs?: number }
   | { fail: number }
   | { hang: true };
@@ -88,13 +89,14 @@ interface ModelRequest {
 
 /**
  * A model that answers each request with the next scripted step: files to
- * write with the `write` tool, a command for the `bash` tool, a final reply,
+ * write with the `write` tool, a controlled fixture disk deletion, a final reply,
  * an HTTP error, or no answer at all, which keeps the turn open until it is
  * stopped. It keeps what it was sent.
  */
 async function scriptedModel(steps: Step[]) {
   let calls = 0;
   const requests: ModelRequest[] = [];
+  let workspace: string | undefined;
   const server = createServer(async (request, response) => {
     const body: Buffer[] = [];
     for await (const chunk of request) body.push(chunk as Buffer);
@@ -112,6 +114,14 @@ async function scriptedModel(steps: Step[]) {
     }
     if ("delayMs" in step && step.delayMs)
       await new Promise((resolve) => setTimeout(resolve, step.delayMs));
+    if ("removeDuringTurn" in step) {
+      if (!workspace) throw new Error("Fixture workspace has not been registered");
+      // Checkpoint deletion coverage uses known fixture files, never a host shell or an Agent delete tool.
+      for (const file of step.removeDuringTurn) {
+        if (!/^[a-z]+\.txt$/.test(file) && file !== "art/hero.png") throw new Error("Invalid fixture removal path");
+        await rm(path.join(workspace, file));
+      }
+    }
     const tools =
       "say" in step
         ? []
@@ -120,7 +130,7 @@ async function scriptedModel(steps: Step[]) {
               name: "write",
               arguments: { path: file, content },
             }))
-          : [{ name: "bash", arguments: { command: step.run } }];
+          : [{ name: "read", arguments: { path: "notes.txt" } }];
     const delta =
       "say" in step
         ? { role: "assistant", content: step.say }
@@ -159,16 +169,17 @@ async function scriptedModel(steps: Step[]) {
   return {
     baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}/v1`,
     requests,
+    setWorkspace: (value: string) => { workspace = value; },
   };
 }
 
 /** A daemon with a project, a conversation and the scripted model selected. */
 async function studio(steps: Step[], type = "web-game") {
-  const directory = await mkdtemp(
+  const directory = await realpath(await mkdtemp(
     path.join(tmpdir(), "ohmygame-agent-checkpoints-"),
-  );
+  ));
   cleanup.push(() => rm(directory, { recursive: true, force: true }));
-  const { baseUrl, requests } = await scriptedModel(steps);
+  const { baseUrl, requests, setWorkspace } = await scriptedModel(steps);
   // A model request that fails is not tried again, so a step that fails ends the turn at once.
   await writeFile(
     path.join(directory, "settings.json"),
@@ -180,9 +191,11 @@ async function studio(steps: Step[], type = "web-game") {
     modelsStorePath: path.join(directory, "catalog.json"),
     allowModelNetwork: false,
   });
+  const accessToken = "agent-checkpoints-test";
   const start = () => {
     const app = createApp({
       dataDirectory: directory,
+      accessToken,
       piAgentDirectory: directory,
       createModelRuntime: async () => runtime,
     });
@@ -196,6 +209,7 @@ async function studio(steps: Step[], type = "web-game") {
       return inject({
         ...options,
         headers: {
+          authorization: `Bearer ${accessToken}`,
           ...(projectId
             ? { "x-workspace-version": versions.get(projectId) ?? "0" }
             : {}),
@@ -222,7 +236,7 @@ async function studio(steps: Step[], type = "web-game") {
       baseUrl,
       api: "openai-completions",
       authentication: "api_key",
-      apiKey: "fixture",
+      apiKey: "agent-checkpoints-fake-credential-20261028",
       models: [
         {
           id: "fixture",
@@ -244,6 +258,7 @@ async function studio(steps: Step[], type = "web-game") {
       payload: { name: "Checkpoints", type },
     })
   ).json();
+  setWorkspace(project.workspacePath);
   const converse = async () =>
     (
       await app.inject({
@@ -356,7 +371,7 @@ async function studio(steps: Step[], type = "web-game") {
     address ??= app.listen({ host: "127.0.0.1", port: 0 });
     const stream = await fetch(
       `${await address}/projects/${project.id}/events?cursor=0`,
-      { signal: AbortSignal.timeout(15_000) },
+      { signal: AbortSignal.timeout(15_000), headers: { authorization: `Bearer ${accessToken}` } },
     );
     const reader = stream
       .body!.pipeThrough(new TextDecoderStream())
@@ -1002,7 +1017,7 @@ describe("Agent turn changes", () => {
   it("lists what each turn changed", async () => {
     const { project, send, ended, changes, published } = await studio([
       { write: { "notes.txt": "first", "player.txt": "changed by the Agent" } },
-      { run: "rm old.txt" },
+      { removeDuringTurn: ["old.txt"] },
       { say: "Wrote the notes." },
       { write: { "notes.txt": "second", "extra/added.txt": "added" } },
       { say: "Changed the notes." },
@@ -1254,7 +1269,7 @@ describe("Agent turn changes", () => {
   it("says so when a file can never be put back", async () => {
     const { project, send, file, missing, ended, undo } = await studio([
       { write: { "notes.txt": "first" } },
-      { run: "rm old.txt" },
+      { removeDuringTurn: ["old.txt"] },
       { say: "Wrote the notes." },
     ]);
     await writeFile(
@@ -1542,14 +1557,15 @@ describe("Agent turn changes", () => {
           "notes.txt": "second",
           "added.txt": "added",
           "data.bin": "a\u0000b",
-          "art/hero.png": "not really a picture",
         },
       },
-      { run: "rm old.txt long.txt story.txt" },
+      { removeDuringTurn: ["old.txt", "long.txt", "story.txt", "art/hero.png"] },
       { say: "Changed the notes." },
     ]);
     // Three bytes a character, so the cut after 256 KB falls inside one.
     const story = "\u4e2d".repeat(100_000);
+    await mkdir(path.join(project.workspacePath, "art"));
+    await writeFile(path.join(project.workspacePath, "art/hero.png"), "classified as media by its filename");
     await writeFile(path.join(project.workspacePath, "notes.txt"), "first");
     await writeFile(path.join(project.workspacePath, "old.txt"), "old");
     await writeFile(path.join(project.workspacePath, "long.txt"), long);
@@ -1584,8 +1600,8 @@ describe("Agent turn changes", () => {
     });
     expect(await view(id, "art/hero.png")).toEqual({
       path: "art/hero.png",
-      before: null,
-      after: { binary: true },
+      before: { binary: true },
+      after: null,
     });
     expect(await view(id, "long.txt")).toEqual({
       path: "long.txt",
@@ -2379,7 +2395,7 @@ describe("The end of a turn", () => {
   });
 
   it.each(["publish", "interactive-story/build"] as const)(
-    "waits for turn closure before tracking a %s request as an active workspace write",
+    "handles %s during turn closure according to the local publication policy",
     async (route) => {
       const { app, project, send, ended } = await studio(
         turn(),
@@ -2421,6 +2437,17 @@ describe("The end of a turn", () => {
             : {}),
         })
         .then((response) => response);
+      if (route === "publish") {
+        // Retired remote publication is refused before entering any workspace/build flow.
+        const response = await request;
+        expect(response.statusCode, response.body).toBe(410);
+        expect(closing).not.toHaveBeenCalled();
+        expect(enter).not.toHaveBeenCalled();
+        expect(artifact).not.toHaveBeenCalled();
+        released.open();
+        expect((await ended("Write the notes")).changes).toMatchObject({ files: 1 });
+        return;
+      }
       await vi.waitFor(() => expect(closing).toHaveBeenCalled());
       expect(enter).not.toHaveBeenCalled();
       expect(artifact).not.toHaveBeenCalled();

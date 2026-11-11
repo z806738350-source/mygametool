@@ -2,6 +2,7 @@ import path from "node:path";
 import { defineConfig } from "vite";
 
 export default defineConfig({
+  envDir: false,
   build: {
     emptyOutDir: false,
     lib: {

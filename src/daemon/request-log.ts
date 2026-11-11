@@ -1,13 +1,25 @@
 import type { FastifyInstance } from "fastify";
+import { createLogRedactor, MAX_LOG_INPUT_LENGTH } from "../shared/log-redaction.js";
 
 /**
  * The daemon's pino options. pino adds the computer name to every line by
  * default, and it often includes the person's name.
  */
 export function daemonLoggerOptions(stream?: { write(line: string): void }) {
+  const destination = stream ?? process.stdout;
+  const redact = createLogRedactor();
   return {
     base: { pid: process.pid },
-    ...(stream ? { stream } : {}),
+    stream: {
+      write(line: string): void {
+        const redacted = redact(line, { maxLength: MAX_LOG_INPUT_LENGTH }).trimEnd();
+        // Keep pino's line format valid even if truncation or a punctuation-only key removed JSON syntax.
+        let output = redacted;
+        try { JSON.parse(output); }
+        catch { output = JSON.stringify({ pid: process.pid, level: 50, msg: "[diagnostic log omitted: invalid JSON]" }); }
+        destination.write(`${output}\n`);
+      },
+    },
   };
 }
 

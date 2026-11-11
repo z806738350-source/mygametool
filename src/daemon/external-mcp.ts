@@ -1,3 +1,4 @@
+import { assertLocalExecutionAllowed, LOCAL_EXECUTION_ENABLED } from "./local-execution-policy.js";
 import { randomBytes, randomUUID } from "node:crypto";
 import {
   mkdir,
@@ -32,9 +33,11 @@ export const EXTERNAL_PROJECT_TOOLS = [
   "generate_speech",
   "generate_sound_effect",
   "generate_music",
+  "recover_media",
   "canvas_check",
   "canvas_initialize",
   "generate_canvas_media",
+  "recover_canvas_media",
   "game_use",
   "playable_add_node",
   "playable_check",
@@ -49,7 +52,9 @@ const JOB_TOOLS = new Set<string>([
   "generate_speech",
   "generate_sound_effect",
   "generate_music",
+  "recover_media",
   "generate_canvas_media",
+  "recover_canvas_media",
 ]);
 
 /** Why a public tool can be missing from a project's tools. */
@@ -212,6 +217,7 @@ export class ExternalMcpService {
   }
 
   async load(): Promise<void> {
+    if (!LOCAL_EXECUTION_ENABLED) { this.#enabled = false; await this.#revoke(); return; }
     try {
       const value = JSON.parse(
         await readFile(this.#settingsPath, "utf8"),
@@ -223,10 +229,11 @@ export class ExternalMcpService {
   }
 
   get enabled(): boolean {
-    return this.#enabled;
+    return LOCAL_EXECUTION_ENABLED && this.#enabled;
   }
 
   async setEnabled(enabled: boolean): Promise<void> {
+    if (enabled) assertLocalExecutionAllowed("External MCP server");
     if (enabled === this.#enabled) return;
     this.#enabled = enabled;
     await this.#write(this.#settingsPath, {
@@ -249,6 +256,7 @@ export class ExternalMcpService {
   }
 
   async handle(request: ExternalMcpRequest): Promise<ExternalMcpAnswer> {
+    if (!LOCAL_EXECUTION_ENABLED) return { status: 403, body: { error: "External MCP is temporarily unavailable pending isolated execution" } };
     if (!this.#token || !matchesBearerToken(request.authorization, this.#token))
       return {
         status: 401,
@@ -331,7 +339,7 @@ export class ExternalMcpService {
   }
 
   async #publishNow(): Promise<void> {
-    if (!this.#enabled || !this.#url) return this.#revoke();
+    if (!LOCAL_EXECUTION_ENABLED || !this.#enabled || !this.#url) return this.#revoke();
     if (this.#token) return;
     // The launcher lists these while OhMyGame is closed, so a client starting does not start the app.
     await this.#write(this.#catalogPath, {

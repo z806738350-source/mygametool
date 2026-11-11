@@ -1,3 +1,5 @@
+import { assertLocalExecutionAllowed } from "./local-execution-policy.js";
+import type { IsolatedProjectExecution } from "./isolated-project-execution.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { watch, type FSWatcher } from "node:fs";
 import {
@@ -31,9 +33,13 @@ import {
   previewScriptArguments,
 } from "./preview-launch.js";
 import { startStaticPreview } from "./preview-static.js";
+import type { CheckedMediaSnapshotStore } from "./checked-media-snapshot.js";
 import { storyWebEditorBridge } from "./story-web-bundle.js";
 
 interface PreviewOptions {
+  mediaSnapshots?: CheckedMediaSnapshotStore;
+  execution?: IsolatedProjectExecution;
+  assertAvailable?: (projectId: string) => void;
   readinessTimeoutMs?: number;
   installTimeoutMs?: number;
   idleTimeoutMs?: number;
@@ -61,6 +67,11 @@ export class PreviewCancelledError extends Error {
   }
 }
 
+class ProjectExecutionBusyError extends ProjectWorkspaceError {
+  readonly statusCode = 409;
+  constructor() { super("A project command or build is running. Wait for it to finish."); }
+}
+
 /** An automatic start found nothing to run yet, which is expected before the first files exist. */
 class PreviewNotReadyError extends ProjectWorkspaceError {}
 
@@ -76,6 +87,7 @@ export class PreviewManager {
   readonly #children = new Map<string, Set<ChildProcess>>();
   readonly #operations = new Map<string, PreviewOperation>();
   readonly #starting = new Map<string, Promise<string>>();
+  readonly #executionBusy = new Set<string>();
   readonly #stopping = new Map<string, Promise<void>>();
   readonly #sessions = new Map<string, PreviewSession>();
   readonly #timer: ReturnType<typeof setInterval>;
@@ -114,6 +126,7 @@ export class PreviewManager {
     automatic = false,
     paused = false,
   ): void {
+    this.options.assertAvailable?.(project.id);
     const session = this.#session(project);
     const first = !session.leases.has(id);
     session.leases.set(
@@ -141,6 +154,7 @@ export class PreviewManager {
   }
 
   touch(project: ProjectState, id: string, active = true): void {
+    if (active) this.options.assertAvailable?.(project.id);
     const session = this.#session(project);
     if (active) {
       session.leases.set(
@@ -172,7 +186,12 @@ export class PreviewManager {
   }
 
   async automatic(project: ProjectState, changedOnly = false): Promise<void> {
+    this.options.assertAvailable?.(project.id);
     const session = this.#session(project);
+    if (this.#executionBusy.has(project.id)) {
+      if (!changedOnly) session.dirty = true;
+      return;
+    }
     if (
       !this.#automaticAllowed(session) ||
       this.#starting.has(project.id) ||
@@ -182,8 +201,13 @@ export class PreviewManager {
     if (
       !this.#stopping.has(project.id) &&
       ["ready", "starting"].includes(project.preview.status)
-    )
+    ) {
+      // Reopening the editor can outlive its file watcher while the guest still serves a snapshot.
+      const child = this.#running.get(project.id);
+      if (!changedOnly && project.preview.status === "ready" && child && this.options.execution)
+        await this.#beginStart(project, false, true, child).catch(() => {});
       return;
+    }
     if (project.preview.status === "error" && !session.dirty) return;
     session.dirty = false;
     // Inspection and launch share one operation, so stopping cancels both.
@@ -193,6 +217,7 @@ export class PreviewManager {
   #automaticAllowed(session: PreviewSession): boolean {
     return (
       this.#sessions.get(session.project.id) === session &&
+      !this.#executionBusy.has(session.project.id) &&
       supportsWebPreview(session.project) &&
       session.project.previewAutoStart !== false &&
       !session.paused &&
@@ -200,7 +225,37 @@ export class PreviewManager {
     );
   }
 
+  /** Let a command or build borrow the script preview's single guest operation. */
+  async withExecutionSlot<T>(project: ProjectState, task: () => Promise<T>, stopPreview = true): Promise<T> {
+    this.options.assertAvailable?.(project.id);
+    if (this.#executionBusy.has(project.id))
+      throw new ProjectExecutionBusyError();
+    this.#executionBusy.add(project.id);
+    const session = this.#session(project);
+    const starting = this.#starting.get(project.id);
+    const suspend = !!starting || this.#running.has(project.id);
+    let succeeded = false;
+    try {
+      if (!stopPreview && (suspend || ["ready", "starting"].includes(project.preview.status)))
+        throw new Error("Stop the preview yourself before changing project capacity; no running preview was interrupted");
+      if (suspend) {
+        await this.stop(project, "execution");
+        await starting?.catch(() => {});
+      }
+      this.options.assertAvailable?.(project.id);
+      const result = await task();
+      succeeded = true;
+      return result;
+    } finally {
+      this.#executionBusy.delete(project.id);
+      if (stopPreview && succeeded && (suspend || session.dirty) && this.#automaticAllowed(session))
+        await this.automatic(project).catch(() => {});
+    }
+  }
+
   ensureStarted(project: ProjectState, manual = true): Promise<string> {
+    try { this.options.assertAvailable?.(project.id); } catch (cause) { return Promise.reject(cause); }
+    if (this.#executionBusy.has(project.id) && !this.#static.has(project.id)) return Promise.reject(new ProjectExecutionBusyError());
     if (!previewable(project))
       return Promise.reject(
         new ProjectWorkspaceError(
@@ -219,8 +274,11 @@ export class PreviewManager {
       !this.#stopping.has(project.id) &&
       project.preview.status === "ready" &&
       project.preview.url
-    )
+    ) {
+      const child = this.#running.get(project.id);
+      if (child && this.options.execution) return this.#beginStart(project, false, false, child);
       return Promise.resolve(project.preview.url);
+    }
     return this.start(project, false, manual);
   }
 
@@ -229,6 +287,8 @@ export class PreviewManager {
     reinstall = false,
     manual = true,
   ): Promise<string> {
+    try { this.options.assertAvailable?.(project.id); } catch (cause) { return Promise.reject(cause); }
+    if (this.#executionBusy.has(project.id)) return Promise.reject(new ProjectExecutionBusyError());
     if (manual) this.#session(project).paused = false;
     return this.#beginStart(project, reinstall);
   }
@@ -237,8 +297,9 @@ export class PreviewManager {
     project: ProjectState,
     reinstall: boolean,
     automatic = false,
+    reuseChild?: ChildProcess,
   ): Promise<string> {
-    const starting = this.#start(project, reinstall, automatic);
+    const starting = this.#start(project, reinstall, automatic, reuseChild);
     this.#starting.set(project.id, starting);
     const forget = () => {
       if (this.#starting.get(project.id) === starting)
@@ -252,6 +313,7 @@ export class PreviewManager {
     project: ProjectState,
     reinstall: boolean,
     automatic: boolean,
+    reuseChild?: ChildProcess,
   ): Promise<string> {
     if (!previewable(project))
       throw new ProjectWorkspaceError(
@@ -261,6 +323,7 @@ export class PreviewManager {
     const operation: PreviewOperation = { automatic };
     this.#operations.set(project.id, operation);
     const assertCurrent = () => {
+      this.options.assertAvailable?.(project.id);
       this.#assertCurrent(project.id, operation);
       if (operation.automatic && !this.#automaticAllowed(session))
         throw new PreviewCancelledError();
@@ -268,6 +331,12 @@ export class PreviewManager {
     let child: ChildProcess | undefined;
     let began = false;
     try {
+      if (reuseChild) {
+        const matches = await this.options.execution!.previewSourceMatches(reuseChild, project);
+        assertCurrent();
+        if (matches && this.#running.get(project.id) === reuseChild && project.preview.url)
+          return project.preview.url;
+      }
       // A web story is its own page: the folder is served as it is, whatever scripts it carries.
       const workspace = await resolvePreviewWorkspace(project.type === "interactive-story"
         ? { workspacePath: project.workspacePath, startupDirectory: ".", previewMode: "static" }
@@ -331,7 +400,7 @@ export class PreviewManager {
           command: "Serve static files",
         });
         assertCurrent();
-        const server = await startStaticPreview(workspace.absolutePath, port);
+        const server = await startStaticPreview(workspace.absolutePath, port, { mediaSnapshots: this.options.mediaSnapshots });
         try {
           assertCurrent();
         } catch (cause) {
@@ -340,10 +409,12 @@ export class PreviewManager {
         }
         this.#static.set(project.id, server);
       } else {
+        if (!this.options.execution) assertLocalExecutionAllowed("Package-script and custom-command previews");
         let command: string;
         let args: string[];
         let custom = false;
         if (workspace.mode === "command") {
+          if (this.options.execution) throw new Error("Custom shell previews remain unavailable; configure an isolated npm script instead");
           command = project
             .previewCommand!.replaceAll("{port}", String(port))
             .replaceAll("{host}", "127.0.0.1");
@@ -362,6 +433,7 @@ export class PreviewManager {
             dependencies,
             project.packageManager,
           );
+          if (this.options.execution && manager !== "npm") throw new Error("This isolated runtime currently supports npm projects only");
           assertCurrent();
           const manifest = JSON.parse(
             await readFile(
@@ -371,7 +443,7 @@ export class PreviewManager {
           );
           assertCurrent();
           this.#update(project, { manager, managerSource: source });
-          command = await resolvePackageManagerExecutable(manager, environment);
+          command = this.options.execution ? manager : await resolvePackageManagerExecutable(manager, environment);
           assertCurrent();
           await ensureProjectDependencies(
             dependencies,
@@ -389,10 +461,12 @@ export class PreviewManager {
                 installArgs,
                 dependencies,
                 log,
+                assertCurrent,
               );
             },
             reinstall,
             assertCurrent,
+            this.options.execution,
           );
           assertCurrent();
           args = packageManagerRunArguments(
@@ -409,7 +483,9 @@ export class PreviewManager {
           });
         }
         assertCurrent();
-        child = spawn(
+        child = this.options.execution
+          ? await this.options.execution.start(project, "preview", workspace.absolutePath, args, port)
+          : spawn(
           custom ? command : packageManagerSpawnCommand(command),
           args,
           {
@@ -421,6 +497,12 @@ export class PreviewManager {
             windowsHide: true,
           },
         );
+        try { assertCurrent(); }
+        catch (cause) {
+          await this.#stopChild(child);
+          await this.options.execution?.settled(child);
+          throw cause;
+        }
         this.#track(project.id, child);
         this.#running.set(project.id, child);
         output = captureOutput([child.stdout, child.stderr], log);
@@ -451,7 +533,8 @@ export class PreviewManager {
           ),
         );
         this.#update(project, { phase: "connecting" });
-        await waitUntilReady(
+        if (this.options.execution) await this.options.execution.ready(child);
+        else await waitUntilReady(
           `http://127.0.0.1:${port}`,
           child,
           this.#readinessTimeoutMs,
@@ -482,6 +565,7 @@ export class PreviewManager {
         },
         {
           port: preferredPort,
+          ...(child && this.options.execution ? { createConnection: () => this.options.execution!.connection(child!) } : {}),
           ...(project.type === "interactive-story" ? { story: { bridge: storyWebEditorBridge } } : {}),
           onActivity: (id, active) => {
             if (proxyHandle && this.#proxies.get(project.id) === proxyHandle)
@@ -545,7 +629,7 @@ export class PreviewManager {
         // Dispose only this launch's child; a replacement may already own the project.
         if (child && this.#running.get(project.id) === child) {
           this.#running.delete(project.id);
-          await terminateProjectProcess(child);
+          await this.#stopChild(child);
         }
         throw new PreviewCancelledError();
       }
@@ -566,6 +650,7 @@ export class PreviewManager {
           });
       } else if (
         operation.automatic &&
+        !reuseChild &&
         !(cause instanceof PreviewCancelledError)
       ) {
         this.#update(project, {
@@ -586,7 +671,7 @@ export class PreviewManager {
 
   async stop(
     project: ProjectState,
-    reason: "manual" | "idle" | "settings" = "manual",
+    reason: "manual" | "idle" | "settings" | "execution" = "manual",
   ): Promise<void> {
     const session = this.#session(project);
     if (reason === "manual") session.paused = true;
@@ -618,7 +703,7 @@ export class PreviewManager {
       error: undefined,
       diagnostic: undefined,
       diagnostics: [],
-      stopReason: reason,
+      stopReason: reason === "execution" && session.paused ? "manual" : reason,
     };
     this.#publish(project);
   }
@@ -749,8 +834,16 @@ export class PreviewManager {
     await Promise.all([
       proxy?.close(),
       staticServer?.close(),
-      ...children.map(terminateProjectProcess),
+      ...children.map(async (child) => {
+        await this.#stopChild(child);
+        await this.options.execution?.settled(child);
+      }),
     ]);
+  }
+
+  async #stopChild(child: ChildProcess): Promise<void> {
+    if (this.options.execution) await this.options.execution.stop(child);
+    else await terminateProjectProcess(child);
   }
 
   async #run(
@@ -759,8 +852,14 @@ export class PreviewManager {
     args: string[],
     cwd: string,
     log: (output: string) => void,
+    assertCurrent: () => void,
   ): Promise<void> {
-    const child = spawn(packageManagerSpawnCommand(command), args, {
+    if (!this.options.execution) assertLocalExecutionAllowed("Project command execution");
+    const project = this.#sessions.get(id)?.project;
+    if (this.options.execution && !project) throw new Error("The isolated project is unavailable");
+    const child = this.options.execution
+      ? await this.options.execution.start(project!, "install", cwd)
+      : spawn(packageManagerSpawnCommand(command), args, {
       cwd,
       env: projectProcessEnvironment(),
       stdio: ["ignore", "pipe", "pipe"],
@@ -771,6 +870,7 @@ export class PreviewManager {
     this.#track(id, child);
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
+      assertCurrent();
       await Promise.race([
         waitForCommand(child, command, log),
         new Promise<never>((_resolve, reject) => {
@@ -785,10 +885,13 @@ export class PreviewManager {
           );
         }),
       ]);
+      await this.options.execution?.settled(child, true);
     } finally {
       clearTimeout(timer);
-      await terminateProjectProcess(child);
-      this.#untrack(id, child);
+      try {
+        await this.#stopChild(child);
+        await this.options.execution?.settled(child);
+      } finally { this.#untrack(id, child); }
     }
   }
   #assertCurrent(id: string, operation: PreviewOperation): void {

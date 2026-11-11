@@ -45,7 +45,6 @@ import { groupProviders } from "./provider-groups.js";
 import { useReadyRuntimeGeneration } from "./runtime-connection.js";
 import { WindowDragRegion } from "./window-drag-region.js";
 import { OnboardingMedia } from "./onboarding-media.js";
-import { OnboardingAgents } from "./onboarding-agents.js";
 import { OnboardingDemo } from "./onboarding-demo.js";
 import { t } from "./i18n.js";
 import "./onboarding.css";
@@ -73,9 +72,9 @@ export function Onboarding({
   const [providerError, setProviderError] = useState<string>();
   const [loadingProviders, setLoadingProviders] = useState(true);
   const [running, setRunning] = useState(false);
+  const runningAction = useRef(false);
   const [savingProvider, setSavingProvider] = useState(false);
-  const [savingAgent, setSavingAgent] = useState(false);
-  const busy = running || savingProvider || savingAgent;
+  const busy = running || savingProvider;
   const failedAction = useRef<(() => Promise<void>) | undefined>(undefined);
   const [connection, setConnection] = useState<Connection>();
   const [adding, setAdding] = useState(false);
@@ -86,8 +85,6 @@ export function Onboarding({
   useEffect(() => {
     if (step !== "welcome") setPlayWelcomeIntro(false);
   }, [step]);
-  const [choosingAgent, setChoosingAgent] = useState(true);
-  const [selectedAgent, setSelectedAgent] = useState<"pi" | AgentRuntimeId>();
   const [selectedModels, setSelectedModels] = useState<
     Partial<Record<"pi" | AgentRuntimeId, AgentModelRef>>
   >({});
@@ -99,11 +96,7 @@ export function Onboarding({
     catalog.defaultModel,
   );
   const model = phase === "ready" ? preferredModel : undefined;
-  const activeAgent =
-    selectedAgent ??
-    (isAgentRuntimeId(preferredModel?.provider)
-      ? preferredModel.provider
-      : "pi");
+  const activeAgent = "pi";
   const agentModels = catalog.models.filter((item) =>
     activeAgent === "pi"
       ? !isAgentRuntimeId(item.provider)
@@ -123,9 +116,7 @@ export function Onboarding({
       : undefined;
   const languageProviders = providers.filter(
     (provider) =>
-      provider.capabilities.includes("language") &&
-      // Signing in to OpenAI covers ChatGPT subscriptions; keep the legacy entry only once saved.
-      (provider.id !== "openai-codex" || chatConnected(provider)),
+      provider.id === "kunpo" && provider.capabilities.includes("language"),
   );
   useEffect(() => {
     if (step !== "connect") return;
@@ -169,7 +160,7 @@ export function Onboarding({
     const load = () => {
       clearTimeout(retry);
       const current = ++sequence;
-      void listModels({ agentRuntimes: true })
+      void listModels({ agentRuntimes: false })
         .then((loadedCatalog) => {
           if (!active || current !== sequence) return;
           setCatalog(loadedCatalog);
@@ -202,7 +193,8 @@ export function Onboarding({
   }, [step, generation, refresh]);
 
   async function run(action: () => Promise<void>) {
-    if (running) return;
+    if (runningAction.current) return;
+    runningAction.current = true;
     setRunning(true);
     setError(undefined);
     try {
@@ -212,6 +204,7 @@ export function Onboarding({
       failedAction.current = action;
       setError(errorMessage(cause));
     } finally {
+      runningAction.current = false;
       setRunning(false);
     }
   }
@@ -226,7 +219,7 @@ export function Onboarding({
         await setProviderEnabled(current.id, true);
       }
       completed(current.id);
-    } else if (current.custom) {
+    } else if (current.custom && current.id !== "kunpo") {
       setCustomSettings(await getCustomProvider(current.id));
       setAdding(true);
     } else {
@@ -263,15 +256,6 @@ export function Onboarding({
     setConnection(undefined);
     setConnectedProvider(providerId);
     setSelectedModels((value) => ({ ...value, pi: undefined }));
-  }
-
-  function selectAgent(id: "pi" | AgentRuntimeId) {
-    setChoosingAgent(false);
-    if (agentModel)
-      setSelectedModels((value) => ({ ...value, [activeAgent]: agentModel }));
-    setSelectedAgent(id);
-    setError(undefined);
-    failedAction.current = undefined;
   }
 
   function navigate(next: OnboardingStep) {
@@ -344,16 +328,7 @@ export function Onboarding({
       <h1 ref={heading} tabIndex={-1}>
         {t("onboarding.chooseProvider")}
       </h1>
-      <OnboardingAgents
-        busy={busy}
-        models={catalog.models}
-        selectedAgent={activeAgent}
-        choosing={choosingAgent}
-        onExpand={() => setChoosingAgent(true)}
-        onSelectAgent={selectAgent}
-        loadingRuntimes={catalog.loadingRuntimes}
-        onBusyChange={setSavingAgent}
-      >
+      <div className="onboarding-provider-content">
         {activeAgent === "pi" ? (
           <>
             <div className="onboarding-provider-heading">
@@ -368,6 +343,7 @@ export function Onboarding({
               <ProviderPicker
                 providers={languageProviders}
                 busy={busy}
+                allowCustom={false}
                 onChoose={(provider, method) =>
                   void run(() => connect(provider, method))
                 }
@@ -398,7 +374,7 @@ export function Onboarding({
             {t("onboarding.loadingAgentModels")}
           </p>
         ) : null}
-      </OnboardingAgents>
+      </div>
     </>
   );
 
@@ -439,7 +415,6 @@ export function Onboarding({
         {error ||
         loadError ||
         (step === "connect" &&
-          !choosingAgent &&
           activeAgent === "pi" &&
           providerError) ? (
           <div className="onboarding-feedback">
@@ -480,7 +455,7 @@ export function Onboarding({
               <button
                 className="onboarding-primary-button"
                 type="button"
-                disabled={busy || choosingAgent || !agentModel}
+                disabled={busy || !agentModel}
                 onClick={() => navigate("media")}
               >
                 {t("onboarding.next")}
@@ -604,11 +579,13 @@ function ProviderPicker({
   busy,
   onChoose,
   onAdd,
+  allowCustom = true,
 }: {
   providers: ProviderSummary[];
   busy: boolean;
   onChoose: (provider: ProviderSummary, method: ModelAuthMethod) => void;
   onAdd: () => void;
+  allowCustom?: boolean;
 }) {
   const [query, setQuery] = useState("");
   const [moreOpen, setMoreOpen] = useState(false);
@@ -667,7 +644,7 @@ function ProviderPicker({
                 />
               )}
             </button>
-          ) : provider.custom ? (
+          ) : provider.custom && provider.id !== "kunpo" ? (
             <button
               className="onboarding-text-button onboarding-icon-button"
               type="button"
@@ -722,7 +699,7 @@ function ProviderPicker({
             onChange={(event) => setQuery(event.target.value)}
           />
         </label>
-        <button
+        {allowCustom ? <button
           className="onboarding-text-button onboarding-add-provider"
           type="button"
           aria-label={t("onboarding.addCustomProvider")}
@@ -731,7 +708,7 @@ function ProviderPicker({
           onClick={onAdd}
         >
           <Plus size={16} aria-hidden="true" />
-        </button>
+        </button> : null}
       </div>
       <div className="onboarding-provider-list">
         {(hasMore ? featured : visible).map(row)}

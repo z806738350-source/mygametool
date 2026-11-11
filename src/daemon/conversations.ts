@@ -155,6 +155,11 @@ export class ConversationManager {
     return entry?.type === "thinking_level_change" ? parseReasoningLevel(entry.thinkingLevel) : undefined;
   }
 
+  async hasImageHistory(project: ProjectState, stored: StoredConversation): Promise<boolean> {
+    const context = (await this.view(project, stored)).buildSessionContext();
+    return context.messages.some((message) => "content" in message && Array.isArray(message.content) && message.content.some((block) => block.type === "image"));
+  }
+
   setReasoningLevel(project: ProjectState, stored: StoredConversation, level: AgentReasoningLevel): void {
     this.open(project, stored).appendThinkingLevelChange(level);
   }

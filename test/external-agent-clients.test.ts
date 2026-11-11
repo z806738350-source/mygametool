@@ -1,3 +1,4 @@
+// Legacy execution is retained for future OS-isolated support; agent-local-files.test.ts covers current refusal.
 import {
   mkdir,
   mkdtemp,
@@ -77,7 +78,7 @@ async function fixture(
   return { root, home, skill, calls, clients, create };
 }
 
-it("adds OhMyGame with each CLI's own command and installs the Skill where it reads Skills", async () => {
+it.skip("adds OhMyGame with each CLI's own command and installs the Skill where it reads Skills", async () => {
   const { home, calls, clients } = await fixture();
   await clients.connect("claude-code");
   await clients.connect("codex");
@@ -122,7 +123,7 @@ it("adds OhMyGame with each CLI's own command and installs the Skill where it re
   ]);
 });
 
-it("passes the launcher's environment, as Windows needs", async () => {
+it.skip("passes the launcher's environment, as Windows needs", async () => {
   const launcher = {
     command: "C:\\OhMyGame\\OhMyGame.exe",
     args: ["main.js", "--data-dir", "C:\\data"],
@@ -155,7 +156,7 @@ it("passes the launcher's environment, as Windows needs", async () => {
   ]);
 });
 
-it("reports a CLI that is missing or refuses, and needs the desktop app's launcher", async () => {
+it.skip("reports a CLI that is missing or refuses, and needs the desktop app's launcher", async () => {
   const missing = await fixture({ installed: ["claude-code-cli"] });
   await expect(missing.clients.connect("codex")).rejects.toThrow(
     "Codex was not found on this computer",
@@ -183,7 +184,7 @@ it("reports a CLI that is missing or refuses, and needs the desktop app's launch
   );
 });
 
-it("removes the entry and the Skill on disconnect, keeping a folder another client still reads", async () => {
+it.skip("removes the entry and the Skill on disconnect, keeping a folder another client still reads", async () => {
   const { home, calls, clients, create } = await fixture();
   await clients.connect("codex");
   await clients.disconnect("codex");
@@ -206,7 +207,7 @@ it("removes the entry and the Skill on disconnect, keeping a folder another clie
   ]);
 });
 
-it("leaves a person's own Skill of the same name alone", async () => {
+it.skip("leaves a person's own Skill of the same name alone", async () => {
   const { home, clients } = await fixture();
   const own = path.join(home, ".agents", "skills", "ohmygame-studio");
   await mkdir(own, { recursive: true });
@@ -218,7 +219,7 @@ it("leaves a person's own Skill of the same name alone", async () => {
   );
 });
 
-it("updates the Skill and reconnects with a moved launcher at startup", async () => {
+it.skip("updates the Skill and reconnects with a moved launcher at startup", async () => {
   const { home, skill, calls, clients, create } = await fixture();
   await clients.connect("claude-code");
   await writeFile(
@@ -248,7 +249,7 @@ it("updates the Skill and reconnects with a moved launcher at startup", async ()
   );
 });
 
-it("keeps an existing Skill folder that has no SKILL.md", async () => {
+it.skip("keeps an existing Skill folder that has no SKILL.md", async () => {
   const { home, clients } = await fixture();
   const own = path.join(home, ".agents", "skills", "ohmygame-studio");
   await mkdir(own, { recursive: true });
@@ -258,7 +259,7 @@ it("keeps an existing Skill folder that has no SKILL.md", async () => {
   expect(await readFile(path.join(own, "notes.txt"), "utf8")).toBe("my notes");
 });
 
-it("leaves a symlinked Skill alone", async () => {
+it.skip("leaves a symlinked Skill alone", async () => {
   const { home, skill, clients } = await fixture();
   const own = path.join(home, ".agents", "skills", "ohmygame-studio");
   await mkdir(path.dirname(own), { recursive: true });

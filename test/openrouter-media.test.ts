@@ -1,9 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
 import { listOpenRouterImageModels, listOpenRouterVideoModels } from "../src/daemon/openrouter-media.js";
 
-const source = { baseUrl: "https://openrouter.ai/api/v1", apiKey: "sk-or", headers: {} };
+// Exercise compatibility parsing only through an explicit local transport mock.
+const source = { baseUrl: "http://127.0.0.1:43199/api/v1", apiKey: "fake-local-key", headers: {} };
 
 describe("OpenRouter media catalogs", () => {
+  it("refuses the retired remote catalogs before invoking the transport", async () => {
+    const request = vi.fn<typeof fetch>();
+    const remote = { ...source, baseUrl: "https://openrouter.ai/api/v1" };
+    await expect(listOpenRouterImageModels(remote, request)).rejects.toThrow(/not allowed|not available|unavailable/i);
+    await expect(listOpenRouterVideoModels(remote, request)).rejects.toThrow(/not allowed|not available|unavailable/i);
+    expect(request).not.toHaveBeenCalled();
+  });
   it("maps image capabilities into editor model options", async () => {
     const request = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ data: [{
       id: "openai/gpt-image-2.5-flare",
@@ -32,7 +40,7 @@ describe("OpenRouter media catalogs", () => {
         ],
       }),
     ]);
-    expect(request.mock.calls[0]?.[0]).toBe("https://openrouter.ai/api/v1/images/models");
+    expect(request.mock.calls[0]?.[0]).toBe(`${source.baseUrl}/images/models`);
   });
 
   it("maps only video models with usable generation constraints", async () => {
@@ -60,7 +68,7 @@ describe("OpenRouter media catalogs", () => {
         imageReferenceMode: "reference",
       }),
     ]);
-    expect(request.mock.calls[0]?.[0]).toBe("https://openrouter.ai/api/v1/videos/models");
+    expect(request.mock.calls[0]?.[0]).toBe(`${source.baseUrl}/videos/models`);
   });
 
   it("uses known reference counts only when the catalog allows images and omits a count", async () => {

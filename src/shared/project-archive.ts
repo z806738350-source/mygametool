@@ -31,6 +31,7 @@ export const PROJECT_ARCHIVE_SETTING_KEYS = [
   "previewPath",
   "previewViewport",
   "mediaModelDefaults",
+  "modelSelections",
   ...PREVIEW_SETTING_KEYS,
 ] as const satisfies readonly (keyof ProjectState)[];
 

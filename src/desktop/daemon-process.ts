@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
 import path from "node:path";
-import type { PlaytestIpcMessage, PlaytestRequest, PlaytestResult } from "../shared/playtest.js";
+import { getPlaytestActionFailure, getPlaytestOpenFailure, type PlaytestIpcMessage, type PlaytestRequest, type PlaytestResult } from "../shared/playtest.js";
 import { signalProcessTree } from "../daemon/process-lifecycle.js";
 import type { DaemonRuntime } from "../shared/desktop-runtime.js";
 import type { ExternalMcpLauncher } from "../shared/external-mcp.js";
@@ -10,6 +10,7 @@ export type { DaemonRuntime } from "../shared/desktop-runtime.js";
 
 const MAX_STARTUP_OUTPUT_CHARS = 8_000;
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 20_000;
+const OWNED_LOCAL_SHUTDOWN_TIMEOUT_MS = 150_000;
 
 export interface ManagedDaemon {
   runtime: DaemonRuntime;
@@ -23,6 +24,11 @@ export interface StartDaemonOptions {
   allowedOrigins: string[];
   runtimeBin?: string;
   piAgentDirectory?: string;
+  /** Explicit local-edition file path. Only the daemon reads its contents. */
+  localEnvFile?: string;
+  reuseLocalEnv?: boolean;
+  /** Non-secret ownership marker for this launcher's private VM lifecycle. */
+  localLaunchId?: string;
   bundledPluginsDirectory?: string;
   preinstalledPluginsDirectory?: string;
   examplesDirectory?: string;
@@ -44,18 +50,24 @@ export interface StartDaemonOptions {
 }
 
 export async function startDaemon(options: StartDaemonOptions): Promise<ManagedDaemon> {
+  if (options.localEnvFile && (options.reuseLocalEnv || !path.isAbsolute(options.localEnvFile) || /[\u0000-\u001f\u007f]/.test(options.localEnvFile))) {
+    throw new Error("Pass an absolute local credential file or reuse its snapshot, never both");
+  }
   const port = await availablePort();
+  const shutdownTimeout = options.localLaunchId ? OWNED_LOCAL_SHUTDOWN_TIMEOUT_MS : GRACEFUL_SHUTDOWN_TIMEOUT_MS;
   const runtime = { url: `http://127.0.0.1:${port}`, token: options.token };
   const environment = { ...(options.environment ?? process.env) };
-  // Also discard inherited tokens, including case variants on Windows.
+  // Only the daemon-owned literal store supplies model credentials. Neither
+  // ambient keys nor runtime loader hooks may enter a fresh daemon process.
   for (const name of Object.keys(environment)) {
-    if (name.toUpperCase() === "OHMYGAME_DAEMON_TOKEN") delete environment[name];
+    if (/(?:^|_)(?:API_?KEY|ACCESS_KEY|PRIVATE_KEY|KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE|CREDENTIALS?|AUTH)(?:_|$)/i.test(name)
+      || /^(?:NODE_OPTIONS|BUN_OPTIONS|NODE_EXTRA_CA_CERTS|NODE_TLS_REJECT_UNAUTHORIZED|SSL_CERT_FILE|SSL_CERT_DIR|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_.+|GIT_ASKPASS|SSH_ASKPASS)$/i.test(name)) delete environment[name];
   }
   if (options.runtimeBin) {
     const pathKey = Object.keys(environment).find((key) => key.toLowerCase() === "path") ?? "PATH";
     environment[pathKey] = [path.resolve(options.runtimeBin), environment[pathKey]].filter(Boolean).join(path.delimiter);
   }
-  const child = spawn(options.executable ?? process.execPath, [path.resolve(options.daemonEntry), ...(options.development ? ["--dev"] : [])], {
+  const child = spawn(options.executable ?? process.execPath, [path.resolve(options.daemonEntry), ...(options.development ? ["--dev"] : []), ...(options.reuseLocalEnv ? ["--reuse-local-env"] : options.localEnvFile ? ["--local-env", path.resolve(options.localEnvFile)] : [])], {
     env: {
       ...environment,
       ELECTRON_RUN_AS_NODE: "1",
@@ -65,6 +77,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<ManagedD
       OHMYGAME_DAEMON_TOKEN_STDIN: "1",
       OHMYGAME_ALLOWED_ORIGINS: options.allowedOrigins.join(","),
       OHMYGAME_PROJECT_PROCESS_IPC: "1",
+      ...(options.localLaunchId ? { OHMYGAME_LOCAL_LAUNCH_ID: options.localLaunchId } : {}),
       ...(options.piAgentDirectory ? { PI_CODING_AGENT_DIR: path.resolve(options.piAgentDirectory) } : {}),
       ...(options.bundledPluginsDirectory ? { OHMYGAME_BUNDLED_PLUGINS_DIR: path.resolve(options.bundledPluginsDirectory) } : {}),
       ...(options.preinstalledPluginsDirectory ? { OHMYGAME_PREINSTALLED_PLUGINS_DIR: path.resolve(options.preinstalledPluginsDirectory) } : {}),
@@ -149,7 +162,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<ManagedD
     ready = true;
   } catch (error) {
     stopped = true;
-    await stopChild(child);
+    await stopChild(child, shutdownTimeout);
     await cleanup();
     throw error;
   }
@@ -162,7 +175,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<ManagedD
       stopped = true;
       return stopping = (async () => {
         playtestRequests?.close();
-        await stopChild(child);
+        await stopChild(child, shutdownTimeout);
         await closed;
       })();
     },
@@ -194,6 +207,8 @@ function bindPlaytestRequests(
         channel: "ohmygame:playtest-response",
         id: message.id as string,
         error: cause instanceof Error ? cause.message : String(cause),
+        ...(getPlaytestActionFailure(cause) ? { actionFailure: getPlaytestActionFailure(cause) } : {}),
+        ...(getPlaytestOpenFailure(cause) ? { openFailure: getPlaytestOpenFailure(cause) } : {}),
       }),
     ).finally(() => active.delete(message.id as string));
   };
@@ -255,14 +270,14 @@ function startupError(message: string, output: string): Error {
   return new Error(detail ? `${message}\n\nDaemon output:\n${detail}` : message);
 }
 
-async function stopChild(child: ChildProcess): Promise<void> {
+async function stopChild(child: ChildProcess, timeoutMs: number): Promise<void> {
   if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
   const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
   // IPC lets Windows close the daemon's services before taskkill. POSIX also
   // supports older daemons through SIGTERM; both paths share the shutdown gate.
   if (child.connected) child.send({ channel: "ohmygame:shutdown" }, () => {});
   if (process.platform !== "win32") child.kill("SIGTERM");
-  if (await exitsWithin(exited, GRACEFUL_SHUTDOWN_TIMEOUT_MS)) return;
+  if (await exitsWithin(exited, timeoutMs)) return;
   if (process.platform === "win32") await signalProcessTree(child.pid, true);
   else child.kill("SIGKILL");
   if (!(await exitsWithin(exited, 5_000))) {

@@ -1,5 +1,4 @@
 import { createRoot } from "react-dom/client";
-import { init as initSentry } from "@sentry/electron/renderer";
 import { App } from "./app.js";
 import { AuthProvider } from "./auth.js";
 import { PlaytestPage } from "./playtest.js";
@@ -7,11 +6,11 @@ import { NodeThumbnailPage } from "./node-thumbnail-page.js";
 import { parseAppRoute } from "./routes.js";
 import { applyAppearance, readAppearance } from "./appearance.js";
 import { DesktopWindowFrame } from "./desktop-window-frame.js";
-import { initializeAnalytics } from "./analytics.js";
 import { initializeRuntimeConnection } from "./runtime-connection.js";
 import { RuntimeNotice } from "./runtime-notice.js";
 import { ErrorBoundary } from "./error-boundary.js";
 import { DesktopCloseGuard } from "./desktop-close-guard.js";
+import { Tooltips } from "./tooltips.js";
 import "./styles.css";
 import "./runtime-recovery.css";
 import { t } from "./i18n.js";
@@ -19,7 +18,6 @@ import { t } from "./i18n.js";
 const root = document.getElementById("root");
 if (!root) throw new Error("Renderer root was not found");
 const route = parseAppRoute(window.location.hash);
-if (window.ohMyGameDesktop) initSentry();
 applyAppearance(readAppearance());
 await initializeRuntimeConnection();
 if (window.ohMyGameDesktop?.platform === "darwin") {
@@ -27,6 +25,7 @@ if (window.ohMyGameDesktop?.platform === "darwin") {
 }
 const content = (
   <>
+    <Tooltips />
     <RuntimeNotice />
     <ErrorBoundary
       label={t("errorBoundary.label.application")}
@@ -59,5 +58,3 @@ createRoot(root).render(
     <DesktopCloseGuard>{content}</DesktopCloseGuard>
   ),
 );
-// The hidden thumbnail window is not a visit. Analytics waits until the first frame is up.
-if (route.page !== "thumbnail") requestIdleCallback(initializeAnalytics, { timeout: 2_000 });

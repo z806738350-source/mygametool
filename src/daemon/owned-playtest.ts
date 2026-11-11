@@ -9,6 +9,7 @@ export class OwnedPlaytestDriver implements GameRuntimeAdapter {
 
   get available() { return this.driver.available; }
   get capabilities() { return this.driver.capabilities; }
+  ownedSessionIds(): readonly string[] { return [...this.#sessions]; }
 
   async request(request: PlaytestRequest, signal?: AbortSignal): Promise<PlaytestResult> {
     if (request.operation === "closeAll") {

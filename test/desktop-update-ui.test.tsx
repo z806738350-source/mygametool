@@ -140,3 +140,13 @@ it("shows one update action and keeps download and restart controls tied to thei
   expect(action()).toBeNull();
   expect(container.textContent).toContain("Preparing a safe restart...");
 });
+
+
+it("shows local update disablement without offering an update request", async () => {
+  updates.state.mockResolvedValue({ currentVersion: "1.0.0", status: { type: "disabled" } });
+  await act(async () => root.render(<SettingsPage section="about" onBack={() => {}} onSectionChange={() => {}} />));
+  expect(container.textContent).toContain("Remote updates are disabled in this local edition.");
+  expect(container.querySelector(".settings-about-actions")).toBeNull();
+  expect(updates.check).not.toHaveBeenCalled();
+  expect(updates.download).not.toHaveBeenCalled();
+});

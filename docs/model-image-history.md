@@ -7,6 +7,51 @@ it does not migrate historical image bytes out of the session file.
 This addresses [#187](https://github.com/WhiteTowerAI/ohmygame/issues/187), where
 repeated screenshots made requests tens of megabytes larger on every turn.
 
+Images pasted or attached to chat stay with the conversation. A screenshot sent
+for feedback reaches the vision model even when the game exceeds its source-size
+budget. Saving an image in the Library or importing it into the game is a
+separate, explicit action. Duplicate attachment IDs in a message resolve once.
+The local server streams file uploads to disk separately from the conversation.
+One chat request can carry up to 128 MiB of original encoded images before the
+outbound model budget is applied. If the combined images exceed that limit,
+send fewer per message. Already uploaded originals can be reused.
+
+Text attachments up to 1 MiB provide a read-only `attachment:<batch>/<id>`
+reference for the agent's `read` tool. Other file types and larger text
+attachments provide metadata. Images sent as files can accompany the prompt
+when the selected model supports them (up to 20 MiB per image).
+
+In this local secure checkout, the [current Kunpo adapter scope](kunpo-local.md)
+supersedes the upstream transport table below. Application-managed user turns
+may add an `ohmygame-image-origins-v1` custom entry immediately before their
+canonical message. It holds only a message digest and ordered asset IDs, never
+URLs, image data or prompts. Exact message and byte checks recover those hints
+for follow-up, queued, revised and recalled images; the private asset source
+receipt must still match before a reviewed Chat or Opus request can use a CDN
+URL. Missing, altered or legacy provenance stays inline. Canonical images are
+unchanged, and GPT-6.1's unverified visual input remains unavailable.
+
+## Local project file tools
+
+In the local secure edition, `read` accepts PNG, JPEG and WebP project paths
+only for image-capable models. It returns the original image bytes, not a UTF-8
+interpretation, after the bounded 64 MiB secure file snapshot has checked paths,
+links, concurrent changes and registered credential values. Text reads retain
+their 1 MiB limit. The existing request-image preview and transmission budgets
+below still apply; reading an image does not rewrite its workspace original.
+
+`write` and `edit` remain text-only. They refuse binary-media filename extensions,
+and `write` checks the opened original before truncating it: files above 1 MiB,
+NUL-containing data and invalid UTF-8 cannot be replaced. Keep generated originals
+and use a separate file for notes or replacement assets, never a text placeholder
+at an image path. `grep` accepts either one safe project file or a directory.
+
+A generated-image download failure is distinct from generation failure. A ready
+image-request journal retains the artifact URL for recovery without another paid
+submission. A retained library original can also recover an accidentally changed
+workspace asset; verify its provenance and hash and save a separate copy rather
+than silently replacing the current workspace file.
+
 ## Request policies
 
 | Route | Transport and images |

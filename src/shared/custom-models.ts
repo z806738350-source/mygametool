@@ -7,12 +7,14 @@ import {
 } from "./contracts.js";
 import { hyper3DCredits } from "./cloud-models.js";
 import { knownImageReferenceLimit } from "./image-reference-limits.js";
+import { providerControlUrl } from "./provider-endpoint.js";
+import { isMeshyEndpoint, isMeshyModelReference, isMeshyProviderConfiguration } from "./disabled-media-providers.js";
 
 export const IMAGE_PROTOCOL_LABELS: Record<ImageProtocol, string> = {
   "openai-images": "OpenAI Images", "gemini-generate-content": "Gemini Generate Content",
   "openrouter-images": "OpenRouter Images", "volcengine-images": "Seedream",
 };
-export const VIDEO_PROTOCOL_LABELS: Record<VideoProtocol, string> = { "openrouter-videos": "OpenRouter Videos", seedance: "Seedance" };
+export const VIDEO_PROTOCOL_LABELS: Record<VideoProtocol, string> = { "openrouter-videos": "OpenRouter Videos", seedance: "Seedance", "kunpo-videos": "Kunpo Videos" };
 
 export function modelUsages(model: CustomProviderModel): CustomModelUsages {
   return model.usages ?? { language: true };
@@ -27,7 +29,7 @@ export function defaultImageSettings(protocol: ImageProtocol = "openai-images", 
 export function defaultVideoSettings(protocol: VideoProtocol = "openrouter-videos"): CustomVideoModelSettings {
   return { protocol, resolutions: ["720p"], aspectRatios: ["16:9", "9:16", "1:1"], durations: [6], maxReferenceImages: 1, referenceModes: ["reference"] };
 }
-export function defaultModel3DSettings(modelType: CustomModel3DSettings["modelType"] = "standard", protocol: CustomModel3DSettings["protocol"] = "meshy"): CustomModel3DSettings {
+export function defaultModel3DSettings(modelType: CustomModel3DSettings["modelType"] = "standard", protocol: CustomModel3DSettings["protocol"] = "tripo"): CustomModel3DSettings {
   if (protocol === "hyper3d") return { protocol, operation: "multi-image-to-3d", modelType: "standard", maxReferenceImages: 5,
     polycount: { min: 500, max: 1_000_000, default: 4_000, presets: [1_000, 4_000, 10_000, 20_000, 100_000] }, supportsTexture: true, supportsPbr: true };
   if (protocol === "tripo") return { protocol, operation: "multi-image-to-3d", modelType: "standard", maxReferenceImages: 4,
@@ -49,10 +51,12 @@ export function customVideoModel(provider: CustomProviderSettings, model: Custom
   const config = model.usages?.video;
   return config ? { provider: provider.id, providerName: provider.name, id: model.id, name: model.name,
     resolutions: config.resolutions, aspectRatios: config.aspectRatios, durations: config.durations,
-    maxImageReferences: config.maxReferenceImages, imageReferenceMode: config.referenceModes[0]!, referenceModes: config.referenceModes } : undefined;
+    maxImageReferences: config.maxReferenceImages, imageReferenceMode: config.referenceModes[0]!, referenceModes: config.referenceModes,
+    ...(config.protocol === "kunpo-videos" ? { frameAspectRatios: ["adaptive"] as const, textAspectRatios: config.aspectRatios.filter((ratio) => ratio !== "adaptive") } : {}) } : undefined;
 }
 export function customModel3D(provider: CustomProviderSettings, model: CustomProviderModel): Model3DModel | undefined {
   const config = model.usages?.["3d"];
+  if (isMeshyProviderConfiguration(provider) || isMeshyModelReference({ provider: provider.id, id: model.id, protocol: config?.protocol }) || isMeshyEndpoint(config?.baseUrl)) return undefined;
   return config ? { ...model3DModel(provider.id, provider.name, { id: model.id, name: model.name, settings: config }), operations: ["image", ...(config.operations ?? [])] } : undefined;
 }
 export function model3DModel(provider: string, providerName: string, model: Model3DDefinition): Model3DModel {
@@ -126,8 +130,7 @@ export function normalizeModelUsages(value: unknown): CustomModelUsages | undefi
 
 export function normalizeEndpoint(value: unknown): string {
   if (typeof value !== "string" || !value.trim()) throw new Error("Base URL is required");
-  const url = new URL(value.trim());
-  if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error("Base URL must be an HTTP(S) URL without credentials, query or fragment");
+  providerControlUrl(value.trim(), true);
   return value.trim().replace(/\/+$/, "");
 }
 function endpoint(config: Record<string, unknown>): { baseUrl?: string } {

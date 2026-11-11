@@ -130,18 +130,28 @@ export async function videoFilmstrip(
   source: Blob,
   count: number,
   height: number,
+  signal?: AbortSignal,
 ): Promise<string[]> {
+  signal?.throwIfAborted();
   const { ALL_FORMATS, BlobSource, CanvasSink, Input } =
     await import("mediabunny");
+  signal?.throwIfAborted();
   const input = new Input({
     formats: ALL_FORMATS,
     source: new BlobSource(source),
   });
+  let disposed = false;
+  const abort = () => { if (!disposed) { disposed = true; input.dispose(); } };
+  signal?.addEventListener("abort", abort, { once: true });
   try {
+    signal?.throwIfAborted();
     const video = await input.getPrimaryVideoTrack();
+    signal?.throwIfAborted();
     if (!video || !(await video.canDecode())) return [];
+    signal?.throwIfAborted();
     const start = await video.getFirstTimestamp();
     const duration = (await video.computeDuration()) - start;
+    signal?.throwIfAborted();
     const sink = new CanvasSink(video, {
       height,
       fit: "cover",
@@ -154,6 +164,7 @@ export async function videoFilmstrip(
     );
     const frames: string[] = [];
     for await (const frame of sink.canvasesAtTimestamps(timestamps)) {
+      signal?.throwIfAborted();
       if (!frame) continue;
       const canvas = frame.canvas;
       frames.push(
@@ -164,9 +175,14 @@ export async function videoFilmstrip(
             ),
       );
     }
+    signal?.throwIfAborted();
     return frames;
+  } catch (cause) {
+    signal?.throwIfAborted();
+    throw cause;
   } finally {
-    input.dispose();
+    signal?.removeEventListener("abort", abort);
+    abort();
   }
 }
 

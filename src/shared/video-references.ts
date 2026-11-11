@@ -1,4 +1,13 @@
-import type { AssetCanvasReference, VideoModel, VideoReferenceMode } from "./contracts.js";
+import type { AssetCanvasReference, ToolJob, VideoModel, VideoReferenceMode } from "./contracts.js";
+
+/** Old jobs have no transport receipt. Only recognize known post-submission evidence. */
+export function videoGenerationNeedsConfirmation(job: ToolJob | undefined): boolean {
+  if (!job || job.toolId !== "generate-video" || !["failed", "cancelled"].includes(job.status)) return false;
+  if (job.canRecoverVideo) return true;
+  if (job.videoSubmission) return job.videoSubmission === "attempted";
+  if (job.videoDiagnostic) return job.videoDiagnostic.category !== "local-policy";
+  return /^(?:Kunpo (?:rejected the video request|video status request failed|video task |video download failed|completed the task without|returned no valid video task ID|returned an invalid video response)|Video (?:submission|status request|status response|waiting timed out)|Local video waiting cancelled|Generation (?:was interrupted|interrupted|cancelled))/.test(job.error ?? "");
+}
 
 export type VideoReferenceMentions = Record<string, AssetCanvasReference>;
 const mentionPattern = /@(Image[1-9][0-9]*)(?![\w])/g;
@@ -39,8 +48,9 @@ export function videoReferenceLimit(model: VideoModel | undefined, requested?: V
 }
 
 export function videoReferenceAspectRatios(model: VideoModel | undefined, count: number, requested?: VideoReferenceMode) {
+  if (videoReferenceMode(model, requested) === "frame" && model?.frameAspectRatios?.length) return model.frameAspectRatios;
+  if (count === 0 && model?.textAspectRatios) return model.textAspectRatios;
   if (count > 0) {
-    if (videoReferenceMode(model, requested) === "frame" && model?.frameAspectRatios?.length) return model.frameAspectRatios;
     if (model?.imageAspectRatios?.length) return model.imageAspectRatios;
   }
   return model?.aspectRatios ?? [];

@@ -1,9 +1,11 @@
-import { mkdir, mkdtemp, readdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { PlayableDraftServer } from "../src/daemon/playable-draft-server.js";
 import type { ProjectState } from "../src/shared/contracts.js";
+import { LoopbackFileServer } from "../src/daemon/loopback-file-server.js";
+import { registerSensitiveValue } from "../src/shared/sensitive-values.js";
 
 const project = { id: "project-1" } as ProjectState;
 let server: PlayableDraftServer | undefined;
@@ -22,6 +24,28 @@ async function draftDirectory(root: string, index: number): Promise<string> {
 }
 
 describe("Playable draft server", () => {
+  it("does not serve known credentials embedded in token-mounted scripts or binary resources", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "ohmygame-loopback-content-"));
+    const files = new LoopbackFileServer();
+    try {
+      const secret = "loopback-file-fake-key-canary-20261028";
+      registerSensitiveValue(secret);
+      const bytes = Buffer.concat([Buffer.from([0, 0xff]), Buffer.from(secret), Buffer.from([1, 2])]);
+      for (const name of ["game.js", "auth-icon.svg"]) await writeFile(path.join(root, name), bytes);
+      const mounted = await files.mount(root);
+      for (const name of ["game.js", "auth-icon.svg"]) {
+        const response = await fetch(`${mounted.url}${name}`);
+        expect(response.status).toBe(403);
+        expect(await response.text()).not.toContain(secret);
+      }
+      const safe = Buffer.from([0, 0xff, 1, 2, 3]);
+      await writeFile(path.join(root, "safe.png"), safe);
+      const response = await fetch(`${mounted.url}safe.png`);
+      expect(response.status).toBe(200);
+      expect(Buffer.from(await response.arrayBuffer())).toEqual(safe);
+    } finally { await files.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
   it("serves a draft under its token path only", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "ohmygame-draft-"));
     server = new PlayableDraftServer(() => draftDirectory(root, 1));

@@ -1,14 +1,16 @@
+import { MESHY_DISABLED_MESSAGE, isMeshyEndpoint, isMeshyIdentifier, isMeshyModelReference, isMeshyProviderConfiguration } from "../shared/disabled-media-providers.js";
+import { providerRequest } from "./provider-network.js";
+import { copyProviderImageSource } from "./provider-image-source.js";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { CUSTOM_IMAGE_MODEL_APIS, type CustomProviderDetails, type ImageAspectRatio, type ImageModel, type ImageModelCatalog, type ImageModelRef, type ImageResolution, type ImageSize, type MediaProviderStatus } from "../shared/contracts.js";
 import { customImageModel } from "../shared/custom-models.js";
-import { imageModelsForProvider } from "./image-models.js";
+import { imageModelCapabilities, imageModelsForProvider } from "./image-models.js";
 import { createImageProtocolAdapters, type ImageSource } from "./image-adapters.js";
 import { customMediaSource } from "./custom-media-source.js";
 import { ImageGenerationError, type GeneratedImage, type ImageGenerationInput, type ImageGenerator } from "./openai-image.js";
-import { listOpenRouterImageModels, listPublicOpenRouterImageModels, resolveOpenRouterMediaSource } from "./openrouter-media.js";
+import { listOpenRouterImageModels, resolveOpenRouterMediaSource } from "./openrouter-media.js";
 import { SEEDREAM_BASE_URL, SEEDREAM_PROVIDER_ID, SEEDREAM_PROVIDER_NAME, seedreamModel, seedreamModels } from "./seedream-models.js";
 
-const CAPABILITY_TTL_MS = 10 * 60_000;
 
 // Models without fixed pixel sizes (Seedream) take resolution + aspect ratio instead.
 const LEGACY_SIZE_ASPECT_RATIOS: Record<ImageSize, ImageAspectRatio> = {
@@ -33,7 +35,6 @@ interface ImageSelection {
 }
 
 export class ProviderImages implements ImageGenerator {
-  #capabilities?: { loadedAt: number; models: Promise<ImageModel[]> };
 
   constructor(
     private readonly runtime: () => Promise<ModelRuntime>,
@@ -43,42 +44,64 @@ export class ProviderImages implements ImageGenerator {
     private readonly options: ProviderImagesOptions = {},
   ) {}
 
+  #blockedCustom(provider: CustomProviderDetails, id?: string): boolean {
+    const definition = id === undefined ? undefined : provider.models.find(model => model.id === id);
+    return isMeshyProviderConfiguration(provider) || isMeshyModelReference({ provider: provider.id, id }) || isMeshyEndpoint(definition?.usages?.image?.baseUrl);
+  }
+  async #blockedSelection(ref?: ImageModelRef): Promise<boolean> {
+    if (!ref) return false;
+    if (isMeshyModelReference(ref)) return true;
+    const provider = (await this.options.customProviders?.() ?? []).find(provider => provider.id === ref.provider);
+    return !!provider && this.#blockedCustom(provider, ref.id);
+  }
+  /** Configuration-only policy admission; no credential lookup or remote discovery. */
+  async assertGenerationAllowed(ref?: ImageModelRef): Promise<void> {
+    if (await this.#blockedSelection(ref ?? this.options.defaultModel?.())) throw new ImageGenerationError(MESHY_DISABLED_MESSAGE, 410, false, true);
+  }
+
   async models(signal?: AbortSignal): Promise<ImageModel[]> {
     return (await this.catalog(signal)).models;
   }
 
   /** Every connected image provider with its models, or the reason it has none. */
-  async catalog(signal?: AbortSignal): Promise<ImageModelCatalog> {
+  async catalog(signal?: AbortSignal, localOnly?: Set<string>): Promise<ImageModelCatalog> {
     const runtime = await this.runtime().catch(() => undefined);
     const custom = runtime ? await this.#customImageProviders(runtime) : [];
+    if (localOnly && this.isEnabled("openrouter") && runtime?.hasConfiguredAuth("openrouter")) localOnly.add("openrouter");
     const entries = await Promise.all([
-      runtime ? this.#openRouterEntry(runtime, signal) : undefined,
-      runtime || this.options.openAIConnection ? this.#openAIEntry(runtime, signal) : undefined,
+      runtime && !localOnly ? this.#openRouterEntry(runtime, signal) : undefined,
+      runtime || this.options.openAIConnection ? this.#openAIEntry(runtime, signal, localOnly) : undefined,
       this.#seedreamEntry(),
-      ...custom.map((provider) => catalogEntry(provider.id, provider.name, () => this.#customModels(runtime!, provider, signal), "Choose and enable image models in Models.")),
-      this.isEnabled("codex-cli") && this.options.codexImages ? this.options.codexImages.catalog(signal).then((catalog) => ({ models: catalog.models, status: catalog.providers[0]! })) : undefined,
+      ...custom.map((provider) => {
+        if (localOnly && provider.modelConfigurationVersion !== 2) { localOnly.add(provider.id); return undefined; }
+        return catalogEntry(provider.id, provider.name, () => this.#customModels(runtime!, provider, signal), "Choose and enable image models in Models.");
+      }),
+      !localOnly && this.isEnabled("codex-cli") && this.options.codexImages ? this.options.codexImages.catalog(signal).then((catalog) => ({ models: catalog.models, status: catalog.providers[0]! })) : undefined,
     ]);
     const connected = entries.filter((entry): entry is CatalogEntry => Boolean(entry));
-    const models = connected.flatMap((entry) => entry.models);
-    const defaultModel = this.options.defaultModel?.();
+    const models = connected.flatMap((entry) => entry.models).filter(model => !isMeshyModelReference(model)).map((model) => ({ ...model, ...imageModelCapabilities(model.id) }));
+    const savedDefault = this.options.defaultModel?.();
+    const defaultModel = await this.#blockedSelection(savedDefault) ? undefined : savedDefault;
     const defaultIndex = models.findIndex((model) => model.provider === defaultModel?.provider && model.id === defaultModel.id);
     if (defaultIndex > 0) models.unshift(...models.splice(defaultIndex, 1));
     return { models, providers: connected.map((entry) => entry.status), ...(defaultModel ? { defaultModel } : {}) };
   }
 
   async #openRouterEntry(runtime: ModelRuntime, signal?: AbortSignal): Promise<CatalogEntry | undefined> {
+    if (isMeshyProviderConfiguration(runtime.getProvider?.("openrouter"))) return undefined;
     if (!this.isEnabled("openrouter")) return undefined;
     const source = await resolveOpenRouterMediaSource(runtime, signal).catch(() => undefined);
     if (!source) return undefined;
     return catalogEntry("openrouter", "OpenRouter", () => listOpenRouterImageModels(source, this.request, signal), "OpenRouter lists no image models for this account.");
   }
 
-  async #openAIEntry(runtime: ModelRuntime | undefined, signal?: AbortSignal): Promise<CatalogEntry | undefined> {
+  async #openAIEntry(runtime: ModelRuntime | undefined, signal?: AbortSignal, localOnly?: Set<string>): Promise<CatalogEntry | undefined> {
     if (!this.isEnabled("openai")) return undefined;
     if (this.options.openAIConnection) {
       try {
         const connection = await this.options.openAIConnection();
-        if (connection.connected === false) return undefined;
+        if (connection.connected === false || isMeshyEndpoint(connection.source?.baseUrl)) return undefined;
+        if (localOnly && connection.source && !connection.models) { localOnly.add("openai"); return undefined; }
         return catalogEntry("openai", "OpenAI", async () => connection.source
           ? connection.models ?? await this.#sourceModels("openai", "OpenAI", connection.source, signal) : [],
         connection.message ?? "Fetch or add image models, then enable them and save.");
@@ -88,7 +111,7 @@ export class ProviderImages implements ImageGenerator {
     }
     if (!runtime) return undefined;
     const provider = runtime.getProvider("openai");
-    if (!provider || !runtime.hasConfiguredAuth("openai")) return undefined;
+    if (!provider || isMeshyProviderConfiguration(provider) || !runtime.hasConfiguredAuth("openai")) return undefined;
     // OpenAI rejects image requests made with a ChatGPT sign-in ("ChatPass credential is not
     // authorized"), and its model list is empty, so don't ask; say what to do instead.
     if (runtime.isUsingOAuth("openai")) {
@@ -97,34 +120,42 @@ export class ProviderImages implements ImageGenerator {
         status: { provider: "openai", providerName: provider.name, state: "empty", message: "Browser sign-in does not include image generation. Connect OpenAI with an API key, or choose another image provider." },
       };
     }
+    if (localOnly) { localOnly.add("openai"); return undefined; }
     return catalogEntry("openai", provider.name, () => this.#compatibleModels(runtime, "openai", signal), "This OpenAI key or endpoint lists no GPT Image models.");
   }
 
   async #customImageProviders(runtime: ModelRuntime): Promise<CustomProviderDetails[]> {
     const providers = await this.options.customProviders?.() ?? [];
-    return providers.filter((provider) => (provider.modelConfigurationVersion === 2
-      ? provider.models.some((model) => model.usages?.image) : CUSTOM_IMAGE_MODEL_APIS.some((api) => api === provider.api))
+    return providers.filter((provider) => !this.#blockedCustom(provider) && (provider.modelConfigurationVersion === 2
+      ? provider.models.some((model) => model.usages?.image && !this.#blockedCustom(provider, model.id)) : CUSTOM_IMAGE_MODEL_APIS.some((api) => api === provider.api))
       && this.isEnabled(provider.id) && runtime.hasConfiguredAuth(provider.id));
   }
 
   async #customModels(runtime: ModelRuntime, provider: CustomProviderDetails, signal?: AbortSignal): Promise<ImageModel[]> {
+    if (this.#blockedCustom(provider)) throw new ImageGenerationError(MESHY_DISABLED_MESSAGE, 410, false, true);
     if (provider.modelConfigurationVersion !== 2) {
       const models = await this.#compatibleModels(runtime, provider.id, signal);
       await this.options.migrateLegacyModels?.(provider.id, models);
       return models;
     }
-    return provider.models.filter((model) => !provider.hiddenModelIds.includes(model.id)).flatMap((model) => {
+    return provider.models.filter((model) => !this.#blockedCustom(provider, model.id) && !provider.hiddenModelIds.includes(model.id)).flatMap((model) => {
       const image = customImageModel(provider, model);
-      return image ? [image] : [];
+      return image ? [{ ...image, ...imageModelCapabilities(image.id) }] : [];
     });
   }
 
   async #customSelection(runtime: ModelRuntime, provider: CustomProviderDetails, requestedId?: string, signal?: AbortSignal): Promise<ImageSelection | undefined> {
+    if (this.#blockedCustom(provider, requestedId)) throw new ImageGenerationError(MESHY_DISABLED_MESSAGE, 410, false, true);
     const models = await this.#customModels(runtime, provider, signal);
     const model = requestedId ? models.find((candidate) => candidate.id === requestedId) : models[0];
     if (!model) return undefined;
     const settings = provider.models.find((candidate) => candidate.id === model.id)?.usages?.image;
+    if (this.#blockedCustom(provider, model.id)) throw new ImageGenerationError(MESHY_DISABLED_MESSAGE, 410, false, true);
+    const signature = JSON.stringify([provider.id, provider.preset, provider.baseUrl, settings]);
     const source = await customMediaSource(runtime, provider, settings?.baseUrl, signal);
+    const fresh = (await this.options.customProviders?.() ?? []).find(item => item.id === provider.id), current = fresh?.models.find(item => item.id === model.id)?.usages?.image;
+    if (fresh && this.#blockedCustom(fresh, model.id) || isMeshyEndpoint(source.baseUrl)) throw new ImageGenerationError(MESHY_DISABLED_MESSAGE, 410, false, true);
+    if (!fresh || signature !== JSON.stringify([fresh.id, fresh.preset, fresh.baseUrl, current])) throw new ImageGenerationError("The selected image connection changed before dispatch", 409);
     return { model, source: { ...source, ...(provider.preset === "google" || provider.api === "google-generative-ai" ? { apiKeyHeader: "x-goog-api-key" as const } : {}) } };
   }
 
@@ -138,14 +169,24 @@ export class ProviderImages implements ImageGenerator {
 
   async generate(input: ImageGenerationInput, signal?: AbortSignal): Promise<GeneratedImage> {
     const requested = input.imageModel ?? this.options.defaultModel?.();
+    await this.assertGenerationAllowed(requested);
     if (requested && !this.isEnabled(requested.provider)) throw new ImageGenerationError("The selected image provider is disabled. Enable it or choose another default image model.", 409);
     const selection = await this.#selection(requested, signal);
     const definition = selection?.model;
     if (!selection || !definition) throw new ImageGenerationError(requested
       ? "The selected image model is unavailable. Choose a connected image provider or update the default image model in Providers."
       : "Image generation is not configured", 503);
+    if (isMeshyModelReference(definition) || isMeshyEndpoint(selection.source?.baseUrl)) throw new ImageGenerationError(MESHY_DISABLED_MESSAGE, 410, false, true);
+    if (input.execution?.recoveryOnly && definition.protocol !== "openai-images") throw new ImageGenerationError("Saved-result recovery is unavailable for this image protocol; no new generation was submitted.", 409);
     if (input.images?.length && !definition.supportsReferenceImage) throw new ImageGenerationError("Reference images are not supported by the selected model", 400);
     if (input.images && definition.maxReferenceImages !== undefined && input.images.length > definition.maxReferenceImages) throw new ImageGenerationError(`The selected image model supports up to ${definition.maxReferenceImages} reference images`, 400);
+    if (input.mask && definition.supportsMask !== true) throw new ImageGenerationError("Masks are not supported by the selected image model", 400);
+    if (input.background === "transparent" && definition.supportsTransparency !== true) throw new ImageGenerationError("Transparent backgrounds are not supported by the selected image model", 400);
+    if (input.quality !== undefined && !definition.qualities?.includes(input.quality)) throw new ImageGenerationError("The selected image model does not support this quality setting", 400);
+    if (input.outputFormat !== undefined && !definition.outputFormats?.includes(input.outputFormat)) throw new ImageGenerationError("The selected image model does not support this output format", 400);
+    if (definition.protocol !== "openai-images" && (input.quality !== undefined || input.outputFormat !== undefined || input.outputCompression !== undefined || input.background !== undefined || input.mask !== undefined)) {
+      throw new ImageGenerationError("The selected image protocol does not support quality, output format, transparency, or mask settings", 400);
+    }
     const { imageModel: _, ...generationInput } = input;
     if (definition.protocol === "codex-cli") {
       if (!this.options.codexImages) throw new ImageGenerationError("Codex image generation is unavailable", 503);
@@ -172,7 +213,7 @@ export class ProviderImages implements ImageGenerator {
     }
     if (!selection.source) throw new ImageGenerationError("Image connection is unavailable", 503);
     const adapter = createImageProtocolAdapters(this.request)[definition.protocol];
-    return adapter.generate(selection.source, selection.model.id, {
+    const generated = await adapter.generate(selection.source, selection.model.id, {
       ...generationInput,
       size,
       resolution,
@@ -180,6 +221,7 @@ export class ProviderImages implements ImageGenerator {
       ...(definition.supportsResolution === false ? { resolution: undefined } : {}),
       ...(definition.supportsAspectRatio === false ? { aspectRatio: undefined } : {}),
     }, signal, definition);
+    return copyProviderImageSource(generated, { ...generated, ...(generated.generation ? { generation: { ...generated.generation, provider: selection.model.provider } } : {}) });
   }
 
   async #selection(requested?: ImageModelRef, signal?: AbortSignal): Promise<ImageSelection | undefined> {
@@ -236,6 +278,7 @@ export class ProviderImages implements ImageGenerator {
   }
 
   async #openRouterSelection(runtime: ModelRuntime, requestedId?: string, signal?: AbortSignal): Promise<ImageSelection | undefined> {
+    if (isMeshyProviderConfiguration(runtime.getProvider?.("openrouter"))) throw new ImageGenerationError(MESHY_DISABLED_MESSAGE, 410, false, true);
     if (!this.isEnabled("openrouter")) return undefined;
     const source = await resolveOpenRouterMediaSource(runtime, signal);
     if (!source) return undefined;
@@ -253,35 +296,25 @@ export class ProviderImages implements ImageGenerator {
 
   async #compatibleModels(runtime: ModelRuntime, providerId: string, signal?: AbortSignal, source?: ImageSource): Promise<ImageModel[]> {
     const provider = runtime.getProvider(providerId);
-    if (!provider || !runtime.hasConfiguredAuth(providerId)) return [];
+    if (!provider || isMeshyProviderConfiguration(provider) || !runtime.hasConfiguredAuth(providerId)) return [];
     source ??= await runtimeSource(runtime, providerId, signal);
     return this.#sourceModels(providerId, provider.name, source, signal);
   }
 
   async #sourceModels(providerId: string, providerName: string, source: ImageSource, signal?: AbortSignal): Promise<ImageModel[]> {
-    const [ids, catalog] = await Promise.all([modelIds(source, this.request, signal), this.#capabilityCatalog(signal)]);
-    return imageModelsForProvider(providerId, providerName, ids, catalog);
+    if (isMeshyEndpoint(source.baseUrl)) throw new ImageGenerationError(MESHY_DISABLED_MESSAGE, 410, false, true);
+    const ids = (await modelIds(source, this.request, signal)).filter(id => !isMeshyIdentifier(id));
+    return imageModelsForProvider(providerId, providerName, ids);
   }
 
   async #configuredOpenAISelection(requestedId?: string, signal?: AbortSignal): Promise<ImageSelection | undefined> {
     if (!this.isEnabled("openai") || !this.options.openAIConnection) return undefined;
     const connection = await this.options.openAIConnection();
+    if (isMeshyEndpoint(connection.source?.baseUrl)) throw new ImageGenerationError(MESHY_DISABLED_MESSAGE, 410, false, true);
     if (!connection.source) return undefined;
-    const models = connection.models ?? await this.#sourceModels("openai", "OpenAI", connection.source, signal);
+    const models = (connection.models ?? await this.#sourceModels("openai", "OpenAI", connection.source, signal)).map((model) => ({ ...model, ...imageModelCapabilities(model.id) }));
     const model = requestedId ? models.find((candidate) => candidate.id === requestedId) : models[0];
     return model ? { model, source: connection.source } : undefined;
-  }
-
-  /** Capabilities for models reached directly; a failed lookup falls back to each family's defaults. */
-  #capabilityCatalog(signal?: AbortSignal): Promise<ImageModel[]> {
-    if (!this.#capabilities || Date.now() - this.#capabilities.loadedAt > CAPABILITY_TTL_MS) {
-      const models = listPublicOpenRouterImageModels(this.request, signal).catch(() => {
-        this.#capabilities = undefined;
-        return [];
-      });
-      this.#capabilities = { loadedAt: Date.now(), models };
-    }
-    return this.#capabilities.models;
   }
 
   async #compatibleSelection(runtime: ModelRuntime, providerId: string, requestedId?: string, signal?: AbortSignal): Promise<ImageSelection | undefined> {
@@ -312,7 +345,9 @@ async function catalogEntry(provider: string, providerName: string, list: () => 
 
 async function runtimeSource(runtime: ModelRuntime, provider: string, signal?: AbortSignal): Promise<ImageSource> {
   const definition = runtime.getProvider(provider);
+  if (isMeshyProviderConfiguration({ id: provider, baseUrl: definition?.baseUrl })) throw new ImageGenerationError(MESHY_DISABLED_MESSAGE, 410, false, true);
   const resolution = await runtime.getAuth(provider, { signal });
+  if (isMeshyEndpoint(resolution?.auth.baseUrl)) throw new ImageGenerationError(MESHY_DISABLED_MESSAGE, 410, false, true);
   const apiKey = resolution?.auth?.apiKey;
   if (!definition?.baseUrl || !apiKey) throw new ImageGenerationError("Image generation is not configured", 503);
   return {
@@ -324,7 +359,7 @@ async function runtimeSource(runtime: ModelRuntime, provider: string, signal?: A
 
 async function modelIds(source: ImageSource, request: typeof fetch, signal?: AbortSignal): Promise<string[]> {
   const timeout = AbortSignal.timeout(10_000);
-  const response = await request(`${source.baseUrl.replace(/\/$/, "")}/models`, {
+  const response = await providerRequest(request, `${source.baseUrl.replace(/\/$/, "")}/models`, {
     headers: { ...source.headers, authorization: `Bearer ${source.apiKey}` },
     signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
   });

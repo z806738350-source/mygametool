@@ -7,7 +7,7 @@ import type { CanvasBoardDetail } from "../src/shared/canvas-workspace.js";
 
 const api = {
   getCanvasBoard: vi.fn(), saveCanvasBoard: vi.fn(), generateCanvasMedia: vi.fn(),
-  listCanvasJobs: vi.fn(), cancelCanvasJob: vi.fn(),
+  listCanvasJobs: vi.fn(), cancelCanvasJob: vi.fn(), recoverCanvasImage: vi.fn(), resumeCanvasVideo: vi.fn(),
 };
 vi.doMock(fileURLToPath(new URL("../src/renderer/canvas-api.ts", import.meta.url)), () => api);
 const { createCanvasBoardStorage } = await import("../src/renderer/canvas-board-storage.js");
@@ -43,6 +43,28 @@ function adapter(onConflict = vi.fn(), flushDocuments = vi.fn<() => Promise<void
 }
 
 describe("canvas board storage", () => {
+  it("resumes the original video job without posting a new generation and rejects stale workspaces", async () => {
+    api.getCanvasBoard.mockResolvedValue(detail(canvas()));
+    const storage = adapter(); await storage.load();
+    api.resumeCanvasVideo.mockResolvedValue({ id: "resume", status: "running" });
+    await storage.resumeVideo!("original-video");
+    expect(api.resumeCanvasVideo).toHaveBeenCalledWith("project", "original-video", "0");
+    expect(api.generateCanvasMedia).not.toHaveBeenCalled();
+    observeWorkspaceVersion("project", "changed");
+    await expect(storage.resumeVideo!("original-video")).rejects.toMatchObject({ code: "workspace_stale" });
+    expect(api.resumeCanvasVideo).toHaveBeenCalledOnce();
+  });
+  it("recovers by original job ID without generating or sending the edited node settings", async () => {
+    api.getCanvasBoard.mockResolvedValue(detail(canvas()));
+    const storage = adapter(); await storage.load();
+    api.recoverCanvasImage.mockResolvedValue({ id: "recovery", status: "running" });
+    await storage.recoverImage("original-job");
+    expect(api.recoverCanvasImage).toHaveBeenCalledWith("project", "original-job", "0");
+    expect(api.generateCanvasMedia).not.toHaveBeenCalled();
+    observeWorkspaceVersion("project", "restored");
+    await expect(storage.recoverImage("original-job")).rejects.toMatchObject({ code: "workspace_stale" });
+    expect(api.recoverCanvasImage).toHaveBeenCalledOnce();
+  });
   it("recovers a draft unchanged from its base after a disk type conversion", async () => {
     const base = canvas(), local = structuredClone(base), remote = structuredClone(base);
     const node = local.nodes[0]!;

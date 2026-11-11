@@ -1,3 +1,4 @@
+import { isMeshyEndpoint, isMeshyModelReference } from "../shared/disabled-media-providers.js";
 import { AGENT_REASONING_LEVELS, type CustomProviderModel, type CustomThinkingLevelMap } from "../shared/contracts.js";
 import { compatibleReasoningProtocols, supportedReasoningLevels } from "../shared/reasoning.js";
 import { modelUsages, normalizeModelUsages } from "../shared/custom-models.js";
@@ -34,6 +35,7 @@ export function initialCustomThinkingLevelMap(model: CustomProviderModel): Custo
 }
 
 export function modelError(model: CustomProviderModel, enabled = false): string | undefined {
+  if (enabled && (isMeshyModelReference({ id: model.id, protocol: model.usages?.["3d"]?.protocol }) || isMeshyEndpoint(model.usages?.["3d"]?.baseUrl))) return t("modelUsage.meshyUnavailable");
   if (!model.id.trim() || /[\s\x00-\x1f]/.test(model.id) || model.id.length > 200) return t("customProvider.errors.modelId");
   try { normalizeModelUsages(model.usages); } catch (cause) { return cause instanceof Error ? cause.message : String(cause); }
   if (enabled && !Object.values(modelUsages(model)).some(Boolean)) return t("customProvider.errors.chooseUse", { name: model.name || model.id });

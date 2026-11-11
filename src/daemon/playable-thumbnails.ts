@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { lstat, mkdir, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { PlayableThumbnailManifest } from "../shared/playable-editor.js";
+import { assertNoKnownSecretBytes } from "./safe-project-file.js";
 
 /**
  * Node thumbnails are editor cache under `.ohmygame/thumbnails/`: one WebP
@@ -45,7 +46,9 @@ export async function readPlayableThumbnail(workspacePath: string, nodeId: strin
   const directory = await thumbnailDirectory(workspacePath, false);
   if (!directory) return undefined;
   try {
-    return await readFile(path.join(directory, `${nodeId}.webp`));
+    const bytes = await readFile(path.join(directory, `${nodeId}.webp`));
+    assertNoKnownSecretBytes(bytes);
+    return bytes;
   } catch (cause) {
     if ((cause as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw cause;
@@ -64,6 +67,7 @@ export async function writePlayableThumbnail(
   nodeIds: ReadonlySet<string>,
 ): Promise<{ hash: string; capturedAt: string }> {
   assertNodeId(nodeId);
+  assertNoKnownSecretBytes(image);
   if (!isPlayableThumbnailHash(hash)) throw new PlayableThumbnailError("Thumbnail hash is invalid");
   if (!nodeIds.has(nodeId)) throw new PlayableThumbnailError(`Node "${nodeId}" is not in graph.json`);
   const directory = (await thumbnailDirectory(workspacePath, true))!;

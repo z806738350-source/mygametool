@@ -3,6 +3,7 @@ import type { ProjectType } from "./contracts.js";
 export interface PlaytestViewport {
   width: number;
   height: number;
+  deviceScaleFactor?: number;
 }
 
 export type GameRuntime = "web" | "godot" | "unity";
@@ -83,6 +84,24 @@ export interface PlaytestFailedRequest {
   timestamp: string;
 }
 
+export interface PlaytestMedia {
+  tag: "audio" | "video";
+  source: string;
+  readyState: number;
+  currentTime: number;
+  duration: number | null;
+  paused: boolean;
+  ended: boolean;
+  errorCode: number | null;
+  totalVideoFrames?: number;
+  droppedVideoFrames?: number;
+  videoWidth?: number;
+  videoHeight?: number;
+  networkState?: number;
+  elementId?: string;
+  buffered?: Array<{ start: number; end: number }>;
+}
+
 export interface GameUseSnapshot {
   sessionId: string;
   runtime: GameRuntime;
@@ -98,6 +117,7 @@ export interface PlaytestSnapshot extends GameUseSnapshot {
   readyState: string;
   elements: PlaytestElement[];
   canvases: PlaytestCanvas[];
+  media?: PlaytestMedia[];
   /** Visible text of the page and its frames, truncated. */
   text?: string;
   logs: PlaytestLog[];
@@ -143,10 +163,53 @@ export interface GameRuntimeAdapter {
   readonly available: boolean;
   readonly capabilities: GameUseCapabilities;
   request(request: PlaytestRequest, signal?: AbortSignal): Promise<PlaytestResult>;
+  /** References owned by this adapter; they may have expired. Never lists another conversation's windows. */
+  ownedSessionIds?(): readonly string[];
   close(): void;
+}
+
+/** Host observation of a stopped action batch; never infer input delivery from error text. */
+export interface PlaytestActionFailure {
+  version: 1;
+  sessionId: string;
+  completedActions: number;
+  failedAction: number;
+  actionType: PlaytestAction["type"];
+  phase: "target_lookup" | "action";
+  inputDispatched: false | "unknown";
+}
+
+const actionFailures = new WeakMap<object, Readonly<PlaytestActionFailure>>();
+export function playtestActionError(message: string, failure: PlaytestActionFailure): Error {
+  const error = new Error(message);
+  actionFailures.set(error, Object.freeze({ version: failure.version, sessionId: failure.sessionId,
+    completedActions: failure.completedActions, failedAction: failure.failedAction,
+    actionType: failure.actionType, phase: failure.phase, inputDispatched: failure.inputDispatched }));
+  return error;
+}
+export function getPlaytestActionFailure(cause: unknown): Readonly<PlaytestActionFailure> | undefined {
+  return cause !== null && typeof cause === "object" ? actionFailures.get(cause) : undefined;
+}
+
+export interface PlaytestOpenFailure {
+  version: 1;
+  reason: "session_limit";
+  limit: number;
+  windowCreated: false;
+}
+const openFailures = new WeakMap<object, Readonly<PlaytestOpenFailure>>();
+export function playtestOpenError(message: string, failure: PlaytestOpenFailure): Error {
+  const error = new Error(message);
+  if (failure.version !== 1 || failure.reason !== "session_limit" || !Number.isInteger(failure.limit)
+    || failure.limit <= 0 || failure.limit > 100 || failure.windowCreated !== false) return error;
+  openFailures.set(error, Object.freeze({ version: failure.version, reason: failure.reason, limit: failure.limit, windowCreated: false }));
+  return error;
+}
+export function getPlaytestOpenFailure(cause: unknown): Readonly<PlaytestOpenFailure> | undefined {
+  return cause !== null && typeof cause === "object" ? openFailures.get(cause) : undefined;
 }
 
 export type PlaytestIpcMessage =
   | { channel: "ohmygame:playtest-request"; id: string; request: PlaytestRequest }
   | { channel: "ohmygame:playtest-cancel"; id: string }
-  | { channel: "ohmygame:playtest-response"; id: string; result?: PlaytestResult; error?: string };
+  | { channel: "ohmygame:playtest-response"; id: string; result?: PlaytestResult; error?: string; actionFailure?: PlaytestActionFailure; openFailure?: PlaytestOpenFailure };

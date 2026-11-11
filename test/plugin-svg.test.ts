@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { validatePluginIconImage } from "../src/daemon/plugin-icons.js";
+import Fastify from "fastify";
+import { registerPluginIconRoutes, validatePluginIconImage } from "../src/daemon/plugin-icons.js";
+import { registerSensitiveValue } from "../src/shared/sensitive-values.js";
 
 const svg = (body: string, attributes = "") =>
   Buffer.from(
@@ -7,6 +9,19 @@ const svg = (body: string, attributes = "") =>
   );
 
 describe("static SVG plugin icons", () => {
+  it("blocks newly registered credentials even after icon validation was cached", async () => {
+    const canary = "CANARY_PLUGIN_ICON_BINARY_KEY_ONLY";
+    const bytes = svg(`<title>${canary}</title><path d="M0 0h32v32H0Z"/>`);
+    const icon = await validatePluginIconImage(bytes);
+    registerSensitiveValue(canary);
+    await expect(validatePluginIconImage(bytes)).rejects.toMatchObject({ statusCode: 403 });
+    const app = Fastify();
+    registerPluginIconRoutes(app, [{ readIcon: async () => icon }]);
+    try {
+      const response = await app.inject({ url: "/plugins/fake/icon" });
+      expect(response.statusCode).toBe(404); expect(response.body).not.toContain(canary);
+    } finally { await app.close(); }
+  });
   it("accepts shapes, gradients, clipping, and local references without changing the source", async () => {
     const bytes = svg(`<title>Example icon</title><defs>
       <linearGradient id="paint"><stop stop-color="#123456"/><stop offset="1" stop-color="rgb(90, 80, 70)"/></linearGradient>

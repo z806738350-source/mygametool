@@ -47,6 +47,7 @@ export function neverTouchPaths(
     path.join(home, ".claude"),
     path.join(home, ".claude.json"),
     path.join(home, ".codex"),
+    path.join(home, ".qoder"),
     path.join(home, ".config", "opencode"),
     path.join(home, ".local", "share", "opencode"),
     path.join(home, ".pi"),
@@ -57,6 +58,7 @@ export function neverTouchPaths(
     path.join(home, "Library", "Keychains"),
     ...[
       process.env.CODEX_HOME,
+      process.env.QODER_CONFIG_DIR,
       process.env.CLAUDE_CONFIG_DIR,
       process.env.OPENCODE_CONFIG_DIR,
       process.env.OPENCODE_CONFIG,

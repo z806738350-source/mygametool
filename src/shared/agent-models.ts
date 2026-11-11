@@ -1,4 +1,10 @@
 import type { AgentModelRef } from "./contracts.js";
+import { kunpoModelOption } from "./kunpo-models.js";
+
+/** Explicit runtime settings take precedence over the built-in connection policy. */
+export function agentModelImageInput(model?: AgentModelRef & { supportsImages?: boolean }): boolean | undefined {
+  return model?.supportsImages ?? (kunpoModelOption("agent", model)?.imageInputStatus === "unverified" ? false : undefined);
+}
 
 export function findAgentModel<T extends AgentModelRef>(
   models: readonly T[],
@@ -21,6 +27,7 @@ export function preferredAgentModel<T extends AgentModelRef>(
  * which the package does not export. Covers the providers first-run setup lists first.
  */
 const RECOMMENDED_AGENT_MODEL_IDS: Record<string, string> = {
+  kunpo: "gpt-5.6-sol",
   anthropic: "claude-opus-4-8",
   deepseek: "deepseek-v4-pro",
   google: "gemini-4-argon",

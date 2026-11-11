@@ -501,7 +501,7 @@ describe("pane and preview boundaries", () => {
     updateRuntimeConnection(ready(1));
     const open = vi.spyOn(window, "open").mockReturnValue(null);
     const project: ProjectState = { id: "routes", name: "Routes", type: "web-game", updatedAt: new Date(0).toISOString(), workspacePath: "/tmp/routes", preview: { status: "ready", url: "http://127.0.0.1:4000" } };
-    const props = { project, agentBusy: false, publishing: false, workspaceRevision: 0, onPublish: async () => false, onOpenPublish: () => {}, onClosePublish: () => {}, onRestart: () => {}, onStop: async () => {} };
+    const props = { project, workspaceRevision: 0, onRestart: () => {}, onStop: async () => {} };
     await act(async () => root.render(createElement(CodingWorkspace, props)));
     const frame = container.querySelector("iframe")!;
     const client = new URL(frame.src).searchParams.get("__ohmygame_client")!;
@@ -518,6 +518,7 @@ describe("pane and preview boundaries", () => {
     expect(container.querySelector(".preview-run-menu")).toBeNull();
     await act(async () => (container.querySelector('.project-settings-dialog [aria-label="Close"]') as HTMLButtonElement).click());
     await act(async () => (container.querySelector('[aria-label="Reload preview"]') as HTMLButtonElement).click());
+    expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/projects/routes/preview?reuse=1"), expect.objectContaining({ method: "POST" }));
     expect(container.querySelector("iframe")).not.toBe(frame);
     const reloaded = new URL(container.querySelector("iframe")!.src);
     expect(reloaded.pathname).toBe("/scene-2");
@@ -532,7 +533,7 @@ describe("pane and preview boundaries", () => {
     const { updateRuntimeConnection } = await import("../src/renderer/runtime-connection.js");
     updateRuntimeConnection(ready(1));
     const project: ProjectState = { id: "logs", name: "Logs", type: "web-game", updatedAt: new Date(0).toISOString(), workspacePath: "/tmp/logs", preview: { status: "stopped", logs: "Preview was stopped." } };
-    await act(async () => root.render(createElement(CodingWorkspace, { project, agentBusy: false, publishing: false, workspaceRevision: 0, onPublish: async () => false, onOpenPublish: () => {}, onClosePublish: () => {}, onRestart: () => {} })));
+    await act(async () => root.render(createElement(CodingWorkspace, { project, workspaceRevision: 0, onRestart: () => {} })));
     await act(async () => (container.querySelector('.workspace-tab[title="Code"]') as HTMLButtonElement).click());
     await act(async () => (container.querySelector('[aria-label="Project settings"]') as HTMLButtonElement).click());
     const logs = [...container.querySelectorAll("button")].find((button) => button.textContent?.trim() === "Preview logs")!;

@@ -1,13 +1,15 @@
+import { providerControlUrl, providerCredentialValues, fetchProviderArtifact, providerRequest } from "./provider-network.js";
 import { readFile } from "node:fs/promises";
 import { videoReferenceAspectRatios } from "../shared/video-references.js";
 import type { VideoModel } from "../shared/contracts.js";
 import {
-  VideoGenerationError,
+  existingOrNewVideoTask, VideoGenerationError,
   type GeneratedVideo,
   type VideoGenerationInput,
   type VideoReferenceAsset,
 } from "./video-generation.js";
 import { SEEDANCE_PROVIDERS, type SeedanceProviderId } from "./seedance-models.js";
+import { KunpoVideoProvider } from "./kunpo-video-provider.js";
 
 const DEFAULT_MAX_WAIT_MS = 15 * 60_000;
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
@@ -23,15 +25,22 @@ export class SeedanceProvider {
   ) {}
 
   async generate(model: VideoModel, input: VideoGenerationInput, signal?: AbortSignal): Promise<GeneratedVideo> {
+    providerControlUrl(this.definition.baseUrl, true);
+    const endpoint = new URL(this.definition.baseUrl);
+    const kunpo = endpoint.hostname === "llm.ziy.cc" || endpoint.pathname.startsWith("/doubao/");
+    if (kunpo && model.id !== "doubao-seedance-2-5-260628") throw new VideoGenerationError("This Seedance version is not integrated with Kunpo task recovery; choose Seedance 2.5", 400);
     const key = this.apiKey();
     if (!key) throw new VideoGenerationError(`${this.definition.name} API key is not configured`, 503);
+    if (kunpo) {
+      return new KunpoVideoProvider({ ...this.definition, apiKey: key, ...this.connection }, this.request, this.pollIntervalMs, this.maxWaitMs).generate(model, input, signal);
+    }
     const duration = input.duration ?? model.durations[0]!;
     const resolution = input.resolution ?? model.resolutions[0]!;
     const references = input.references ?? [];
     const referenceMode = input.referenceMode ?? (model.referenceModes?.includes("frame") ? "frame" : model.referenceModes?.[0] ?? "frame");
     if (referenceMode !== "frame" && referenceMode !== "reference") throw new VideoGenerationError("Unsupported video reference mode", 400);
     if (model.referenceModes && !model.referenceModes.includes(referenceMode)) throw new VideoGenerationError("The selected video model does not support this reference mode", 400);
-    const availableRatios = videoReferenceAspectRatios(model, references.length, referenceMode);
+    const availableRatios = videoReferenceAspectRatios(model, references.length, references.length ? referenceMode : "reference");
     const aspectRatio = input.aspectRatio ?? availableRatios[0]!;
     validateInput(model, references, duration, resolution, aspectRatio, referenceMode === "frame" ? Math.min(2, model.maxImageReferences) : model.maxImageReferences, availableRatios);
 
@@ -39,22 +48,16 @@ export class SeedanceProvider {
       Promise.resolve({ type: "text" as const, text: input.prompt }),
       ...references.map((reference, index) => imageContent(reference, referenceMode === "reference" ? "reference_image" : index === 0 ? "first_frame" : "last_frame")),
     ]);
-    const created = await this.#json(`${this.definition.baseUrl}/contents/generations/tasks`, {
-      method: "POST",
-      headers: this.#headers(key, true),
-      body: JSON.stringify({
-        model: model.id,
-        content,
-        resolution: resolution === "4K" ? "4k" : resolution,
-        ratio: aspectRatio,
-        duration,
-        generate_audio: true,
-        watermark: false,
-      }),
-      signal,
-    }, "video generation request failed");
-    const requestId = string(created.id);
-    if (!requestId) throw new VideoGenerationError(`${this.definition.name} returned no video task ID`);
+    const submissionUrl = `${this.definition.baseUrl}/contents/generations/tasks`;
+    const headers = this.#headers(key, true);
+    const body = JSON.stringify({
+      model: model.id, content, resolution: resolution === "4K" ? "4k" : resolution,
+      ratio: aspectRatio, duration, generate_audio: true, watermark: false,
+    });
+    const requestId = await existingOrNewVideoTask(input.execution, JSON.stringify([submissionUrl, headers]), body, async () => {
+      const created = await this.#json(submissionUrl, { method: "POST", headers, body, signal }, "video generation request failed");
+      return string(created.id);
+    });
 
     const deadline = Date.now() + this.maxWaitMs;
     const taskUrl = `${this.definition.baseUrl}/contents/generations/tasks/${encodeURIComponent(requestId)}`;
@@ -65,12 +68,12 @@ export class SeedanceProvider {
       if (state === "succeeded") {
         const videoUrl = httpUrl(record(task.content).video_url);
         if (!videoUrl) throw new VideoGenerationError(`${this.definition.name} completed without a video URL`);
-        const response = await this.request(videoUrl, { signal });
+        const response = await fetchProviderArtifact(this.request, videoUrl, this.definition.baseUrl, { signal, protectedSecrets: providerCredentialValues(key, this.connection?.headers) });
         if (!response.ok) throw new VideoGenerationError(`${this.definition.name} video download failed (${response.status})`, response.status);
         return { bytes: Buffer.from(await response.arrayBuffer()), mediaType: "video/mp4", requestId };
       }
-      if (state === "failed" || state === "expired") {
-        throw new VideoGenerationError(errorMessage(task.error) ?? `${this.definition.name} video generation ${state}`, 400);
+      if (state === "failed" || state === "expired" || state === "cancelled" || state === "canceled") {
+        throw new VideoGenerationError(`${this.definition.name} video generation ${state}`, 400);
       }
       await delay(this.pollIntervalMs, signal);
     }
@@ -84,17 +87,16 @@ export class SeedanceProvider {
   async #json(url: string, init: RequestInit, operation: string): Promise<Record<string, unknown>> {
     let response: Response;
     try {
-      response = await this.request(url, init);
+      response = await providerRequest(this.request, url, init);
     } catch (cause) {
       if (cause instanceof Error && cause.name === "AbortError") throw cause;
       throw new VideoGenerationError(`Could not reach ${this.definition.name}`, 502);
     }
     const body = await response.json().catch(() => ({})) as Record<string, unknown>;
     if (response.ok) return body;
-    const detail = errorMessage(body.error) ?? string(body.message);
-    if (response.status === 401 || response.status === 403) throw new VideoGenerationError(`${this.definition.name} credentials were rejected`, 503);
+    if (response.status === 401 || response.status === 403) throw new VideoGenerationError(`${this.definition.name} credentials were rejected`, 503, init.method === "POST");
     if (response.status === 429) throw new VideoGenerationError(`${this.definition.name} video generation is temporarily rate limited`, 429);
-    throw new VideoGenerationError(detail ? `${this.definition.name}: ${detail}` : `${this.definition.name} ${operation}`, response.status >= 500 ? 502 : 400);
+    throw new VideoGenerationError(`${this.definition.name} ${operation}`, response.status >= 500 ? 502 : response.status);
   }
 
   #headers(apiKey: string, json = false): Record<string, string> {
@@ -133,11 +135,6 @@ async function imageContent(reference: VideoReferenceAsset, role: "first_frame" 
   };
 }
 
-function errorMessage(value: unknown): string | undefined {
-  if (typeof value === "string" && value.trim()) return value.trim();
-  const error = record(value);
-  return string(error.message) ?? string(error.code);
-}
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? value as Record<string, unknown> : {};

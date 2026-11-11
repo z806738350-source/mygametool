@@ -1,17 +1,17 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
-import { ArrowLeft, Bot, Check, ExternalLink, Globe2, InfoCircle, Palette, Plug, Server, UserRound, Wifi } from "./icons.js";
-import { useAuth } from "./auth.js";
+import { ArrowLeft, Bot, Check, Folder, Globe2, InfoCircle, Palette, Plug, Server, UserRound, Wifi } from "./icons.js";
+import { LocalEditionNotice } from "./local-edition-notice.js";
 import { readSidebarWidth } from "./app-sidebar.js";
 import { ModelsSettings, type ModelsView } from "./models-settings.js";
 import { AgentsSettings, type AgentsView } from "./agents-settings.js";
 import type { SettingsSection } from "./routes.js";
-import { UserAvatar } from "./user-avatar.js";
 import { WindowDragRegion } from "./window-drag-region.js";
 import type { DesktopUpdateState } from "../shared/desktop-update.js";
 import { readAppearance, setAppearance as persistAppearance, type Appearance } from "./appearance.js";
 import { WebSearchSettingsPanel } from "./web-search-settings.js";
 import { NetworkSettingsPanel } from "./network-settings.js";
-import { ExternalAgentsSettings } from "./external-agents-settings.js";
+import { StorageSettingsPanel } from "./storage-settings.js";
+import { ExecutionStorageSettingsPanel } from "./execution-storage-settings.js";
 import { readChatLayout, setChatLayout, type ChatLayout } from "./chat-layout.js";
 import { SegmentedControl } from "./segmented-control.js";
 import { readLanguagePreference, setLanguagePreference, t, type LanguagePreference } from "./i18n.js";
@@ -19,7 +19,6 @@ import { ChangelogPanel } from "./changelog-panel.js";
 import { exportDiagnostics } from "./api.js";
 import brandMark from "../shared/assets/ohmygame-mark-v2.svg";
 
-const BILLING_DASHBOARD_URL = "https://account.ohmygame.ai/account/billing";
 const CHAT_LAYOUT_OPTIONS: readonly { value: ChatLayout; label: string }[] = [
   { value: "left", label: t("settings.appearance.left") },
   { value: "right", label: t("settings.appearance.right") },
@@ -34,10 +33,11 @@ const LANGUAGE_OPTIONS: readonly { value: LanguagePreference; label: string }[] 
 const SETTINGS_SECTIONS: Array<{ section: SettingsSection; label: string; icon: typeof UserRound }> = [
   { section: "providers", label: t("settings.nav.providers"), icon: Server },
   { section: "agents", label: t("settings.nav.agents"), icon: Bot },
-  { section: "account", label: t("settings.nav.account"), icon: UserRound },
   { section: "appearance", label: t("settings.nav.appearance"), icon: Palette },
   { section: "web-search", label: t("settings.nav.webSearch"), icon: Globe2 },
   { section: "network", label: t("settings.nav.network"), icon: Wifi },
+  { section: "storage", label: t("settings.nav.storage"), icon: Folder },
+  { section: "execution-storage", label: t("settings.nav.executionStorage"), icon: Server },
   { section: "mcp-server", label: t("settings.nav.mcpServer"), icon: Plug },
   { section: "about", label: t("settings.nav.about"), icon: InfoCircle },
 ];
@@ -61,7 +61,6 @@ export function SettingsPage({ section, onBack, onSectionChange, onOpenOnboardin
 
   function chooseSection(next: SettingsSection): void {
     if (next === "providers") setModelsView({ page: "providers" });
-    if (next === "agents") setAgentsView({ page: "agents" });
     onSectionChange(next);
   }
 
@@ -90,39 +89,19 @@ export function SettingsPage({ section, onBack, onSectionChange, onOpenOnboardin
       <section className="settings-page-content">
         <WindowDragRegion />
         <div className="settings-page-inner">
-          {section === "account" ? <AccountSettings /> : null}
-          {section === "billing" ? <BillingSettings /> : null}
+          {section === "account" || section === "billing" ? <LocalEditionNotice /> : null}
           {section === "appearance" ? <AppearanceSettings /> : null}
           {section === "providers" ? <ModelsSettings view={modelsView} onViewChange={setModelsView} onOpenAgents={() => chooseSection("agents")} /> : null}
           {section === "agents" ? <AgentsSettings view={agentsView} onViewChange={setAgentsView} onOpenProviders={() => chooseSection("providers")} /> : null}
           {section === "web-search" ? <WebSearchSettingsPanel /> : null}
           {section === "network" ? <NetworkSettingsPanel /> : null}
-          {section === "mcp-server" ? <ExternalAgentsSettings /> : null}
+          {section === "storage" ? <StorageSettingsPanel /> : null}
+          {section === "execution-storage" ? <ExecutionStorageSettingsPanel /> : null}
+          {section === "mcp-server" ? <LocalEditionNotice message={t("localEdition.externalAgentsUnavailable")} /> : null}
           {section === "about" ? <AboutSettings onOpenNetwork={() => chooseSection("network")} onOpenOnboarding={onOpenOnboarding} /> : null}
         </div>
       </section>
     </main>
-  );
-}
-
-async function openBillingDashboard(): Promise<void> {
-  if (window.ohMyGameDesktop?.openExternal) {
-    await window.ohMyGameDesktop.openExternal(BILLING_DASHBOARD_URL);
-  } else {
-    window.open(BILLING_DASHBOARD_URL, "_blank", "noopener,noreferrer");
-  }
-}
-
-function BillingSettings() {
-  return (
-    <section className="settings-panel settings-overview-panel settings-billing-panel">
-      <header className="settings-panel-header"><h3>{t("settings.billing.title")}</h3></header>
-      <p>{t("settings.billing.description")}</p>
-      <button className="settings-primary-button" type="button" onClick={() => void openBillingDashboard()}>
-        <span>{t("settings.billing.open")}</span>
-        <ExternalLink size={14} aria-hidden="true" />
-      </button>
-    </section>
   );
 }
 
@@ -221,32 +200,6 @@ function ThemePreviewContent() {
   </span>;
 }
 
-function AccountSettings() {
-  const auth = useAuth();
-  const [error, setError] = useState<string>();
-  return (
-    <section className="settings-panel settings-overview-panel settings-account-panel">
-      <header className="settings-panel-header"><h3>{t("settings.nav.account")}</h3></header>
-      {auth.state.status === "signed-in" ? (
-        <div className="settings-account-row">
-          <div className="settings-account-profile">
-            <UserAvatar className="settings-account-avatar" name={auth.state.user.name} avatarUrl={auth.state.user.avatarUrl} />
-            <span className="settings-account-copy">
-              <small>{t("settings.account.signedInAs")}</small>
-              <strong>{auth.state.user.name}</strong>
-              {auth.state.user.email ? <span>{auth.state.user.email}</span> : null}
-            </span>
-          </div>
-          <button className="settings-danger-button" type="button" onClick={() => void auth.signOut().catch((cause) => setError(errorMessage(cause)))}>{t("common.signOut")}</button>
-        </div>
-      ) : (
-        <button className="settings-primary-button" type="button" onClick={auth.openSignIn}>{t("common.signIn")}</button>
-      )}
-      {error ? <p className="settings-error" role="alert">{error}</p> : null}
-    </section>
-  );
-}
-
 function AboutSettings({ onOpenNetwork, onOpenOnboarding }: { onOpenNetwork: () => void; onOpenOnboarding?: () => void }) {
   const [update, setUpdate] = useState<DesktopUpdateState | null>(null);
   const [copied, setCopied] = useState(false);
@@ -259,7 +212,8 @@ function AboutSettings({ onOpenNetwork, onOpenOnboarding }: { onOpenNetwork: () 
     return () => { disposed = true; unsubscribe(); };
   }, [updates]);
   const status = update?.status;
-  const message = status?.type === "up-to-date" ? t("settings.about.upToDate")
+  const message = status?.type === "disabled" ? t("settings.about.disabled")
+    : status?.type === "up-to-date" ? t("settings.about.upToDate")
     : status?.type === "checking" ? t("settings.about.checking")
       : status?.type === "available" ? t("settings.about.available", { version: status.version })
         : status?.type === "downloading" ? t("settings.about.downloading", { percent: status.percent })
@@ -297,7 +251,7 @@ function AboutSettings({ onOpenNetwork, onOpenOnboarding }: { onOpenNetwork: () 
               {updates && message ? <p className="settings-about-status" role="status">{message}</p> : null}
             </div>
           </div>
-          {updates && status?.type !== "downloading" && status?.type !== "installing" ? (
+          {updates && status && status.type !== "disabled" && status.type !== "downloading" && status.type !== "installing" ? (
             <div className="settings-about-actions">
               {status?.type === "available" ? (
                 <button className="settings-primary-button" type="button" onClick={() => void updates.download()}>{t("settings.about.download")}</button>

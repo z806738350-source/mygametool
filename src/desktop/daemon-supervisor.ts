@@ -22,6 +22,7 @@ export class DaemonSupervisor {
   };
   #stopped = false;
   #restarts: number[] = [];
+  #localEnvImported = false;
 
   constructor(private readonly options: SupervisorOptions) {}
 
@@ -84,10 +85,12 @@ export class DaemonSupervisor {
       await previous?.stop();
       const daemon = await startDaemon({
         ...this.options,
+        ...(this.options.localEnvFile && this.#localEnvImported ? { localEnvFile: undefined, reuseLocalEnv: true } : {}),
         onUnexpectedExit: (error) => {
           void this.#unexpectedExit(generation, error).catch(() => {});
         },
       });
+      if (this.options.localEnvFile) this.#localEnvImported = true;
       if (this.#stopped) {
         await daemon.stop();
         throw new Error("The background service has stopped.");

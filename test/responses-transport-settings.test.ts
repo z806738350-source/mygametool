@@ -142,7 +142,7 @@ describe("Responses transport settings", () => {
       payload: {
         name: "Responses relay",
         api: "openai-responses",
-        baseUrl: "https://relay.example/v1",
+        baseUrl: "http://127.0.0.1:43219/v1",
         authentication: "none",
         models: [],
       },

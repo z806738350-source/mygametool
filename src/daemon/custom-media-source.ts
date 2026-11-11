@@ -1,8 +1,10 @@
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { CustomProviderSettings } from "../shared/contracts.js";
 import type { ImageSource } from "./image-adapters.js";
+import { providerControlUrl } from "./provider-network.js";
 
 export async function customMediaSource(runtime: ModelRuntime, provider: CustomProviderSettings, baseUrl?: string, signal?: AbortSignal): Promise<ImageSource> {
+  providerControlUrl(baseUrl ?? provider.baseUrl, true);
   const auth = await runtime.getAuth(provider.id, { signal });
   const apiKey = auth?.auth.apiKey;
   if (provider.authentication !== "none" && !apiKey) throw new Error(`${provider.name} API key is not configured`);

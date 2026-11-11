@@ -1,3 +1,5 @@
+import { assertLocalExecutionAllowed } from "./local-execution-policy.js";
+import type { IsolatedProjectExecution } from "./isolated-project-execution.js";
 import { parse as parseYaml } from "yaml";
 import { createHash } from "node:crypto";
 import {
@@ -26,12 +28,14 @@ export function ensureProjectDependencies(
   run: (command: string, args: string[]) => Promise<void>,
   force = false,
   assertCurrent?: () => void,
+  execution?: IsolatedProjectExecution,
 ): Promise<void> {
+  if (!execution) assertLocalExecutionAllowed("Project dependency installation");
   const key = path.resolve(workspacePath);
   const operation = (installs.get(key) ?? Promise.resolve())
     .catch(() => {})
     .then(() =>
-      installProjectDependencies(key, manager, run, force, assertCurrent),
+      installProjectDependencies(key, manager, run, force, assertCurrent, execution?.dependenciesInGuest),
     );
   installs.set(key, operation);
   void operation
@@ -48,8 +52,19 @@ async function installProjectDependencies(
   run: (command: string, args: string[]) => Promise<void>,
   force: boolean,
   assertCurrent?: () => void,
+  isolated = false,
 ): Promise<void> {
   assertCurrent?.();
+  if (isolated) {
+    // Only the guest owns this install. Host node_modules may belong to another toolchain.
+    const manifest = JSON.parse(await readFile(path.join(workspacePath, "package.json"), "utf8")) as DependencyManifest;
+    if (manifest.workspaces || [manifest.dependencies, manifest.devDependencies, manifest.optionalDependencies, manifest.peerDependencies].some(group => group && Object.keys(group).length)) {
+      assertCurrent?.();
+      await run(packageManagerCommand(manager), packageManagerInstallArguments(manager));
+    }
+    assertCurrent?.();
+    return;
+  }
   const pending = path.join(workspacePath, PENDING_INSTALL);
   const modules = path.join(workspacePath, "node_modules");
   const stamp = path.join(modules, ".ohmygame-dependencies.json");

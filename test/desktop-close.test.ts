@@ -1,4 +1,5 @@
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 const host = vi.hoisted(() => ({
@@ -6,12 +7,13 @@ const host = vi.hoisted(() => ({
   ipcEvents: new Map<string, (...args: any[]) => void>(),
   handlers: new Map<string, (...args: any[]) => any>(),
   windowEvents: new Map<string, (...args: any[]) => void>(),
-  sender: { id: 1, send: vi.fn(), on: vi.fn() },
-  thumbnails: [] as Array<{ webContents: { id: number }; destroy: ReturnType<typeof vi.fn> }>,
+  sender: { id: 1, send: vi.fn(), on: vi.fn(), mainFrame: { url: "" } },
+  thumbnails: [] as Array<{ webContents: { id: number; mainFrame: { url: string } }; destroy: ReturnType<typeof vi.fn> }>,
   stopped: vi.fn(async () => {}),
+  openExternal: vi.fn(async (_url: string) => {}),
   quit: vi.fn(), relaunch: vi.fn(), close: vi.fn(),
-  install: undefined as (() => Promise<void>) | undefined,
   options: undefined as Record<string, unknown> | undefined,
+  mediaClosed: vi.fn(),
 }));
 vi.mock("electron", () => ({
   app: {
@@ -25,7 +27,7 @@ vi.mock("electron", () => ({
     on: (name: string, fn: (...args: any[]) => void) => host.ipcEvents.set(name, fn),
   },
   nativeTheme: {}, session: { fromPartition: () => ({ setProxy: async () => {} }), defaultSession: { setProxy: async () => {} } },
-  BrowserWindow: { getAllWindows: () => [] }, clipboard: {}, dialog: { showErrorBox: vi.fn() }, Menu: {}, shell: {},
+  BrowserWindow: { getAllWindows: () => [] }, clipboard: {}, dialog: { showErrorBox: vi.fn() }, Menu: {}, shell: { openExternal: host.openExternal },
 }));
 vi.mock("undici/index.js", () => ({ setGlobalDispatcher: vi.fn() }));
 vi.doMock(path.resolve("src/daemon/environment.ts"), () => ({ loadEnvironmentFiles: vi.fn() }));
@@ -49,17 +51,18 @@ vi.doMock(path.resolve("src/desktop/oauth.ts"), () => ({
 vi.doMock(path.resolve("src/desktop/playtest-driver.ts"), () => ({ ElectronPlaytestDriver: class { close() {} } }));
 vi.doMock(path.resolve("src/desktop/web-game-player.ts"), () => ({ WebGamePlayerWindows: class { close() {} } }));
 vi.doMock(path.resolve("src/desktop/updater.ts"), () => ({ DesktopUpdater: class {
-  constructor(_version: string, install: () => Promise<void>) { host.install = install; }
   subscribe() {} check() {}
-}, DesktopUpdatePreparationError: class extends Error {} }));
+} }));
+vi.doMock(path.resolve("src/desktop/native-media.ts"), () => ({ installNativeMediaGuard: () => ({ close: host.mediaClosed }) }));
 vi.doMock(path.resolve("src/desktop/window.ts"), () => ({
-  createDesktopWindow: async (options: { hidden?: boolean; beforeLoad(window: unknown): void }) => {
+  createDesktopWindow: async (options: { hidden?: boolean; rendererFile?: string; beforeLoad(window: unknown): void }) => {
     host.options = options as unknown as Record<string, unknown>;
+    const mainFrame = { url: pathToFileURL(options.rendererFile!).href };
     if (options.hidden) {
       let destroyed = false;
       const events = new Map<string, () => void>();
       const window = {
-        webContents: { id: host.thumbnails.length + 2 }, isDestroyed: () => destroyed,
+        webContents: { id: host.thumbnails.length + 2, mainFrame }, isDestroyed: () => destroyed,
         once: (name: string, listener: () => void) => events.set(name, listener),
         destroy: vi.fn(() => { destroyed = true; events.get("closed")?.(); }),
       };
@@ -67,6 +70,7 @@ vi.doMock(path.resolve("src/desktop/window.ts"), () => ({
       options.beforeLoad(window);
       return window;
     }
+    host.sender.mainFrame = mainFrame;
     const window = {
       webContents: host.sender, isDestroyed: () => false, close: host.close,
       on: (name: string, fn: (...args: any[]) => void) => host.windowEvents.set(name, fn),
@@ -76,6 +80,7 @@ vi.doMock(path.resolve("src/desktop/window.ts"), () => ({
     return window;
   },
   waitForRenderer: async () => {}, fitPlaytestContentSize: vi.fn(), isValidPlaytestViewport: () => true, windowsTitleBarOverlay: vi.fn(),
+  isRendererPage: (value: string, target: string) => value.split("#")[0] === target,
 }));
 
 beforeEach(async () => {
@@ -90,9 +95,26 @@ beforeEach(async () => {
 afterEach(() => { process.argv.splice(process.argv.lastIndexOf("--built-renderer"), 1); vi.useRealTimers(); });
 
 const settle = async () => { await vi.advanceTimersByTimeAsync(0); };
+const applicationEvent = (sender: { mainFrame: { url: string } } = host.sender) => ({ sender, senderFrame: sender.mainFrame });
+it("rejects privileged IPC from a subframe or a navigated renderer", () => {
+  const restart = host.handlers.get("ohmygame:restart-app")!;
+  expect(() => restart({ sender: host.sender, senderFrame: { url: host.sender.mainFrame.url } })).toThrow("Invalid application IPC source");
+  const original = host.sender.mainFrame.url;
+  host.sender.mainFrame.url = "https://foreign.example/";
+  try { expect(() => restart(applicationEvent())).toThrow("Invalid application IPC source"); }
+  finally { host.sender.mainFrame.url = original; }
+});
+it("enables native media only on the main editor and releases its owner on close", () => {
+  expect(host.options?.nativeMedia).toBe(true);
+  host.windowEvents.get("closed")!();
+  expect(host.mediaClosed).toHaveBeenCalledOnce();
+});
+it("refuses retired cloud OAuth entry points", () => {
+  for (const channel of ["ohmygame:open-auth-url", "ohmygame:take-auth-callback", "ohmygame:auth-callback-url", "ohmygame:cancel-auth"]) expect(() => host.handlers.get(channel)!(applicationEvent())).toThrow("Cloud account authentication is disabled");
+});
 function acknowledge(error?: string, sender: { id: number; send: unknown } = host.sender, id?: number) {
   const sent = host.sender.send.mock.calls.findLast(([channel]) => channel === "ohmygame:prepare-close")!;
-  host.ipcEvents.get("ohmygame:ready-to-close")!({ sender }, id ?? sent[1], error);
+  host.ipcEvents.get("ohmygame:ready-to-close")!({ sender, senderFrame: host.sender.mainFrame }, id ?? sent[1], error);
 }
 function quit() { const event = { preventDefault: vi.fn() }; host.appEvents.get("before-quit")!(event); expect(event.preventDefault).toHaveBeenCalledOnce(); }
 
@@ -114,11 +136,33 @@ it("saves before closing a window and shares that save with a concurrent Quit", 
   expect(host.close).not.toHaveBeenCalled();
   expect(host.stopped).toHaveBeenCalledOnce();
 });
-it("closes a saved macOS window while keeping the daemon alive", async () => {
-  host.windowEvents.get("close")!({ preventDefault() {} });
-  acknowledge(); await settle();
-  expect(host.close).toHaveBeenCalledOnce();
+it("quits from the main red close button after saving, with repeated closes sharing cleanup", async () => {
+  const close = host.windowEvents.get("close")!;
+  const event = { preventDefault: vi.fn() };
+  close(event); close(event); close(event);
+  expect(event.preventDefault).toHaveBeenCalledTimes(3);
+  expect(host.quit).toHaveBeenCalledOnce();
+  expect(host.sender.send).toHaveBeenCalledTimes(1);
   expect(host.stopped).not.toHaveBeenCalled();
+  acknowledge(); await settle();
+  expect(host.close).not.toHaveBeenCalled();
+  expect(host.stopped).toHaveBeenCalledOnce();
+  expect(host.quit).toHaveBeenCalledTimes(2);
+  const afterSave = { preventDefault: vi.fn() };
+  close(afterSave);
+  expect(afterSave.preventDefault).not.toHaveBeenCalled();
+  expect(host.stopped).toHaveBeenCalledOnce();
+});
+it("keeps the main window and services alive after a failed red-close save, then permits retry", async () => {
+  const close = host.windowEvents.get("close")!;
+  close({ preventDefault() {} });
+  acknowledge("Resolve the board conflict before saving."); await settle();
+  expect(host.stopped).not.toHaveBeenCalled();
+  expect(host.close).not.toHaveBeenCalled();
+  expect(host.sender.send).toHaveBeenLastCalledWith("ohmygame:cancel-close", 1, expect.stringContaining("conflict"));
+  close({ preventDefault() {} });
+  acknowledge(); await settle();
+  expect(host.stopped).toHaveBeenCalledOnce();
 });
 it("cancels a failed Quit and permits a later retry", async () => {
   quit(); acknowledge("Resolve the board conflict before saving."); await settle();
@@ -139,40 +183,41 @@ it("rejects foreign and stale acknowledgements and resumes after a timeout", asy
   expect(host.stopped).toHaveBeenCalledOnce();
 });
 it("does not schedule a restart until its save succeeds", async () => {
-  host.handlers.get("ohmygame:restart-app")!({ sender: host.sender });
+  host.handlers.get("ohmygame:restart-app")!(applicationEvent());
   expect(host.relaunch).not.toHaveBeenCalled();
   acknowledge("Disk unavailable"); await settle();
   expect(host.relaunch).not.toHaveBeenCalled();
-  host.handlers.get("ohmygame:restart-app")!({ sender: host.sender });
+  host.handlers.get("ohmygame:restart-app")!(applicationEvent());
   acknowledge(); await settle();
   expect(host.relaunch).toHaveBeenCalledOnce();
   expect(host.stopped).toHaveBeenCalledOnce();
 });
-it("requires the same save acknowledgement before installing an update", async () => {
-  const installing = host.install!();
-  expect(host.stopped).not.toHaveBeenCalled();
-  acknowledge(); await installing;
-  expect(host.stopped).toHaveBeenCalledOnce();
-});
-it("blocks an update when background services cannot stop safely", async () => {
-  host.stopped.mockRejectedValueOnce(new Error("Service is still writing"));
-  const installing = host.install!();
-  acknowledge();
-  await expect(installing).rejects.toThrow();
-  expect(host.quit).not.toHaveBeenCalled();
-});
 
 it("cancels active and queued thumbnail captures and frees slots for the next batch", async () => {
   const capture = (id: string, batch: string) => host.handlers.get("ohmygame:capture-node-thumbnail")!(
-    { sender: host.sender }, "p", id, { width: 1280, height: 720 }, batch,
+    applicationEvent(), "p", id, { width: 1280, height: 720 }, batch,
   ) as Promise<boolean>;
   const previous = [capture("a", "old"), capture("b", "old"), capture("c", "old")];
   expect(host.thumbnails).toHaveLength(2);
-  host.handlers.get("ohmygame:cancel-node-thumbnails")!({ sender: host.sender }, "old");
+  host.handlers.get("ohmygame:cancel-node-thumbnails")!(applicationEvent(), "old");
   await expect(Promise.all(previous)).resolves.toEqual([false, false, false]);
   expect(host.thumbnails.every(window => window.destroy.mock.calls.length === 1)).toBe(true);
   const next = capture("next", "new");
   expect(host.thumbnails).toHaveLength(3);
-  host.handlers.get("ohmygame:finish-node-thumbnail")!({ sender: host.thumbnails[2]!.webContents }, true);
+  host.handlers.get("ohmygame:finish-node-thumbnail")!(applicationEvent(host.thumbnails[2]!.webContents), true);
   await expect(next).resolves.toBe(true);
+});
+
+
+it("opens official Codex sign-in URLs through a separate privileged channel", async () => {
+  const open = host.handlers.get("ohmygame:open-codex-login-url")!;
+  for (const url of ["https://auth.openai.com/oauth/authorize?state=fixture", "https://chatgpt.com/auth/authorize?state=fixture"])
+    await open(applicationEvent(), url);
+  expect(host.openExternal.mock.calls).toEqual([["https://auth.openai.com/oauth/authorize?state=fixture"], ["https://chatgpt.com/auth/authorize?state=fixture"]]);
+  expect(() => open({ sender: host.sender, senderFrame: { url: host.sender.mainFrame.url } }, "https://auth.openai.com/oauth/authorize")).toThrow("Invalid application IPC source");
+});
+
+it.each(["http://auth.openai.com/oauth/authorize", "https://auth.openai.com.evil.invalid/oauth/authorize", "https://auth.openai.com@evil.invalid/", "https://user:password@auth.openai.com/", "https://auth.openai.com:8443/", "file:///tmp/login.html", "javascript:alert(1)", "https://127.0.0.1/", null])("refuses an invalid Codex sign-in destination: %s", async (url) => {
+  await expect(host.handlers.get("ohmygame:open-codex-login-url")!(applicationEvent(), url)).rejects.toThrow("Invalid Codex sign-in URL");
+  expect(host.openExternal).not.toHaveBeenCalled();
 });

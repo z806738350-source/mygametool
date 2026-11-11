@@ -1,3 +1,4 @@
+import { assertLocalExecutionAllowed } from "./local-execution-policy.js";
 import { spawn } from "node:child_process";
 import { mkdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
@@ -92,6 +93,7 @@ export class PluginIntegrationHost {
     project?: ProjectState,
     projectId?: string,
   ): PluginIntegrationState {
+    assertLocalExecutionAllowed("Plugin integration execution");
     if (this.#closed)
       throw new LocalPluginError("Plugin integrations are shutting down", 503);
     assertIntegrationPlugin(plugin, project);

@@ -1,5 +1,441 @@
 # Coding agents
 
+The local controlled-agent sections below take precedence over the upstream
+framework reference. Codex and the first-stage Qoder connection have separate
+controlled startup paths. Claude Code, OpenCode, external MCP, plugin execution
+and the arbitrary host-execution switch remain disabled.
+
+## Local secure edition: controlled Qoder (first stage)
+
+**Settings → Agents → Qoder** adds an optional main conversation agent. It starts
+disabled and is offered only in Settings and the existing conversation model
+picker, not first-run setup. Enabling Qoder does not switch existing
+conversations, rewrite project defaults, change Kunpo credentials or media
+selections, or reroute Asset Canvas text generation. Project-level Agent defaults
+still use their existing contract; this stage does not add Qoder to that field.
+
+This source connection accepts only the statically reviewed macOS arm64
+artifacts: **Qoder Agent SDK 1.0.59** and its paired native **CLI 1.1.83**. The
+isolated installations are under `.runtime/qoder-sdk/1.0.59/` and
+`.runtime/qoder-cli/1.1.83/`; the repository's root dependencies are unchanged.
+The executable and SDK entry are checked before startup. Detection does not run
+candidate executables or login shells. Another version, platform or artifact
+needs a new compatibility review; a matching version string is insufficient.
+The SDK's default installer, shared-daemon selection and automatic runtime
+downloads are not used by this connection.
+
+An owned helper process loads the SDK with a minimal environment and starts an
+explicit private process daemon. Separate `HOME` and `QODER_CONFIG_DIR`
+directories keep this connection's sign-in and history apart from `~/.qoder`,
+shell startup files and other applications. User/project/local settings,
+discovered Skills, plugins and external MCP are not inherited. The helper gets
+no Kunpo key, OhMyGame daemon token or ambient model credentials. The runtime
+still handles its own authentication and model network connection; these tool
+restrictions do not establish a complete OS sandbox for that runtime.
+Startup settings disable the reviewed update/statistics paths and the helper
+sets `OTEL_SDK_DISABLED`. Qoder's authenticated data policy can affect native
+statistics behavior; these controls do not certify that every telemetry path is
+disabled. The offline verification used an OS network denial as its hard boundary.
+
+Only the existing OhMyGame project tools are registered through the SDK's
+in-process MCP control channel, including guarded project read, write, edit and
+search tools. Writes recheck pending source review inside the project write lock;
+image reads follow the selected model's image-input capability. Rejected controlled
+tools keep their original result and trusted preflight reason before the native
+loop is stopped. A known protected-boundary rejection is reported as such rather
+than as an unknown provider outcome; it still blocks automatic continuation.
+The read-only `ls`, `find` and `grep` tools accept an omitted or empty directory
+path as the project root, equivalent to `"."`. File reads and writes still
+require a file path. Absolute, parent, private and linked paths remain blocked.
+Native file, shell, network, subagent and plugin
+tools are excluded; Full access and the global execution switch stay off. Before
+sending a prompt, the helper checks the actual runtime version, working
+directory, tool inventory and MCP status against that session's controlled
+surface, and fails closed on a mismatch. CLI 1.1.83 also reports its registered
+`general-purpose`, `Explore` and `Plan` names when the native `Agent` tool is
+unavailable. These known directory entries are metadata; the exact active tool
+inventory and both permission callbacks still deny native Agent execution.
+Unknown directory entries are refused. Planning restrictions, project/path
+validation, file-review approvals, recovery, cancellation and Kunpo media
+handlers remain daemon-owned. Duplicate calls must reuse the original result;
+an uncertain media outcome must be recovered by its original ID rather than
+submitted again. Qoder's file rewind does not replace OhMyGame checkpoints or
+retained-file review.
+
+The session Skill allowlist does not disable native discovery: CLI 1.1.83 can
+still register its built-in `imagegen` Skill. The helper therefore also sends
+`settings.skills.enabled: false` and continues to require an empty discovered
+Skill inventory. Native media Skills stay unavailable. MCP status is checked
+against the CLI's fully qualified `mcp__ohmygame__<tool>` names. Older native
+contexts rebuild from the shared transcript when this startup policy changes.
+The CLI injects `mcp_list`, `mcp_get` and `mcp_call` outside its built-in
+`--tools` filter, even with MCP lazy loading off. The helper explicitly denies
+these three generic entry points; the exact active inventory must still consist
+only of the session's qualified project tools. Native permission rules filter
+the denied names out of both active tools and model declarations.
+The daemon also emits a complete `system.init` snapshot before each user turn.
+Every snapshot must retain the same session ID and pass the full inventory,
+working-directory and permission checks. A matching refresh is consumed without
+rebinding the conversation, forwarding another UI initialization, releasing more
+input or clearing tool-call IDs and cached results. A changed boundary after
+input stops the turn and retains existing results; its error does not claim that
+no prompt was sent. Fixed helper-authored protocol reasons can be shown in CLI
+details while arbitrary SDK diagnostics remain opaque.
+Qoder's completed `assistant` frames can contain one original content block:
+their local `content[0]` index can differ from the preceding stream index.
+The adapter reconciles text using the native message ID and tracked stream-block
+identity, including completion before `content_block_stop`. Unstreamed frames
+use their envelope UUID, and independent blocks or messages with identical text
+stay independent. Final text also updates the retained stream buffer so later
+stop/turn completion cannot truncate it. This does not rewrite historical
+conversation entries or deduplicate text by content.
+
+**Prepare sign-in command** returns a command for this independent configuration.
+OhMyGame only displays and copies it: it does not execute it, open a sign-in URL
+or import an existing login. When ready, run the displayed command yourself and
+complete Qoder's authentication, then return to **Check again**. After the
+compatibility and account checks succeed, enable Qoder and choose an available
+Qoder model for the intended conversation. Account or billing information that
+cannot be established stays unknown. Native model and effort availability must
+come from the runtime, not an old hard-coded tier list.
+
+The fixed SDK and native runtime completed an unauthenticated daemon handshake
+and cache-only model lookup in a fresh temporary configuration under a macOS
+sandbox that denied all network connections. No user prompt or fabricated
+credential was supplied. Session initialization correctly required authentication.
+Later, existing logs from the user's authenticated attempt showed a successful
+session and MCP setup followed by a local inventory rejection before any prompt.
+The registered Agent metadata was mistaken for executable tool permissions, and
+the app factory had omitted guarded file tools. Both paths now have regression
+fixtures using the native initialization shape and the real app session factory;
+they make no Qoder or Kunpo requests. Runtime compatibility failures retain a
+safe diagnostic category instead of always suggesting another sign-in. Older
+Qoder context registries rebuild from the shared transcript on the next session.
+Further checks use the installed, pinned SDK through the real helper's stdio
+path and a local protocol daemon, rather than replacing `sdk.query`. They cover
+the implicit plan-mode control, qualified MCP status, model-policy callback,
+permission and hook IDs, tool results, inventory rejection and malformed frames.
+Their fresh configuration has no credentials or account data. Node network APIs,
+workers and unrelated child processes are denied inside these fixture processes;
+this is not a new OS-sandbox acceptance of the native CLI. A boundary failure is
+retained before SDK iterator cleanup so cleanup cannot replace it with a generic
+SDK error. Diagnostics expose only finite failure categories, local startup
+phases and mismatched boundary names, never raw SDK messages or auth payloads.
+Real inference, media, billing and the updated desktop application have not been
+accepted. This stage keeps the checked Qoder account and model catalog in process
+memory. Restarting the app does not delete the separate CLI authentication
+store. When Qoder is enabled, the first account or model-list read after restart
+automatically verifies that existing sign-in and refreshes its model catalog.
+Concurrent reads share one check; it does not construct a model query, submit a
+prompt or sign in again. Loading settings alone and reading a disabled agent's
+status remain passive. A failed automatic check is retained for this app session,
+without background retries; **Check again** explicitly retries it. No cached
+signed-in assertion is restored from disk. A failed account check stays unknown, rather than
+claiming sign-out. If the account check succeeds but the catalog check fails,
+the account remains signed in and models stay unavailable until rechecked; a
+conversation cannot start with a model absent from the verified current catalog.
+The helper does not inherit proxy environment variables or change system/TUN
+settings. It currently supplies no SDK proxy override; Qoder's direct connection
+and the application's provider proxy configuration are separate paths.
+
+The SDK and runtime are not assumed to share an MIT or Apache redistribution
+license. Commercial redistribution, a shared billing identity and service
+resale remain outside this local stage and need a separate review of the
+[Qoder service terms](https://qoder.com/product-service) and
+[application integration requirements](https://docs.qoder.com/cli/sdk/integration-scenarios).
+The SDK supports several authentication identities; this connection uses the
+independent [CLI sign-in](https://docs.qoder.com/cli/sdk/authentication), without
+distributing organization credentials in the app.
+
+## Reference images, retained originals and visual verification
+
+Kunpo, Codex and Qoder share the application's attachment store. Supported small
+images accompany the initial message as image blocks; attachment descriptions
+and file names are metadata, not evidence that a model understood the pixels.
+The timeline therefore says **Image attached**, including for historical turns.
+It does not report that a model viewed or understood an image.
+
+The host supplies canonical `attachment:batch/id` references for readable UTF-8
+text and PNG/JPEG/WebP image attachments. Use `read_attachment` with the exact
+reference; the controlled `read` tool also accepts it where registered. These
+receipts are authorized by host-written prompt details bound to a real user
+message on the current conversation branch. User-authored attachment markup,
+another conversation's receipt, and receipts excluded by branching grant no
+access. Images are returned whole, with a 20 MiB limit and format, decode,
+stable-file and secret checks. Neither path grants arbitrary host paths, URLs,
+hidden-directory access or writes. The Codex VM still cannot read host `.data`.
+
+`generate_image` and `generate_reference_image` also accept these exact current-
+branch receipts in `imagePaths`, alongside project PNG/JPEG paths in the requested
+order. Attachment references keep the 20 MiB limit, complete decoding, secret,
+stable-file, cancellation and branch-authorization checks. Canvas retains the
+uploaded original as a reference source before dispatching the existing generation
+job; repeated calls retain the existing billing and recovery protections. Reading
+or listing an attachment alone never submits it for generation. `maskPath` still
+requires a project PNG. WebP attachments, URLs, host paths, filenames and session
+image IDs are not accepted as attachment generation references. Older images
+without canonical receipts can still be inspected with `recall_image`; do not
+invent a receipt or silently regenerate them.
+
+Transparent-image quality is judged by intended use, including for Sunburst and
+Flare. Requesting a transparent background does not guarantee perfect matting;
+an alpha flag or a small number of low-alpha pixels alone is neither approval
+nor grounds for another paid generation. Inspect the affected location and
+area, alpha distribution and edges over light, dark, checkerboard and game
+backgrounds at display scale. Preserve antialiasing, hair, shadows and intended
+translucent effects; RGB values under zero alpha are not a visible background.
+There is no universal alpha cutoff. Prefer reversible local cleanup in a
+separate derivative for a verified visible defect, retain the original and
+frame geometry, and require actual quality evidence and a reason suitable local
+repair cannot meet the requirement before proposing regeneration. These are
+agent instructions, not an automatic cutout filter or a guarantee of model
+compliance.
+
+`recall_image` reads an original image block retained on the current branch,
+including older screenshots and images whose large request copies were
+explicitly omitted. Native continuation and context rebuilding receive a bounded
+list of branch-local image IDs, with an explicit omitted count; the list contains
+no pixels. Agents must call `recall_image` before relying on earlier visual
+details. Old image attachments without canonical file receipts can still use
+their retained session image IDs. Restoring or switching an agent does not
+automatically resubmit image generation or resend all historical images.
+
+Saved isolated-review images use the separate controlled `read_image` action
+on `recover_isolated_changes`, with the exact review, listed path, raw/working
+variant and source hash. It returns actual image content only for a model with
+verified image input. A bounded display proxy carries separate source/display
+identities and an explicit proxy flag; it does not alter the original or working
+asset. The response explicitly reports that no fresh guest state or adoption
+approval is established. This does not turn metadata into a visual receipt or
+prove that a remote provider understood the pixels. See
+[retained image inspection before adoption](isolated-storage-lifecycle.md#controlled-review-and-adoption-of-a-legacy-batch)
+for the size, queue, cancellation and saved-artifact boundaries.
+
+The controlled tool registries use `controlled-codex-v14` and
+`controlled-qoder-v13`. Older native contexts rebuild from shared history only
+on the next user turn. Updating the application does not start another model
+request, replay a prior turn or tool call, or upgrade old receipts, approvals
+and generation contracts.
+
+The main Agent can call `recover_isolated_changes` with only
+`action: "plan_first_allocation"` to compare current workspace metadata with
+the real legacy and versioned runtime capacity envelopes. It should distinguish
+observations and incomplete scans from the person's unmeasured future workload,
+and never infer memory, GPU capacity or frame rate from encoded file size. This
+read-only comparison does not select or allocate a volume, establish guest
+capability or approve migration. An unallocated volume does not establish that a
+project is new; a separate native plan and approval remain necessary for a
+versioned profile. See [execution storage lifecycle](isolated-storage-lifecycle.md).
+
+A connection without verified image input fails before a native model turn when
+the branch contains images. Codex preserves `model/list.inputModalities` from its
+live catalog; missing or malformed capability metadata stays unverified.
+Qoder also checks the actual target model's visual
+capability in each SDK model-policy callback, covering initial, recalled and tool
+images and resumed contexts. Unsupported GIF input and invalid image envelopes
+fail with an image-input diagnostic; originals remain unchanged. Model metadata,
+image upload success and offline protocol tests do not prove that a remote model
+actually fetched or understood an image.
+
+Agents must report image access from actual returned content. Text ID receipts
+are separate from image blocks and do not establish that only text was returned.
+OhMyGame does not supply generated image captions in these read results. The
+provider's internal preprocessing is not observable here; do not invent a
+captioning service, a disabled image context or pixel-level measurements to
+explain uncertainty. State what visual content could be verified and what remains
+unknown. Existing readable attachments do not need another upload for inspection.
+
+For a private-data-free visual acceptance check, prepare two small raster images
+with independently randomized colored shapes and a short random marker. Keep the
+answer key outside the project and all agent-accessible context. Remove EXIF,
+use unrelated file names, and include no answers in the prompt, alt text or file
+metadata. Ask each chosen Agent to report grid positions, shapes, colors and the
+marker, and to say explicitly if pixels are unavailable. Compare direct
+attachment, restart followed by recall, and a second-image substitution; add a
+text-only negative control. Record transfer evidence separately from answer
+accuracy. Run local mock transports first. Any real-provider checks require a
+separate authorization and request budget, with no automatic retries or media
+generation. No live visual acceptance was performed for this change.
+A separate local integration exercised saved pixels through the actual backend,
+tool, native-session/shared-history reload, recall and request serializers, while
+CLI/SDK transports and private-lease bookkeeping were mocked. It made no provider
+request and did not establish live-model vision, full-resolution quality or
+native approval; GLB parsing was separate from that image fixture.
+
+3D metadata and saved provider results are likewise not visual or playback
+acceptance. Native agents use the same controlled media/recovery tools; a local
+GLB inspection or merge failure does not authorize another paid generation. See
+[local model inspection and recovery](canvas-agent.md#local-model-inspection-and-retained-results)
+for the bounded daemon reader and retained local-result boundaries. Meshy calls,
+including remote recovery, are disabled across Agent tools and recognizable
+custom Meshy connections. Existing assets and receipts remain; a local read is
+not a provider retry. Already local output can be delivered through a persisted
+ToolRun/runId only with the original tool/context and existing permission and
+integrity checks. A raw task ID/receipt cannot poll or download Meshy, and missing
+local output is not promised recoverable. Choose Kunpo Tripo explicitly for a
+supported new workflow; old Meshy selections are not silently remapped. Use actual saved clip names
+rather than requested action labels; structural compatibility is not proof of
+motion semantics.
+That reader does not cover browser/model-viewer texture decoding, FBX parsing
+or GPU/FPS; a worker heap setting is not a whole-process memory limit.
+
+## Local secure edition: controlled Codex
+
+**Settings → Agents → Codex** provides an optional main conversation agent.
+It starts disabled. Sign in only when ready, then check again, enable Codex and
+choose a Codex model in the conversation's model picker. Enabling it does not
+change existing conversations or their models, project media models, or the
+Kunpo credential. Asset Canvas text generation still uses the configured text
+model; generated images, video, audio and 3D keep using the existing project tools.
+The independent Codex image provider remains disabled.
+
+The built-in `openai` provider selects its endpoint for the active authentication
+method. The controlled connection leaves `openai_base_url` unset and rejects
+an inherited override; ambient API keys and endpoint environment variables are
+not forwarded. ChatGPT CLI sign-in must not be forced onto the Platform API
+endpoint. This does not create new API permissions or change account billing.
+See [OpenAI's authentication routing guidance](https://learn.chatgpt.com/docs/enterprise/roll-out-a-gateway).
+The first turn after this routing correction rebuilds older native contexts from
+the shared conversation history, so saved endpoint overrides cannot survive a
+resume. Existing messages, project files and media are retained.
+
+The daemon uses its own `agent-runtimes/codex-home` for Codex authentication and
+history, and an empty `codex-host-home` for HOME. It never imports `~/.codex`,
+ambient API keys, shell startup files, user MCP servers, hooks or plugin Skills.
+A browser sign-in is started only by the explicit **Sign in** button. The desktop
+opens its OpenAI HTTPS link through a dedicated Codex IPC channel; retired cloud
+account authentication stays disabled. While preparing the link, the page shows
+progress. Browser-open failures appear near the top of the page and the prepared
+link remains available to open again or copy into a browser. An updated desktop
+preload requires saving work and fully restarting the app before this channel
+can be used. These messages report link preparation, not successful login. Closing
+OhMyGame stops its owned CLI processes. Recheck after completing the browser flow;
+no automated login or paid model request is needed to inspect this page.
+
+This initial connection is pinned to the audited macOS native executable
+`0.167.0-alpha.3.2`, SHA-256
+`a636331ed87605efc4cf84028ac2884a75363f9d10ead63cffb57ea0016d486e`, bundled
+inside the installed ChatGPT app. Discovery never executes a login shell. An
+unrecognized binary is rejected before version or authentication probes run.
+An app update or a different CLI build needs another isolation check before
+changing this pin; it is not automatically accepted. Do not select `bin/codex`,
+which is a shell launcher; use `CodexCLI.app/Contents/MacOS/codex`.
+
+This CLI uses Code Mode's separate V8 runner to dispatch project tools through
+`functions.exec`. The controlled connection enables that runner with in-process
+fallback disabled and verifies its SHA-256
+`c0285b76616ed906bfcbb353fe46f64dcbc577113fc8836f9ab6da530438dbdc`.
+Only the `ohmygame` namespace is registered for project tools; native `functions`,
+`collaboration`, `web` and `clock` namespaces are excluded from nested dispatch.
+This JavaScript runtime has no Node, filesystem, subprocess or network APIs.
+Its project operations still pass through the same validated host bridge,
+planning permissions, cancellation and Kunpo generation handlers. Native shell,
+patching, external MCP, plugins and the global execution switch remain disabled
+or denied by the existing permission profile. Native tool notifications do not
+duplicate the host's structured tool result or replace its artifact metadata.
+Older tool registries are rebuilt from shared conversation history on the next
+turn. This protocol is experimental and remains pinned to the audited CLI and
+runner; a successful local mock does not establish real-provider media success.
+
+Codex's project tools use the existing stdio dynamic-tool bridge, now including
+OhMyGame's guarded file tools. No arbitrary HTTP tool endpoint is opened.
+Native shell, network tools, image generation, MCP, plugins, browser, computer
+use and child agents are disabled in startup configuration. The remaining native
+`apply_patch` is confined to a read-only private session directory; project,
+credential, application-data and shared temporary paths are denied. Permission
+and sandbox escape requests are always declined. Full access is unavailable.
+These settings do not sandbox the app-server process itself; the audited CLI
+still handles its own OpenAI authentication and model network connection.
+
+A conversation retains its Codex thread ID in the common transcript. Restart,
+model change and native-session expiry use the existing resume/handoff path;
+legacy native contexts without the controlled-policy version rebuild from the
+common transcript so their old tool inventory is never reused.
+Finished tool artifacts remain available on the canvas. Tool requests must
+belong to the active thread/turn. Duplicate call IDs reuse the original pending
+or completed result, while mismatched arguments are rejected. Planning uses the
+existing read-only tool set, and cancellation refuses later calls. Media journals
+and recovery tools retain their existing safeguards for uncertain outcomes;
+changing an agent does not authorize repeating a paid generation.
+
+Game inspection and capture are read-only observations. A playtest batch stopped
+at click-target lookup reports exactly how many earlier actions completed and
+that the failed click sent no player input. This confirmed stopped outcome can
+continue in the Agent loop, but the owned session requires a successful
+`game_use inspect` before another `act`; capture alone does not clear it. Inspect
+fresh state and issue only the remaining intended actions. Dispatch failures,
+timeouts and missing or inconsistent action progress remain unknown and must not
+authorize a replay. Progress crosses the private desktop IPC only when bound to
+the original request, session, action type and index. Error text or untrusted
+JSON properties are not progress evidence.
+
+Opening a fifth retained playtest window is rejected before window creation.
+The host carries this bounded capacity rejection through private IPC as trusted
+preflight evidence. It is correctable and does not leave an unknown open that
+blocks later automatic continuation. Existing windows and the four-session limit
+remain intact. The error lists only references owned by the current conversation;
+they may have expired. Inspect and reuse a suitable session, or close only a
+finished owned session before a new open with a new call ID. The tool never
+automatically closes windows or repeats the rejected open. Other open failures,
+untrusted error fields and isolated effects from preview preparation retain their
+existing safeguards. Old unknown records are not upgraded from matching error text.
+
+Every `open` allocates an independent player window. Reuse an owned session for
+inspection and input; `inspect` and `resize` do not reload changed game code.
+When a fresh version requires a new open, close finished owned sessions rather
+than accumulating revision windows. The native window close button hides agent
+players; `game_use close` actually destroys its window. Hidden or minimized
+players are frozen and muted between tool requests; this can leave allocated
+WebGL resources in memory and is not proof of released GPU memory. Idle hidden
+sessions are destroyed after ten minutes; this idle timer preserves watched
+windows and active tool requests, and hiding starts a new idle interval. Run
+completion, failure or cancellation separately cleans up that conversation's
+owned sessions. Stopping a preview server alone is not a player-window close.
+The tool never
+evicts another conversation's windows or a window the user is watching to make
+room for a new open.
+
+DOM snapshots and semantic target matching normalize whitespace consistently,
+including line breaks and non-breaking spaces. Multiple visible matches are
+ambiguous: use a unique selector or test ID. Hidden targets are not a fallback,
+and disabled click targets do not receive input. A snapshot is an observation at
+one point in time; inspect after a stopped batch rather than assuming the page
+is unchanged.
+
+Canvas recovery attempts retain the exact observed job ID even when no result is
+available. A host-verified recovery rejection before job execution is correctable
+and allows other work to continue; it does not settle the original generation or
+its possible charge. The Agent can read compact `canvas/jobs.json` metadata
+without transferring embedded retry images into its source budget. See the
+[Canvas file contract and media recovery](canvas-agent.md) for the private input
+store, cancellation limits and preservation of failed nodes.
+
+The [app-server dynamic-tools protocol](https://learn.chatgpt.com/docs/app-server)
+is experimental. Startup checks configuration and the active filesystem profile
+before a turn, failing closed on incompatibility. Tests use an in-memory CLI,
+mock Kunpo artifacts and temporary projects. The installed native CLI and V8
+runner were also exercised through the compiled driver against a loopback fake
+model. Code Mode called guarded file tools, returned a mock Kunpo artifact once,
+and completed a mock playtest; its nested registry contained only project tools.
+The fixture kept production file permissions and skipped only empty temporary
+project-instruction discovery to avoid nested macOS Seatbelt helpers. These
+checks do not verify real-provider media, billing or commercial distribution
+rights. An earlier native patch check also confirmed that a denied file could
+not be read or altered.
+
+To connect, open **Settings → Agents → Codex**, inspect its executable/status,
+click **Sign in**, complete the browser flow yourself, return and **Check again**,
+then enable Codex and choose its model for the desired conversation. Native CLI authentication is described in
+[OpenAI's account flow](https://learn.chatgpt.com/docs/app-server). OpenAI documents
+separate [ChatGPT plan usage for locally hosted/open-source apps](https://developers.openai.com/siwc/token-sharing-open-source)
+and asks paid or hosted products to register interest. The open-source harness
+license does not establish subscription reuse or redistribution rights. A
+commercial release needs a separate review of the chosen authentication and
+billing arrangement; this work does not implement a commercial OAuth client.
+
+## Upstream framework reference
+
+
 A conversation can run on a coding agent CLI that is already installed on the
 computer: Claude Code, Codex, or OpenCode 2.1.0 or newer in the 2.x series.
 OpenCode v1 is no longer supported. The CLI runs the agent loop with its
@@ -203,9 +639,13 @@ plan mode, cancellation, errors and events are the same code.
   Pi messages/model changes, cancellation, failure, legacy metadata and
   interrupted writes also invalidate it. An expired native session triggers
   one fresh-context retry with handoff rather than silently losing history.
+  Classified safe interruptions also use the shared [bounded continuation](agent-errors.md#automatic-continuation-after-an-interruption)
+  protocol after original tool outcomes and task ownership are verified. Failed
+  contexts rebuild; continuation does not resend the user message or checkpoint.
 - **Handoff.** When an agent joins a conversation it has not seen, its first
   message carries a summary built from the stored record: recent turns and the
-  files the earlier agent worked on, the structured plan, and restore notices.
+  files the earlier agent worked on, bounded tool results with original call/job
+  IDs and unresolved-outcome warnings, the structured plan, and restore notices.
   It asks no model, and private context such
   as file references is left out. Moving back to Pi needs no summary; Pi reads
   the stored messages. A native turn reaches Pi as text: what the agent said,
@@ -315,7 +755,11 @@ and the simple read commands the policy allows, and refuse everything else with
 feedback naming what is allowed, so the agent adjusts instead of stopping; a
 bare OpenCode rejection would end its loop. Native agents are told that
 OhMyGame's tools, including `update_plan`, come from its `ohmygame` tool server
-under their CLI's MCP names. Claude's `ExitPlanMode` is
+under their CLI's MCP names. `questionnaire` is exposed only in planning mode;
+recording steps with `update_plan` during a normal turn does not change that mode.
+Normal and executing turns omit this tool to match the host's planning-only
+guard. Daemon-issued paid-media confirmations still use their separate guarded
+request path. Claude's `ExitPlanMode` is
 declined with a pointer to `update_plan`, because OhMyGame reviews plans itself.
 Codex registers every OhMyGame tool when its thread starts, since a thread that
 begins in planning continues after the plan is approved; tools the current mode

@@ -7,6 +7,7 @@ import type { FastifyInstance } from "fastify";
 import { ZipFile } from "yazl";
 import { diagnosticsFileName } from "../shared/diagnostics.js";
 import { createLogRedactor } from "../shared/log-redaction.js";
+import { redactKnownSensitiveValues } from "../shared/sensitive-values.js";
 
 const APP_VERSION: string = createRequire(import.meta.url)(
   "../../package.json",
@@ -75,12 +76,17 @@ export async function diagnosticsArchive<Summary extends object>(
   options: DiagnosticsOptions<Summary>,
 ): Promise<Buffer> {
   const createdAt = (options.now?.() ?? new Date()).toISOString();
-  const redact = options.redact ?? createLogRedactor();
+  const redactText = options.redact ?? createLogRedactor();
+  const redact = (text: string) => redactKnownSensitiveValues(redactText(redactKnownSensitiveValues(text)));
   const logs = await diagnosticSection(() => logFiles(options.logDirectory));
   const summary = await diagnosticSection(options.summary);
   const zip = new ZipFile();
   if (Array.isArray(logs)) {
-    for (const log of logs) zip.addBuffer(log.content, `logs/${log.name}`);
+    for (const log of logs) {
+      // Re-scrub old logs using credentials registered since those lines were written.
+      const content = log.content.toString("utf8").split("\n").map((line) => redact(line)).join("\n");
+      zip.addBuffer(Buffer.from(content, "utf8"), `logs/${log.name}`);
+    }
   }
   const system = {
     format: 1,

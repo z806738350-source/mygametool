@@ -25,7 +25,6 @@ import {
   Play,
   RefreshCw,
   Search,
-  Share2,
   Smartphone,
   Tablet,
   Trash2,
@@ -47,7 +46,6 @@ import { ProjectAssetCollectionFilters } from "./library-filters.js";
 import { ProjectRenameDialog } from "./project-rename-dialog.js";
 import { HighlightedCode } from "./highlighted-code.js";
 import { MarkdownContent, workspaceLinkPath } from "./markdown-content.js";
-import { PublishDialog, type PublishDetails } from "./publish-dialog.js";
 import { ProjectSettingsDialog } from "./project-settings-dialog.js";
 import { AssetMedia } from "./asset-gallery.js";
 import { useWorkspaceAssetUrl } from "./use-workspace-asset-url.js";
@@ -73,14 +71,8 @@ export function workspacePathAfterChange(selectedPath: string | undefined, chang
 }
 interface CodingWorkspaceProps {
   project?: ProjectState;
-  agentBusy: boolean;
-  publishing: boolean;
   workspaceRevision: number;
   previewPaused?: boolean;
-  onPublish: (details: PublishDetails) => Promise<boolean>;
-  publishDialog?: "open" | "success";
-  onOpenPublish: () => void;
-  onClosePublish: () => void;
   onRestart: (project?: ProjectState, reinstall?: boolean) => void;
   onStop?: () => Promise<void>;
   onAskAgent?: (text: string) => void;
@@ -100,14 +92,8 @@ interface CodingWorkspaceProps {
 
 export function CodingWorkspace({
   project,
-  agentBusy,
-  publishing,
   workspaceRevision,
   previewPaused = false,
-  onPublish,
-  publishDialog,
-  onOpenPublish,
-  onClosePublish,
   onRestart,
   onStop,
   onAskAgent,
@@ -126,10 +112,6 @@ export function CodingWorkspace({
 }: CodingWorkspaceProps) {
   const supportsPreview = supportsWebPreview(project);
   const hasPreview = supportsProjectPreview(project);
-  const publishingUnavailable = project?.type === "godot-game" || !!project?.integration;
-  const publishLabel = project?.type === "godot-game"
-    ? t("workspace.godotPublishing")
-    : publishing ? t("workspace.publishing") : t("workspace.publish");
   const [selectedTab, setSelectedTab] = useState<WorkspaceTab>(hasPreview ? "preview" : "code");
   const activeTab = selectedTab === "preview" && !hasPreview ? "code" : selectedTab;
   const shownTab = designOpen ? "design" : activeTab;
@@ -200,8 +182,13 @@ export function CodingWorkspace({
     const watch = window.ohMyGameDesktop?.agentPlaytests;
     if (!watch) return;
     let disposed = false;
-    const unsubscribe = watch.onState((state) => { if (!disposed) setAgentPlaytestWatch(state); });
-    void watch.state().then((state) => { if (!disposed) setAgentPlaytestWatch(state); }).catch(() => undefined);
+    let receivedState = false;
+    const unsubscribe = watch.onState((state) => {
+      if (disposed) return;
+      receivedState = true;
+      setAgentPlaytestWatch(state);
+    });
+    void watch.state().then((state) => { if (!disposed && !receivedState) setAgentPlaytestWatch(state); }).catch(() => undefined);
     return () => { disposed = true; unsubscribe(); };
   }, []);
 
@@ -279,7 +266,10 @@ export function CodingWorkspace({
     if (preview?.status === "ready") {
       if (player.open) void player.reload();
       else if (nativePreview) setReload((value) => value + 1);
-      else { setPreviewPath(actualPreviewPath); setReload((value) => value + 1); }
+      else void player.reload(() => {
+        setPreviewPath(actualPreviewPath);
+        setReload((value) => value + 1);
+      });
     } else if (preview?.status === "error" || preview?.status === "stopped") {
       onRestart();
     }
@@ -360,17 +350,6 @@ export function CodingWorkspace({
             disabled={player.pending || (player.checking && !player.error) || (!player.open && (!project || preview?.status === "waiting" || preview?.status === "starting"))}
             onClick={playGame}
           >{player.pending ? <LoaderCircle className="spin" size={14} /> : <Play size={14} />}</button> : null}
-          <button
-            className="publish-button workspace-publish-button"
-            type="button"
-            onClick={onOpenPublish}
-            disabled={!project || publishingUnavailable || publishing || agentBusy}
-            title={publishLabel}
-            aria-label={publishLabel}
-          >
-            {publishing ? <LoaderCircle className="spin" size={14} /> : <Share2 size={14} />}
-            <span>{t("workspace.publish")}</span>
-          </button>
           {onClose ? (
             <button
               className="icon-button pane-header-action"
@@ -455,7 +434,6 @@ export function CodingWorkspace({
         />
       ) : null}
       {supportsPreview && logsOpen ? <PreviewLogs project={project} onClose={() => setLogsOpen(false)} /> : null}
-      {project && publishDialog ? <PublishDialog project={project} publishing={publishing} justPublished={publishDialog === "success"} onClose={onClosePublish} onPublish={onPublish} /> : null}
       {project && projectSettingsOpen ? <ProjectSettingsDialog
         project={project}
         previewUrl={currentPreviewUrl}
@@ -1520,13 +1498,27 @@ export function AssetsView({
   const [query, setQuery] = useState("");
   const [selectedPath, setSelectedPath] = useState<string>();
   const [filters, setFilters] = useState<ProjectAssetFilters>({});
-  const assets = useMemo(() => files.filter(hasMediaType).map((file) => ({ ...file, projectId: projectId ?? "", revision, referenceOnly: file.purpose === "reference" })), [files, projectId, revision]);
+  const [catalog, setCatalog] = useState<{ projectId: string; files?: WorkspaceFile[]; error?: string }>();
+  useEffect(() => {
+    if (!projectId) return;
+    let active = true;
+    const load = () => { void listWorkspaceFiles(projectId, true).then(
+      result => { if (active) setCatalog({ projectId, files: result }); },
+      cause => { if (active) setCatalog({ projectId, error: errorMessage(cause) }); },
+    ); };
+    load();
+    window.addEventListener("ohmygame:model-preview-changed", load);
+    return () => { active = false; window.removeEventListener("ohmygame:model-preview-changed", load); };
+  }, [projectId, revision, files]);
+  const catalogFiles = catalog && catalog.projectId === projectId ? catalog.files ?? files : files;
+  const catalogError = catalog && catalog.projectId === projectId ? catalog.error : undefined;
+  const assets = useMemo(() => catalogFiles.filter(hasMediaType).map((file) => ({ ...file, projectId: projectId ?? "", revision, referenceOnly: file.purpose === "reference" })), [catalogFiles, projectId, revision]);
   const visibleAssets = useMemo(() => filterAssets(assets, mediaFilter, query, filters), [assets, mediaFilter, query, filters]);
   const selectedAsset = assets.find((asset) => asset.path === selectedPath);
 
   if (loading && files.length === 0) return <WorkspaceState loading label={t("workspace.loadingAssets")} />;
-  if (error) return <WorkspaceState error={error} />;
-  if (!projectId || files.length === 0) return <WorkspaceState icon={<ImageIcon size={20} />} label={t("workspace.noMedia")} />;
+  if (error || catalogError) return <WorkspaceState error={error ?? catalogError} />;
+  if (!projectId || catalogFiles.length === 0) return <WorkspaceState icon={<ImageIcon size={20} />} label={t("workspace.noMedia")} />;
   return (
     <div className="assets-view">
       <div className="assets-toolbar">
@@ -1540,7 +1532,7 @@ export function AssetsView({
       {selectedAsset ? <WorkspaceAssetDialog
         asset={selectedAsset}
         onClose={() => setSelectedPath(undefined)}
-        onShowInCode={() => { setSelectedPath(undefined); onShowInCode(selectedAsset.path); }}
+        onShowInCode={selectedAsset.path.startsWith(".data/") ? undefined : () => { setSelectedPath(undefined); onShowInCode(selectedAsset.path); }}
       /> : null}
     </div>
   );

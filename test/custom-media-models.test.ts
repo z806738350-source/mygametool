@@ -9,6 +9,8 @@ import { ProjectManager } from "../src/daemon/projects.js";
 import { ProviderModelSettingsStore } from "../src/daemon/provider-model-settings.js";
 import { defaultImageSettings, defaultModel3DSettings, defaultVideoSettings } from "../src/shared/custom-models.js";
 import type { CustomProviderModel, SaveCustomProviderRequest, ToolId } from "../src/shared/contracts.js";
+import { MESHY_DISABLED_MESSAGE } from "../src/shared/disabled-media-providers.js";
+import { KUNPO_DEFAULT_MODEL_REFS } from "../src/shared/kunpo-models.js";
 
 const directories: string[] = [];
 const apps: ReturnType<typeof createApp>[] = [];
@@ -17,8 +19,11 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
-const connection = { name: "My studio", baseUrl: "https://studio.test/v1", api: "openai-completions", authentication: "api_key" as const, apiKey: "studio-test-key" };
-const reference = { mediaType: "image/png", data: Buffer.from("reference").toString("base64") };
+const connection = { name: "My studio", baseUrl: "http://127.0.0.1:43199/v1", api: "openai-completions", authentication: "api_key" as const, apiKey: "studio-test-key" };
+// All compatible-provider success paths use explicit loopback transport mocks.
+const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==", "base64");
+const mp4 = Buffer.from([0, 0, 0, 24, 102, 116, 121, 112]);
+const reference = { mediaType: "image/png", data: png.toString("base64") };
 const model = (id: string, usages: CustomProviderModel["usages"]): CustomProviderModel => ({
   id, name: id, api: "openai-completions", contextWindow: 32_000, maxTokens: 4_000, reasoning: false, supportsImages: false, usages,
 });
@@ -49,8 +54,24 @@ async function generate(app: ReturnType<typeof createApp>, tool: ToolId, payload
 }
 
 describe("unified custom media models", () => {
+  it.each([
+    ["image", "https://images.test/v1"], ["video", "https://videos.test/api"],
+    ["3d", "https://api.meshy.ai/openapi/v1"], ["video", "https://ohmygame.ai/v1"],
+  ] as const)("rejects an unreviewed %s override %s before discovery or generation", async (usage, baseUrl) => {
+    const request = vi.fn<typeof fetch>();
+    const { app } = await fixture(request);
+    const settings = usage === "image" ? { image: { ...defaultImageSettings(), baseUrl } }
+      : usage === "video" ? { video: { ...defaultVideoSettings(), baseUrl } } : { "3d": { ...defaultModel3DSettings(), baseUrl } };
+    const result = await app.inject({ method: "POST", url: "/settings/models/providers/custom", payload: {
+      ...connection, modelConfigurationVersion: 2, models: [model("blocked-model", settings)],
+    } });
+    expect(result.statusCode, result.body).toBe(400);
+    expect(result.body).not.toContain(connection.apiKey);
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it("saves a GPT Image default and sends all 16 references through the generation route", async () => {
-    const request = vi.fn<typeof fetch>(async () => Response.json({ data: [{ b64_json: Buffer.from("generated").toString("base64") }] }));
+    const request = vi.fn<typeof fetch>(async () => Response.json({ data: [{ b64_json: png.toString("base64") }] }));
     const { app, save } = await fixture(request);
     const { id } = await save([model("gpt-image-2", { image: defaultImageSettings("openai-images", "gpt-image-2") })]);
     const images = Array.from({ length: 16 }, () => reference);
@@ -106,7 +127,10 @@ describe("unified custom media models", () => {
     expect(restored.defaultVideoModel()).toEqual({ provider: id, id: "my-video-alias" });
     expect(restored.defaultModel3D()).toEqual({ provider: id, id: "my-mesh-alias" });
     expect((await app.inject({ method: "DELETE", url: "/video-models/default" })).statusCode).toBe(204);
-    expect((await app.inject({ method: "GET", url: "/video-models/catalog" })).json()).not.toHaveProperty("defaultModel");
+    expect((await app.inject({ method: "GET", url: "/video-models/catalog" })).json().defaultModel).toEqual(KUNPO_DEFAULT_MODEL_REFS.video);
+    const cleared = new ProviderModelSettingsStore(directory, directory);
+    await cleared.load();
+    expect(cleared.defaultVideoModel()).toBeUndefined();
     expect((await app.inject({ method: "PUT", url: "/video-models/default", payload: { provider: id, id: "my-video-alias" } })).statusCode).toBe(204);
     expect(await readFile(path.join(directory, "model-visibility.json"), "utf8")).not.toContain(connection.apiKey);
     const hidden = await app.inject({ method: "PUT", url: `/settings/models/providers/${id}/models/visibility`, payload: { ids: ["same-model", "my-video-alias", "my-mesh-alias"], visible: false } });
@@ -122,15 +146,15 @@ describe("unified custom media models", () => {
 
   it.each(["openai-images", "gemini-generate-content", "openrouter-images", "volcengine-images"] as const)("generates an arbitrary image alias with %s and its address override", async (protocol) => {
     const request = vi.fn<typeof fetch>(async (url) => {
-      if (String(url).includes(":generateContent")) return Response.json({ candidates: [{ content: { parts: [{ inlineData: { mimeType: "image/png", data: Buffer.from("image").toString("base64") } }] } }] });
-      return Response.json({ data: [{ b64_json: Buffer.from("image").toString("base64") }] });
+      if (String(url).includes(":generateContent")) return Response.json({ candidates: [{ content: { parts: [{ inlineData: { mimeType: "image/png", data: png.toString("base64") } }] } }] });
+      return Response.json({ data: [{ b64_json: png.toString("base64") }] });
     });
     const { app, save } = await fixture(request);
-    const { id } = await save([model("totally-custom-image", { image: { ...defaultImageSettings(protocol), baseUrl: "https://images.test/v1" } })]);
+    const { id } = await save([model("totally-custom-image", { image: { ...defaultImageSettings(protocol), baseUrl: "http://127.0.0.1:43200/v1" } })]);
     await generate(app, "generate-image", { prompt: "A game icon", resolution: "1K", aspectRatio: "1:1", imageModel: { provider: id, id: "totally-custom-image" } });
     expect(request).toHaveBeenCalledTimes(1);
     const [url, init] = request.mock.calls[0]!;
-    expect(String(url)).toBe(protocol === "gemini-generate-content" ? "https://images.test/v1beta/models/totally-custom-image:generateContent" : protocol === "openrouter-images" ? "https://images.test/v1/images" : "https://images.test/v1/images/generations");
+    expect(String(url)).toBe(protocol === "gemini-generate-content" ? "http://127.0.0.1:43200/v1beta/models/totally-custom-image:generateContent" : protocol === "openrouter-images" ? "http://127.0.0.1:43200/v1/images" : "http://127.0.0.1:43200/v1/images/generations");
     expect(init?.headers).toMatchObject({ authorization: `Bearer ${connection.apiKey}` });
     if (protocol !== "gemini-generate-content") expect(JSON.parse(String(init?.body)).model).toBe("totally-custom-image");
     expect(request.mock.calls.some(([url]) => String(url).endsWith("/models"))).toBe(false);
@@ -138,43 +162,51 @@ describe("unified custom media models", () => {
 
   it.each(["openrouter-videos", "seedance"] as const)("creates, polls and downloads a custom video alias with %s", async (protocol) => {
     const request = vi.fn<typeof fetch>(async (url, init) => {
-      if (String(url) === "https://files.test/output.mp4") return new Response(Buffer.from("video"));
+      if (String(url) === "http://127.0.0.1:43201/output.mp4") return new Response(mp4, { headers: { "content-type": "video/mp4" } });
       if (init?.method === "POST") return Response.json({ id: "video-job" });
-      return protocol === "seedance" ? Response.json({ status: "succeeded", content: { video_url: "https://files.test/output.mp4" } })
-        : Response.json({ status: "completed", unsigned_urls: ["https://files.test/output.mp4"] });
+      return protocol === "seedance" ? Response.json({ status: "succeeded", content: { video_url: "http://127.0.0.1:43201/output.mp4" } })
+        : Response.json({ status: "completed", unsigned_urls: ["http://127.0.0.1:43201/output.mp4"] });
     });
     const { app, save } = await fixture(request);
-    const { id } = await save([model("custom-video", { video: { ...defaultVideoSettings(protocol), baseUrl: "https://videos.test/api" } })]);
+    const { id } = await save([model("custom-video", { video: { ...defaultVideoSettings(protocol), baseUrl: "http://127.0.0.1:43201/api" } })]);
     await generate(app, "generate-video", { prompt: "A game trailer", duration: 6, resolution: "720p", aspectRatio: "16:9", model: { provider: id, id: "custom-video" } });
     expect(request.mock.calls.map(([url]) => String(url))).toEqual(protocol === "seedance"
-      ? ["https://videos.test/api/contents/generations/tasks", "https://videos.test/api/contents/generations/tasks/video-job", "https://files.test/output.mp4"]
-      : ["https://videos.test/api/videos", "https://videos.test/api/videos/video-job", "https://files.test/output.mp4"]);
+      ? ["http://127.0.0.1:43201/api/contents/generations/tasks", "http://127.0.0.1:43201/api/contents/generations/tasks/video-job", "http://127.0.0.1:43201/output.mp4"]
+      : ["http://127.0.0.1:43201/api/videos", "http://127.0.0.1:43201/api/videos/video-job", "http://127.0.0.1:43201/output.mp4"]);
     expect(JSON.parse(String(request.mock.calls[0]?.[1]?.body)).model).toBe("custom-video");
   });
 
-  it.each(["image-to-3d", "multi-image-to-3d"] as const)("runs a custom Meshy alias through %s with its configured polycount", async (operation) => {
-    const request = vi.fn<typeof fetch>(async (url, init) => String(url) === "https://files.test/model.glb" ? new Response(new Uint8Array(TEST_GLB))
-      : init?.method === "POST" ? Response.json({ result: "mesh-job" }) : Response.json({ status: "SUCCEEDED", model_urls: { glb: "https://files.test/model.glb" } }));
-    const { app, save } = await fixture(request);
-    const config = { ...defaultModel3DSettings(), operation, maxReferenceImages: operation === "multi-image-to-3d" ? 4 : 1, baseUrl: "https://meshes.test/openapi/v1" };
-    const { id } = await save([model("my-mesh-v5", { "3d": config })]);
-    await generate(app, "image-to-3d", { images: operation === "multi-image-to-3d" ? [reference, reference] : [reference], targetPolycount: 100_000, model: { provider: id, id: "my-mesh-v5" } });
-    expect(request.mock.calls.map(([url]) => String(url))).toEqual([`https://meshes.test/openapi/v1/${operation}`, `https://meshes.test/openapi/v1/${operation}/mesh-job`, "https://files.test/model.glb"]);
-    expect(JSON.parse(String(request.mock.calls[0]?.[1]?.body))).toMatchObject({ ai_model: "my-mesh-v5", target_polycount: 100_000, should_remesh: true });
+  it.each(["image-to-3d", "multi-image-to-3d"] as const)("rejects a new custom Meshy alias through %s before saving or submitting", async (operation) => {
+    const request = vi.fn<typeof fetch>();
+    const { app } = await fixture(request);
+    const config = { ...defaultModel3DSettings("standard", "meshy"), operation, maxReferenceImages: operation === "multi-image-to-3d" ? 4 : 1, baseUrl: "http://127.0.0.1:43202/openapi/v1" };
+    const saved = await app.inject({ method: "POST", url: "/settings/models/providers/custom", payload: { ...connection, modelConfigurationVersion: 2, models: [model("my-mesh-v5", { "3d": config })] } });
+    expect(saved.statusCode).toBe(400); expect(saved.json().error).toBe(MESHY_DISABLED_MESSAGE);
+    expect((await app.inject("/model3d-models/catalog")).json().models).toEqual([]);
+    expect(request).not.toHaveBeenCalled();
   });
 
-  it.each(["image", "video", "3d"] as const)("resolves %s node overrides, project defaults and global inheritance without switching unavailable selections", async (usage) => {
+  it.each(["image", "video", "3d"] as const)("resolves %s node, legacy project and global inheritance after explicitly clearing a new project's selection", async (usage) => {
     const request = vi.fn<typeof fetch>(async (url, init) => {
-      if (String(url) === "https://files.test/model.glb") return new Response(new Uint8Array(TEST_GLB));
-      if (String(url) === "https://files.test/output.mp4") return new Response(Buffer.from("generated"));
-      if (String(url).endsWith("/images/generations")) return Response.json({ data: [{ b64_json: Buffer.from("image").toString("base64") }] });
+      if (String(url) === "http://127.0.0.1:43199/model.glb") return new Response(new Uint8Array(TEST_GLB));
+      if (String(url) === "http://127.0.0.1:43199/output.mp4") return new Response(mp4, { headers: { "content-type": "video/mp4" } });
+      if (String(url).endsWith("/images/generations")) return Response.json({ data: [{ b64_json: png.toString("base64") }] });
+      if (usage === "3d") {
+        if (String(url).endsWith("/files")) return Response.json({ code: 0, data: { file_token: "file" } });
+        if (init?.method === "POST") return Response.json({ code: 0, data: { task_id: "job" } });
+        return Response.json({ code: 0, data: { status: "success", output: { model_url: "http://127.0.0.1:43199/model.glb" } } });
+      }
       if (init?.method === "POST") return Response.json({ id: "job", result: "job" });
-      return Response.json({ status: "completed", model_urls: { glb: "https://files.test/model.glb" }, unsigned_urls: ["https://files.test/output.mp4"] });
+      return Response.json({ status: "completed", model_urls: { glb: "http://127.0.0.1:43199/model.glb" }, unsigned_urls: ["http://127.0.0.1:43199/output.mp4"] });
     });
     const { app, directory, save } = await fixture(request);
     const config = usage === "image" ? { image: defaultImageSettings() } : usage === "video" ? { video: defaultVideoSettings() } : { "3d": defaultModel3DSettings() };
     const { id } = await save(["global", "project", "node"].map((name) => model(name, config)));
-    const projectId = (await app.inject({ method: "POST", url: "/projects", payload: { type: "asset-canvas", name: "Test canvas" } })).json().id;
+    const project = (await app.inject({ method: "POST", url: "/projects", payload: { type: "asset-canvas", name: "Test canvas" } })).json();
+    const projectId = project.id;
+    const role = usage === "3d" ? "3d-generation" : usage;
+    expect(project.modelSelections[role]).toEqual(KUNPO_DEFAULT_MODEL_REFS[role]);
+    expect((await app.inject({ method: "PATCH", url: `/projects/${projectId}/model-selections`, payload: { [role]: null } })).statusCode).toBe(200);
     const ref = (name: string) => ({ provider: id, id: name });
     const endpoint = usage === "3d" ? "model3d" : usage;
     expect((await app.inject({ method: "PUT", url: `/${endpoint}-models/default`, payload: ref("global") })).statusCode).toBe(204);
@@ -188,7 +220,7 @@ describe("unified custom media models", () => {
     const tool = usage === "3d" ? "image-to-3d" : usage === "image" ? "generate-image" : "generate-video";
     const key = usage === "image" ? "imageModel" : "model";
     const input = usage === "3d" ? { images: [reference] } : usage === "image" ? { prompt: "Icon", resolution: "1K", aspectRatio: "1:1" } : { prompt: "Trailer" };
-    const sentModels = () => request.mock.calls.filter(([, init]) => init?.method === "POST").map(([, init]) => { const body = JSON.parse(String(init?.body)); return body.model ?? body.ai_model; });
+    const sentModels = () => request.mock.calls.filter(([, init]) => init?.method === "POST" && typeof init.body === "string").map(([, init]) => { const body = JSON.parse(String(init?.body)); return body.model ?? body.ai_model; });
     await generate(app, tool, { ...input, projectId, nodeId: "node-1", [key]: ref("node") });
     await generate(app, tool, { ...input, projectId, nodeId: "node-2" });
     expect((await app.inject({ method: "PUT", url: settingsUrl, payload: {} })).statusCode).toBe(200);
@@ -207,10 +239,10 @@ describe("unified custom media models", () => {
     expect((await app.inject({ method: "PUT", url: settingsUrl, payload: { language: ref("global") } })).statusCode).toBe(400);
   });
 
-  it("supports native Google authentication and no-key local image services", async () => {
+  it("uses explicit local Google-compatible authentication and no-key local image services", async () => {
     const request = vi.fn<typeof fetch>(async (url) => String(url).includes(":generateContent")
-      ? Response.json({ candidates: [{ content: { parts: [{ inlineData: { mimeType: "image/png", data: Buffer.from("image").toString("base64") } }] } }] })
-      : Response.json({ data: [{ b64_json: Buffer.from("image").toString("base64") }] }));
+      ? Response.json({ candidates: [{ content: { parts: [{ inlineData: { mimeType: "image/png", data: png.toString("base64") } }] } }] })
+      : Response.json({ data: [{ b64_json: png.toString("base64") }] }));
     const { app, save } = await fixture(request);
     const google = await save([model("native-image", { image: defaultImageSettings("gemini-generate-content") })], { preset: "google", api: "google-generative-ai" });
     await generate(app, "generate-image", { prompt: "Icon", resolution: "1K", aspectRatio: "1:1", imageModel: { provider: google.id, id: "native-image" } });
@@ -272,19 +304,13 @@ describe("unified custom media models", () => {
   });
 });
 
-it("uses an opted-in hidden custom Meshy connection for animations without forcing a key", async () => {
-  const request = vi.fn<typeof fetch>(async (url) => String(url).endsWith("/animations/library") ? Response.json([{ action_id: 0, name: "Idle" }]) : Response.json({ data: [] }));
-  const { app, save } = await fixture(request);
-  const base = { ...defaultModel3DSettings(), baseUrl: "http://relay.test/openapi/v1" };
-  const disabled = await save([model("geometry-only", { "3d": base })], { authentication: "none", apiKey: undefined });
-  const rejected = await app.inject(`/model3d-animations?provider=${disabled.id}&id=geometry-only`);
-  expect(rejected.statusCode).toBe(503);
-  const enabled = await save([model("geometry", { "3d": { ...base, operations: ["animate", "retexture"] } })], { name: "Animation studio", authentication: "none", apiKey: undefined, hiddenModelIds: ["geometry"] });
-  expect((await app.inject("/model3d-models/catalog")).json().models.some((model: { provider: string }) => model.provider === enabled.id)).toBe(false);
-  expect((await app.inject("/model3d-operations")).json()).toContainEqual(expect.objectContaining({ provider: enabled.id, operations: expect.arrayContaining(["animate", "retexture"]) }));
-  const response = await app.inject(`/model3d-animations?provider=${enabled.id}&id=geometry`);
-  expect(response.statusCode, response.body).toBe(200); expect(response.json()).toMatchObject([{ id: 0, name: "Idle" }]);
-  const call = request.mock.calls.find(([url]) => String(url).endsWith("/animations/library"))!;
-  expect(call[0]).toBe("http://relay.test/openapi/v1/animations/library");
-  expect(new Headers(call[1]?.headers).has("authorization")).toBe(false);
+it("rejects hidden custom Meshy animation connections without forcing a credential or reviving recovery", async () => {
+  const request = vi.fn<typeof fetch>();
+  const { app } = await fixture(request);
+  const base = { ...defaultModel3DSettings("standard", "meshy"), baseUrl: "http://127.0.0.1:43203/openapi/v1", operations: ["animate", "retexture"] as const };
+  const saved = await app.inject({ method: "POST", url: "/settings/models/providers/custom", payload: { ...connection, authentication: "none", apiKey: undefined, modelConfigurationVersion: 2, hiddenModelIds: ["geometry"], models: [model("geometry", { "3d": { ...base, operations: [...base.operations] } })] } });
+  expect(saved.statusCode).toBe(400); expect(saved.json().error).toBe(MESHY_DISABLED_MESSAGE);
+  const response = await app.inject("/model3d-animations?provider=meshy&id=geometry");
+  expect(response.statusCode).toBe(410); expect(response.json().error).toBe(MESHY_DISABLED_MESSAGE);
+  expect(request).not.toHaveBeenCalled();
 });

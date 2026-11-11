@@ -69,6 +69,7 @@ export function downloadAssetBlob(blob: Blob, name: string): void {
 }
 
 const DOWNLOAD_EXTENSIONS: Record<string, string> = {
+  "application/vnd.autodesk.fbx": "fbx",
   "image/png": "png",
   "image/jpeg": "jpg",
   "image/svg+xml": "svg",

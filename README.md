@@ -1,3 +1,18 @@
+> [!IMPORTANT]
+> **Local secure source edition — selected local workflows have been verified.**
+> Account sign-in, Community, cloud publishing/quotas, Sentry/PostHog uploads,
+> and author-hosted updates are disabled in code and cannot be restored through
+> environment variables. Host shell and external MCP/plugin execution remain
+> disabled. The optional controlled Codex and first-stage Qoder connections are documented in [coding agents](docs/coding-agents.md). Registered VM stores additionally provide isolated_shell with guarded
+> source return. Controlled public npm installation, builds and dynamic Web previews are
+> verified in the dedicated launcher store and registered VM test store; execution
+> remains disabled for other stores. See [local security policy](docs/local-security.md).
+> Local launcher instructions and remaining checks are in [manual acceptance notes](docs/manual-acceptance.md).
+> The feature and first-run descriptions below document the **upstream framework**,
+> not a promise that every workflow is available in this edition. Upstream download
+> buttons and releases do **not** contain these local changes. Copyright and
+> upstream reference links are retained.
+
 <div align="center">
 
 <img src="docs/assets/banner.webp" alt="OhMyGame — the open-source studio for making games with AI" width="100%" />
@@ -189,8 +204,9 @@ OhMyGame does not lock you into one model or charge per run.
   and 3D uses, protocol templates and generation defaults.
   See [custom model configuration](docs/custom-models.md).
 
-Keys stay in the local daemon. They never reach the agent's workspace, your
-game, or the renderer.
+Keys are stored by the local daemon, with credential isolation and filtering
+for renderer APIs, project workspaces and exports. Selected code and assets
+still go to the model service; filtering cannot identify every possible secret.
 
 ## Quick start
 
@@ -199,12 +215,20 @@ game, or the renderer.
 See [the changelog](CHANGELOG.md) for changes in each release, or open
 **Settings → About → Changelog** inside the app.
 
-Grab the installer from the buttons at the top or from
-[Releases](https://github.com/WhiteTowerAI/ohmygame/releases). Builds are
-available for macOS (Apple silicon) and Windows (x64). The Windows build is
-not code-signed yet, so Windows may show a SmartScreen warning during install.
+The buttons at the top and
+[Releases](https://github.com/WhiteTowerAI/ohmygame/releases) point to
+upstream distributions, not installers for this local secure edition. Upstream
+builds are available for macOS (Apple silicon) and Windows (x64). The upstream
+Windows build is not code-signed yet. No local installer has been verified.
 
 ### First run
+
+The following walkthrough describes upstream. This edition has no account
+sign-in or public web search, and external coding agents and plugin/MCP execution
+are unavailable. KunpoAPI now has a built-in connection and per-project model
+lists, with simulated coverage for the primary Agent and media adapters. Real
+account access and output quality remain unverified. See the
+[current Kunpo adapter scope](docs/kunpo-local.md) before using a real key.
 
 ![First-run AI connection screen](docs/assets/first-run-onboarding.png)
 
@@ -267,8 +291,8 @@ Click **Next** to connect a model before your first prompt:
 3. **Pick a model and describe your game.** Choose the model in the prompt box
    on the home screen, then describe what you want to make.
 
-Web search works without setup. Sign in under **Account** only when you want
-to publish a game; making games locally needs no account.
+Upstream offers public web search and account publishing. Both are disabled in
+this edition; local projects do not require an account.
 Reopen the welcome from **Settings → About → View getting started**.
 
 To move a project to another computer, choose **Export project** in its card
@@ -280,20 +304,22 @@ page opens it as a new project. See [Project archives](docs/project-archives.md)
 ### Run from source
 
 Requires Bun 1.4.2 or newer for the toolchain and Node.js 22.19+ for the daemon.
+Use this modified checkout. Cloning upstream `main` creates an upstream checkout
+without this edition's security changes.
 
 ```bash
-git clone --branch main https://github.com/WhiteTowerAI/ohmygame.git
-cd ohmygame
-bun install --frozen-lockfile
-bun run dev            # web renderer + local daemon
-# or
-bun run dev:desktop    # Electron app
+ELECTRON_SKIP_BINARY_DOWNLOAD=1 bun install --frozen-lockfile --ignore-scripts
 ```
 
-This uses the release branch. For development contributions, start from `dev`
-using [CONTRIBUTING.md](CONTRIBUTING.md#fork-and-create-a-branch).
-Local development can start without cloud configuration; see
-[CONTRIBUTING.md](CONTRIBUTING.md#configuration) for optional integrations.
+This downloads locked packages without lifecycle scripts. It does not install
+the Electron binary or prove that native dependencies and builds work. Review
+the downloaded dependencies before separately authorizing type checks, focused
+tests, renderer builds, or startup; see [CONTRIBUTING.md](CONTRIBUTING.md#make-and-check-your-change).
+Selected tests, builds and isolated workflows have run with fake keys; this does
+not verify every upstream feature. Local development needs no cloud account or authentication
+environment variables. See [local security policy](docs/local-security.md) for
+disabled workflows and remaining boundaries. Upstream contributions still use
+the [documented branch workflow](CONTRIBUTING.md#fork-and-create-a-branch).
 
 Design and Asset Canvas share boards, Markdown documents, and local media
 under `canvas/`. See [Canvas workspace](docs/canvas-agent.md) for the file
@@ -301,14 +327,22 @@ contract and offline migration instructions.
 
 ## Privacy
 
-Your projects and keys stay on your machine. Prompts and generation requests go
-directly to the model providers you choose. Publishing requires an OhMyGame
-account and uploads only your game's static build. Release builds check for
-updates and send anonymous usage events (PostHog, no session recording) and
-crash reports (Sentry, no personal data). Builds from source send no telemetry.
-The desktop app keeps redacted logs on your machine; they leave it only if you
-export them from **Settings → About → Diagnostics** and share the file. See
-[logs and diagnostics](docs/diagnostics.md).
+This edition removes application Sentry/PostHog initialization and upload
+dependencies, disables author cloud/account/publishing clients and remote
+updates, and does not download author examples or preinstalled plugins at
+startup. Environment variables cannot restore those paths.
+
+Explicit model requests can send prompts, code, screenshots and selected assets
+to the configured model endpoint; generated artifacts may require separate
+downloads. Local storage and redacted diagnostic logs remain sensitive, and
+exported files leave your machine when you share them. See [logs and
+diagnostics](docs/diagnostics.md).
+
+These are source policy changes, not proof of zero network traffic or complete
+isolation. Downloaded dependencies, browser/WebRTC behavior, official binaries
+and private services need their own verification. Browser content has not been
+placed inside an OS network sandbox. Real Kunpo/media calls and general-purpose
+execution remain unverified. See [local security policy](docs/local-security.md).
 
 ## Roadmap
 

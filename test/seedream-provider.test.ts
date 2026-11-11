@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { seedreamModel } from "../src/daemon/seedream-models.js";
-import { SeedreamProvider } from "../src/daemon/seedream-provider.js";
+import { SeedreamProvider } from "./local-secure-provider-fixtures.js";
 
 describe("Seedream provider", () => {
   it("generates a Pro image with references and the documented pixel size", async () => {
@@ -24,7 +24,7 @@ describe("Seedream provider", () => {
     })).resolves.toEqual({ bytes: Buffer.from("generated-image"), mediaType: "image/png", requestId: "image-request-1" });
 
     expect(request).toHaveBeenCalledTimes(1);
-    expect(request.mock.calls[0]?.[0]).toBe("https://ark.cn-beijing.volces.com/api/v3/images/generations");
+    expect(request.mock.calls[0]?.[0]).toBe("http://127.0.0.1:43199/api/v3/images/generations");
     expect(request.mock.calls[0]?.[1]?.headers).toEqual({ authorization: "Bearer volc-key", "content-type": "application/json" });
     expect(JSON.parse(String(request.mock.calls[0]?.[1]?.body))).toEqual({
       model: "doubao-seedream-5-0-pro-260628",
@@ -77,13 +77,13 @@ describe("Seedream provider", () => {
       prompt: "test",
       resolution: "1K",
       aspectRatio: "1:1",
-    })).rejects.toMatchObject({ message: "Model is not activated", statusCode: 400 });
+    })).rejects.toMatchObject({ message: "Volcengine Ark image generation failed", statusCode: 400 });
   });
 
   it.each([
     [401, "Volcengine Ark credentials were rejected", 503],
     [429, "Volcengine Ark image generation is temporarily rate limited", 429],
-    [500, "unavailable", 502],
+    [500, "Volcengine Ark image generation failed", 502],
   ])("maps an HTTP %s response to a useful error", async (status, message, statusCode) => {
     const request = vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json({ error: { message: status === 500 ? "unavailable" : "ignored" } }, { status }));
     const model = seedreamModel("doubao-seedream-5-0-pro-260628")!;

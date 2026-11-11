@@ -80,6 +80,15 @@ export const AGENT_RUNTIME_DEFINITIONS: Record<
     loginCommand: "opencode auth login",
     installUrl: "https://opencode.ai/v2/docs/",
   },
+  "qoder-cli": {
+    id: "qoder-cli",
+    name: "Qoder",
+    binaries: ["qoder", "qodercli"],
+    versionArgs: ["--version"],
+    testedVersion: "1.1.83",
+    loginCommand: "qoder login",
+    installUrl: "https://docs.qoder.com/cli/installation",
+  },
 };
 
 /**
@@ -93,7 +102,7 @@ export function commandSandbox(
   platform: NodeJS.Platform = process.platform,
   onPath: (program: string) => boolean = programOnPath,
 ): "os" | "none" {
-  if (id === "opencode-cli") return "none";
+  if (id === "opencode-cli" || id === "qoder-cli") return "none";
   if (platform === "darwin") return "os";
   if (platform !== "linux") return "none";
   return id === "codex-cli" || (onPath("bwrap") && onPath("socat"))

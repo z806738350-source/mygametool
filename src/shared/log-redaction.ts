@@ -1,13 +1,14 @@
 import os from "node:os";
 import path from "node:path";
 import { sanitizeDiagnosticText } from "@earendil-works/pi-ai/utils/provider-failure";
+import { redactKnownSensitiveValues } from "./sensitive-values.js";
 
 /** Longer lines are cut, so one runaway write cannot fill a log file. */
 export const MAX_LOG_LINE_LENGTH = 16_000;
 export const MAX_LOG_INPUT_LENGTH = MAX_LOG_LINE_LENGTH * 4;
 export const OMITTED_LOG_TEXT = "[diagnostic text omitted: too long]";
 const SENSITIVE_FIELD =
-  /^(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|password|secret|cookie)$/i;
+  /^(?:key|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|password|secret|cookie)$/i;
 
 interface LogTextOptions {
   maxLength?: number;
@@ -60,13 +61,17 @@ export function createLogRedactor(
     // Node's console formatter uses single quotes (or backticks) for object
     // values. Keep spaces, separators and escaped quotes inside the value.
     const quoted = decoded.replace(
-      /(\b(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|password|secret|cookie)["']?\s*[:=]\s*)(["'`])(?:\\[\s\S]?|(?!\2)[^\\])*(?:\2|$)/gi,
+      /(\b(?:key|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|password|secret|cookie)["']?\s*[:=]\s*)(["'`])(?:\\[\s\S]?|(?!\2)[^\\])*(?:\2|$)/gi,
       (_entry, field: string, quote: string) =>
         `${field}${quote}[redacted]${quote}`,
     );
+    const keys = quoted.replace(
+      /(\bkey["']?\s*[:=]\s*)(?!\s*["'`])[^\s,;}\r\n]+/gi,
+      "$1[redacted]",
+    );
     // An unquoted Cookie header may contain multiple credentials separated
     // by semicolons. None of that header's remainder is safe to keep.
-    const cookies = quoted.replace(
+    const cookies = keys.replace(
       /(\bcookie["']?\s*[:=]\s*)(?!\s*["'`])[^\r\n]+/gi,
       "$1[redacted]",
     );
@@ -75,7 +80,7 @@ export function createLogRedactor(
   };
   return (line, { maxLength = MAX_LOG_LINE_LENGTH, tail = false } = {}) => {
     // Truncating first can remove a credential's field name or closing quote.
-    const text = redact(line);
+    const text = redactKnownSensitiveValues(redact(redactKnownSensitiveValues(line)));
     return tail ? text.slice(-maxLength) : text.slice(0, maxLength);
   };
 }

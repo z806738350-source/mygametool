@@ -11,10 +11,20 @@ export class WorkspaceError extends Error {
   constructor(message: string, readonly code?: string) { super(message); }
 }
 
-export async function listWorkspaceFiles(workspacePath: string): Promise<WorkspaceFile[]> {
+export async function listWorkspaceFiles(workspacePath: string, options: { assets?: boolean } = {}): Promise<WorkspaceFile[]> {
   const files: WorkspaceFile[] = [];
   await visit(workspacePath, "", files);
   const metadata = await readAssetMetadata(workspacePath);
+  // Editor model sources stay outside the code tree and isolated game transfer.
+  if (options.assets) {
+    for (const assetPath of Object.keys(metadata.libraryAssets)) {
+      if (!/^\.data\/model-assets\/[a-f0-9]{64}\/(?:original\.fbx|[a-f0-9]{64}\.glb)$/.test(assetPath)) continue;
+      let size = 0;
+      try { size = (await getWorkspaceMedia(workspacePath, assetPath)).size; }
+      catch (cause) { if (!(cause instanceof WorkspaceError && cause.code === "ENOENT")) continue; }
+      files.push({ path: assetPath, size, mediaType: "model" });
+    }
+  }
   for (const file of files) {
     if (file.directory) continue;
     const prompt = metadata.prompts[file.path];

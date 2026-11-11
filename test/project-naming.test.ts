@@ -41,7 +41,7 @@ describe("background project naming", () => {
       id: "text",
       name: "Fixture text",
       api: "openai-completions",
-      baseUrl: "https://fixture.example/v1",
+      baseUrl: "https://llm.ziy.cc/v1",
       reasoning: false,
       input: ["text"],
       contextWindow: 32_000,
@@ -60,10 +60,13 @@ describe("background project naming", () => {
       getModel: () => model,
       getProvider: () => ({ name: "Fixture" }),
       hasConfiguredAuth: () => true,
+      getAuth: async () => ({ auth: { apiKey: "sk-project-naming-fixture-key-only" } }),
       completeSimple,
     } as unknown as ModelRuntime;
+    const headers = { authorization: "Bearer project-naming-test" };
     const app = createApp({
       dataDirectory: await directory(),
+      accessToken: "project-naming-test",
       createModelRuntime: async () => runtime,
       createSession: async () => ({
         messages: [],
@@ -75,12 +78,13 @@ describe("background project naming", () => {
     });
     cleanups.push(() => app.close());
     const project = (
-      await app.inject({ method: "POST", url: "/projects", payload: {} })
+      await app.inject({ method: "POST", url: "/projects", payload: {}, headers })
     ).json();
     const conversation = (
       await app.inject({
         method: "POST",
         url: `/projects/${project.id}/conversations`,
+        headers,
         payload: { model: { provider: model.provider, id: model.id } },
       })
     ).json();
@@ -90,19 +94,20 @@ describe("background project naming", () => {
         await app.inject({
           method: "POST",
           url: `/projects/${project.id}/conversations/${conversation.id}/turns`,
+          headers,
           payload: { prompt: "制作月球种植游戏" },
         })
       ).statusCode,
     ).toBe(202);
     await vi.waitFor(async () =>
       expect(
-        (await app.inject({ method: "GET", url: "/projects" })).json()[0],
+        (await app.inject({ method: "GET", url: "/projects", headers })).json()[0],
       ).toMatchObject({ name: "月球花园", nameSource: "ai" }),
     );
     expect(completeSimple).toHaveBeenCalledTimes(1);
     expect(completeSimple.mock.calls[0]?.[0]).toBe(model);
     expect(
-      (await app.inject({ method: "GET", url: "/projects/activity" })).json()
+      (await app.inject({ method: "GET", url: "/projects/activity", headers })).json()
         .names,
     ).toEqual([{ id: project.id, name: "月球花园", nameSource: "ai" }]);
     const address = await app.listen({ host: "127.0.0.1", port: 0 });
@@ -111,6 +116,7 @@ describe("background project naming", () => {
       const response = await fetch(
         `${address}/projects/${project.id}/events?cursor=0`,
         {
+          headers,
           signal: AbortSignal.any([
             controller.signal,
             AbortSignal.timeout(2_000),

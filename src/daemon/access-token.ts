@@ -1,4 +1,5 @@
 import type { Readable } from "node:stream";
+import { randomBytes } from "node:crypto";
 
 const MAX_TOKEN_CHARS = 4_096;
 
@@ -9,12 +10,15 @@ const MAX_TOKEN_CHARS = 4_096;
  * `OHMYGAME_DAEMON_TOKEN`. Either way it leaves the environment, which every
  * process the daemon starts inherits.
  */
-export async function takeAccessToken(environment: NodeJS.ProcessEnv, input: Readable): Promise<string | undefined> {
+export async function takeAccessToken(environment: NodeJS.ProcessEnv, input: Readable): Promise<string> {
   const fromEnvironment = environment.OHMYGAME_DAEMON_TOKEN;
   const fromInput = environment.OHMYGAME_DAEMON_TOKEN_STDIN === "1";
   delete environment.OHMYGAME_DAEMON_TOKEN;
   delete environment.OHMYGAME_DAEMON_TOKEN_STDIN;
-  if (!fromInput) return fromEnvironment;
+  if (!fromInput) {
+    if (fromEnvironment !== undefined && !/^[\x21-\x7e]{1,4096}$/.test(fromEnvironment)) throw new Error("Invalid daemon access token");
+    return fromEnvironment ?? randomBytes(32).toString("base64url");
+  }
   let token = "";
   for await (const chunk of input.setEncoding("utf8")) {
     token += chunk;
@@ -22,5 +26,6 @@ export async function takeAccessToken(environment: NodeJS.ProcessEnv, input: Rea
   }
   // An app that sends a token must never get a daemon that accepts requests without one.
   if (!token) throw new Error("The daemon access token was not received");
+  if (!/^[\x21-\x7e]+$/.test(token)) throw new Error("Invalid daemon access token");
   return token;
 }

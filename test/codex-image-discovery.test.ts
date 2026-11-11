@@ -44,16 +44,14 @@ async function fixture(enabled: boolean) {
   return { app, connection, connect };
 }
 
-it("does not check a disabled CLI while listing providers, initializing onboarding or toggling another provider", async () => {
+it("does not discover a retired CLI and refuses retired provider toggles during setup", async () => {
   const { app, connect } = await fixture(false);
   const providers = await app.inject({
     method: "GET",
     url: "/settings/providers",
   });
   expect(providers.statusCode).toBe(200);
-  expect(providers.json()).toContainEqual(
-    expect.objectContaining({ id: "codex-cli", enabled: false }),
-  );
+  expect(providers.json().some((provider: { id: string }) => provider.id === "codex-cli")).toBe(false);
   expect(
     (await app.inject({ method: "GET", url: "/settings/onboarding" }))
       .statusCode,
@@ -66,18 +64,18 @@ it("does not check a disabled CLI while listing providers, initializing onboardi
         payload: { enabled: false },
       })
     ).statusCode,
-  ).toBe(200);
+  ).toBe(404);
   expect(connect).not.toHaveBeenCalled();
   const enabled = await app.inject({
     method: "PATCH",
     url: "/settings/models/providers/codex-cli/enabled",
     payload: { enabled: true },
   });
-  expect(enabled.statusCode).toBe(200);
-  expect(enabled.json()).toMatchObject({ enabled: true, configured: false });
+  expect(enabled.statusCode).toBe(404);
 });
 
-it("serves provider operations during a slow login check and adopts the saved sign-in", async () => {
+// Retained for future OS-isolated CLI execution; codex-image-provider.test.ts covers the current refusal.
+it.skip("serves provider operations during a slow login check and adopts the saved sign-in", async () => {
   const { app, connection, connect } = await fixture(true);
   let release!: (value: typeof connection) => void;
   connect.mockImplementationOnce(

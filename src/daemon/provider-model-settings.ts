@@ -1,3 +1,4 @@
+import { registerSensitiveValue } from "../shared/sensitive-values.js";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -8,6 +9,10 @@ import { modelUsageList, modelUsages, normalizeEndpoint, normalizeModelUsages } 
 import type { RuntimeModel } from "./agent.js";
 import { automaticCustomReasoning, normalizeThinkingLevelMap, resolveCustomModelCapabilities, type CustomModelCatalog } from "./custom-model-capabilities.js";
 import { supportedReasoningLevels } from "../shared/reasoning.js";
+import type { LocalRuntimeProvider } from "./local-model-runtime.js";
+import { KUNPO_PROVIDER_ID, kunpoProviderDetails } from "../shared/kunpo-models.js";
+import { isDeepStrictEqual } from "node:util";
+import { isMeshyEndpoint, isMeshyModelReference, isMeshyProviderConfiguration, MESHY_DISABLED_MESSAGE } from "../shared/disabled-media-providers.js";
 
 type JsonObject = Record<string, unknown>;
 type CustomProviderRegistry = Record<string, {
@@ -70,8 +75,9 @@ export class ProviderModelSettingsStore {
     }
   }
 
-  isEnabled(provider: string): boolean { return !this.#disabled.includes(provider); }
-  isCustom(provider: string): boolean { return Object.hasOwn(this.#customProviders, provider); }
+  isEnabled(provider: string): boolean { return !isMeshyProviderConfiguration({ id: provider, preset: this.#customProviders[provider]?.preset }) && !this.#disabled.includes(provider); }
+  isCustom(provider: string): boolean { return provider === KUNPO_PROVIDER_ID || Object.hasOwn(this.#customProviders, provider); }
+  isBuiltIn(provider: string): boolean { return provider === KUNPO_PROVIDER_ID && !Object.hasOwn(this.#customProviders, provider); }
 
   responsesTransport(provider: string): ResponsesTransportMode {
     return Object.hasOwn(this.#responsesTransports, provider) ? this.#responsesTransports[provider] : "auto";
@@ -94,6 +100,7 @@ export class ProviderModelSettingsStore {
 
   saveModel3D(provider: Native3DProviderId, value: unknown, create = false): Promise<void> {
     const model = normalizeNativeModel3D(provider, value);
+    if (isMeshyModelReference({ provider, id: model.id, protocol: model.settings.protocol })) return Promise.reject(new Error(MESHY_DISABLED_MESSAGE));
     return this.#enqueue(async () => {
       const exists = this.models3D(provider).some((entry) => entry.id === model.id);
       if (create && exists) throw new Error("A model with this ID already exists");
@@ -121,7 +128,7 @@ export class ProviderModelSettingsStore {
   }
 
   resolveModel(model: RuntimeModel, catalog: CustomModelCatalog): RuntimeModel {
-    return this.isCustom(model.provider) ? resolveCustomModelCapabilities(model, catalog, this.#customProviders[model.provider].reasoningCapabilities?.[model.id]) : model;
+    return this.isCustom(model.provider) && !this.isBuiltIn(model.provider) ? resolveCustomModelCapabilities(model, catalog, this.#customProviders[model.provider]?.reasoningCapabilities?.[model.id]) : model;
   }
 
   defaultImageModel(): ModelRef | undefined { return this.#defaultImageModel; }
@@ -129,9 +136,18 @@ export class ProviderModelSettingsStore {
   defaultModel3D(): ModelRef | undefined { return this.#defaultModel3D; }
 
   setDefaultMediaModel(usage: MediaModelUsage, model?: ModelRef): Promise<void> {
+    const definition = model && this.#customProviders[model.provider]?.models?.find((item) => item.id === model.id);
+    if (model && (isMeshyProviderConfiguration({ id: model.provider, preset: this.#customProviders[model.provider]?.preset }) || isMeshyModelReference(model) || isMeshyEndpoint(definition?.baseUrl) || (usage === "3d" && (definition?.usages?.["3d"]?.protocol === "meshy" || isMeshyEndpoint(definition?.usages?.["3d"]?.baseUrl))))) return Promise.reject(new Error(MESHY_DISABLED_MESSAGE));
     const key = usage === "image" ? "defaultImageModel" : usage === "video" ? "defaultVideoModel" : "defaultModel3D";
     const selected = model ? { provider: model.provider, id: model.id } : undefined;
     return this.#enqueue(async () => {
+      if (selected && await this.#blockedProvider(selected.provider)) throw new Error(MESHY_DISABLED_MESSAGE);
+      if (selected) {
+        const { config } = await this.#readModels();
+        const provider = isObject(config.providers) ? config.providers[selected.provider] : undefined;
+        const entries = isObject(provider) && Array.isArray(provider.models) ? provider.models.filter(isObject) : [];
+        if (isMeshyEndpoint(entries.find((entry) => entry.id === selected.id)?.baseUrl)) throw new Error(MESHY_DISABLED_MESSAGE);
+      }
       await this.#writePreferences({ [key]: selected });
       if (usage === "image") this.#defaultImageModel = selected;
       else if (usage === "video") this.#defaultVideoModel = selected;
@@ -144,9 +160,13 @@ export class ProviderModelSettingsStore {
   }
 
   setEnabled(provider: string | readonly string[], enabled: boolean): Promise<void> {
+    if (enabled && (typeof provider === "string" ? [provider] : provider).some((id) => isMeshyProviderConfiguration({ id, preset: this.#customProviders[id]?.preset }))) return Promise.reject(new Error(MESHY_DISABLED_MESSAGE));
     return this.#enqueue(async () => {
       const disabled = new Set(this.#disabled);
-      for (const id of typeof provider === "string" ? [provider] : provider) enabled ? disabled.delete(id) : disabled.add(id);
+      for (const id of typeof provider === "string" ? [provider] : provider) {
+        if (enabled && await this.#blockedProvider(id)) throw new Error(MESHY_DISABLED_MESSAGE);
+        enabled ? disabled.delete(id) : disabled.add(id);
+      }
       await this.#writePreferences({ disabled: [...disabled] });
       this.#disabled = [...disabled];
     });
@@ -154,15 +174,58 @@ export class ProviderModelSettingsStore {
 
   async customProvider(id: string, catalog: CustomModelCatalog = new Map()): Promise<CustomProviderDetails | undefined> {
     if (!this.isCustom(id)) return undefined;
+    if (this.isBuiltIn(id)) return this.#kunpoProvider();
     const { config } = await this.#readModels();
     return this.#customProvider(id, config, catalog);
   }
 
+  async #blockedProvider(id: string): Promise<boolean> {
+    const { config } = await this.#readModels();
+    const entry = isObject(config.providers) ? config.providers[id] : undefined;
+    return isMeshyProviderConfiguration({ id, preset: this.#customProviders[id]?.preset, baseUrl: isObject(entry) ? entry.baseUrl : undefined });
+  }
+
   async customProviderCatalog(): Promise<CustomProviderDetails[]> {
-    if (!Object.keys(this.#customProviders).length) return [];
+    if (!Object.keys(this.#customProviders).length) return [this.#kunpoProvider()];
     const { config } = await this.#readModels();
     const catalog: CustomModelCatalog = new Map();
-    return Object.keys(this.#customProviders).map((id) => this.#customProvider(id, config, catalog));
+    const providers = Object.keys(this.#customProviders).map((id) => this.#customProvider(id, config, catalog));
+    return this.isBuiltIn(KUNPO_PROVIDER_ID) ? [this.#kunpoProvider(), ...providers] : providers;
+  }
+
+  #kunpoProvider(): CustomProviderDetails {
+    const provider = kunpoProviderDetails();
+    return { ...provider, hiddenModelIds: provider.models.filter((model) => !this.isVisible({ provider: provider.id, id: model.id })).map((model) => model.id) };
+  }
+
+  /** Replay inert model metadata only; SDK command keys, headers, OAuth and extensions are never loaded. */
+  async localRuntimeProviders(): Promise<LocalRuntimeProvider[]> {
+    const { config } = await this.#readModels();
+    const configured = Object.entries(isObject(config.providers) ? config.providers : {}).flatMap(([id, entry]) => {
+      if (!isObject(entry) || typeof entry.api !== "string" || typeof entry.baseUrl !== "string") return [];
+      if (isMeshyProviderConfiguration({ id, preset: this.#customProviders[id]?.preset, baseUrl: entry.baseUrl })) return [];
+      try {
+        if (!["openai-completions", "openai-responses", "anthropic-messages"].includes(entry.api)) return [];
+        const api = entry.api as "openai-completions" | "openai-responses" | "anthropic-messages";
+        const baseUrl = normalizeEndpoint(entry.baseUrl);
+        const models = (Array.isArray(entry.models) ? entry.models.filter(isObject) : []).filter((model) => !isMeshyModelReference({ provider: id, id: model.id }) && !isMeshyEndpoint(model.baseUrl)).map((model) => {
+          const normalized = normalizeCustomProviderModel({ ...model, supportsImages: Array.isArray(model.input) && model.input.includes("image") }, api, baseUrl);
+          return {
+            id: normalized.id, name: normalized.name, api: normalized.api as typeof api, baseUrl: normalized.baseUrl,
+            contextWindow: normalized.contextWindow, maxTokens: normalized.maxTokens, reasoning: normalized.reasoning,
+            input: normalized.supportsImages ? ["text" as const, "image" as const] : ["text" as const],
+            ...(normalized.thinkingLevelMap ? { thinkingLevelMap: normalized.thinkingLevelMap } : {}),
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          };
+        });
+        return [{ id, config: { name: typeof entry.name === "string" ? entry.name : id, api, baseUrl, models } }];
+      } catch {
+        // Old official endpoints and malformed legacy metadata stay unavailable. They cannot trigger migration or auth resolution.
+        return [];
+      }
+    });
+    // Explicit existing provider metadata retains precedence; defaults never rewrite models.json.
+    return configured.some((provider) => provider.id === KUNPO_PROVIDER_ID) ? configured : [kunpoRuntimeProvider(), ...configured];
   }
 
   #customProvider(id: string, config: JsonObject, catalog: CustomModelCatalog): CustomProviderDetails {
@@ -173,7 +236,23 @@ export class ProviderModelSettingsStore {
     const registry = this.#customProviders[id];
     const models = (registry.models ?? (Array.isArray(entry.models) ? entry.models.filter(isObject) : [])).map((model) => {
       const reported = registry.reasoningCapabilities?.[String(model.id)];
-      return normalizeCustomProviderModel({ ...model, supportsImages: "supportsImages" in model ? model.supportsImages : Array.isArray(model.input) && model.input.includes("image"), ...(reported ? { reasoningCapabilities: { source: "provider", thinkingLevelMap: reported } } : {}) }, api, baseUrl, catalog);
+      const saved = { ...model, supportsImages: "supportsImages" in model ? model.supportsImages : Array.isArray(model.input) && model.input.includes("image"), ...(reported ? { reasoningCapabilities: { source: "provider", thinkingLevelMap: reported } } : {}) };
+      // Historic endpoints remain displayable as inert metadata; execution and saves still reject them.
+      const sanitized = structuredClone(saved) as JsonObject;
+      const modelEndpoint = isMeshyEndpoint(sanitized.baseUrl) ? sanitized.baseUrl as string : undefined;
+      if (modelEndpoint) delete sanitized.baseUrl;
+      const endpoints: Record<string, string> = {};
+      if (isObject(sanitized.usages)) for (const usage of ["image", "video", "3d"]) {
+        const details = sanitized.usages[usage];
+        if (isObject(details) && isMeshyEndpoint(details.baseUrl)) { endpoints[usage] = details.baseUrl as string; delete details.baseUrl; }
+      }
+      const normalized = normalizeCustomProviderModel(sanitized, api, baseUrl, catalog);
+      if (modelEndpoint) normalized.baseUrl = modelEndpoint;
+      if (normalized.usages) for (const usage of ["image", "video", "3d"] as const) {
+        const details = normalized.usages[usage];
+        if (details && endpoints[usage]) details.baseUrl = endpoints[usage];
+      }
+      return normalized;
     });
     return {
       id, name: String(entry.name), api, baseUrl, authentication: registry.authentication,
@@ -200,10 +279,20 @@ export class ProviderModelSettingsStore {
   }
 
   saveCustomProvider(id: string, settings: SaveCustomProviderRequest, apply: () => Promise<void>, onlyLegacy = false): Promise<void> {
+    if (this.isBuiltIn(id)) return Promise.reject(new Error("The reviewed Kunpo provider is built in; configure its API key instead of editing its transport"));
+    if (isMeshyProviderConfiguration({ id, preset: settings.preset, baseUrl: settings.baseUrl })) return Promise.reject(new Error(MESHY_DISABLED_MESSAGE));
     return this.#enqueue(async () => {
       if (onlyLegacy && this.#customProviders[id]?.modelConfigurationVersion === 2) return;
       const { text, config } = await this.#readModels();
       const existing = isObject(config.providers) ? config.providers[id] : undefined;
+      for (const model of settings.models ?? []) {
+        if (isMeshyModelReference({ provider: id, id: model.id }) || isMeshyEndpoint(model.baseUrl)) throw new Error(MESHY_DISABLED_MESSAGE);
+        const media = model.usages?.["3d"];
+        if (media && (media.protocol === "meshy" || isMeshyEndpoint(media.baseUrl))) {
+          const prior = this.#customProviders[id]?.models?.find((item) => item.id === model.id)?.usages?.["3d"];
+          if (!isDeepStrictEqual(media, prior)) throw new Error(MESHY_DISABLED_MESSAGE);
+        }
+      }
       if (existing !== undefined && !this.isCustom(id)) throw new Error("Only custom providers can be edited");
       const name = customProviderNameKey(settings.name);
       if (!isObject(existing) || customProviderNameKey(String(existing.name)) !== name) {
@@ -270,6 +359,7 @@ export class ProviderModelSettingsStore {
   }
 
   removeProviderSettings(id: string, apply: () => Promise<void>): Promise<void> {
+    if (this.isBuiltIn(id)) return Promise.reject(new Error("The reviewed Kunpo provider is built in and cannot be removed"));
     return this.#enqueue(async () => {
       const { text, config } = await this.#readModels();
       const contents = isObject(config.providers) && Object.hasOwn(config.providers, id)
@@ -321,6 +411,7 @@ export class ProviderModelSettingsStore {
   }
 
   setVisibility(provider: string, ids: string[], visible: boolean): Promise<void> {
+    if (visible && (isMeshyProviderConfiguration({ id: provider, preset: this.#customProviders[provider]?.preset }) || ids.some((id) => isMeshyModelReference({ provider, id })))) return Promise.reject(new Error(MESHY_DISABLED_MESSAGE));
     return this.#enqueue(async () => {
       const hidden = new Set(Array.isArray(this.#hidden[provider]) ? this.#hidden[provider] : []);
       for (const id of ids) visible ? hidden.delete(id) : hidden.add(id);
@@ -337,6 +428,7 @@ export class ProviderModelSettingsStore {
   }
 
   async addCustomModel(provider: string, model: CustomProviderModel): Promise<void> {
+    if (isMeshyProviderConfiguration({ id: provider, preset: this.#customProviders[provider]?.preset }) || isMeshyModelReference({ provider, id: model.id }) || isMeshyEndpoint(model.baseUrl) || model.usages?.["3d"]?.protocol === "meshy" || isMeshyEndpoint(model.usages?.["3d"]?.baseUrl)) throw new Error(MESHY_DISABLED_MESSAGE);
     if (this.isCustom(provider)) {
       const settings = (await this.customProvider(provider))!;
       if (settings.models.some((item) => item.id === model.id)) throw new Error("A model with this ID already exists");
@@ -384,6 +476,20 @@ export class ProviderModelSettingsStore {
     this.#pending = next.catch(() => undefined);
     return next;
   }
+}
+
+export function kunpoRuntimeProvider(): LocalRuntimeProvider {
+  const provider = kunpoProviderDetails();
+  return { id: provider.id, config: { name: provider.name, api: "openai-completions", baseUrl: provider.baseUrl,
+    models: provider.models.filter((model) => model.usages?.language).map((model) => ({
+      id: model.id, name: model.name, api: model.api as "openai-completions" | "openai-responses" | "anthropic-messages",
+      ...(model.baseUrl ? { baseUrl: model.baseUrl } : {}),
+      input: model.supportsImages ? ["text" as const, "image" as const] : ["text" as const],
+      reasoning: model.reasoning, contextWindow: model.contextWindow, maxTokens: model.maxTokens,
+      ...(model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap } : {}),
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    })),
+  } };
 }
 
 function modifyFormattedJsonc(text: string, jsonPath: JSONPath, value: unknown): string {
@@ -446,6 +552,7 @@ export function normalizeCustomProvider(value: unknown, catalog: CustomModelCata
   }
   const modelConfigurationVersion = value.modelConfigurationVersion === 2 || models?.some((model) => model.usages !== undefined) ? 2 : undefined;
   if (modelConfigurationVersion === 2 && models?.some((model) => !hiddenModelIds?.includes(model.id) && !modelUsageList(model).length)) throw new Error("Assign a use to each enabled model");
+  registerSensitiveValue(apiKey);
   return { name, api, baseUrl, authentication: value.authentication, ...(value.preset ? { preset: value.preset as CustomProviderSettings["preset"] } : {}),
     ...(modelConfigurationVersion ? { modelConfigurationVersion } : {}), ...(apiKey ? { apiKey } : {}), ...(models ? { models } : {}), ...(hiddenModelIds ? { hiddenModelIds } : {}) };
 }

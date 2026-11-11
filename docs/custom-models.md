@@ -1,5 +1,16 @@
 # Custom providers and models
 
+For this local edition, configure KunpoAPI or a supported custom endpoint in
+**Providers & Models**. Historical standalone media keys appear there only
+when available to clear. The built-in provider and Cloud workflows described
+below document the upstream application. Meshy is disabled, including recognizable
+custom Meshy IDs, protocols and endpoints: discovery, generation/processing,
+rigging/animation, balance, polling, remote recovery and downloads cannot be
+enabled by a preset or saved key. Old definitions and local assets remain;
+existing Meshy choices are not silently remapped to Kunpo Tripo. Use the enabled
+Kunpo Tripo connection for supported new 3D work. See
+[local provider setup](kunpo-local.md) and [3D recovery boundaries](3d-providers.md).
+
 In **Providers & Models**, choose **Add provider**, enter a name, Base URL and
 authentication, and select a service preset if one fits your endpoint. Presets
 provide connection defaults; each model can use its own generation protocol.
@@ -9,7 +20,7 @@ Existing duplicate names remain usable while you rename them.
 
 Choose **Fetch** to load the complete model list, or **Add a model manually** to
 enter a model ID that the endpoint does not list. Model discovery is optional;
-services such as Meshy, Tripo and Hyper3D may require manual IDs. Their official connections
+supported services such as Tripo and Hyper3D may require manual IDs. Their connections
 offer **Load presets** instead of requesting a language `/models` endpoint. This
 loads documented starter definitions and does not check key access. Compatible
 custom relays can still fetch their own model lists. Discovery never generates media.
@@ -67,6 +78,8 @@ The SDK stores remote metadata in `pi-agent/models-store.json`, separately from
 user configuration in `models.json`.
 
 ![Refresh models in a built-in provider’s model list (browser fixture)](assets/pi-model-catalog-refresh.png)
+
+The local `/models` response includes `supportsImages` for Pi connections. It describes the effective configured transport, not the upstream model family; coding-agent catalogs may omit it. An image-capable model can still have an unverified gateway adapter. See [the GPT-6.1 Sol connection policy](kunpo-local.md#2026-11-08-gpt-61-sol-图片能力与连接策略). Conversations containing images are checked before saving an incompatible model choice.
 
 ## Azure provider upgrade
 
@@ -138,7 +151,7 @@ image connection to generate again.
 | Image | Seedream | `/images/generations` with Seedream JSON parameters |
 | Video | OpenRouter Videos | `/videos`, task polling and output download |
 | Video | Seedance | `/contents/generations/tasks`, task polling and output download |
-| 3D | Meshy | `/image-to-3d` or `/multi-image-to-3d`, task polling and GLB download |
+| 3D | Meshy (disabled) | Historical definitions only; no requests, polling or downloads |
 | 3D | Tripo V3 | `/files`, `/generation/image-to-model` or `/generation/multiview-to-model`, `/tasks/{id}` and GLB download |
 | 3D | Hyper3D Rodin | multipart `/rodin`, `/status`, `/download` and GLB download |
 
@@ -163,25 +176,25 @@ restore a known model's reference count without resetting its other settings.
 Video settings include resolutions, ratios, durations (1–30 seconds), reference-image limits
 (up to 30), and first/last-frame or reference modes.
 
-For Meshy-compatible 3D models, choose a single-image or multi-image template and
-standard or smart topology. Smart topology uses one image. Configure the face
-count range, default and presets, plus texture and PBR support. These paths generate
-GLB files from images. Meshy's rigging and animation library remain separate
-capabilities of the built-in Meshy connection.
+Old Meshy-compatible templates remain readable as historical configuration;
+they are excluded from selectable capabilities and cannot be enabled or reused
+through a custom Base URL to restore Meshy operations.
 
 For Tripo-compatible services, choose **Tripo V3** and enter the model ID or gateway
 alias. One reference uses the single-image endpoint; two to four references use
 multiview in **Front / Left / Back / Right** order. The first reference is always
 the front view. Set the face-count range for the model version: P1 supports up to
 20,000 faces; standard V3.1 supports up to 1,500,000. Texture and PBR are optional;
-disabling texture also disables PBR. Canvas converts WebP references to PNG before
-upload; direct 3D tool requests accept PNG and JPEG.
+disabling texture also disables PBR. Canvas and the Agent accept PNG, JPEG and WebP
+project files. They convert WebP to PNG locally for modeling and preserve the source
+file. Direct API requests accept PNG and JPEG.
 
 The built-in **Tripo** provider only needs an API key in its provider detail page.
 It includes P1, P2 (preview), V3.1, V3.0, and V2.5 using their documented V3 model IDs. Versions are pinned to keep saved projects
 stable. The connection uses `https://openapi.tripo3d.ai/v3`; custom relays can use
-their own Base URL and headers with the same protocol. Rigging and animation
-continue to use the built-in Meshy connection.
+their own Base URL and headers with the same protocol where supported. In this
+local edition, Kunpo Tripo retains its own rigging and animation workflow; it
+does not fall back to Meshy.
 
 The built-in **Hyper3D** provider uses your own API key and requires no OhMyGame
 login. The same **Hyper3D** settings page also offers **Free account credits**.
@@ -195,8 +208,9 @@ The adapter uses GLB, Raw geometry, and Gen 2.5's explicit medium texture mode,
 without add-ons. Displayed generation credits are estimates, not a live key balance.
 Custom relays can choose the Hyper3D protocol and their own endpoint/model alias.
 
-Built-in **Meshy**, **Tripo** and **Hyper3D** use the same searchable model list and visibility
-controls as other providers. Choose **Edit**, then edit a model or **Add model**.
+The upstream built-in **Tripo** and **Hyper3D** model-list contracts use the same
+search and visibility controls as other providers. Meshy definitions are historical
+only; visibility or enable state does not restore them. Choose **Edit**, then edit a model or **Add model**.
 An added version uses its exact ID with the existing provider key and protocol;
 start from an official template, then verify the new version's capabilities.
 Language token fields are not required for 3D-only definitions.
@@ -237,7 +251,8 @@ provider** (or **Remove API key** for Hyper3D). For custom
 providers, it removes the provider definition, credential
 and model settings. For built-in providers, including Meshy, Tripo and Hyper3D, it clears
 the saved credential, endpoint overrides, custom models and visibility/enable
-settings; the service remains available to connect again. Global media defaults
+settings; reconnecting remains subject to current local policy, and clearing a
+Meshy key cannot make Meshy available. Global media defaults
 pointing to the deleted connection are reset. Project defaults and existing node
 choices stay saved and need an available connection to generate again.
 
@@ -266,8 +281,9 @@ Changing defaults affects newly created nodes and requests without an explicit m
 
 ## Native 3D catalog updates
 
-Official presets were checked against public documentation on 2026-10-23. Meshy
-includes T2, T2.5, 7.1, 7 (deprecated), 6, 6 Lite, and the `latest` alias. Tripo includes
+Official preset metadata was checked against public documentation on 2026-10-23.
+Retained Meshy T2/T2.5/7.1/7/6/6 Lite/`latest` definitions are historical only and
+not selectable or callable. Tripo includes
 `P1-20260311`, `P2-20260801` (preview), `v3.1-20260211`, `v3.0-20250812`, and
 `v2.5-20250123`. Hyper3D includes ten Rodin tiers. Preview/deprecated entries
 remain labeled, and listing a version does not verify the key's entitlement.
@@ -291,8 +307,9 @@ generation APIs likewise are not additional image-to-3D model versions.
 
 ## 3D operations
 
-Model 3D supports image/text generation, retexturing and Meshy/Tripo remeshing.
-Animate 3D selects Meshy or Tripo independently of generation-model visibility.
+Model 3D exposes only available supported connections for image/text generation,
+retexturing and remeshing. Animate 3D retains Kunpo Tripo independently of its
+generation-model visibility; Meshy generation, processing and animation are blocked.
 Compatible custom connections opt into additional operations in their 3D capability
 settings. See [3D provider workflows](3d-providers.md) for operation inputs, rig and
 texture versions, task recovery, GLB checks and the remaining documented APIs.

@@ -1,0 +1,16 @@
+[
+  { "extension": ".png", "header": "89504e470d0a1a0a" },
+  { "extension": ".jpg", "header": "ffd8ff" },
+  { "extension": ".jpeg", "header": "ffd8ff" },
+  { "extension": ".webp", "header": "524946460000000057454250" },
+  { "extension": ".gif", "header": "474946383961" },
+  { "extension": ".avif", "header": "000000186674797061766966" },
+  { "extension": ".mp4", "header": "000000186674797069736f6d" },
+  { "extension": ".mov", "header": "000000186d6f6f76" },
+  { "extension": ".webm", "header": "1a45dfa3" },
+  { "extension": ".m4a", "header": "00000018667479704d344120" },
+  { "extension": ".mp3", "header": "49443304000000000000" },
+  { "extension": ".wav", "header": "524946460000000057415645" },
+  { "extension": ".ogg", "header": "4f67675300" },
+  { "extension": ".glb", "header": "676c54460200000040000000" }
+]

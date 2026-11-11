@@ -107,6 +107,14 @@ export function validateAssetCanvasDocument(document: AssetCanvasDocument): void
   }
   const nodes = new Map(document.nodes.map((node) => [node.id, node]));
   for (const node of document.nodes) {
+    if (node.type === "voice" && Boolean(node.data.selectedAssetId) !== Boolean(node.data.selectedSha256)) throw new Error(`Node ${node.id} has an incomplete voice selection`);
+    if (node.type === "speech") {
+      if (node.data.referenceSha256 && !node.data.referenceAssetId) throw new Error(`Node ${node.id} has an incomplete audio reference`);
+      if (node.data.voiceSourceNodeId) {
+        const source = nodes.get(node.data.voiceSourceNodeId);
+        if (!node.data.referenceAssetId || !node.data.referenceSha256 || !(source?.type === "voice" || source?.type === "asset" && source.data.mediaType === "audio")) throw new Error(`Node ${node.id} has an invalid voice source`);
+      }
+    }
     if (node.type === "text" || node.type === "document") {
       for (const reference of node.data.references ?? []) {
         const source = nodes.get(reference.nodeId);
@@ -118,6 +126,7 @@ export function validateAssetCanvasDocument(document: AssetCanvasDocument): void
     }
     if (node.type === "image" || node.type === "model-3d") {
       for (const reference of node.data.images) validateReference(node.id, reference, nodes, ["image", "asset"]);
+      if (node.type === "image" && node.data.mask) validateReference(node.id, node.data.mask, nodes, ["image", "asset"]);
     }
     if (node.type === "video") {
       for (const reference of node.data.references) validateReference(node.id, reference, nodes, ["image", "video", "asset"]);

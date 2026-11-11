@@ -1,3 +1,6 @@
+import { assertLocalExecutionAllowed } from "../local-execution-policy.js";
+import { isControlledCodexProcess } from "./controlled-codex.js";
+import { isControlledQoderProcess } from "./controlled-qoder.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import readline from "node:readline";
 import { trackAgentProcess } from "./process-recovery.js";
@@ -50,6 +53,7 @@ export class AgentProcess {
   #stopping?: Promise<void>;
 
   constructor(options: AgentProcessOptions) {
+    if (!isControlledCodexProcess(options) && !isControlledQoderProcess(options)) assertLocalExecutionAllowed("Native CLI process");
     this.child = spawnProcess(options.binaryPath, options.args, {
       cwd: options.cwd,
       env: options.env,

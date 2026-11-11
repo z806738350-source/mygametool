@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { access, copyFile, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { access, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { ProjectCoverMode, ProjectCoverState } from "../shared/contracts.js";
+import { assertNoKnownSecretBytes } from "./safe-project-file.js";
 
 /** The largest cover a project accepts, uploaded or imported. */
 export const MAX_PROJECT_COVER_BYTES = 5 * 1024 * 1024;
@@ -53,9 +54,8 @@ export class ProjectCovers {
   copy(source: string, destination: string): Promise<void> {
     return this.#serial(source, async () => {
       for (const file of [CUSTOM_COVER, AUTOMATIC_COVER, FROZEN_COVER, COVER_STATE]) {
-        await copyFile(path.join(source, file), path.join(destination, file)).catch((error: NodeJS.ErrnoException) => {
-          if (error.code !== "ENOENT") throw error;
-        });
+        const contents = await readOptional(path.join(source, file));
+        if (contents) await replaceFile(path.join(destination, file), contents);
       }
     });
   }
@@ -97,7 +97,9 @@ async function hasCustomCover(directory: string): Promise<boolean> {
 
 async function readOptional(file: string): Promise<Buffer | undefined> {
   try {
-    return await readFile(file);
+    const bytes = await readFile(file);
+    assertNoKnownSecretBytes(bytes);
+    return bytes;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     return undefined;
@@ -105,6 +107,7 @@ async function readOptional(file: string): Promise<Buffer | undefined> {
 }
 
 async function replaceFile(destination: string, contents: Uint8Array): Promise<void> {
+  assertNoKnownSecretBytes(contents);
   const temporary = `${destination}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporary, contents, { flag: "wx" });

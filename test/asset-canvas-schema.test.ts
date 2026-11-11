@@ -10,6 +10,12 @@ const canvas = (node: object) => ({
 });
 
 describe("Asset Canvas schema diagnostics", () => {
+  it("allows a local speech reference without breaking legacy IDs, and rejects embedded audio", () => {
+    const node = { id: "speech", type: "speech", data: { text: "Hello", referenceAssetId: "local-reference", voiceId: "legacy-id" } };
+    expect(Check(ASSET_CANVAS_SCHEMA, canvas(node))).toBe(true);
+    expect(Check(ASSET_CANVAS_SCHEMA, canvas({ ...node, data: { ...node.data, referenceAssetId: 12 } }))).toBe(false);
+    expect(Check(ASSET_CANVAS_SCHEMA, canvas({ ...node, data: { ...node.data, referenceAudio: "private-bytes" } }))).toBe(false);
+  });
   it.each([[16, true], [17, false]] as const)("validates a board with %i image references", (count, accepted) => {
     expect(Check(ASSET_CANVAS_SCHEMA, canvas({ id: "image", type: "image", data: {
       prompt: "Compose references", resolution: "1K", aspectRatio: "1:1",
@@ -21,6 +27,22 @@ describe("Asset Canvas schema diagnostics", () => {
     expect(Check(ASSET_CANVAS_SCHEMA, canvas({ id: "tripo", type: "model-3d", data: {
       model: { provider: "tripo", id: "v3.1-20260211" }, targetPolycount: 1_200_000, texture: true, pbr: true, images: [],
     } }))).toBe(true);
+  });
+
+  it("persists Tripo operation parameters and rig types without dropping explicit selections", () => {
+    for (const options of [{ quad: true, geometryQuality: "detailed", textureModel: "v3.5-20260815" }, { quad: true, smartUv: true }]) {
+      expect(Check(ASSET_CANVAS_SCHEMA, canvas({ id: "mesh", type: "model-3d", data: {
+        model: { provider: "tripo", id: "v3.1-20260211" }, targetPolycount: 4_000, texture: true, pbr: true, images: [], options,
+      } }))).toBe(true);
+    }
+    for (const rigType of ["avian", "others"]) {
+      expect(Check(ASSET_CANVAS_SCHEMA, canvas({ id: "rig", type: "animate-3d", data: {
+        heightMeters: 1.7, actionIds: [], options: { rigModel: "v3.0-20260909", rigType },
+      } }))).toBe(true);
+    }
+    expect(Check(ASSET_CANVAS_SCHEMA, canvas({ id: "mesh", type: "model-3d", data: {
+      targetPolycount: 4_000, texture: true, pbr: true, images: [], options: { smartUv: "true" },
+    } }))).toBe(false);
   });
 
   it.each([

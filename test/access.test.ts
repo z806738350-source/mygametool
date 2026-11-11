@@ -1,11 +1,13 @@
-import { mkdtemp } from "node:fs/promises";
+import { chmod, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { takeAccessToken } from "../src/daemon/access-token.js";
 import { createApp } from "../src/daemon/app.js";
 import { LOCAL_DEBUG_ACCESS_TOKEN } from "../src/shared/local-debug.js";
+import { isAllowedLocalOrigin, isLoopbackHostHeader } from "../src/shared/local-security.js";
+import { DAEMON_RUNTIME_FILE, publishLocalDaemonRuntime, readLocalDaemonRuntime } from "../src/daemon/runtime-descriptor.js";
 
 const apps: ReturnType<typeof createApp>[] = [];
 afterEach(async () => { await Promise.all(apps.splice(0).map((app) => app.close())); });
@@ -80,6 +82,21 @@ describe("desktop daemon access", () => {
       headers: { origin: "https://untrusted.example" },
     });
     expect(rejected.headers["access-control-allow-origin"]).toBeUndefined();
+    expect(rejected.statusCode).toBe(403);
+  });
+
+  it("rejects rebinding hosts and foreign origins even with a valid bearer or configured foreign origin", async () => {
+    const app = createApp({ dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-access-")), accessToken: "secret", allowedOrigins: ["https://foreign.example"] });
+    apps.push(app);
+    for (const headers of [{ host: "rebind.example:43110" }, { origin: "https://foreign.example" }]) {
+      expect((await app.inject({ url: "/health", headers: { ...headers, authorization: "Bearer secret" } })).statusCode).toBe(403);
+    }
+  });
+
+  it("requires explicit authentication before opening a network listener", async () => {
+    const app = createApp({ dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-access-")) });
+    apps.push(app);
+    expect(() => app.listen({ host: "127.0.0.1", port: 0 })).toThrow("access token is required");
   });
 
   it("preserves renderer CORS headers on the event stream", async () => {
@@ -118,12 +135,15 @@ describe("desktop daemon access", () => {
     }
   });
 
-  it.each(["http://127.0.0.1:43120", "null"])("allows signed-in Community reads from the configured renderer origin %s", async (origin) => {
+  it.each(["http://127.0.0.1:43120", "null"])("rejects retired Community reads while preserving CORS and authentication for %s", async (origin) => {
+    const transport = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => { throw new Error("Retired Cloud transport called"); });
     const app = createApp({
       dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-community-cors-")),
       accessToken: "desktop-secret",
       allowedOrigins: [origin],
       localDebug: true,
+      publishFetch: transport,
+      cloudFetch: transport,
     });
     apps.push(app);
 
@@ -147,10 +167,11 @@ describe("desktop daemon access", () => {
       url: "/community/games?metrics=true",
       headers: { origin, authorization: "Bearer desktop-secret", "x-publish-access-token": LOCAL_DEBUG_ACCESS_TOKEN },
     });
-    expect(games.statusCode).toBe(200);
+    expect(games.statusCode).toBe(410);
     expect(games.headers["access-control-allow-origin"]).toBe(origin);
-    expect(games.json()).toEqual([]);
+    expect(games.json()).toMatchObject({ error: expect.stringContaining("local secure edition") });
     expect((await app.inject({ method: "GET", url: "/community/me/games", headers: { origin, "x-publish-access-token": LOCAL_DEBUG_ACCESS_TOKEN } })).statusCode).toBe(401);
+    expect(transport).not.toHaveBeenCalled();
   });
 });
 
@@ -171,7 +192,9 @@ describe("daemon access token", () => {
     const environment: NodeJS.ProcessEnv = { OHMYGAME_DAEMON_TOKEN: "standalone-secret", PATH: "/usr/bin" };
     expect(await takeAccessToken(environment, Readable.from(["ignored"]))).toBe("standalone-secret");
     expect(environment).toEqual({ PATH: "/usr/bin" });
-    expect(await takeAccessToken({}, Readable.from([]))).toBeUndefined();
+    const token = await takeAccessToken({}, Readable.from([]));
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(await takeAccessToken({}, Readable.from([]))).not.toBe(token);
   });
 
   it("rejects oversized stdin tokens without falling back to the environment", async () => {
@@ -188,5 +211,38 @@ describe("daemon access token", () => {
     })());
     await expect(takeAccessToken(environment, input)).rejects.toThrow("Token pipe failed");
     expect(environment).toEqual({});
+  });
+});
+
+describe("local HTTP boundaries", () => {
+  it("only accepts loopback authorities and explicit local cross-origins", () => {
+    for (const host of ["127.0.0.1:43110", "localhost:43110", "[::1]:43110"]) expect(isLoopbackHostHeader(host)).toBe(true);
+    for (const host of ["remote.example", "127.0.0.1@remote.example", "user@127.0.0.1", "127.0.0.1/path", undefined]) expect(isLoopbackHostHeader(host)).toBe(false);
+    expect(isAllowedLocalOrigin("https://remote.example", "localhost", new Set(["https://remote.example"]))).toBe(false);
+    expect(isAllowedLocalOrigin("null", "localhost")).toBe(false);
+    expect(isAllowedLocalOrigin("null", "localhost", new Set(["null"]))).toBe(true);
+    expect(isAllowedLocalOrigin("http://127.0.0.1:43120", "127.0.0.1:43110", new Set(["http://127.0.0.1:43120"]))).toBe(true);
+  });
+
+  it("keeps standalone credentials in a private file and only removes its own runtime", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-private-runtime-"));
+    const file = path.join(directory, DAEMON_RUNTIME_FILE);
+    try {
+      const first = { url: "http://127.0.0.1:43110", token: "first-test-secret", pid: 100 };
+      const cleanup = await publishLocalDaemonRuntime(directory, first);
+      expect(readLocalDaemonRuntime(file)).toEqual(first);
+      if (process.platform !== "win32") expect((await stat(file)).mode & 0o077).toBe(0);
+      const second = { ...first, token: "second-test-secret", pid: 200 };
+      const secondCleanup = await publishLocalDaemonRuntime(directory, second);
+      await cleanup();
+      expect(readLocalDaemonRuntime(file)).toEqual(second);
+      if (process.platform !== "win32") {
+        await chmod(file, 0o644);
+        expect(() => readLocalDaemonRuntime(file)).toThrow("Private daemon runtime");
+        await chmod(file, 0o600);
+      }
+      await secondCleanup();
+      expect(() => readLocalDaemonRuntime(file)).toThrow();
+    } finally { await rm(directory, { recursive: true, force: true }); }
   });
 });

@@ -498,7 +498,8 @@ describe("Plugin Builder", () => {
     expect((await setup.read(state.id)).busy).toBe(false);
   });
 
-  it("configures and probes a draft without installing it or exposing credentials, and invalidates checks after configuration changes", async () => {
+  // Retained for future OS-isolated plugin execution; agent-local-files.test.ts covers the current refusal.
+  it.skip("configures and probes a draft without installing it or exposing credentials, and invalidates checks after configuration changes", async () => {
     const { setup, directory, local, app } = await environment();
     const state = await setup.create();
     const root = await writeDraft(directory, state.id, true);

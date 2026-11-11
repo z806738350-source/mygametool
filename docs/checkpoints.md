@@ -98,6 +98,12 @@ recovery drafts use that version in their local storage keys, so an old draft
 cannot silently reappear after Undo or a daemon restart. Generation instructions
 and candidate history remain available for explicit adoption.
 
+Renaming a project changes metadata outside the creative workspace, so its
+name-only `PATCH /projects/:projectId` does not require a file version. It still
+waits for snapshots, is refused during restoration or unfinished recovery, and
+keeps lifecycle and request-draining protection. A rename does not advance an
+editor's cached workspace version or make an old draft safe to save.
+
 External editors and commands outside the daemon remain independent. Checkpoint
 file signatures and content checks detect conflicting changes during restoration;
 an operation rolls back when possible rather than silently overwriting them.

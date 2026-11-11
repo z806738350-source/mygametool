@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import i18next from "i18next";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import type { ComponentProps } from "react";
@@ -35,6 +36,20 @@ function AgentTimeline({ items, activeTurnId, failedTurnId, cancelledTurnId, ...
 }
 
 describe("AgentTimeline", () => {
+  it.each([
+    { locale: "en", checking: "Checking animation actions", checked: "Checked animation actions" },
+    { locale: "zh-CN", checking: "正在查询骨架动画动作", checked: "已查询骨架动画动作" },
+  ])("localizes the read-only animation catalog activity in $locale", async ({ locale, checking, checked }) => {
+    const previous = i18next.language;
+    try {
+      await i18next.changeLanguage(locale);
+      const activity = { ...tool(), tool: "list_animation_actions", arguments: { rigType: "quadruped" } };
+      const running = renderToStaticMarkup(<AgentTimeline items={[user(), { ...activity, status: "inProgress" }]} activeTurnId="turn-1" />);
+      const completed = renderToStaticMarkup(<AgentTimeline items={[user(), activity]} />);
+      expect(running).toContain(checking); expect(completed).toContain(checked);
+      expect(running).not.toContain("list_animation_actions");
+    } finally { await i18next.changeLanguage(previous); }
+  });
   it("places Branch in new chat immediately after Copy for every persisted completed response", () => {
     const response: ThreadItem = { id: "response", turnId: "turn-1", type: "agentMessage", text: "Done", status: "completed", phase: "final_answer", branchEntryId: "stored-response" };
     const html = renderToStaticMarkup(<AgentTimeline items={[user(), response]} onBranch={() => {}} />);
@@ -1025,14 +1040,14 @@ describe("AgentTimeline", () => {
     expect(html).not.toContain(">references/hero.png</span>");
   });
 
-  it("renders image-reading and completed compaction records", () => {
+  it("renders image-attachment counts and completed compaction records", () => {
     const html = renderToStaticMarkup(<AgentTimeline items={[
       user(),
       { id: "images", turnId: "turn-1", type: "imageRead", count: 2, status: "completed" },
       { id: "compaction", turnId: "compaction", type: "contextCompaction", status: "completed" },
     ]} />);
 
-    expect(html).toContain("Viewed 2 images");
+    expect(html).toContain("2 images attached");
     expect(html).toContain("Context compacted");
   });
 
@@ -1093,15 +1108,38 @@ describe("AgentTimeline", () => {
     expect(html).not.toContain("Working for 0s");
   });
 
-  it("expands image-reading activity to show the viewed images", () => {
+  it("expands attachment activity to preview the attached images", () => {
     const html = renderToStaticMarkup(<AgentTimeline items={[
       { ...user(), images: [{ name: "reference.png", mediaType: "image/png", data: "aW1hZ2U=" }] },
       { id: "images", turnId: "turn-1", type: "imageRead", count: 1, status: "completed" },
     ]} />);
 
-    expect(html).toContain("Viewed an image");
+    expect(html).toContain("Image attached");
     expect(html).toContain('class="image-read-previews"');
     expect(html).toContain('alt="reference.png"');
+  });
+
+  it.each([
+    { locale: "en", single: "Image attached", plural: "2 images attached", preview: "Attached image", misleading: "Viewed" },
+    { locale: "zh-CN", single: "已附加一张图片", plural: "已附加 2 张图片", preview: "已附加图片", misleading: "查看了" },
+  ])("labels legacy imageRead records as attachments without claiming agent acknowledgement in $locale", async ({ locale, single, plural, preview, misleading }) => {
+    const previous = i18next.language;
+    try {
+      await i18next.changeLanguage(locale);
+      for (const count of [1, 2]) {
+        for (const failed of [false, true]) {
+          const html = renderToStaticMarkup(<AgentTimeline items={[
+            { ...user(), images: Array.from({ length: count }, () => ({ mediaType: "image/png" as const, data: "aW1hZ2U=" })) },
+            { id: "images", turnId: "turn-1", type: "imageRead", count, status: "completed" },
+          ]} failedTurnId={failed ? "turn-1" : undefined} />);
+          expect(html).toContain(count === 1 ? single : plural);
+          expect(html).not.toContain(misleading);
+          const previews = html.match(/class="image-read-previews">([\s\S]*?)<\/div>/)?.[1];
+          expect(previews).toContain(`alt="${preview} 1"`);
+          if (count === 2) expect(previews).toContain(`alt="${preview} 2"`);
+        }
+      }
+    } finally { await i18next.changeLanguage(previous); }
   });
 
   it("centers model switches between conversation turns", () => {

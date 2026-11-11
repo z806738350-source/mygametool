@@ -1,5 +1,7 @@
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
+import { getPlaytestActionFailure, getPlaytestOpenFailure } from "../shared/playtest.js";
+import { toolPreflightError } from "./agent-tool-errors.js";
 import type {
   GameRuntimeAdapter,
   GameUseInputCapability,
@@ -10,9 +12,17 @@ import type {
   PlaytestSnapshot,
 } from "../shared/playtest.js";
 
+const pendingInspections = new WeakMap<GameRuntimeAdapter, Set<string>>();
+function inspections(driver: GameRuntimeAdapter): Set<string> {
+  let pending = pendingInspections.get(driver);
+  if (!pending) pendingInspections.set(driver, pending = new Set());
+  return pending;
+}
+
 const viewportSchema = Type.Object({
   width: Type.Integer({ minimum: 240, maximum: 4096 }),
   height: Type.Integer({ minimum: 240, maximum: 4096 }),
+  deviceScaleFactor: Type.Optional(Type.Number({ minimum: 1, maximum: 2, description: "Display pixel ratio. Defaults to the native display on open; omit on resize to keep the current ratio." })),
 }, { additionalProperties: false });
 
 const targetSchema = Type.Union([
@@ -77,7 +87,7 @@ function gameUseParameters<Action extends TSchema>(action: Action) {
     path: Type.Optional(Type.String({ maxLength: 1_000, description: "Path, query, or hash within a web game target; used only by open" })),
     viewport: Type.Optional(viewportSchema),
     sessionId: Type.Optional(Type.String({ minLength: 1, maxLength: 100, description: "Session returned by open; required for inspect, act, capture, and close" })),
-    actions: Type.Optional(Type.Array(action, { minItems: 1, maxItems: 20, description: "Actions to run; required for act" })),
+    actions: Type.Optional(Type.Array(action, { minItems: 1, maxItems: 20, description: "Ordered player actions. Optional for open (run after the initial page loads), required for act." })),
   }, { additionalProperties: false });
 }
 
@@ -89,18 +99,25 @@ export function createGameUseTool(
   return defineTool<typeof parameters, unknown>({
     name: "game_use",
     label: "Game Use",
-    description: "Use the current game runtime as a player: open and control the game, inspect interactive elements and canvas state, capture screenshots, review console and network failures, and call an optional deterministic game bridge. Open and act return a fresh state snapshot. Reuse the returned sessionId and close the session when finished.",
+    description: "Use the current game runtime as a player: open and control the game, inspect interactive elements and canvas state, capture screenshots, review console and network failures, and call an optional deterministic game bridge. Successful open and act return a fresh state snapshot; stopped batches report progress and require inspect before more input. Reuse the returned sessionId and close the session when finished.",
     promptSnippet: "Use the current game with real player input, runtime inspection, and screenshots",
     promptGuidelines: [
       "Use game_use for game runtime or visual verification; a successful build alone is not a playtest",
-      "Batch adjacent input and wait steps into one act call; open and act already return fresh state, so inspect only when a separate refresh is needed",
+      "Batch player actions in open or act. Open waits for the initial game snapshot before running its actions. Successful batches return fresh state; stopped batches report progress and require inspect.",
+      "A stopped action batch reports completedActions and whether the failed input was sent. Inspect that session before another act; do not replay completed actions. Ambiguous or hidden targets require a fresh snapshot and a unique selector or testId.",
+      "Every open allocates an independent window. Reuse a current owned session for inspection, input or resizing; inspect/resize do not reload changed game code. Before opening a revised version, close finished owned sessions rather than accumulating revision windows. The native close button only hides a player; game_use close releases it. Preserve sessions the user wants to keep. If open reaches the session limit, no window or initial actions were started. Inspect owned references (which may have expired), then reuse a suitable session or close only finished owned sessions before a new open. Do not close another conversation's windows or repeatedly open until capacity changes.",
+      "For a video or audio request error, trigger playback through the game, wait briefly, and compare media snapshots. Check errorCode, currentTime, and video frame counts before removing or replacing an asset.",
+      "Network failures are session history. A paused video at currentTime=0 or a small frame count does not prove playback failure. Compare fresh progress, buffered ranges, dimensions and dropped frames after playback; inspect duplicate media elements too. Range/206 helps seeking; its absence alone does not prove that whole-file playback fails.",
+      "Use snapshot.bridgeCapabilities for the current page's supported bridge methods. Custom methods such as setPlayer are unavailable; use real keyboard/pointer input and snapshots. Reuse sessionId for resize/DPR checks to preserve the current game.",
       "Capture screenshots for Canvas or WebGL verification and close playtest sessions when finished",
     ],
     parameters: bridge === "reset" ? resetOnlyParameters : parameters,
     executionMode: "sequential",
     execute: async (_toolCallId, input, signal) => {
+      signal?.throwIfAborted();
       if (!driver.available) throw new Error("Game use is not available in this environment");
       if (input.operation === "open") {
+        const actions = input.actions && supportedActions(driver, input.actions);
         const target = await resolveOpenTarget();
         signal?.throwIfAborted();
         if (target.runtime !== driver.capabilities.runtime) {
@@ -113,8 +130,15 @@ export function createGameUseTool(
           operation: "open",
           target: resolvedTarget,
           viewport: input.viewport ?? { width: 1280, height: 720 },
-        }, signal);
+        }, signal).catch(cause => {
+          signal?.throwIfAborted();
+          const failure = getPlaytestOpenFailure(cause);
+          if (!failure) throw cause;
+          const owned = driver.ownedSessionIds?.().slice(-20) ?? [];
+          throw toolPreflightError(`Playtest session limit ${failure.limit} reached before creating a window; no initial actions ran. Owned session references (may have expired): ${JSON.stringify(owned)}. Inspect and reuse a suitable session, or close only finished owned sessions before a new open. Other conversations' sessions are unavailable; do not replay the rejected call ID.`, "playtest_session_limit");
+        });
         if (result.operation !== "open") throw new Error("Unexpected game use response");
+        if (actions) return act(driver, result.snapshot.sessionId, actions, signal);
         return snapshotResult(result.snapshot);
       }
       if (input.operation === "capture") {
@@ -137,16 +161,46 @@ export function createGameUseTool(
       if (input.operation === "close") {
         const sessionId = requiredSessionId(input.operation, input.sessionId);
         await driver.request({ operation: "close", sessionId }, signal);
+        inspections(driver).delete(sessionId);
         return { content: [{ type: "text", text: `Closed game session ${sessionId}` }], details: undefined };
       }
       const sessionId = requiredSessionId(input.operation, input.sessionId);
-      const result = input.operation === "inspect"
-        ? await driver.request({ operation: "inspect", sessionId }, signal)
-        : await driver.request({ operation: "act", sessionId, actions: supportedActions(driver, requiredActions(input.actions)) }, signal);
-      if (result.operation !== "inspect" && result.operation !== "act") throw new Error("Unexpected game use response");
+      if (input.operation === "act") {
+        if (inspections(driver).has(sessionId)) throw toolPreflightError(`Inspect session ${JSON.stringify(sessionId)} before sending more actions. No new player input was sent.`, "playtest_inspection_required");
+        return act(driver, sessionId, supportedActions(driver, requiredActions(input.actions)), signal);
+      }
+      const result = await driver.request({ operation: "inspect", sessionId }, signal);
+      if (result.operation !== "inspect") throw new Error("Unexpected game use response");
+      if (result.snapshot.sessionId !== sessionId) throw new Error("The inspected game session did not match the requested session");
+      inspections(driver).delete(sessionId);
       return snapshotResult(result.snapshot);
     },
   });
+}
+
+async function act(driver: GameRuntimeAdapter, sessionId: string, actions: PlaytestAction[], signal?: AbortSignal) {
+  try {
+    signal?.throwIfAborted();
+    const result = await driver.request({ operation: "act", sessionId, actions }, signal);
+    if (result.operation !== "act") throw new Error("Unexpected game use response");
+    return snapshotResult(result.snapshot);
+  } catch (cause) {
+    signal?.throwIfAborted();
+    inspections(driver).add(sessionId);
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    const receipt = getPlaytestActionFailure(cause);
+    const failure = receipt?.sessionId === sessionId && receipt.failedAction === receipt.completedActions + 1
+      && receipt.completedActions >= 0 && receipt.completedActions < actions.length && actions[receipt.completedActions]?.type === receipt.actionType ? receipt : undefined;
+    if (failure?.phase === "target_lookup" && failure.inputDispatched === false && failure.actionType === "click") {
+      const status = failure.completedActions ? "partially_completed" : "not_executed";
+      return {
+        content: [{ type: "text" as const, text: `${reason}. Batch stopped: ${failure.completedActions} earlier action(s) completed; the failed click sent no player input and no later actions ran. Inspect session ${JSON.stringify(sessionId)} before continuing. Do not replay completed actions; choose only the remaining intended actions from fresh state.` }],
+        details: { playtestAction: { status, ...failure, requestedActions: actions.length, requiresInspection: true } },
+      };
+    }
+    const progress = failure ? `${failure.completedActions} earlier action(s) completed; the failed action's input delivery is unknown. ` : "Earlier actions may already have run. ";
+    throw new Error(`${reason}. Inspect session ${JSON.stringify(sessionId)} before continuing. ${progress}Do not replay the batch.`, { cause });
+  }
 }
 
 function requiredSessionId(operation: string, sessionId?: string): string {

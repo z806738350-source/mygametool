@@ -4,11 +4,10 @@
  * project code.
  */
 export function projectProcessEnvironment(environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const result = { ...environment };
-  delete result.ESBUILD_BINARY_PATH;
-  for (const name of Object.keys(result)) {
-    const key = name.toUpperCase();
-    if (key.startsWith("OHMYGAME_") || key === "DAEMON_HOST" || key === "DAEMON_PORT") delete result[name];
+  const allowed = new Set(["PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TMPDIR", "TMP", "TEMP", "LANG", "TZ"]);
+  const result: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(environment)) {
+    if (allowed.has(name.toUpperCase()) && value !== undefined) result[name] = value;
   }
   return result;
 }

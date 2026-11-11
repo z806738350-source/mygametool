@@ -9,7 +9,7 @@ import { ASSET_CANVAS_QUICK_STARTS, createAssetCanvasQuickStart, loadQuickStartM
 import { ProjectCard } from "./project-card.js";
 import { ProjectCreateDialog } from "./project-create-dialog.js";
 import { ProjectRenameDialog } from "./project-rename-dialog.js";
-import { projectDeletionConfirmation } from "./project-deletion.js";
+import { confirmProjectDeletion } from "./project-deletion.js";
 import type { AppNavigationTarget } from "./routes.js";
 import { WindowDragRegion } from "./window-drag-region.js";
 import { useProjectActivity } from "./use-project-activity.js";
@@ -130,7 +130,7 @@ export function AssetCanvasHome({ onNavigate, onOpenProject }: {
                 },
                 onDuplicate: () => void action(() => duplicateProject(project.id)),
                 onDelete: () => {
-                  if (window.confirm(projectDeletionConfirmation(project))) void action(() => deleteProject(project.id));
+                  if (confirmProjectDeletion(project)) return action(() => deleteProject(project.id));
                 },
               }}
             />)}

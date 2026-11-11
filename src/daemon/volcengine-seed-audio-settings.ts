@@ -1,5 +1,7 @@
+import { registerSensitiveValue } from "../shared/sensitive-values.js";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdir, open, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { DOUBAO_SEED_AUDIO_PROVIDER_NAME } from "../shared/audio.js";
 
@@ -19,9 +21,17 @@ export class VolcengineSeedAudioSettingsStore {
 
   async load(): Promise<void> {
     try {
-      const parsed = JSON.parse(
-        await readFile(this.#filePath, "utf8"),
-      ) as Record<string, unknown>;
+      const handle = await open(this.#filePath, constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW ?? 0));
+      let parsed: Record<string, unknown>;
+      try {
+        const entry = await handle.stat();
+        if (!entry.isFile() || entry.nlink !== 1 || entry.size > 1024 * 1024 || process.platform !== "win32" &&
+          ((entry.mode & 0o077) !== 0 || typeof process.getuid === "function" && entry.uid !== process.getuid())) throw new Error("Audio settings are not private");
+        const bytes = Buffer.alloc(1024 * 1024 + 1);
+        const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+        if (bytesRead > 1024 * 1024) throw new Error("Audio settings are too large");
+        parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, bytesRead))) as Record<string, unknown>;
+      } finally { await handle.close(); }
       if (parsed.version !== 1)
         throw new Error(
           `Invalid ${DOUBAO_SEED_AUDIO_PROVIDER_NAME} settings: ${this.#filePath}`,
@@ -32,6 +42,7 @@ export class VolcengineSeedAudioSettingsStore {
           ? { apiKey: parsed.apiKey }
           : {}),
       };
+      registerSensitiveValue(this.#settings.apiKey);
     } catch (cause) {
       if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
     }
@@ -51,6 +62,7 @@ export class VolcengineSeedAudioSettingsStore {
       throw new Error(
         `${DOUBAO_SEED_AUDIO_PROVIDER_NAME} API key must contain only printable ASCII characters`,
       );
+    registerSensitiveValue(normalized);
     await this.#mutate(async () => {
       const next: StoredVolcengineSeedAudioSettings = {
         version: 1,
@@ -62,6 +74,7 @@ export class VolcengineSeedAudioSettingsStore {
         await writeFile(temporary, `${JSON.stringify(next)}\n`, {
           encoding: "utf8",
           mode: 0o600,
+          flag: "wx",
         });
         await rename(temporary, this.#filePath);
       } finally {

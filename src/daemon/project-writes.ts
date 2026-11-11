@@ -95,9 +95,11 @@ export class ProjectWrites {
   }
   /**
    * Admits a request to the workspace. `read` requests do not change it; a
-   * write carries the workspace version its content was made from.
+   * write carries the workspace version its content was made from. Metadata
+   * writes keep write coordination without depending on a file version.
    */
-  async enter(id: string, read: boolean, version?: string): Promise<() => void> {
+  async enter(id: string, access: boolean | "metadata", version?: string): Promise<() => void> {
+    const read = access === true;
     const state = this.#state(id);
     const deadline = Date.now() + ENTER_WAIT_MS;
     while (state.lock && !(read && state.lock.kind === "snapshot")) {
@@ -115,7 +117,7 @@ export class ProjectWrites {
       clearTimeout(timer);
     }
     // A read gets the workspace as it is now, so it has no version to match.
-    if (!read) this.assertVersion(id, version);
+    if (!read && access !== "metadata") this.assertVersion(id, version);
     state.active++;
     let released = false;
     return () => {

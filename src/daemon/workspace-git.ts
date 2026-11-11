@@ -10,6 +10,7 @@ import type {
 import { countLineChanges } from "../shared/line-diff.js";
 import { changeText, MAX_CHANGE_BYTES } from "./file-line-changes.js";
 import { readWorkspaceFile, WorkspaceError } from "./workspace.js";
+import { projectProcessEnvironment } from "./project-process.js";
 
 const DIFF_ARGS = [
   "diff",
@@ -31,9 +32,12 @@ function git(
     const child = execFile(
       "git",
       [
+        "--no-pager",
         "--no-optional-locks",
         "-c",
         "core.fsmonitor=false",
+        "-c",
+        "protocol.allow=never",
         "-C",
         workspace,
         ...args,
@@ -44,11 +48,11 @@ function git(
         timeout: 10_000,
         windowsHide: true,
         env: {
-          ...Object.fromEntries(
-            Object.entries(process.env).filter(
-              ([key]) => !key.startsWith("GIT_"),
-            ),
-          ),
+          ...projectProcessEnvironment(),
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
+          GIT_NO_LAZY_FETCH: "1",
+          GIT_TERMINAL_PROMPT: "0",
           GIT_LITERAL_PATHSPECS: "1",
           LC_ALL: "C",
         },

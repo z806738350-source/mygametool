@@ -3,6 +3,12 @@ import type { AgentErrorCause, AgentErrorDiagnostics, ThreadItemError, ThreadIte
 
 export const AGENT_ERROR_ENTRY = "ohmygame-agent-error";
 
+export class RepeatedMediaArgumentsError extends Error {
+  constructor(tool: string) {
+    super(`The same arguments for ${tool} failed local validation twice in a row. See the last tool result for the correction. Neither call submitted a generation.`);
+  }
+}
+
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
@@ -74,6 +80,7 @@ function providerFailureFields(failure: unknown): Record<string, unknown> {
 }
 
 export function thrownAgentError(cause: unknown): ThreadItemError {
+  if (cause instanceof RepeatedMediaArgumentsError) return { code: "repeated_media_arguments", message: cause.message };
   const diagnostic = createProviderFailureDiagnostic(cause);
   const message = typeof cause === "string" ? cause : diagnostic.error?.message ?? "The model request failed";
   return normalizeAgentError(message, providerFailureFields(diagnostic));
@@ -97,6 +104,15 @@ function classifyAgentError(message: string, diagnostics: AgentErrorDiagnostics)
   if (status === 404) return "model_unavailable";
   if (status === 400 || status === 422) return "invalid_request";
   if (status >= 500 && status <= 599) return "provider_unavailable";
+  if (/\bSSE_IDLE_TIMEOUT\b/.test(codes) || message === "Provider SSE stream timed out locally after 180 seconds without data") return "sse_idle_timeout";
+  if (/\bSSE_VALIDATION_FAILED\b/.test(codes) || /^Provider SSE response (?:failed local validation|exceeded the secure size limit)$/.test(message)) return "sse_validation_failed";
+  if (/\bSSE_CONNECTION_INTERRUPTED\b/.test(codes) || message === "Provider SSE connection was interrupted while reading the response") return "sse_connection_interrupted";
+  if (diagnostics.transport !== "websocket" && (diagnostics.transport === "sse" || (status >= 200 && status < 300))) {
+    const incomplete = /^(?:Stream ended without finish_reason|Anthropic stream ended (?:before message_stop|without a stop reason)|(?:Azure )?OpenAI Responses stream ended (?:without a stop reason|before a terminal response event))$/;
+    if (incomplete.test(message) || causes.some(cause => incomplete.test(cause.message ?? ""))) return "sse_connection_interrupted";
+  }
+  // These old guard messages did not distinguish an interrupted read from a failed check, or report idle time.
+  if (/^Provider SSE response (?:could not be safely verified|exceeded the secure time limit)$/.test(message)) return "stream_error";
   if (/invalid[_ ]api[_ ]key|authentication[_ ]error|credentials.*expired/i.test(text)) return "authentication_failed";
   if (/rate.?limit|too many requests/i.test(text)) return "rate_limited";
   if (/CERT|TLS|SSL|UNABLE_TO_VERIFY|SELF_SIGNED|ERR_TLS/.test(codes) || /certificate|TLS handshake/i.test(transportText)) return "tls_error";

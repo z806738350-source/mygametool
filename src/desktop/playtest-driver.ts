@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { restrictLocalGameNetwork } from "./game-network.js";
 import { BrowserWindow, type NativeImage, type WebFrameMain } from "electron";
 import {
   WEB_GAME_USE_CAPABILITIES,
+  playtestActionError,
+  playtestOpenError,
   type GameRuntimeAdapter,
   type GameUseOpenTarget,
   type PlaytestAction,
@@ -25,6 +28,9 @@ interface PlaytestSession {
   logs: PlaytestLog[];
   failedRequests: PlaytestFailedRequest[];
   idleTimer?: ReturnType<typeof setTimeout>;
+  activeRequests: number;
+  activity: Promise<void>;
+  running: boolean;
 }
 
 /** A frame of the page and how its coordinates map to the window's. */
@@ -36,17 +42,20 @@ interface PlaytestFrame {
   scaleY: number;
 }
 
-type FrameElements = Pick<PlaytestSnapshot, "elements"> & { text: string };
+type FrameElements = Pick<PlaytestSnapshot, "elements" | "media"> & { text: string };
 
 const MAX_LOGS = 100;
 const MAX_FAILED_REQUESTS = 100;
 const MAX_SESSIONS = 4;
-/** Sessions the agent leaves open are closed after this long without a request. */
+/** Hidden sessions the agent leaves open are closed after this long without a request. */
 const IDLE_TIMEOUT_MS = 10 * 60_000;
 const MAX_ELEMENTS = 100;
+const MAX_MEDIA = 16;
 const MAX_TEXT = 4_000;
 /** Screenshots are resent with every later model request, so keep them small. */
 const CAPTURE_JPEG_QUALITY = 80;
+
+class TargetLookupError extends Error {}
 
 export class ElectronPlaytestDriver implements GameRuntimeAdapter {
   readonly available = true;
@@ -69,10 +78,12 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
     for (const state of this.#sessions.values()) {
       if (state.window.isDestroyed() || !state.ready) continue;
       if (visible) {
+        if (state.window.isMinimized()) state.window.restore();
         state.window.showInactive();
       } else {
         state.window.hide();
       }
+      this.#visibilityChanged(state);
     }
     return this.#publishWatchState();
   }
@@ -81,9 +92,9 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
     signal?.throwIfAborted();
     switch (request.operation) {
       case "open": return { operation: "open", snapshot: await this.#open(request.target, request.viewport, signal) };
-      case "inspect": return { operation: "inspect", snapshot: await this.#inspect(this.#activeSession(request.sessionId), signal) };
-      case "act": return { operation: "act", snapshot: await this.#act(this.#activeSession(request.sessionId), request.actions, signal) };
-      case "capture": return { operation: "capture", capture: await this.#capture(this.#activeSession(request.sessionId), signal) };
+      case "inspect": return this.#withSession(request.sessionId, async (state) => ({ operation: "inspect", snapshot: await this.#inspect(state, signal) }));
+      case "act": return this.#withSession(request.sessionId, async (state) => ({ operation: "act", snapshot: await this.#act(state, request.actions, signal) }));
+      case "capture": return this.#withSession(request.sessionId, async (state) => ({ operation: "capture", capture: await this.#capture(state, signal) }));
       case "close":
         this.#close(request.sessionId);
         return { operation: "close" };
@@ -102,7 +113,9 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
     const url = validatedPlaytestUrl(target.url);
     validateViewport(viewport);
     if (this.#sessions.size >= MAX_SESSIONS) {
-      throw new Error(`Close an existing game session before opening more than ${MAX_SESSIONS}`);
+      throw playtestOpenError(`Close an existing game session before opening more than ${MAX_SESSIONS}`, {
+        version: 1, reason: "session_limit", limit: MAX_SESSIONS, windowCreated: false,
+      });
     }
     url.searchParams.set("ohmygamePlaytest", "1");
     const id = randomUUID();
@@ -127,7 +140,10 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
         partition: `ohmygame-playtest-${id}`,
       },
     });
-    const state: PlaytestSession = { id, origin: url.origin, window, ready: false, logs: [], failedRequests: [] };
+    const state: PlaytestSession = { id, origin: url.origin, window, ready: false, logs: [], failedRequests: [], activeRequests: 1, activity: Promise.resolve(), running: true };
+    // Agent sessions are silent unless the user is watching their visible window.
+    window.webContents.setAudioMuted(true);
+    restrictLocalGameNetwork(window.webContents, () => state.origin);
     this.#sessions.set(id, state);
     this.#resetIdleTimer(state);
     this.#publishWatchState();
@@ -136,6 +152,10 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
       event.preventDefault();
       this.setVisible(false);
     });
+    window.on("show", () => this.#visibilityChanged(state));
+    window.on("hide", () => this.#visibilityChanged(state));
+    window.on("minimize", () => this.#visibilityChanged(state));
+    window.on("restore", () => this.#visibilityChanged(state));
     window.once("closed", () => {
       clearTimeout(state.idleTimer);
       this.#closingSessions.delete(id);
@@ -147,7 +167,7 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
     };
     window.webContents.on("will-navigate", preventCrossOriginNavigation);
     window.webContents.on("will-redirect", preventCrossOriginNavigation);
-    window.webContents.on("page-title-updated", (event) => event.preventDefault());
+    window.on("page-title-updated", (event) => event.preventDefault());
     window.webContents.on("console-message", (details) => {
       state.logs.push({
         level: details.level,
@@ -185,11 +205,20 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
 
     try {
       window.webContents.debugger.attach("1.3");
-      await window.loadURL(url.href);
+      if (viewport.deviceScaleFactor !== undefined) {
+        // Chromium needs a live renderer to acknowledge metrics before the game's first script runs.
+        await abortableResult(window.loadURL("about:blank"), signal);
+        await setPixelRatio(window, viewport.deviceScaleFactor);
+      }
+      await abortableResult(window.loadURL(url.href), signal);
       signal?.throwIfAborted();
       state.ready = true;
       if (this.#visible) window.showInactive();
-      return await this.#inspect(state, signal);
+      const snapshot = await this.#inspect(state, signal);
+      state.activeRequests--;
+      this.#resetIdleTimer(state);
+      await this.#updateActivity(state);
+      return snapshot;
     } catch (cause) {
       this.#close(id);
       throw cause;
@@ -199,29 +228,33 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
   async #inspect(state: PlaytestSession, signal?: AbortSignal): Promise<PlaytestSnapshot> {
     signal?.throwIfAborted();
     this.#assertLive(state);
-    const page = await state.window.webContents.executeJavaScript(PAGE_INSPECTION_SCRIPT, true) as Omit<PlaytestSnapshot, "sessionId" | "logs" | "failedRequests">;
+    const page = await abortableResult(state.window.webContents.executeJavaScript(PAGE_INSPECTION_SCRIPT, true), signal) as Omit<PlaytestSnapshot, "sessionId" | "logs" | "failedRequests">;
     // Content in child frames, such as the sandbox that runs Playable Nodes,
     // is listed in window coordinates after the page's own.
     const elements = [...page.elements];
+    const media = [...(page.media ?? [])];
     const text = page.text ? [page.text] : [];
-    for (const child of (await this.#frames(state)).slice(1)) {
-      const found = await child.frame.executeJavaScript(FRAME_INSPECTION_SCRIPT, true).catch(() => undefined) as FrameElements | undefined;
+    for (const child of (await this.#frames(state, signal)).slice(1)) {
+      const found = await abortableResult(child.frame.executeJavaScript(FRAME_INSPECTION_SCRIPT, true), signal).catch(() => undefined) as FrameElements | undefined;
       if (!found) continue;
       for (const element of found.elements) {
         if (elements.length >= MAX_ELEMENTS) break;
         elements.push({ ...element, index: elements.length, box: frameBox(child, element.box) });
       }
       if (found.text) text.push(found.text);
+      if (found.media) media.push(...found.media.slice(0, MAX_MEDIA - media.length));
     }
     signal?.throwIfAborted();
     const visibleText = text.join("\n").slice(0, MAX_TEXT);
     return {
       ...page,
       elements,
+      ...(media.length ? { media } : {}),
       ...(visibleText ? { text: visibleText } : {}),
       sessionId: state.id,
       runtime: this.capabilities.runtime,
-      capabilities: this.capabilities,
+      capabilities: { ...this.capabilities, deterministic: (page.bridgeCapabilities ?? []).flatMap(method =>
+        method === "setSeed" ? ["seed" as const] : method === "snapshot" || method === "reset" || method === "step" ? [method] : []) },
       logs: [...state.logs],
       failedRequests: [...state.failedRequests],
     };
@@ -229,10 +262,23 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
 
   async #act(state: PlaytestSession, actions: PlaytestAction[], signal?: AbortSignal): Promise<PlaytestSnapshot> {
     if (actions.length < 1 || actions.length > 20) throw new Error("Provide 1 to 20 playtest actions");
-    for (const action of actions) {
+    for (const [index, action] of actions.entries()) {
       signal?.throwIfAborted();
       this.#assertLive(state);
-      await this.#runAction(state, action, signal);
+      try { await this.#runAction(state, action, signal); }
+      catch (cause) {
+        signal?.throwIfAborted();
+        if (action.type === "click" && cause instanceof TargetLookupError) {
+          throw playtestActionError(`Action ${index + 1} (click) failed: ${cause.message}`, {
+            version: 1, sessionId: state.id, completedActions: index, failedAction: index + 1, actionType: "click",
+            phase: "target_lookup", inputDispatched: false,
+          });
+        }
+        throw playtestActionError(`Action ${index + 1} (${action.type}) failed: ${cause instanceof Error ? cause.message : String(cause)}`, {
+          version: 1, sessionId: state.id, completedActions: index, failedAction: index + 1, actionType: action.type,
+          phase: "action", inputDispatched: "unknown",
+        });
+      }
     }
     return this.#inspect(state, signal);
   }
@@ -241,7 +287,7 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
     const debuggerApi = state.window.webContents.debugger;
     switch (action.type) {
       case "click": {
-        const point = await this.#targetPoint(state, action.target);
+        const point = await this.#targetPoint(state, action.target, signal);
         await debuggerApi.sendCommand("Input.dispatchMouseEvent", { type: "mouseMoved", ...point });
         await debuggerApi.sendCommand("Input.dispatchMouseEvent", { type: "mousePressed", ...point, button: "left", clickCount: 1 });
         await debuggerApi.sendCommand("Input.dispatchMouseEvent", { type: "mouseReleased", ...point, button: "left", clickCount: 1 });
@@ -251,8 +297,8 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
       case "type": {
         const target = JSON.stringify(action.target);
         let focused = false;
-        for (const frame of await this.#frames(state)) {
-          focused = await frame.frame.executeJavaScript(`(${FOCUS_TARGET_SCRIPT})(${target})`, true).catch(() => false) === true;
+        for (const frame of await this.#frames(state, signal)) {
+          focused = await abortableResult(frame.frame.executeJavaScript(`(${FOCUS_TARGET_SCRIPT})(${target})`, true), signal).catch(() => false) === true;
           if (focused) break;
         }
         if (!focused) throw new Error("Playtest target was not found or is not editable");
@@ -286,42 +332,52 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
         }
         await abortableDelay(action.milliseconds, signal);
         return;
-      case "resize":
+      case "resize": {
         validateViewport(action.viewport);
-        state.window.setContentSize(action.viewport.width, action.viewport.height);
+        const { width, height, deviceScaleFactor } = action.viewport;
+        const [currentWidth, currentHeight] = state.window.getContentSize();
+        if (width !== currentWidth || height !== currentHeight) state.window.setContentSize(width, height);
+        if (deviceScaleFactor !== undefined) await setPixelRatio(state.window, deviceScaleFactor);
         await abortableDelay(100, signal);
         return;
+      }
       case "bridge": {
         const value = "value" in action ? action.value : undefined;
-        const result = await state.window.webContents.executeJavaScript(`(${BRIDGE_ACTION_SCRIPT})(${JSON.stringify(action.method)}, ${JSON.stringify(value)})`, true);
+        const result = await abortableResult(state.window.webContents.executeJavaScript(`(${BRIDGE_ACTION_SCRIPT})(${JSON.stringify(action.method)}, ${JSON.stringify(value)})`, true), signal);
         if (result !== true) throw new Error(`The game playtest bridge does not support ${action.method}`);
         await abortableDelay(50, signal);
       }
     }
   }
 
-  async #targetPoint(state: PlaytestSession, target: PlaytestTarget): Promise<{ x: number; y: number }> {
+  async #targetPoint(state: PlaytestSession, target: PlaytestTarget, signal?: AbortSignal): Promise<{ x: number; y: number }> {
     if ("x" in target) return checkedPoint(target);
-    for (const frame of await this.#frames(state)) {
-      const point = await frame.frame.executeJavaScript(`(${TARGET_POINT_SCRIPT})(${JSON.stringify(target)})`, true).catch(() => undefined) as unknown;
+    const points: { x: number; y: number }[] = [];
+    for (const frame of await this.#frames(state, signal)) {
+      const point = await abortableResult(frame.frame.executeJavaScript(`(${TARGET_POINT_SCRIPT})(${JSON.stringify(target)})`, true), signal).catch(() => undefined) as unknown;
       if (point && typeof point === "object") {
+        if ("targetError" in point && ["ambiguous", "disabled"].includes(String(point.targetError))) throw new TargetLookupError(point.targetError === "ambiguous"
+          ? "Multiple visible playtest targets match. Inspect the session and use a unique selector or testId."
+          : "The playtest target is disabled. Inspect the session before continuing.");
         const { x, y } = point as { x: number; y: number };
-        return checkedPoint({ x: frame.x + x * frame.scaleX, y: frame.y + y * frame.scaleY });
+        points.push(checkedPoint({ x: frame.x + x * frame.scaleX, y: frame.y + y * frame.scaleY }));
       }
     }
-    throw new Error("Playtest target was not found or is not visible");
+    if (points.length > 1) throw new TargetLookupError("Multiple visible playtest targets match across frames. Inspect the session and use a unique selector or testId.");
+    if (points.length) return points[0]!;
+    throw new TargetLookupError("Playtest target was not found or is not visible");
   }
 
   /**
    * The main frame and its direct child frames. Each child is matched to its
    * iframe element to find where, and at what scale, it is drawn.
    */
-  async #frames(state: PlaytestSession): Promise<PlaytestFrame[]> {
+  async #frames(state: PlaytestSession, signal?: AbortSignal): Promise<PlaytestFrame[]> {
     const main = state.window.webContents.mainFrame;
     const frames: PlaytestFrame[] = [{ frame: main, x: 0, y: 0, scaleX: 1, scaleY: 1 }];
     const children = main.frames;
     if (!children.length) return frames;
-    const boxes = await main.executeJavaScript(IFRAME_BOXES_SCRIPT, true) as { url: string; x: number; y: number; scaleX: number; scaleY: number }[];
+    const boxes = await abortableResult(main.executeJavaScript(IFRAME_BOXES_SCRIPT, true), signal) as { url: string; x: number; y: number; scaleX: number; scaleY: number }[];
     const unmatched = new Set(boxes.keys());
     for (const frame of children) {
       const index = [...unmatched].find((candidate) => boxes[candidate]!.url === frame.url) ?? [...unmatched][0];
@@ -336,7 +392,7 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
   async #capture(state: PlaytestSession, signal?: AbortSignal): Promise<PlaytestCapture> {
     signal?.throwIfAborted();
     this.#assertLive(state);
-    const image = await state.window.webContents.capturePage();
+    const image = await abortableResult(state.window.webContents.capturePage(), signal);
     signal?.throwIfAborted();
     const screenshot = logicalSizeImage(image, state.window.getContentSize()[0]);
     const { width, height } = screenshot.getSize();
@@ -356,15 +412,66 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
     return state;
   }
 
-  #activeSession(id: string): PlaytestSession {
+  async #withSession<T>(id: string, operation: (state: PlaytestSession) => Promise<T>): Promise<T> {
     const state = this.#session(id);
+    state.activeRequests++;
     this.#resetIdleTimer(state);
-    return state;
+    try {
+      await this.#updateActivity(state);
+      return await operation(state);
+    } finally {
+      state.activeRequests--;
+      if (this.#sessions.get(id) === state) {
+        if (!state.activeRequests) this.#resetIdleTimer(state);
+        await this.#updateActivity(state);
+      }
+    }
+  }
+
+  #visibilityChanged(state: PlaytestSession): void {
+    this.#resetIdleTimer(state);
+    void this.#updateActivity(state).catch((error) => {
+      state.logs.push({ level: "error", message: `Could not update playtest activity: ${String(error)}`, timestamp: new Date().toISOString() });
+      if (state.logs.length > MAX_LOGS) state.logs.shift();
+    });
+  }
+
+  #updateActivity(state: PlaytestSession): Promise<void> {
+    // Visibility events and concurrent tool requests must not freeze an active request.
+    const next = state.activity.catch(() => {}).then(async () => {
+      if (this.#sessions.get(state.id) !== state || state.window.isDestroyed()) return;
+      const watched = this.#isWatched(state);
+      const running = state.activeRequests > 0 || watched;
+      const contents = state.window.webContents;
+      contents.setAudioMuted(!watched);
+      if (!running) {
+        await contents.debugger.sendCommand("Emulation.setFocusEmulationEnabled", { enabled: false });
+        contents.setBackgroundThrottling(true);
+      }
+      if (running !== state.running) {
+        await contents.debugger.sendCommand("Page.setWebLifecycleState", { state: running ? "active" : "frozen" });
+        state.running = running;
+        // The bundled Chromium leaves thawed pages hidden; emulate visibility without focusing a native window.
+        if (running) await contents.debugger.sendCommand("Emulation.setFocusEmulationEnabled", { enabled: true });
+      }
+      if (running) await contents.debugger.sendCommand("Emulation.setFocusEmulationEnabled", { enabled: state.activeRequests > 0 });
+      contents.setBackgroundThrottling(state.activeRequests === 0);
+    });
+    state.activity = next;
+    return next;
   }
 
   #resetIdleTimer(state: PlaytestSession): void {
     clearTimeout(state.idleTimer);
-    state.idleTimer = setTimeout(() => this.#close(state.id), this.idleTimeoutMs);
+    state.idleTimer = setTimeout(() => {
+      if (this.#sessions.get(state.id) !== state) return;
+      if (state.activeRequests > 0 || this.#isWatched(state)) this.#resetIdleTimer(state);
+      else this.#close(state.id);
+    }, this.idleTimeoutMs);
+  }
+
+  #isWatched(state: PlaytestSession): boolean {
+    return this.#visible && !state.window.isDestroyed() && state.window.isVisible() && !state.window.isMinimized();
   }
 
   #assertLive(state: PlaytestSession): void {
@@ -455,6 +562,15 @@ function validateViewport(viewport: PlaytestViewport): void {
       viewport.width < 240 || viewport.width > 4096 || viewport.height < 240 || viewport.height > 4096) {
     throw new Error("Playtest viewport dimensions must be integers between 240 and 4096");
   }
+  const ratio = viewport.deviceScaleFactor;
+  if (ratio !== undefined && (!Number.isFinite(ratio) || ratio < 1 || ratio > 2)) {
+    throw new Error("Playtest deviceScaleFactor must be a number between 1 and 2");
+  }
+}
+
+function setPixelRatio(window: BrowserWindow, deviceScaleFactor: number) {
+  // Zero dimensions leave the CSS viewport under native window control, including manual watch-window resizes.
+  return window.webContents.debugger.sendCommand("Emulation.setDeviceMetricsOverride", { width: 0, height: 0, mobile: false, deviceScaleFactor });
 }
 
 function sameOrigin(value: string, origin: string): boolean {
@@ -479,8 +595,24 @@ function checkedPoint(value: { x: number; y: number }): { x: number; y: number }
 
 function keyboardEvent(key: string): { key: string; code: string; text?: string } {
   if (!key || key.length > 40) throw new Error("Invalid playtest key");
+  if (/^[a-z]$/i.test(key)) return { key, code: `Key${key.toUpperCase()}`, text: key };
+  if (/^[0-9]$/.test(key)) return { key, code: `Digit${key}`, text: key };
   const aliases: Record<string, string> = { " ": "Space", Escape: "Escape", Enter: "Enter", Tab: "Tab" };
   return { key, code: aliases[key] ?? key, ...(key.length === 1 ? { text: key } : {}) };
+}
+
+async function abortableResult<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return pending;
+  const abort = () => rejectAbort(signal.reason ?? new DOMException("Game use request aborted", "AbortError"));
+  let rejectAbort!: (reason: unknown) => void;
+  const cancelled = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+  if (signal.aborted) abort();
+  else signal.addEventListener("abort", abort, { once: true });
+  try {
+    return await Promise.race([pending, cancelled]);
+  } finally {
+    signal.removeEventListener("abort", abort);
+  }
 }
 
 async function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {
@@ -526,18 +658,19 @@ const isVisible = (element) => {
   const box = element.getBoundingClientRect();
   return box.width > 0 && box.height > 0 && (!element.checkVisibility || element.checkVisibility({ opacityProperty: true, visibilityProperty: true }));
 };
+const normalizeText = (value) => String(value || "").replace(/\s+/g, " ").trim();
 const matches = (element, target) => {
   if (target.testId) return element.getAttribute("data-testid") === target.testId;
-  if (target.text) return (element.innerText || element.textContent || "").trim().includes(target.text);
-  if (target.role) return roleFor(element) === target.role && (!target.name || nameFor(element).trim().includes(target.name));
+  if (target.text) { const text = normalizeText(target.text); return !!text && normalizeText(element.innerText || element.textContent).includes(text); }
+  if (target.role) return roleFor(element) === target.role && (!target.name || normalizeText(nameFor(element)).includes(normalizeText(target.name)));
   return false;
 };
-const findTarget = (target) => {
-  if (target.selector) { try { return deepQueryAll(target.selector).find(isVisible) || deepQueryAll(target.selector)[0] || null; } catch { return null; } }
-  const candidates = deepQueryAll(INTERACTIVE + ", canvas").filter((element) => matches(element, target));
-  return candidates.find(isVisible) || candidates[0] || null;
+const findTargets = (target) => {
+  if (target.selector) { try { return deepQueryAll(target.selector).filter(isVisible); } catch { return []; } }
+  return deepQueryAll(INTERACTIVE + ", canvas").filter((element) => isVisible(element) && matches(element, target));
 };
-const clean = (value, limit = 300) => String(value || "").replace(/\s+/g, " ").trim().slice(0, limit);
+const findTarget = (target) => { const candidates = findTargets(target); return candidates.length === 1 ? candidates[0] : null; };
+const clean = (value, limit = 300) => normalizeText(value).slice(0, limit);
 const listElements = () => deepQueryAll(INTERACTIVE)
   .filter(isVisible)
   .slice(0, 100)
@@ -577,8 +710,11 @@ const visibleText = () => {
 };`;
 
 const TARGET_POINT_SCRIPT = `(target) => { ${TARGET_HELPERS}
-  const element = findTarget(target);
+  const candidates = findTargets(target);
+  if (candidates.length > 1) return { targetError: "ambiguous" };
+  const element = candidates[0];
   if (!element) return null;
+  if (element.disabled || element.getAttribute("aria-disabled") === "true") return { targetError: "disabled" };
   const box = element.getBoundingClientRect();
   if (box.width <= 0 || box.height <= 0) return null;
   return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
@@ -609,11 +745,28 @@ const IFRAME_BOXES_SCRIPT = `(() => { ${TARGET_HELPERS}
   });
 })()`;
 
-const FRAME_INSPECTION_SCRIPT = `(() => { ${TARGET_HELPERS}
-  return { elements: listElements(), text: visibleText() };
+const MEDIA_INSPECTION = `const listMedia = () => deepQueryAll("video, audio").filter(element => element instanceof HTMLMediaElement).slice(0, ${MAX_MEDIA}).map(element => {
+  const url = URL.parse(element.currentSrc || element.src);
+  const quality = element.localName === "video" ? element.getVideoPlaybackQuality() : undefined;
+  const buffered = element.buffered;
+  return {
+    tag: element.localName,
+    source: url ? (url.protocol === "http:" || url.protocol === "https:" ? url.pathname.slice(0, 300) : url.protocol) : "",
+    readyState: element.readyState, currentTime: element.currentTime,
+    duration: Number.isFinite(element.duration) ? element.duration : null,
+    paused: element.paused, ended: element.ended, errorCode: element.error?.code ?? null,
+    networkState: element.networkState, elementId: element.id.slice(0, 200),
+    buffered: Array.from({ length: Math.min(buffered.length, 16) }, (_, index) => ({ start: buffered.start(index), end: buffered.end(index) })),
+    ...(quality ? { totalVideoFrames: quality.totalVideoFrames, droppedVideoFrames: quality.droppedVideoFrames,
+      videoWidth: element.videoWidth, videoHeight: element.videoHeight } : {}),
+  };
+});`;
+
+const FRAME_INSPECTION_SCRIPT = `(() => { ${TARGET_HELPERS} ${MEDIA_INSPECTION}
+  return { elements: listElements(), text: visibleText(), media: listMedia() };
 })()`;
 
-const PAGE_INSPECTION_SCRIPT = `(async () => { ${TARGET_HELPERS}
+const PAGE_INSPECTION_SCRIPT = `(async () => { ${TARGET_HELPERS} ${MEDIA_INSPECTION}
   const elements = listElements();
   const canvases = Array.from(document.querySelectorAll("canvas")).map((canvas, index) => {
     const box = canvas.getBoundingClientRect();
@@ -640,9 +793,10 @@ const PAGE_INSPECTION_SCRIPT = `(async () => { ${TARGET_HELPERS}
     url: location.href,
     title: document.title,
     readyState: document.readyState,
-    viewport: { width: innerWidth, height: innerHeight },
+    viewport: { width: innerWidth, height: innerHeight, deviceScaleFactor: window.devicePixelRatio },
     elements,
     canvases,
+    media: listMedia(),
     ...(text ? { text } : {}),
     ...(gameState !== undefined ? { gameState } : {}),
     ...(capabilities.length ? { bridgeCapabilities: capabilities } : {}),

@@ -9,6 +9,19 @@ OhMyGame treats audio as a capability family rather than a TTS-only feature. The
 
 The daemon owns credentials, provider calls, generated files, and Library registration. The renderer and agents submit provider-neutral requests and never receive saved API keys.
 
+Kunpo speech, sound effects and experimental ambient music share pure input
+validation before new Canvas jobs or provider submissions. Unsupported options
+(including guaranteed seamless loops), invalid duration/output settings and
+invalid speech parameters return a host-owned `audio_input_invalid` receipt.
+The agent can inspect capabilities and correct the input with a new call ID;
+replaying the rejected ID retains its failure. New direct agent requests are
+validated before creating a Canvas node; existing nodes keep their editable
+input. No audio request, automatic correction or replacement is submitted by
+this validation. Credential, authorization and reference-integrity failures,
+in-flight duplicates, provider replies and interrupted/unknown submissions do
+not gain this receipt. Historical unknown attempts are not reclassified from
+their error text, and existing outputs and request records remain intact.
+
 ## Architecture
 
 `src/shared/audio.ts` defines requests, output settings, model capabilities, catalogs, and generated-audio metadata. A provider adapter implements `AudioProviderAdapter`; `ProviderAudio` selects only a configured, enabled model that advertises the requested operation. `ToolRunner` then persists MP3 or WAV output through the same job and Library flow used by image, video, and 3D generation.
@@ -17,89 +30,73 @@ The stable tool boundary is:
 
 | Tool                    | Operation      | Current implementation                     |
 | ----------------------- | -------------- | ------------------------------------------ |
-| `generate-speech`       | `speech`       | Volcengine Doubao Speech synthesis 2.0     |
-| `generate-sound-effect` | `sound-effect` | Volcengine Doubao Seed Audio 1.0            |
-| `generate-music`        | `music`        | Volcengine Doubao Seed Audio 1.0            |
+| `generate-speech`       | `speech`       | Kunpo optional-reference speech / voice samples (candidate)     |
+| `generate-sound-effect` | `sound-effect` | Kunpo Seed Audio 1.0            |
+| `generate-music`        | `music`        | Kunpo Seed Audio 1.0            |
 
 Unsupported operations fail before an incompatible provider is called. Adding ElevenLabs, MiniMax, Suno, Gemini, Fish Audio, or SiliconFlow should normally require a new adapter and settings integration, not changes to jobs or Library storage.
 
 ## Asset Canvas audio nodes
 
-Asset Canvas exposes the common layer as three generation node types: **Speech**, **Sound effect**, and **Music**. The Add menu shows a type only when the live audio catalog contains a configured, enabled model for that operation, and each existing node filters the same catalog by its required operation. A speech-only model therefore cannot be selected for music or effects. A Text or Document node can be connected as a prompt source; its current content is combined with the node's local text when the job starts.
+Asset Canvas exposes the common layer as four generation node types: **Voice**, **Speech**, **Sound effect**, and **Music**. Voice uses the existing `generate-speech` tool with `voiceDesign: true`, `voiceDescription`, and `text` as the editable sample script; this is a local intent, not a separate upstream voice-provisioning API. Voice nodes require a speech model advertising `supportsVoiceDesign`. The Add menu shows a type only when the live audio catalog contains a configured, enabled model for that operation, and each existing node filters the same catalog by its required operation. A speech-only model therefore cannot be selected for music or effects. A Text or Document node can be connected as a prompt source; its current content is combined with the node's local text when the job starts.
 
-Speech nodes store provider-neutral model, speaker, and speed settings. Sound-effect and music nodes store provider-neutral prompt, duration, and loop settings, plus capability-gated options such as negative prompts, lyrics, and instrumental mode. Generated MP3 or WAV output is registered in the Library, written back to the node as an `assetId`, and playable in both generation nodes and Library asset nodes. Model and option selections are remembered independently for each node type.
+Voice nodes store a description, editable sample script, model, latest output, and an independently selected sample asset/digest. Selection or a connection does not generate. Missing/changed/over-limit bytes reject the binding and preserve the previous reference; a source/target change while validation is pending cannot overwrite the newer choice. Speech nodes store model, optional local `referenceAssetId`, its SHA-256 content binding after explicit selection, optional source node, and speed settings. This digest is necessary because materialized project media can be edited while its asset ID stays the same. Regenerating or selecting another voice candidate never changes an already-bound speech node; **Update voice** explicitly adopts the new selection. Removing a source node or edge keeps the adopted audio; removing the reference thumbnail explicitly selects unconditioned speech. Deleting the recording from the project, or confirming its removal from all projects in the Library, clears matching speech references, source links and voice sample selections. Previously rendered speech stays available when its output file is a different asset. A missing or changed bound file fails rather than silently reverting to no reference. Clipboard duplication remaps source nodes only when copied together and always retains the pinned asset. Selected candidates participate in normal asset materialization/export and usage tracking. Legacy `voiceId` fields round-trip for old-project compatibility but are not inherited by new nodes, displayed as a selection, or sent upstream. Sound-effect and music nodes store provider-neutral prompt, duration, and loop settings, plus capability-gated options such as negative prompts, lyrics, and instrumental mode. Generated MP3 or WAV output is registered in the Library, written back to the node as an `assetId`, and playable in both generation nodes and Library asset nodes. Model and option selections are remembered independently for each node type.
 
 Existing nodes remain readable when a provider is disconnected, but generation stays disabled until a compatible model is available. Installing a future adapter that advertises sound-effect or music activates the existing node contract and adds that node type to the menu without another canvas schema change. Agent generation tools follow the same live capability filter, so unsupported operations are not offered on a turn.
 
-## Volcengine Doubao Speech
+## Kunpo voice samples and optional-reference speech
 
-The first adapter uses the official TTS v3 unidirectional HTTP streaming endpoint. Configure it in **Settings → Providers & Models → Doubao Speech**. The key is stored in the local data directory with restricted file permissions and is sent only from the daemon.
+The local edition uses [Kunpo Seed Audio](https://docs.ziy.cc/api-reference/seed-audio/) at `POST https://llm.ziy.cc/v1/audio/speech`, with daemon-only Bearer authentication. `seed-audio-1.0` and `seed-audio-1.0-multilingual` return a complete binary MP3/WAV. There is no streaming playback, subtitle/alignment JSON or resumable audio task ID. Exact reading and voice consistency remain unverified.
 
-Configure a default Volcengine Speaker ID from the console's Voice Library, or supply `voiceId` on an individual request. The adapter supports the official Speech synthesis 2.0 service, MP3 output, mono audio, supported sample rates, language hints, delivery context, and speech-rate control. The first adapter deliberately avoids streamed WAV because the provider documents repeated WAV headers as a streaming caveat; the common layer still supports WAV for adapters that return a valid complete file. Account activation, API key access, model entitlement, quota, and the exact voice ID still belong to the user's Volcengine account and must be verified with a real credential. Voice Clone 2.0 (`seed-icl-2.0`) is intentionally separate because its resource ID, entitlements, and model options differ.
+An unconditioned **Speech** request omits `references`; the service does not document a fixed default voice or deterministic identity. A **Voice** node separates voice description from an editable short sample script, produces a WAV/48 kHz candidate, and binds a sample through explicit selection or a direct connection gesture. If no sample was selected, dragging its output to speech validates/adopts the current generated sample; an existing selection takes precedence. The sample can be auditioned locally; it is not a permanent speaker ID or proof of stable identity. Generated samples over 30 seconds, invalid formats or unavailable bytes remain playable where possible but cannot be adopted as references.
 
-The settings page ships the published seed-tts-2.0 preset voice catalog (`VOLCENGINE_TTS_VOICES` in `src/shared/audio.ts`) as a picker. The provider's `ListSpeakers` API is a console API that requires AccessKey signing instead of the console API key, so the catalog is bundled from the official voice list; cloned or custom Speaker IDs can still be entered as raw IDs. The default voice saves on its own without re-entering the API key, and a preview action synthesizes a short sample (up to 500 characters) to verify the connection and voice before real use.
+On a **Speech** node, optionally use **Reference audio → Upload** or select an existing compatible Library audio asset. Audition it with the thumbnail's play button; remove it with ×. These operations are local and do not submit a generation request. This client accepts one actual MP3/WAV, nonempty, at most 10 MB and 30 seconds. Local uploads named `.mp3` or `.wav` are identified from their contents; the imported copy uses the detected MIME and extension with identical bytes, leaving the original untouched. Existing Library assets still require their registered MIME to match their contents. M4A, raw PCM and OGG are not integrated here; renaming an extension does not convert a file. The renderer validates the bytes locally and the daemon reopens the bounded Library file and validates actual format/duration again before submission.
 
-The daemon endpoints are:
+`ToolRunner` resolves `referenceAssetId` to bytes internally. When a reference is selected, the adapter sends `references: [{audio_data: "<raw Base64>"}]` (no data-URL prefix, public audio URL, `speaker`, or `voice`) and directs `@音频1` to supply timbre rather than words. Audio bytes are not embedded in job/history metadata, catalogs or logs; explicit local audition/download reads the selected media through the protected asset API. The explicitly imported reference remains a local Library/project media file and is included when that project is exported. Keep reference recordings appropriate for the intended sharing scope. The generated asset records model, protocol and safe parameters, including the submitted reference asset ID and actual content digest when present; no reference bytes or signed URLs are stored in provenance. Provider submission stays in the daemon; the model credential never enters the VM. Project media remains project content and is subject to the normal project execution/export scope.
 
-- `GET /audio-models/catalog` — available models plus provider status;
-- `GET /settings/models/providers/volcengine-tts` — saved settings without the key;
-- `PUT /settings/models/providers/volcengine-tts` — save `{ "apiKey": "..." }`, `{ "defaultVoiceId": "..." }`, or both (voice-only updates keep the stored key; `defaultVoiceId: null` clears it);
-- `POST /settings/models/providers/volcengine-tts/preview` — synthesize a short sample and return MP3 bytes;
-- `DELETE /settings/models/providers/volcengine-tts` — remove the saved connection;
-- `POST /tools/generate-speech/jobs` — enqueue speech generation.
+No Speaker ID setting or paid settings-preview action is provided. Old settings data is retained without using its default ID. `GET /settings/models/providers/volcengine-tts` returns only connection state; legacy PUT and preview routes return 410 without requesting generation. Shared Kunpo credential setup is described in [the local guide](kunpo-local.md).
 
-Example job body:
+Example local job body (use the actual imported Library asset ID):
 
 ```json
 {
   "text": "欢迎来到雾港。",
-  "voiceId": "your-volcengine-voice-id",
-  "style": "calm fantasy narrator",
+  "referenceAssetId": "local-library-asset-id",
+  "model": { "provider": "volcengine-tts", "id": "seed-audio-1.0" },
   "speed": 0,
   "output": { "format": "mp3", "sampleRate": 24000 }
 }
 ```
 
-The model can be omitted to use the first configured compatible model, or supplied explicitly as `{ "provider": "volcengine-tts", "id": "seed-tts-2.0" }`.
+Generation sends the selected recording and script to Kunpo and can incur output-duration charges. Importing/auditioning does not establish model quality or a permanent voice clone. A missing/deleted/invalid reference fails before generation. Once submitted, cancellation, timeout or an unusable result may leave completion unknown; no automatic replay is allowed. A later explicit new generation can cost again. The response-header wait, including upload, is bounded to 300 seconds; receiving the binary is bounded to 180 seconds, with an overall 480-second ceiling and 64 MiB response limit. These are client limits, not promised provider processing times.
 
-## Volcengine Doubao Seed Audio
+Failed jobs/logs preserve only an `audioDiagnostic` with stage/category enums, optional HTTP status/error classification, request byte count and bounded elapsed milliseconds. Node transport events distinguish connecting, writing the upload and waiting for response headers; reading a response is a separate stage. A custom transport without these events reports the less precise `request` stage. Bytes accepted by the local transport do not prove gateway/model acceptance. No raw error text, body, recording, script, URL or provider request ID is added to diagnostics. The shared error classifier reads at most 8 KiB for one second and recognizes Kunpo's documented `bad_response_status_code` as `bad-response-status`, which is not proof of a parameter error or of non-submission.
 
-The Seed Audio adapter uses the official non-streaming `POST /api/v3/tts/create` endpoint with model `seed-audio-1.0`. Configure it separately in **Settings → Providers & Models → Doubao Seed Audio**. Its API key is stored in `volcengine-seed-audio.json` and is never returned by a settings or catalog endpoint. Doubao Speech and Doubao Seed Audio deliberately remain separate connections, so enabling, disabling, replacing, or deleting one does not change the other.
+The classifier checks all four structured `code` / `type` fields for specific allowlisted categories before falling back to the generic `bad-response-status` tag. Free-form `message` / `param` text is not classified. Generic/unknown failures are displayed as “reason unknown”; their HTTP status and diagnostic tag remain separate. No verified full message templates are currently available, so none are matched. Even a specific provider-reported category is not an independently verified root cause or billing outcome.
 
-The first integration exposes text-to-audio generation for standalone game sound effects and instrumental game background music. It supports MP3 and WAV at 8, 16, 24, or 48 kHz, an optional target duration from 1 to 120 seconds, and Chinese or English prompts. Provider-specific prompt instructions keep sound-effect jobs free of dialogue and music, and music jobs free of voices and lyrics. Generated bytes are validated before they enter the normal job and Library flow.
+The previous client used a 180-second total deadline. The reference Dubbing Workbench source uses separate 300-second response and 180-second receive windows; this adapter now follows those bounded phase windows with an overall 480-second ceiling. Transport connection timeouts remain unchanged and may fail sooner. This is a usability adjustment, not evidence that waiting caused the upstream HTTP 500 or that reference audio now succeeds. Phase deadline, transport failure, cancellation and unknown outcomes retain safe diagnostics and never trigger replay. Canvas ordinary generation after an unknown outcome additionally requires explicit confirmation of the latest local job ID; stale/missing acknowledgement and pure retry are rejected without a provider POST. A private 0600 write-ahead marker also prevents replay of the same stable Agent/tool recovery ID across concurrent calls and restart, even when no output was received. It stores no script, audio, credential or URL. A marker is conservative: once the generator was about to be called, that identity is not reused even after a known error. An explicit retry of a definite rejection receives a new identity; unknown outcomes still reject pure retry. Stateless `/tools/generate-speech/jobs` with a new identity remains an explicit new-request API; callers must not treat it as recovery.
 
-Although the underlying Seed Audio API can accept richer scene prompts and reference media, this adapter does not yet advertise reference audio, images, lyrics, negative prompts, channel selection, or guaranteed seamless loops. Those options stay hidden in Asset Canvas and are rejected at the daemon boundary rather than being silently ignored. A real Volcengine account must have Seed Audio 1.0 access; a Doubao Speech key alone does not prove that entitlement is enabled.
+Speech, voice samples, sound effects and music share the same delivery path. If a valid audio file has reached the daemon and copying it into the project fails, the Agent can use `recover_media` with the original tool name and `recoverCallId` to import the retained run. If the run itself cannot be written after Library registration, the error identifies the retained Library asset. A Canvas node whose local attachment failed reuses the received result on its next generation action or job retry, including after reopening. When the connection breaks before a complete file is available, the binary service has no saved URL or task ID to resume. A new paid Agent submission after that outcome needs a user decision.
 
-The daemon endpoints are:
+### 2026-10-31 reference-audio investigation
 
-- `GET /settings/models/providers/volcengine-seed-audio` — saved connection state without the key;
-- `PUT /settings/models/providers/volcengine-seed-audio` — save `{ "apiKey": "..." }`;
-- `DELETE /settings/models/providers/volcengine-seed-audio` — remove only the Seed Audio connection;
-- `POST /tools/generate-sound-effect/jobs` — enqueue sound-effect generation;
-- `POST /tools/generate-music/jobs` — enqueue instrumental music generation.
+The user's saved speech attempts on October 30 timed out with unknown outcomes; those older jobs predate the stage diagnostics, so they cannot locate an upload/header/model stall. The selected reference is a standard PCM16 WAV (44.1 kHz, stereo, about 27.074 seconds and 4,776,014 bytes), within the documented input limits. Only its RIFF format header and existing metadata were inspected; the recording was not played or uploaded. Its size alone does not establish why it failed.
 
-Example sound-effect job body:
+Earlier isolated real-test receipts establish a narrower comparison: on October 30 at 08:25 UTC the no-reference sound-effect request returned HTTP 200 in about 12 seconds, with a locally parsed 3.048-second MP3. At 08:31 UTC, adding a self-created 2-second PCM16 mono 48 kHz WAV (192,044 bytes, 256,503-byte complete JSON) returned HTTP 500 after about 19.7 seconds. Each made exactly one POST, with no automatic retries. This was not a 180-second timeout or the same large-payload condition as the video failures. The reference test appended `references` in an isolated transport supplement to the sound-effect baseline; it did not exercise the full speech node and did not explicitly mention `@音频1`. Its 410-byte adapter diagnostic measured the baseline before supplementation; the receipt separately records the actual 256,503-byte wire request. Do not reuse that fixture as evidence of missing production references, exact speech behavior, or a billing outcome, and do not replay either old one-shot script.
 
-```json
-{
-  "prompt": "A heavy castle door slams shut with a short stone echo",
-  "durationSeconds": 3,
-  "output": { "format": "mp3", "sampleRate": 48000 }
-}
-```
+The current speech implementation includes `@音频1`, original raw Base64, native configuration and binary response handling consistent with the public contract. No definite product-side cause of the upstream 500 has been established. The earlier follow-up strengthened actual speech-provider loopback tests through both direct and proxy routes with synthetic small/192,044-byte/large-stereo references, full-byte diagnostics, 500-as-unknown, privacy and no automatic replay. Five provider/settings files passed 71 tests; 16 selected application/lifecycle tests passed (107 unrelated tests filtered out); type and diff checks passed. Logs are in `/tmp/ohmygame-audio-followup-check/`. No real key/model request, user recording upload, user-instance restart or network-setting change occurred in this follow-up. That earlier batch kept the request parameters and 180-second limit unchanged. The later voice-node implementation changes the phase limits as documented above; no real-provider test was run for that implementation, and any next live comparison requires separate authorization. Explicit reference syntax, reference content/format and upstream variability remain hypotheses, not established causes. The public documentation gives no minimum reference duration or mono-only rule, so neither restriction is invented here.
 
-Example music job body:
+### Voice-design API example
 
-```json
-{
-  "prompt": "Quiet harbor exploration theme with piano and soft strings",
-  "instrumental": true,
-  "durationSeconds": 30,
-  "output": { "format": "wav", "sampleRate": 48000 }
-}
-```
+Use `POST /tools/generate-speech/jobs` with `{"voiceDesign":true,"voiceDescription":"Warm, relaxed adult female voice","text":"Good morning. The adventure begins here.","model":{"provider":"volcengine-tts","id":"seed-audio-1.0"},"output":{"format":"wav","sampleRate":48000}}`. Omit both the design fields and reference for unconditioned speech. A design cannot contain a reference; the description is never used as the script. Prompt + instructions must fit the documented 3,000-character limit. Supported advertised rates are 8000, 16000, 24000, 32000, 44100 and 48000; 22050 is rejected.
 
-The model can be omitted to use the configured compatible model, or supplied explicitly as `{ "provider": "volcengine-seed-audio", "id": "seed-audio-1.0" }`.
+## Kunpo effects and ambient music
+
+The same Kunpo binary endpoint serves **Sound effect** and the unverified **Music** candidate under provider `volcengine-seed-audio`. The daemon uses the shared Kunpo credential, not the retired native Volcengine endpoint or separate vendor keys. Effects and music do not reuse the speech reference selection.
+
+The app supports MP3/WAV, documented sample rates, and a requested 1–120 second duration expressed as an instruction. Music is limited to experimental instrumental ambient audio, not a verified full BGM or seamless-loop service. Lyrics, negative prompts, channel selection, dialogue, reference-conditioned music and voice cloning are unavailable and rejected rather than silently ignored. Sound effects and speech are separate operations with distinct capability filters.
+
+The common job endpoints are `POST /tools/generate-speech/jobs`, `POST /tools/generate-sound-effect/jobs`, and `POST /tools/generate-music/jobs`. The live catalog is `GET /audio-models/catalog`. Model identity is persisted; the client does not silently switch models or automatically retry unknown outcomes.
 
 ## Adding another provider
 
@@ -110,3 +107,27 @@ The model can be omitted to use the configured compatible model, or supplied exp
 5. Add request-translation, failure-mapping, catalog, job, and Library tests.
 
 Do not make one adapter pretend to support all audio operations. Capability-driven selection is what lets TTS, effects, music, dialogue, voice cloning, and future realtime speech coexist behind one contract.
+
+### Voice-node verification — 2026-10-31
+
+This batch used the existing dirty `42d7e21` source checkout, isolated temporary HOME/data, synthetic audio and fake credentials only. The final selected regression run passed **25 files / 632 tests, zero failures or skips**; it is not the entire repository suite. It includes actual Agent-tool invocation, canvas/API-to-provider mock wiring, raw reference byte equality, no-reference/design requests, selected-version persistence/reopen, clipboard/reference lifecycle, changed-content rejection, bounded phase waits/cancellation, unknown-outcome acknowledgement, privacy, Library/archive and network boundaries. The replay-marker addition also covers concurrent/reopened stable-call replays and preserves explicit retry after a definite quota rejection. Type checking, host TypeScript compilation, renderer and playable-sandbox builds passed to `/tmp/ohmygame-voice-node-check/`; the user's built application was not replaced or restarted.
+
+A dedicated Terra/xhigh Computer Use agent checked a real browser rendering of CanvasBoardEditor against an isolated mock harness: editable description/sample, generation/playback/selection, voice→speech connection, no automatic replacement, explicit update, local synthetic WAV selection/removal, unconditioned speech, unavailable reference/oversized candidate rejection, unknown-result cancellation and duplicate-click protection, and light/dark 1280×720 / 640×720 layouts. Those UI checks are mock workflow evidence, not real Kunpo voice-quality verification. Rapid double-clicking Generate can dismiss the confirmation via its backdrop, without submitting; a single click reopens it. No native select/dialog was introduced. Screenshot evidence was emitted by Computer Use; no local screenshot file was provided. Playback entered the Pause state, but a reliable manual pause-before-end check was not completed: one follow-up attempt with a synthetic 20-second WAV was blocked by `Browser is not available: iab`. The mock UI server/tab were stopped. Actual over-limit Blob rejection was covered by an automated lazy-Blob test proving `arrayBuffer()` was not called; UI covered over-limit metadata. UI notes are at `/tmp/ohmygame-voice-node-ui-harness/acceptance-notes.txt`.
+
+No real Key was read, no upstream generation/upload was sent, and no user project/instance or reference workbench was modified. Earlier real audio HTTP 500 and manual timeout causes remain unresolved; a future one-shot provider test requires separate authorization. Strict reading, voice-description fidelity and cross-request timbre identity still require listening tests. The host process-list inspection was denied by the sandbox and was not bypassed; cleanup confirmation is limited to owned tool sessions and the dedicated mock UI server/tab, not a system-wide no-process claim.
+
+### Direct voice connections and selection follow-up — 2026-10-31
+
+The only audio connection direction is **Voice output → Speech reference input** (Speech cards are titled Audio). If no sample is selected, a direct drag validates/adopts the current saved output; an already-selected version takes precedence. Validation checks actual bytes/duration/content digest and applies source/target updates together; missing/changed media, duplicate gestures, and concurrent changes preserve existing bindings. Connections do not submit generation. Regenerating a voice still cannot replace existing speech references; updating remains explicit. Plain node clicks now explicitly select the node even in XYFlow `nodrag` regions; modifier selection is left to XYFlow and no input focus or pointer/drag settings were changed.
+
+Final related checks passed **20 files / 392 tests, zero failures or skips**, plus full type checking, renderer build and diff checks. Logs/builds are isolated under `/tmp/ohmygame-audio-link-check/`, with no replacement of the user's running build. Real UI follow-up is blocked: the dedicated Computer Use agent found no isolated IAB surface, only the user's Chrome; it did not touch that browser or start the prepared 43982 harness. DOM/mock checks are not a substitute for actual pointer/drag acceptance. User-uploaded reference audio is not declared fully accepted.
+
+Read-only manual-case checks distinguish two failures. The 4,776,014-byte reference is valid PCM16 RIFF/WAVE, stereo 44.1 kHz, about 27.074 seconds, and had already been imported. Its 2026-10-31 06:43:57 UTC speech attempt recorded 6,368,565 request bytes and timed out waiting for response headers after 300,003 ms, with no HTTP status/output and an unknown outcome. Body-sent events do not prove gateway/model acceptance or billing. A separate 358,932-byte PCM16 mono 16 kHz reference (11.215 seconds) has a successful speech job at 06:47:47 UTC and one output. They use the same model and script but different nodes/references. Neither Library filename matches the rejected roughly 310 KB / 7–8 second WAV shown in the user's screenshots; that file's original path/header is still needed. No audio was played, converted, uploaded or resubmitted during these checks; only existing metadata and RIFF/fmt headers were read.
+
+The reference Workbench source (`server/audio.mjs`, `scheduler.mjs`, `worker.mjs`, `templates.mjs`) copies original uploaded bytes and sends raw Base64 without automatic compression/resampling. Its default dry template and WAV/48 kHz output differ from OhMyGame's English instructions, default MP3/48 kHz and explicit watermark-off fields. Both defaults now use 300-second response / 180-second receive waits. Workbench has ffprobe/ffmpeg validation fallback whereas this client uses Mediabunny's MP3/WAVE parser; its WAVE codec support is narrower than the container extension. This is a possible explanation for local rejection, not a diagnosis of the unavailable file. OhMyGame explicitly configures an Undici global direct/proxy dispatcher; the inspected Workbench worker uses native fetch without that local dispatcher code. Actual Workbench launch flags/proxy/Key/account/model/selected template and its claimed successful attempt have not been verified. The same-provider report does not isolate these variables; no sender, parser, proxy or upstream cause has been proven, and no safety boundary or audio encoding policy was relaxed.
+
+A subsequent separate transport check passed **40 tests in `volcengine-tts-provider.test.ts`** (`/tmp/ohmygame-audio-link-check/transport-compare.log`). For synthetic references including a ~4.8 MB stereo PCM shape, real loopback direct and CONNECT-proxy receivers checked exact complete JSON bytes, `Content-Length == received bytes`, no unexpected chunked transfer on the production string-body path, and exact raw Base64 reference equality. One native-fetch control per route sent the identical synthetic JSON and matched as well. These tests do not run the Workbench, inspect its current credentials, upload a user recording, or contact the real gateway; they do not establish external proxy/TLS/model reliability or the user's failure cause. No production audio transmission/codec policy was changed by this comparison.
+
+The subsequently supplied path resolved the separate ~310 KB import failure: metadata-only inspection identified actual MP3 (ID3/MPEG Layer III), 310,378 bytes, stereo 44.1 kHz and 7.732 seconds, despite its `.wav` filename. The original importer inferred WAV from that suffix and rejected the detected MP3; it was not evidence of a corrupt WAV or an upstream request. Local upload detection now canonicalizes only the imported filename/MIME without transcoding or changing bytes. Registered-asset/provider validation remains strict, and unsupported/invalid/over-limit content still fails. Synthetic tests cover both MP3 named WAV and WAV named MP3, original-byte preservation, binding and no automatic generation. The playback control is centered in its existing thumbnail with the same 22 × 24 click area, colors, focus and removal control. The dedicated Computer Use agent still found no isolated IAB, so actual layout/drag acceptance remains unverified; the user's running app was not touched.
+
+This final filename/control follow-up passed **4 files / 128 tests, no failures or skips**, type checking, renderer build and diff checking. Its logs are `renamed-audio-final-tests.log`, `renamed-audio-final-types.log` and `renamed-audio-renderer.log` in the same isolated log directory. These checks do not resolve the independent 4.8 MB response-header timeout or prove real synthesis quality.

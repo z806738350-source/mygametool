@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_MODEL_3D_CONFIG, buildModel3DToolRequest, normalizeModel3DConfig, resolveModel3D } from "../src/shared/generation-config.js";
+import { DEFAULT_ANIMATION_ACTION_IDS, DEFAULT_MODEL_3D, MODEL_3D_MODELS, DEFAULT_MODEL_3D_CONFIG, buildModel3DToolRequest, normalizeModel3DConfig, resolveModel3D } from "../src/shared/generation-config.js";
 
 describe("shared generation config", () => {
   it("resolves legacy free references and shares tier capabilities with API-key models", () => {
@@ -15,7 +15,7 @@ describe("shared generation config", () => {
     expect(resolveModel3D({ provider: "meshy", id: "rodin" })).toBeUndefined();
   });
   it("uses the supported 3D controls by default", () => {
-    expect(DEFAULT_MODEL_3D_CONFIG).toEqual({ targetPolycount: 4_000, texture: true, pbr: false });
+    expect(DEFAULT_MODEL_3D_CONFIG).toEqual({ targetPolycount: 30_000, texture: true, pbr: false });
   });
 
   it("normalizes polycount and disables PBR with textures", () => {
@@ -32,11 +32,11 @@ describe("shared generation config", () => {
     });
   });
 
-  it("keeps the polycount inside the chosen model's range", () => {
+  it("preserves disabled saved references without replacing them with a supported provider", () => {
     const meshy71 = { provider: "meshy", id: "meshy-7.1" };
     expect(normalizeModel3DConfig({ model: meshy71, targetPolycount: 100_000 })).toMatchObject({ targetPolycount: 100_000 });
-    expect(normalizeModel3DConfig({ targetPolycount: 100_000 })).toMatchObject({ targetPolycount: 4_000 });
-    expect(normalizeModel3DConfig({ model: meshy71, targetPolycount: 400_000 })).toMatchObject({ targetPolycount: 30_000 });
+    expect(normalizeModel3DConfig({ targetPolycount: 100_000 })).toMatchObject({ targetPolycount: 100_000 });
+    expect(normalizeModel3DConfig({ model: meshy71, targetPolycount: 400_000 })).toMatchObject({ model: meshy71, targetPolycount: 400_000 });
   });
 
   it("preserves Tripo V3.1 high-poly settings when building a request and bounds P1 separately", () => {
@@ -48,8 +48,11 @@ describe("shared generation config", () => {
   });
 
   it("resolves known 3D models and defaults to the first", () => {
-    expect(resolveModel3D(undefined)).toMatchObject({ id: "meshy-t2" });
-    expect(resolveModel3D({ provider: "meshy", id: "meshy-7.1" })).toMatchObject({ maxReferenceImages: 4 });
+    expect(resolveModel3D(undefined)).toEqual(DEFAULT_MODEL_3D);
+    expect(DEFAULT_MODEL_3D).toMatchObject({ provider: "tripo", id: "v3.1-20260211" });
+    expect(MODEL_3D_MODELS.some(model => model.provider === "meshy" || model.protocol === "meshy")).toBe(false);
+    expect(DEFAULT_ANIMATION_ACTION_IDS).toEqual(["preset:idle", "preset:walk", "preset:run"]);
+    expect(resolveModel3D({ provider: "meshy", id: "meshy-7.1" })).toBeUndefined();
     expect(resolveModel3D({ provider: "meshy", id: "meshy-5" })).toBeUndefined();
     expect(resolveModel3D(null)).toBeUndefined();
   });

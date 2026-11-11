@@ -1,3 +1,4 @@
+import { assertLocalExecutionAllowed } from "./local-execution-policy.js";
 import { createRequire } from "node:module";
 import { createHash, randomUUID } from "node:crypto";
 import { createJiti } from "jiti";
@@ -60,6 +61,7 @@ export class PluginMcpHost {
     config: EffectiveMcpConfig,
     publishStatus = true,
   ): Promise<ExtensionFactory> {
+    assertLocalExecutionAllowed("Plugin MCP extension loading");
     const factory = (await adapter()).createMcpAdapter({
       config: {
         ...config,
@@ -135,6 +137,7 @@ export class PluginMcpHost {
     config: EffectiveMcpConfig,
     agentDir: string,
   ): Promise<{ tool: ToolDefinition; close: () => Promise<void> }> {
+    assertLocalExecutionAllowed("Plugin MCP execution");
     if (this.#closed) throw new Error("MCP host is closed");
     const settingsManager = SettingsManager.inMemory({ packages: [] });
     const resourceLoader = new DefaultResourceLoader({
@@ -189,6 +192,7 @@ export class PluginMcpHost {
     action: "test" | "auth-start" | "auth-complete",
     input?: string,
   ): Promise<PluginMcpResult> {
+    assertLocalExecutionAllowed("Plugin MCP connection");
     if (this.#closed) throw new Error("MCP host is closed");
     const operation = (this.#operations.get(key) ?? Promise.resolve())
       .catch(() => {})

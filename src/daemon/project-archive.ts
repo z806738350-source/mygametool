@@ -1,5 +1,5 @@
-import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
+import { constants, createReadStream, createWriteStream } from "node:fs";
+import { lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable, Transform } from "node:stream";
@@ -37,11 +37,13 @@ import { sniffImageType } from "./image-format.js";
 import { ensureNodeCodebaseContract } from "./playable-codebase.js";
 import { MAX_PROJECT_COVER_BYTES } from "./project-covers.js";
 import type { ProjectManager } from "./projects.js";
+import { containsKnownSensitiveValue, knownSensitiveValueOverlap } from "../shared/sensitive-values.js";
+import { isPrivateProjectPath } from "../shared/private-project-paths.js";
 
 const GRAPH_FILE = "graph.json";
 
 // Dependencies and version control are left out wherever they are, as are
-// environment files, which usually hold secrets. Build output, caches and
+// credential names and environment files, which usually hold secrets. Build output, caches and
 // OhMyGame's agent data are left out at the workspace root only, like in
 // checkpoints. The rest of `.data/` is kept: asset metadata and previews must
 // travel with the assets they describe.
@@ -55,11 +57,13 @@ const EXCLUDED_AT_ROOT = new Set([
   ".ohmygame-install-pending",
   ".data/agent-attachments",
   "canvas/jobs.json",
+  "canvas/.job-inputs",
 ]);
 const SKIPPED_ON_IMPORT_AT_ROOT = new Set([
   ".ohmygame",
   ".ohmygame-install-pending",
   ".data/agent-attachments",
+  "canvas/.job-inputs",
 ]);
 
 const EXTRACTION_ERRORS: Record<ArchiveExtractionFailure, string> = {
@@ -93,7 +97,7 @@ export class ProjectArchiveError extends Error {
 
 /** Whether a workspace-relative path stays out of project archives. */
 export function excludedFromProjectArchive(relativePath: string): boolean {
-  return matchesPath(relativePath, EXCLUDED_AT_ROOT, true);
+  return isPrivateProjectPath(relativePath) || matchesPath(relativePath, EXCLUDED_AT_ROOT, true);
 }
 
 /**
@@ -131,6 +135,7 @@ interface ArchiveFile {
 interface PreparedArchiveFile extends ArchiveFile {
   size: number;
   mode?: number;
+  identity?: { dev: number; ino: number };
 }
 
 /** Builds an archive on disk before downloading, so both import size limits
@@ -147,9 +152,10 @@ export async function exportProjectArchive(
   if (project.workspaceAvailable === false) {
     throw new ProjectArchiveError("The project folder is not available.", 409);
   }
-  const files = await archiveFiles(project.workspacePath);
+  const workspace = path.join(await realpath(path.dirname(project.workspacePath)), path.basename(project.workspacePath));
+  const files = await archiveFiles(workspace);
   const { graph, copies } = await packStoryGraph(
-    project,
+    { ...project, workspacePath: workspace },
     files,
     options.library,
   );
@@ -179,13 +185,14 @@ export async function exportProjectArchive(
       source:
         graph !== undefined && file === GRAPH_FILE
           ? Buffer.from(graph, "utf8")
-          : path.join(project.workspacePath, ...file.split("/")),
+          : path.join(workspace, ...file.split("/")),
     });
   }
   for (const copy of copies) {
+    if (isPrivateProjectPath(copy.path)) throw new ProjectArchiveError("Credential-named Library files cannot be exported", 409);
     entries.push({
       path: workspaceEntry(copy.path),
-      source: copy.absolutePath,
+      source: path.join(await realpath(path.dirname(copy.absolutePath)), path.basename(copy.absolutePath)),
     });
   }
   const limits = options.limits ?? DEFAULT_LIMITS;
@@ -221,12 +228,13 @@ export async function exportProjectArchive(
             file.path,
             { ...entry, size: file.size },
             (done) => {
-              const input = createReadStream(source);
-              input.once("error", (error: Error) => output.destroy(error));
-              const cancel = () => input.destroy();
-              output.once("close", cancel);
-              input.once("close", () => output.off("close", cancel));
-              done(null, input);
+              void archiveReadStream(source, file.identity!).then((input) => {
+                input.once("error", (error: Error) => output.destroy(error));
+                const cancel = () => input.destroy();
+                output.once("close", cancel);
+                input.once("close", () => output.off("close", cancel));
+                done(null, input);
+              }, (cause: Error) => done(cause, Readable.from([])));
             },
           );
       }
@@ -259,9 +267,9 @@ async function packStoryGraph(
   if (!files.includes(GRAPH_FILE)) return { copies: [] };
   let graph: unknown;
   try {
-    graph = JSON.parse(
-      await readFile(path.join(project.workspacePath, GRAPH_FILE), "utf8"),
-    );
+    const handle = await openArchiveFile(path.join(project.workspacePath, GRAPH_FILE));
+    try { graph = JSON.parse(await handle.readFile("utf8")); }
+    finally { await handle.close(); }
   } catch (cause) {
     // A damaged graph travels as it is, for the agent to repair after import.
     if (cause instanceof SyntaxError) return { copies: [] };
@@ -300,9 +308,13 @@ async function prepareArchiveFiles(
     const batch = await Promise.all(
       files.slice(index, index + SIZE_CHECK_CONCURRENCY).map(async (file) => {
         if (Buffer.isBuffer(file.source))
-          return { ...file, size: file.source.length };
-        const stats = await stat(file.source);
-        return { ...file, size: stats.size, mode: stats.mode };
+          {
+            assertNoExportCredential(file.source.toString("utf8"));
+            return { ...file, size: file.source.length };
+          }
+        const stats = await lstat(file.source);
+        if (!stats.isFile() || stats.nlink !== 1) throw new ProjectArchiveError("Linked or non-ordinary files cannot be exported", 409);
+        return { ...file, size: stats.size, mode: stats.mode, identity: { dev: stats.dev, ino: stats.ino } };
       }),
     );
     for (const file of batch) {
@@ -312,6 +324,10 @@ async function prepareArchiveFiles(
     if (bytes > limits.maxBytes) throw exportTooLarge();
   }
   return prepared;
+}
+
+function assertNoExportCredential(text: string): void {
+  if (containsKnownSensitiveValue(text)) throw new ProjectArchiveError("A project file contains a known local credential. Remove it before exporting.", 409);
 }
 
 function exportTooLarge(): ProjectArchiveError {
@@ -329,16 +345,52 @@ async function archiveFiles(
   files: string[] = [],
 ): Promise<string[]> {
   const directory = path.join(root, ...relative.split("/").filter(Boolean));
+  const info = await lstat(directory);
+  if (info.isSymbolicLink() || !info.isDirectory()) throw new ProjectArchiveError("The project root and directories must not be symbolic links", 409);
   const entries = await readdir(directory, { withFileTypes: true });
   for (const entry of entries.sort((left, right) =>
     left.name.localeCompare(right.name),
   )) {
     const child = relative ? `${relative}/${entry.name}` : entry.name;
-    if (entry.isSymbolicLink() || excludedFromProjectArchive(child)) continue;
+    if (excludedFromProjectArchive(child)) continue;
+    if (entry.isSymbolicLink()) throw new ProjectArchiveError("Symbolic links cannot be exported", 409);
     if (entry.isDirectory()) await archiveFiles(root, child, files);
-    else if (entry.isFile()) files.push(child);
+    else if (entry.isFile()) {
+      const info = await lstat(path.join(root, ...child.split("/")));
+      if (!info.isFile() || info.nlink !== 1) throw new ProjectArchiveError("Linked or non-ordinary files cannot be exported", 409);
+      files.push(child);
+    }
   }
   return files;
+}
+
+async function archiveReadStream(file: string, identity: { dev: number; ino: number }): Promise<Readable> {
+  const handle = await openArchiveFile(file, identity);
+  const input = handle.createReadStream();
+  const checked = Readable.from((async function* () {
+    // Inspect the exact bytes entering the ZIP, including UTF-8 credentials split across chunks.
+    const overlap = (knownSensitiveValueOverlap() + 1) * 4;
+    let tail = Buffer.alloc(0);
+    for await (const chunk of input) {
+      const bytes = chunk as Buffer;
+      const span = tail.length ? Buffer.concat([tail, bytes]) : bytes;
+      assertNoExportCredential(span.toString("utf8"));
+      tail = Buffer.from(span.subarray(Math.max(0, span.length - overlap)));
+      yield bytes;
+    }
+  })(), { objectMode: false });
+  checked.once("close", () => input.destroy());
+  return checked;
+}
+
+async function openArchiveFile(file: string, identity?: { dev: number; ino: number }) {
+  const handle = await open(file, constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.nlink !== 1 || await realpath(file) !== file || identity && (identity.dev !== info.dev || identity.ino !== info.ino))
+      throw new ProjectArchiveError("Linked, changed or non-ordinary files cannot be exported", 409);
+    return handle;
+  } catch (cause) { await handle.close(); throw cause; }
 }
 
 /**

@@ -1,3 +1,4 @@
+import { registerSensitiveValue } from "../shared/sensitive-values.js";
 import { mkdir, readFile, rm, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Native3DProviderId } from "../shared/model3d-presets.js";
@@ -14,6 +15,7 @@ export class MediaProviderKeyStore {
     try {
       const value = JSON.parse(await readFile(this.#filePath, "utf8")) as { version?: unknown; apiKey?: unknown };
       this.#apiKey = value.version === 1 && typeof value.apiKey === "string" ? value.apiKey : undefined;
+      registerSensitiveValue(this.#apiKey);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
@@ -30,6 +32,7 @@ export class MediaProviderKeyStore {
   async update(apiKey: string): Promise<{ configured: boolean }> {
     const value = apiKey.trim();
     if (!value || !/^[\x21-\x7E]+$/.test(value)) throw new Error(`${this.providerName} API key is invalid`);
+    registerSensitiveValue(value);
     await mkdir(path.dirname(this.#filePath), { recursive: true });
     const temporary = `${this.#filePath}.tmp`;
     await writeFile(temporary, `${JSON.stringify({ version: 1, apiKey: value })}\n`, { encoding: "utf8", mode: 0o600 });

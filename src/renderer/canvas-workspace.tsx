@@ -3,7 +3,8 @@ import { useCanvasTables } from "./use-canvas-tables.js";
 import { Equal } from "typebox/value";
 import { CanvasTableConflictNotice, ExpandedCanvasTable, type CanvasTables } from "./canvas-table-node.js";
 import { canvasTablePath } from "../shared/canvas-table.js";
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { registerCanvasDraftReader, type CanvasDraftStatus } from "./canvas-draft-safety.js";
 import { createPortal } from "react-dom";
 import type { AssetCanvasNode, ProjectState, PromptContext } from "../shared/contracts.js";
 import { canvasBoardPath } from "../shared/canvas-workspace.js";
@@ -160,6 +161,13 @@ export function CanvasWorkspace({ project, headerActionsTarget = null, onLeaveRe
   const tableConflicts = [...tableStorage.sessions.values()].flatMap((session) => session.conflict ? [session.conflict] : []);
   const hasTableDraft = [...tableStorage.sessions.values()].some((session) => session.issue && !Equal(session.local, session.base.table));
   const status = docs.conflict || boardConflict || tableConflicts.length ? "conflict" : docs.error || tableStorage.error || boardStatus === "error" ? "error" : docs.saving || tableStorage.saving || boardStatus === "saving" ? "saving" : hasDocumentDraft || hasTableDraft ? "draft" : docs.loadError ? "sync-error" : boardStatus;
+  const draftState = useRef<CanvasDraftStatus>("unknown");
+  draftState.current = !workspace || ["loading", "load-error", "sync-error"].includes(status) ? "unknown" : status === "saved" && !busy ? "clear" : "pending";
+  useLayoutEffect(() => registerCanvasDraftReader(project.id, () => {
+    if (docsRef.current.hasDraft() || [...tablesRef.current.sessions.values()].some((session) => !Equal(session.local, session.base.table))) return "pending";
+    if ([...Object.values(docsRef.current.generations), ...Object.values(tablesRef.current.generations)].some((generation) => generation.proposal || generation.generating || generation.applying)) return "pending";
+    return draftState.current;
+  }), [project.id]);
   const saveStatus = status === "conflict" ? <button type="button" className="design-save-status design-sync-retry" aria-label={t("canvas.reviewConflicts")} onClick={() => setSaveAttempt((value) => value + 1)}>{t("canvas.reviewChanges")}</button> : status === "error" ? <button type="button" className="design-save-status design-sync-retry is-error" disabled={saveRetrying} aria-label={t("canvas.retrySaving")} onClick={() => {
     setSaveRetrying(true); setSaveAttempt((value) => value + 1);
     void flush().catch(() => {}).finally(() => setSaveRetrying(false));

@@ -1,10 +1,12 @@
 import { diagnosticsFileName } from "../shared/diagnostics.js";
+import { isPinnedNativeMediaUrl } from "../shared/native-media.js";
 import type { StoryLibraryMediaResult, StoryUpgradeResult, StoryUpgradeStatus } from "../shared/story-web.js";
 import { PROJECT_ARCHIVE_CONTENT_TYPE } from "../shared/project-archive.js";
 import type { CommunityGameStats, CommunityGamesQuery, CommunityProfile } from "../shared/publish-v1.js";
 import { runtimeConnection, subscribeRuntimeConnection } from "./runtime-connection.js";
 import { assertWorkspaceVersion, observeWorkspaceVersion, workspaceVersion, type WorkspaceRequestInit } from "./workspace-version.js";
 import type { DesktopRuntimeService } from "../shared/desktop-runtime.js";
+import type { DesktopStorageCleanup, StorageCleanupExecuteRequest, StorageCleanupPlanRequest } from "../shared/desktop-storage.js";
 import {
   RUNTIME_EVENT_TYPES,
   type AgentContextUsage,
@@ -25,9 +27,9 @@ import {
   type LibraryAssetSummary,
   type LibraryUploadMediaType,
   type MediaModelDefaults,
+  type ProjectModelSelectionPatch,
   type ImageModel,
   type ImageModelCatalog,
-  type ImageModelRef,
   type ModelAuthEvent,
   type ModelAuthMethod,
   type ModelProviderEndpointSettings,
@@ -87,13 +89,16 @@ import type { NodeRuntimeResponse, PlayableThumbnailSnapshot } from "../shared/p
 import type { NodeCodebaseDetail, NodeCodebaseUpdate } from "../shared/playable-codebase.js";
 import type { PlayableAddedNode, PlayablePresetSummary, PlayableProjectValidationResult as PlayableProjectValidation, PlayableThumbnailManifest } from "../shared/playable-editor.js";
 import type { InstallPluginRequest, PluginCatalog, PluginDetail, PluginInstallInspection, PluginSettings, PluginSkillContent } from "../shared/plugins.js";
-import type { UpdateWebSearchSettings, WebSearchSettings } from "../shared/web-search.js";
+import type { WebSearchSettings } from "../shared/web-search.js";
 import type { ExternalAgentClientId, ExternalAgentSettings, UpdateExternalAgentSettings } from "../shared/external-mcp.js";
 import type { DesktopClipboardFile } from "../shared/file-transfer.js";
 import type { WebGamePlayerBridge } from "../shared/web-game-player.js";
 import type { NetworkConnectionTest, NetworkSettings, NetworkSettingsState } from "../shared/network-settings.js";
-import { composerDrafts } from "./composer-drafts.js";
+import { assertProjectCanvasDraftsSaved, assertProjectDraftsSaved } from "./project-deletion.js";
 import type { OnboardingState, UpdateOnboardingRequest } from "../shared/onboarding.js";
+import type { ExecutionStorageOverview } from "../shared/execution-storage.js";
+import type { IsolatedSourceConfirmation } from "../shared/execution-storage.js";
+import type { VolumeMigrationConfirmation } from "../shared/volume-migration.js";
 import { t } from "./i18n.js";
 
 const API_BASE = "/api";
@@ -132,8 +137,12 @@ declare global {
     ohMyGameDesktop?: {
       platform: string;
       runtime: DesktopRuntime;
+      /** Only the main editor has the guarded native media request bridge. */
+      nativeMedia?: boolean;
       runtimeService?: DesktopRuntimeService;
+      storageCleanup?: DesktopStorageCleanup;
       openExternal: (url: string) => Promise<void>;
+      openCodexLogin?: (url: string) => Promise<void>;
       setAppearance: (appearance: "system" | "light" | "dark") => Promise<void>;
       restartApp?: () => Promise<void>;
       onPrepareClose?: (listener: () => Promise<void>) => () => void;
@@ -287,8 +296,39 @@ export async function importProject(file: File): Promise<ProjectState> {
 }
 
 export async function deleteProject(projectId: string): Promise<void> {
+  assertProjectDraftsSaved(projectId);
   await request(`/projects/${projectId}`, { method: "DELETE" });
-  composerDrafts.deleteProject(projectId);
+}
+
+export function getExecutionStorageOverview(signal?: AbortSignal): Promise<ExecutionStorageOverview> {
+  return request("/execution-storage", { cache: "no-store", signal });
+}
+
+export interface ProjectExecutionStorage {
+  supported: boolean;
+  projectId: string;
+  state: "absent" | "resident" | "archived" | "recovery-pending" | "busy" | "unavailable";
+  dirty: boolean;
+  recoverable: boolean;
+  recoveryValidation?: "metadata-only";
+  generation?: string;
+  reason?: string;
+  approvedReviewId?: string;
+}
+
+export async function getProjectExecutionStorage(projectId: string): Promise<ProjectExecutionStorage> {
+  return request(`/projects/${projectId}/execution-storage`, { cache: "no-store" });
+}
+
+export async function openProjectExecutionStorage(projectId: string): Promise<void> {
+  await request(`/projects/${projectId}/execution-storage/open`, { method: "POST", body: "{}" });
+}
+
+export async function recoverProjectExecutionStorage(projectId: string, generation: string): Promise<{ changed: string[]; recovery?: string }> {
+  assertProjectCanvasDraftsSaved(projectId);
+  return request(`/projects/${projectId}/execution-storage/recover`, {
+    method: "POST", body: JSON.stringify({ generation }), workspaceVersion: workspaceVersion(projectId),
+  });
 }
 
 /** Conversations list coding agents' models too; canvas text and other one-off generation use OhMyGame's own models only. */
@@ -316,10 +356,11 @@ export async function recheckCodexImages(): Promise<ProviderSummary> {
   return request("/settings/models/providers/codex-cli/images/recheck", { method: "POST" });
 }
 
-export async function answerApproval(projectId: string, conversationId: string, requestId: string, decision: ApprovalDecision): Promise<void> {
+export async function answerApproval(projectId: string, conversationId: string, requestId: string, decision: ApprovalDecision, sourceConfirmation?: IsolatedSourceConfirmation, volumeMigrationConfirmation?: VolumeMigrationConfirmation): Promise<void> {
+  if (decision !== "deny" && (sourceConfirmation || volumeMigrationConfirmation)) assertProjectCanvasDraftsSaved(projectId);
   await request(`/projects/${projectId}/conversations/${conversationId}/approvals/${encodeURIComponent(requestId)}`, {
     method: "POST",
-    body: JSON.stringify({ decision } satisfies AnswerApprovalRequest),
+    body: JSON.stringify({ decision, ...(sourceConfirmation ? { sourceConfirmation } : {}), ...(volumeMigrationConfirmation ? { volumeMigrationConfirmation } : {}) } satisfies AnswerApprovalRequest),
   });
 }
 
@@ -448,70 +489,12 @@ export async function updateOpenAIEndpointSettings(baseUrl: string): Promise<Mod
   });
 }
 
-export async function updateModel3DProviderApiKey(providerId: string, apiKey: string): Promise<{ configured: boolean }> {
-  const result = await request<{ configured: boolean }>(`/settings/models/providers/${encodeURIComponent(providerId)}`, { method: "PUT", body: JSON.stringify({ apiKey }) });
-  notifyAgentModelsChanged();
-  return result;
-}
-export async function updateSeedanceApiKey(providerId: string, apiKey: string): Promise<{ configured: boolean }> {
-  return request(`/settings/models/providers/${encodeURIComponent(providerId)}/seedance-key`, {
-    method: "PUT",
-    body: JSON.stringify({ apiKey }),
-  });
+export async function listLegacyMediaKeys(): Promise<Array<{ id: string; name: string }>> {
+  return request("/settings/models/legacy-media-keys");
 }
 
-export async function updateMinimaxApiKey(providerId: string, apiKey: string): Promise<{ configured: boolean }> {
-  return request(`/settings/models/providers/${encodeURIComponent(providerId)}/minimax-key`, {
-    method: "PUT",
-    body: JSON.stringify({ apiKey }),
-  });
-}
-
-export async function getVolcengineTtsSettings(): Promise<{ configured: boolean; defaultVoiceId?: string }> {
-  return request("/settings/models/providers/volcengine-tts");
-}
-
-export async function updateVolcengineTtsApiKey(apiKey: string): Promise<{ configured: boolean; defaultVoiceId?: string }> {
-  const result = await request<{ configured: boolean; defaultVoiceId?: string }>("/settings/models/providers/volcengine-tts", {
-    method: "PUT",
-    body: JSON.stringify({ apiKey }),
-  });
-  notifyAgentModelsChanged();
-  return result;
-}
-
-export async function updateVolcengineSeedAudioApiKey(apiKey: string): Promise<{ configured: boolean }> {
-  const result = await request<{ configured: boolean }>("/settings/models/providers/volcengine-seed-audio", {
-    method: "PUT",
-    body: JSON.stringify({ apiKey }),
-  });
-  notifyAgentModelsChanged();
-  return result;
-}
-
-export async function saveVolcengineTtsDefaultVoiceId(defaultVoiceId: string | null): Promise<{ configured: boolean; defaultVoiceId?: string }> {
-  return request<{ configured: boolean; defaultVoiceId?: string }>("/settings/models/providers/volcengine-tts", {
-    method: "PUT",
-    body: JSON.stringify(defaultVoiceId ? { defaultVoiceId } : { defaultVoiceId: null }),
-  });
-}
-
-export interface VolcengineTtsPreviewInput {
-  text: string;
-  voiceId?: string;
-  language?: string;
-  style?: string;
-  speed?: number;
-}
-
-export async function previewVolcengineTtsSpeech(input: VolcengineTtsPreviewInput): Promise<Blob> {
-  const response = await fetch(apiUrl("/settings/models/providers/volcengine-tts/preview"), {
-    method: "POST",
-    headers: { "content-type": "application/json", ...runtimeHeaders() },
-    body: JSON.stringify(input),
-  });
-  if (!response.ok) throw await responseError(response);
-  return response.blob();
+export async function clearLegacyMediaKey(providerId: string): Promise<void> {
+  await request(`/settings/models/legacy-media-keys/${encodeURIComponent(providerId)}`, { method: "DELETE" });
 }
 
 export async function startModelProviderLogin(providerId: string, method: ModelAuthMethod): Promise<string> {
@@ -565,6 +548,10 @@ export async function updateProjectMediaModelDefaults(projectId: string, default
   return request(`/projects/${encodeURIComponent(projectId)}/settings/generation-models`, { method: "PUT", body: JSON.stringify(defaults) });
 }
 
+export async function updateProjectModelSelections(projectId: string, patch: ProjectModelSelectionPatch): Promise<ProjectState> {
+  return request(`/projects/${encodeURIComponent(projectId)}/model-selections`, { method: "PATCH", body: JSON.stringify(patch) });
+}
+
 export async function listVideoModelCatalog(): Promise<MediaModelCatalog<VideoModel>> {
   return request("/video-models/catalog");
 }
@@ -592,8 +579,8 @@ export async function getWebSearchSettings(): Promise<WebSearchSettings> {
   return request("/settings/web-search");
 }
 
-export async function updateWebSearchSettings(input: UpdateWebSearchSettings): Promise<WebSearchSettings> {
-  return request("/settings/web-search", { method: "PUT", body: JSON.stringify(input) });
+export async function clearWebSearchCredentials(): Promise<WebSearchSettings> {
+  return request("/settings/web-search/credentials", { method: "DELETE" });
 }
 
 export async function getExternalAgentSettings(): Promise<ExternalAgentSettings> {
@@ -875,8 +862,12 @@ export async function setProjectCoverMode(projectId: string, mode: ProjectCoverM
   await request(`/projects/${projectId}/cover/state`, { method: "PUT", body: JSON.stringify({ mode }) });
 }
 
-export async function listWorkspaceFiles(projectId: string): Promise<WorkspaceFile[]> {
-  return request(`/projects/${projectId}/files`);
+export async function listWorkspaceFiles(projectId: string, assets = false): Promise<WorkspaceFile[]> {
+  return request(`/projects/${projectId}/files${assets ? "?assets=true" : ""}`);
+}
+
+export async function rebuildProjectModelPreview(projectId: string, assetId: string): Promise<void> {
+  await request(`/projects/${encodeURIComponent(projectId)}/model-assets/resolve`, { method: "POST", body: JSON.stringify({ assetId, rebuildPreview: true }) });
 }
 
 export async function getWorkspaceGitChanges(projectId: string): Promise<WorkspaceGitChanges> {
@@ -946,14 +937,69 @@ export async function createCanvasImportFolder(projectId: string, name: string):
   return request(`/projects/${encodeURIComponent(projectId)}/canvas/folders`, { method: "POST", body: JSON.stringify({ name }) });
 }
 
-export async function getLibraryAsset(assetId: string): Promise<Blob> {
-  const response = await fetch(apiUrl(`/library/assets/${encodeURIComponent(assetId)}/content`), { headers: runtimeHeaders() });
+export async function getLibraryAsset(assetId: string, preview = false, signal?: AbortSignal, sha256?: string): Promise<Blob> {
+  const response = await fetch(apiUrl(mediaContentBinding(`/library/assets/${encodeURIComponent(assetId)}/content${preview ? "?preview=true" : ""}`, sha256)), { headers: runtimeHeaders(), signal });
   if (!response.ok) throw await responseError(response);
   return response.blob();
 }
 
+/** The main process authorizes native requests; each range is pinned to the inspected bytes. */
+export async function getNativeMediaUrl(source: { libraryAssetId: string } | { projectId: string; filePath: string }, signal?: AbortSignal): Promise<string | undefined> {
+  if (window.ohMyGameDesktop?.nativeMedia !== true) return;
+  const selected = desktopRuntime();
+  if (!selected) return;
+  const runtime = { ...selected };
+  signal?.throwIfAborted();
+  const resource = "libraryAssetId" in source
+    ? `/library/assets/${encodeURIComponent(source.libraryAssetId)}/content?preview=true`
+    : `/projects/${encodeURIComponent(source.projectId)}/files/raw?${new URLSearchParams({ path: source.filePath })}`;
+  const url = new URL(resource, runtime.daemonUrl);
+  const response = await fetch(url.href, { method: "HEAD", headers: { authorization: `Bearer ${runtime.token}` }, signal });
+  if (!response.ok) throw await responseError(response);
+  const current = desktopRuntime();
+  if (!current || current.daemonUrl !== runtime.daemonUrl || current.token !== runtime.token) throw new Error(t("api.serviceUnavailableLong"));
+  signal?.throwIfAborted();
+  const type = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+  if (!type || !["video/mp4", "video/webm", "video/quicktime", "audio/wav", "audio/mpeg", "audio/ogg", "audio/mp4", "model/gltf-binary"].includes(type)) return;
+  const digest = /^"([a-f0-9]{64})"$/.exec(response.headers.get("etag") ?? "");
+  if (!digest) throw new Error(t("api.mediaBindingMissing"));
+  url.searchParams.set("sha256", digest[1]!);
+  if (!isPinnedNativeMediaUrl(url.href, { url: runtime.daemonUrl })) return;
+  return url.href;
+}
+
+function mediaContentBinding(resource: string, sha256?: string): string {
+  if (sha256 === undefined) return resource;
+  if (!/^[a-f0-9]{64}$/.test(sha256)) throw new Error("Invalid media content binding");
+  return `${resource}${resource.includes("?") ? "&" : "?"}sha256=${sha256}`;
+}
+
+export async function getCanvasModelPreview(projectId: string, assetId: string, signal?: AbortSignal): Promise<Blob> {
+  const response = await fetch(apiUrl(`/projects/${encodeURIComponent(projectId)}/canvas/assets/${encodeURIComponent(assetId)}/model-preview`), { headers: runtimeHeaders(), signal });
+  if (!response.ok) throw await responseError(response);
+  return response.blob();
+}
+export async function rebuildModelPreview(assetId: string, projectId?: string): Promise<void> {
+  await request(projectId ? `/projects/${encodeURIComponent(projectId)}/canvas/assets/${encodeURIComponent(assetId)}/model-preview` : `/library/assets/${encodeURIComponent(assetId)}/model-preview`, { method: "POST" });
+}
+
+export function storageCleanupAvailable(): boolean {
+  const cleanup = window.ohMyGameDesktop?.storageCleanup;
+  return !!cleanup && [cleanup.scan, cleanup.plan, cleanup.execute, cleanup.result].every((method) => typeof method === "function");
+}
+
+function storageCleanup(): DesktopStorageCleanup {
+  if (!storageCleanupAvailable()) throw new Error("unsupported");
+  return window.ohMyGameDesktop!.storageCleanup!;
+}
+
+export const scanStorageCleanup = () => storageCleanup().scan();
+export const planStorageCleanup = (request: StorageCleanupPlanRequest) => storageCleanup().plan(request);
+export const executeStorageCleanup = (request: StorageCleanupExecuteRequest) => storageCleanup().execute(request);
+export const getStorageCleanupResult = (planId: string) => storageCleanup().result(planId);
+
 /** Copies a Library asset into the project's `assets/imported/` folder; sending the same asset again returns the existing file. */
-export async function addLibraryAssetToProject(projectId: string, assetId: string): Promise<{ path: string; assetId: string }> {
+export async function addLibraryAssetToProject(projectId: string, assetId: string): Promise<{ path: string; assetId: string; modelRuntimePath?: string }> {
   return request(`/projects/${encodeURIComponent(projectId)}/library-assets/${encodeURIComponent(assetId)}`, { method: "POST" });
 }
 
@@ -971,8 +1017,8 @@ export interface LibraryAssetReference {
   type: ProjectState["type"];
 }
 
-export async function listLibraryAssetReferences(assetId: string): Promise<LibraryAssetReference[]> {
-  return request(`/library/assets/${encodeURIComponent(assetId)}/references`);
+export async function listLibraryAssetReferences(assetId: string, signal?: AbortSignal): Promise<LibraryAssetReference[]> {
+  return request(`/library/assets/${encodeURIComponent(assetId)}/references`, { signal, cache: "no-store" });
 }
 
 export async function forceDeleteLibraryAsset(assetId: string): Promise<void> {
@@ -992,9 +1038,10 @@ export async function getConversationImage(url: string, signal?: AbortSignal): P
   return response.blob();
 }
 
-export async function getWorkspaceAsset(projectId: string, filePath: string): Promise<Blob> {
-  const response = await fetch(apiUrl(`/projects/${projectId}/files/raw?path=${encodeURIComponent(filePath)}`), {
+export async function getWorkspaceAsset(projectId: string, filePath: string, signal?: AbortSignal, sha256?: string): Promise<Blob> {
+  const response = await fetch(apiUrl(mediaContentBinding(`/projects/${projectId}/files/raw?path=${encodeURIComponent(filePath)}`, sha256)), {
     headers: runtimeHeaders(),
+    signal,
   });
   if (!response.ok) throw await responseError(response);
   return response.blob();
@@ -1267,7 +1314,10 @@ export async function request<T>(path: string, init: WorkspaceRequestInit = {}):
 async function responseError(response: Response): Promise<ApiError> {
   const body = await response.json().catch(() => ({})) as { error?: string; message?: string; code?: string; conflicts?: unknown; blocked?: unknown };
   const conflicts = Array.isArray(body.conflicts) && body.conflicts.every((path) => typeof path === "string") ? body.conflicts as string[] : undefined;
-  return new ApiError(body.message ?? body.error ?? t("api.requestFailed", { status: response.status }), response.status, body.code, conflicts, body.blocked === true || undefined);
+  const message = body.code === "execution_retirement_unavailable"
+    ? t("api.executionRetirementUnavailable")
+    : body.message ?? body.error ?? t("api.requestFailed", { status: response.status });
+  return new ApiError(message, response.status, body.code, conflicts, body.blocked === true || undefined);
 }
 
 async function streamProjectEvents(
@@ -1459,7 +1509,7 @@ function projectRuntimeHeaders(projectId: string, version = workspaceVersion(pro
 
 function runtimeHeaders(): HeadersInit {
   const runtime = desktopRuntime();
-  return runtime ? { authorization: `Bearer ${runtime.token}` } : {};
+  return runtime ? { authorization: `Bearer ${runtime.token}` } : { "x-ohmygame-dev-client": "1" };
 }
 
 function modelRef(model: AgentModelRef): AgentModelRef {

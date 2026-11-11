@@ -26,6 +26,7 @@ import nvidia from "@lobehub/icons-static-svg/icons/nvidia-color.svg";
 import openAI from "@lobehub/icons-static-svg/icons/openai.svg";
 import openCode from "@lobehub/icons-static-svg/icons/opencode.svg";
 import openRouter from "@lobehub/icons-static-svg/icons/openrouter.svg";
+import qoder from "@lobehub/icons-static-svg/icons/qoder-color.svg";
 import qwen from "@lobehub/icons-static-svg/icons/qwen-color.svg";
 import together from "@lobehub/icons-static-svg/icons/together-color.svg";
 import vercel from "@lobehub/icons-static-svg/icons/vercel.svg";
@@ -82,6 +83,7 @@ export const PROVIDER_ICONS: Readonly<Partial<Record<string, ProviderIcon>>> = {
   "claude-code-cli": color(claudeCode),
   "codex-cli": color(codex),
   "opencode-cli": monochrome(openCode),
+  "qoder-cli": color(qoder),
   opencode: monochrome(openCode),
   "opencode-go": monochrome(openCode),
   openrouter: monochrome(openRouter),

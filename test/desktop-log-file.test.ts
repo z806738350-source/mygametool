@@ -6,6 +6,7 @@ import Fastify from "fastify";
 import { afterEach, describe, expect, it } from "vitest";
 import { RotatingLogFile } from "../src/desktop/log-file.js";
 import { createLogRedactor } from "../src/shared/log-redaction.js";
+import { registerSensitiveValue, redactKnownSensitiveValues } from "../src/shared/sensitive-values.js";
 import { daemonLoggerOptions } from "../src/daemon/request-log.js";
 import {
   recordConsole,
@@ -277,6 +278,29 @@ describe("rotating log file", () => {
 });
 
 describe("log redaction", () => {
+  it("redacts literal credentials registered after a redactor was created", () => {
+    const redact = createLogRedactor("/Users/log-canary-owner", "darwin");
+    const secret = 'literal-canary-privacy+/quote"slash\\value';
+    registerSensitiveValue(secret);
+    for (const form of [secret, JSON.stringify(secret).slice(1, -1), encodeURIComponent(secret)]) {
+      const result = redact(`Unlabelled provider failure: ${form}`);
+      expect(result).toContain("[redacted]");
+      expect(result).not.toContain(form);
+    }
+    registerSensitiveValue("retired-canary-privacy-key");
+    registerSensitiveValue("replacement-canary-privacy-key");
+    expect(redactKnownSensitiveValues("retired-canary-privacy-key replacement-canary-privacy-key"))
+      .toBe("[redacted] [redacted]");
+  });
+
+  it("redacts generic key fields without treating every ordinary word as a key", () => {
+    const redact = createLogRedactor();
+    for (const text of ['{"key":"field-canary-private"}', "key='field-canary-private'", "key=field-canary-private"]) {
+      expect(redact(text)).not.toContain("field-canary-private");
+      expect(redact(text)).toContain("[redacted]");
+    }
+    expect(redact("keyboard controls are available")).toBe("keyboard controls are available");
+  });
   it.each([
     "password='fixture with spaces and \\'quotes\\''",
     "password='fixture without a closing quote",

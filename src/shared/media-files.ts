@@ -15,6 +15,7 @@ export const MEDIA_FILE_TYPES = {
   ".mov": { mediaType: "video", contentType: "video/quicktime" },
   ".webm": { mediaType: "video", contentType: "video/webm" },
   ".glb": { mediaType: "model", contentType: "model/gltf-binary" },
+  ".fbx": { mediaType: "model", contentType: "application/vnd.autodesk.fbx" },
 } as const satisfies Record<
   string,
   { mediaType: "image" | "video" | "audio" | "model"; contentType: string }

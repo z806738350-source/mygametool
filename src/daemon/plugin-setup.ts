@@ -1,3 +1,4 @@
+import { assertLocalExecutionAllowed } from "./local-execution-policy.js";
 import { randomUUID } from "node:crypto";
 import {
   mkdir,
@@ -409,6 +410,7 @@ export class PluginSetupManager {
     return history;
   }
   async prompt(id: string, input: PluginSetupPrompt): Promise<void> {
+    assertLocalExecutionAllowed("Plugin Builder agent execution");
     const state = await this.#loadState(id);
     if (state.busy) throw new Error("The plugin assistant is already working");
     if (this.#closed) throw new Error("Plugin assistant is closed");

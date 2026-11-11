@@ -5,12 +5,16 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 const exportDiagnostics = vi.fn();
+const listAgentRuntimes = vi.fn();
+const getExternalAgentSettings = vi.fn();
 vi.doMock(path.resolve("src/renderer/auth.tsx"), () => ({
   useAuth: () => ({ state: { status: "signed-out" }, openSignIn: vi.fn() }),
 }));
 vi.doMock(path.resolve("src/renderer/api.ts"), async (importOriginal) => ({
   ...(await importOriginal<object>()),
   exportDiagnostics,
+  listAgentRuntimes,
+  getExternalAgentSettings,
 }));
 const { SettingsPage } = await import("../src/renderer/settings-page.js");
 
@@ -84,6 +88,16 @@ it("explains a failed export", async () => {
     "Could not export diagnostics: The service is not running",
   );
   expect(button.disabled).toBe(false);
+});
+
+it.each(["agents", "mcp-server"] as const)("keeps the retired %s page explicit without probing or offering enable controls", async (section) => {
+  await act(async () => root.render(<SettingsPage section={section} onBack={() => {}} onSectionChange={() => {}} />));
+  expect(container.textContent).toContain("External CLI agents and MCP connections are not integrated");
+  expect(container.textContent).toContain("Use the built-in Agent with KunpoAPI");
+  expect(container.querySelector('input[role="switch"]')).toBeNull();
+  expect(container.querySelector(".settings-provider-action")).toBeNull();
+  expect(listAgentRuntimes).not.toHaveBeenCalled();
+  expect(getExternalAgentSettings).not.toHaveBeenCalled();
 });
 
 it("opens the logs folder in the desktop app only", async () => {

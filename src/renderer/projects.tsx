@@ -8,7 +8,7 @@ import { hasTransferredFiles } from "./file-transfer.js";
 import { ProjectCard } from "./project-card.js";
 import { ProjectCreateDialog } from "./project-create-dialog.js";
 import { ProjectRenameDialog } from "./project-rename-dialog.js";
-import { projectDeletionConfirmation } from "./project-deletion.js";
+import { confirmProjectDeletion } from "./project-deletion.js";
 import { createdProjectView, type AppNavigationTarget, type ProjectListFilters, type ProjectSort } from "./routes.js";
 import { SidebarPageHeader, SidebarPageLayout } from "./sidebar-page.js";
 import { PROJECT_TYPES } from "./project-types.js";
@@ -109,9 +109,9 @@ export function ProjectsPage({ projectType = "all", query = "", sort = "updated"
     }
   }
 
-  function remove(project: ProjectState): void {
-    if (!window.confirm(projectDeletionConfirmation(project))) return;
-    void runAction(() => deleteProject(project.id));
+  async function remove(project: ProjectState): Promise<void> {
+    if (!confirmProjectDeletion(project)) return;
+    await runAction(() => deleteProject(project.id));
   }
 
   return (

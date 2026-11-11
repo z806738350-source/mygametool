@@ -154,10 +154,10 @@ export function useWebGamePlayer(projectId: string | undefined, previewBaseUrl: 
     return () => { disposed = true; };
   }, [projectId, previewBaseUrl, shown.open, previewRevision, bridge]);
 
-  async function run(action: () => Promise<void>): Promise<void> {
+  async function run(action: () => Promise<void>, suspendEditor = true): Promise<void> {
     if (!projectId || busy.current === projectId) return;
     busy.current = projectId;
-    setState((current) => ({ ...(current.projectId === projectId ? current : initial()), pending: true, error: undefined }));
+    setState((current) => ({ ...(current.projectId === projectId ? current : initial()), pending: suspendEditor, error: undefined }));
     try {
       await action();
       const revision = stateRevision.current;
@@ -178,7 +178,11 @@ export function useWebGamePlayer(projectId: string | undefined, previewBaseUrl: 
     suspended: shown.open || shown.pending || shown.checking,
     play: (request: WebGamePlayerRequest) => run(() => bridge.open(projectId!, request)),
     close: () => projectId ? bridge.close(projectId) : Promise.resolve(),
-    reload: () => run(() => bridge.refresh(projectId!, true)),
+    reload: (reloadEditor?: () => void) => run(async () => {
+      if (!reloadEditor) return bridge.refresh(projectId!, true);
+      await ensureProjectPreview(projectId!);
+      reloadEditor();
+    }, !reloadEditor),
   };
 }
 

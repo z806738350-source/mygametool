@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { LibraryAsset } from "../src/renderer/library-assets.js";
 import { LibraryAssetPicker } from "../src/renderer/node-workbench.js";
+import { t } from "../src/renderer/i18n.js";
 
 const project = { id: "forest", name: "Forest", type: "web-game" as const };
 const otherProject = { id: "desert", name: "Desert", type: "web-game" as const };
@@ -60,4 +61,40 @@ it("keeps the current project in the filter when it has no Library assets", asyn
   const projectSelect = document.querySelectorAll<HTMLSelectElement>(".library-filter-popover select")[1]!;
   expect(projectSelect.value).toBe(project.id);
   expect([...projectSelect.options].map((option) => option.value)).toEqual(["", "unassigned", otherProject.id, project.id]);
+});
+
+it("waits for a fresh Library list before offering cached assets", async () => {
+  let finish!: () => void;
+  const onReload = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
+  const onUpload = vi.fn();
+  const render = (assets: LibraryAsset[]) => <LibraryAssetPicker title="From Library" assets={assets} onReload={onReload} onUpload={onUpload} onClose={vi.fn()} onSelect={vi.fn()} />;
+  await act(async () => root.render(render([asset])));
+  expect(onReload).toHaveBeenCalledOnce();
+  expect(document.querySelector('[role="status"]')?.textContent).toContain(t("library.loading"));
+  expect(document.querySelectorAll(".story-video-picker-list > button")).toHaveLength(0);
+  const upload = document.querySelector<HTMLButtonElement>(".story-video-picker-upload")!;
+  expect(upload.disabled).toBe(true);
+  await act(async () => upload.click());
+  expect(onUpload).not.toHaveBeenCalled();
+  await act(async () => { root.render(render([otherAsset])); finish(); });
+  expect(onReload).toHaveBeenCalledOnce();
+  expect([...document.querySelectorAll<HTMLButtonElement>(".story-video-picker-list > button")].map(button => button.title)).toEqual(["villain.png"]);
+  expect(upload.disabled).toBe(false);
+  await act(async () => upload.click());
+  expect(onUpload).toHaveBeenCalledOnce();
+});
+
+it("reports refresh errors and retries without exposing the stale list", async () => {
+  const onReload = vi.fn().mockRejectedValueOnce(new Error("Synthetic Library refresh failed")).mockResolvedValue(undefined);
+  const render = (assets: LibraryAsset[]) => <LibraryAssetPicker title="From Library" assets={assets} onReload={onReload} onClose={vi.fn()} onSelect={vi.fn()} />;
+  await act(async () => root.render(render([asset])));
+  expect(document.querySelector('[role="alert"]')?.textContent).toContain("Synthetic Library refresh failed");
+  expect(document.querySelectorAll(".story-video-picker-list > button")).toHaveLength(0);
+  await act(async () => {
+    root.render(render([]));
+    document.querySelector<HTMLButtonElement>('[role="alert"] button')!.click();
+  });
+  expect(onReload).toHaveBeenCalledTimes(2);
+  expect(document.querySelector('[role="alert"]')).toBeNull();
+  expect(document.querySelector(".story-video-picker-list")?.textContent).toContain(t("nodeWorkbench.empty"));
 });

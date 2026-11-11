@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import path from "node:path";
-import { act, createElement } from "react";
+import { act, createElement, type ComponentProps } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -151,6 +151,162 @@ describe("preview settings drafts", () => {
         ),
     );
   }
+  async function renderPreview(
+    preview: ProjectState["preview"],
+    previewActions?: ComponentProps<
+      typeof ProjectSettingsDialog
+    >["previewActions"],
+    previewUrl?: string,
+  ) {
+    await act(async () =>
+      root.render(
+        <ProjectSettingsDialog
+          project={{ ...project, preview }}
+          previewActions={previewActions}
+          previewUrl={previewUrl}
+          onClose={() => {}}
+          onSaved={() => {}}
+        />,
+      ),
+    );
+  }
+
+  it.each(["ready", "starting", "waiting", "stopped", "error"] as const)(
+    "keeps the unique %s stop action after the browser shortcut and outside the collapsed preview actions",
+    async (status) => {
+      const previewActions = {
+        onRestart: vi.fn(),
+        onStop: vi.fn(),
+        onLogs: vi.fn(),
+      };
+      await renderPreview({ status }, previewActions, "http://127.0.0.1:43121");
+      const shortcuts = container.querySelector(
+        ".project-settings-preview-shortcuts",
+      )!;
+      expect(shortcuts).not.toBeNull();
+      const buttons = [
+        ...shortcuts.querySelectorAll<HTMLButtonElement>("button"),
+      ];
+      const stopLabel =
+        status === "starting" ? "Cancel startup" : "Stop preview";
+      expect(buttons.map((button) => button.textContent)).toEqual([
+        "Open preview in browser",
+        stopLabel,
+      ]);
+      const stop = buttons[1]!;
+      expect(
+        [...container.querySelectorAll("button")].filter(
+          (button) => button.textContent === stopLabel,
+        ),
+      ).toEqual([stop]);
+      const foldedActions = [...container.querySelectorAll("details")].find(
+        (details) =>
+          details.querySelector("summary")?.textContent === "Preview actions",
+      );
+      expect(foldedActions).toBeDefined();
+      expect(foldedActions!.open).toBe(false);
+      expect(stop.closest("details")).toBeNull();
+      expect(stop.disabled).toBe(!["ready", "starting"].includes(status));
+      await act(async () => stop.click());
+      expect(previewActions.onStop).toHaveBeenCalledTimes(
+        ["ready", "starting"].includes(status) ? 1 : 0,
+      );
+      expect(previewActions.onRestart).not.toHaveBeenCalled();
+      expect(previewActions.onLogs).not.toHaveBeenCalled();
+      expect(updateProjectRunSettings).not.toHaveBeenCalled();
+    },
+  );
+
+  it("can cancel startup from the shortcut row before a preview URL exists", async () => {
+    const previewActions = {
+      onRestart: vi.fn(),
+      onStop: vi.fn(),
+      onLogs: vi.fn(),
+    };
+    await renderPreview({ status: "starting" }, previewActions);
+    const shortcuts = container.querySelector(
+      ".project-settings-preview-shortcuts",
+    )!;
+    expect(shortcuts).not.toBeNull();
+    const buttons = [
+      ...shortcuts.querySelectorAll<HTMLButtonElement>("button"),
+    ];
+    expect(buttons.map((button) => button.textContent)).toEqual([
+      "Cancel startup",
+    ]);
+    expect(buttons[0]!.disabled).toBe(false);
+    expect(buttons[0]!.closest("details")).toBeNull();
+    await act(async () => buttons[0]!.click());
+    expect(previewActions.onStop).toHaveBeenCalledOnce();
+    expect(previewActions.onRestart).not.toHaveBeenCalled();
+    expect(updateProjectRunSettings).not.toHaveBeenCalled();
+  });
+
+  it("disables the browser and stop shortcuts while settings are saving", async () => {
+    const previewActions = {
+      onRestart: vi.fn(),
+      onStop: vi.fn(),
+      onLogs: vi.fn(),
+    };
+    await renderPreview(
+      { status: "ready" },
+      previewActions,
+      "http://127.0.0.1:43121",
+    );
+    let finish!: (saved: ProjectState) => void;
+    updateProjectRunSettings.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    try {
+      await save();
+      const buttons = [
+        ...container.querySelectorAll<HTMLButtonElement>(
+          ".project-settings-preview-shortcuts button",
+        ),
+      ];
+      expect(buttons).toHaveLength(2);
+      expect(buttons.every((button) => button.disabled)).toBe(true);
+      await act(async () => {
+        buttons.forEach((button) => button.click());
+      });
+      expect(open).not.toHaveBeenCalled();
+      expect(previewActions.onStop).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => finish(project));
+      open.mockRestore();
+    }
+  });
+
+  it("omits an empty shortcut row when there is neither a URL nor a stop callback", async () => {
+    await renderPreview(
+      { status: "stopped" },
+      { onRestart: vi.fn(), onLogs: vi.fn() },
+    );
+    expect(
+      container.querySelector(".project-settings-preview-shortcuts"),
+    ).toBeNull();
+    expect(container.textContent).not.toContain("Stop preview");
+    expect(container.textContent).not.toContain("Cancel startup");
+  });
+
+  it("keeps the browser-only shortcut when no preview action callbacks are supplied", async () => {
+    await renderPreview({ status: "ready", url: "http://127.0.0.1:43121" });
+    const shortcuts = container.querySelector(
+      ".project-settings-preview-shortcuts",
+    )!;
+    expect(shortcuts).not.toBeNull();
+    expect(
+      [...shortcuts.querySelectorAll("button")].map(
+        (button) => button.textContent,
+      ),
+    ).toEqual(["Open preview in browser"]);
+    expect(container.textContent).not.toContain("Stop preview");
+    expect(container.textContent).not.toContain("Preview actions");
+  });
 
   it.each(["static", "command"])(
     "ignores invalid script drafts for %s during inspection and save",

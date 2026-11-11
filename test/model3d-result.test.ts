@@ -2,6 +2,24 @@ import { describe, expect, it, vi } from "vitest";
 import { readModel3DResult } from "../src/daemon/model3d.js";
 
 describe("3D artifact downloads", () => {
+  it("cancels a stalled artifact even if the stream's cancellation never settles", async () => {
+    const controller = new AbortController();
+    const cancel = vi.fn(() => new Promise<void>(() => {}));
+    const body = new ReadableStream<Uint8Array>({ pull() {}, cancel }, { highWaterMark: 0 });
+    const pending = readModel3DResult(new Response(body), controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("bounds a stalled artifact independently of the full generation deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const pending = readModel3DResult(new Response(new ReadableStream<Uint8Array>({ pull() {}, cancel() { return new Promise<void>(() => {}); } })));
+      const assertion = expect(pending).rejects.toMatchObject({ statusCode: 504 });
+      await vi.advanceTimersByTimeAsync(120_001); await assertion;
+    } finally { vi.useRealTimers(); }
+  });
   it("assembles streamed chunks in order and releases the reader", async () => {
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {

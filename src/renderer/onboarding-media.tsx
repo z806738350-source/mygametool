@@ -3,11 +3,9 @@ import type {
   ProviderCapability,
   ProviderSummary,
 } from "../shared/contracts.js";
-import { HYPER3D_CONNECTION_ID } from "../shared/cloud-models.js";
 import { listProviders, MODELS_CHANGED_EVENT } from "./api.js";
-import { Check, LoaderCircle, Plus, Server, Settings } from "./icons.js";
+import { Check, LoaderCircle, Server, Settings } from "./icons.js";
 import { ProviderAuthView } from "./models-settings.js";
-import { CustomProviderForm } from "./custom-provider-dialog.js";
 import { PROVIDER_ICONS } from "./provider-icons.js";
 import { t } from "./i18n.js";
 import { useReadyRuntimeGeneration } from "./runtime-connection.js";
@@ -18,7 +16,6 @@ type MediaCapability = (typeof CAPABILITIES)[number];
 /** Optional setup reuses Settings' provider forms; it never changes the chat model. */
 export function OnboardingMedia({
   busy,
-  onSavingChange,
 }: {
   busy: boolean;
   onSavingChange: (saving: boolean) => void;
@@ -29,10 +26,9 @@ export function OnboardingMedia({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [detail, setDetail] = useState<ProviderSummary>();
-  const [adding, setAdding] = useState(false);
   const [refresh, setRefresh] = useState(0);
   useEffect(() => {
-    if (detail || adding) return;
+    if (detail) return;
     setLoading(true);
     let active = true;
     let revision = 0;
@@ -41,7 +37,7 @@ export function OnboardingMedia({
       void listProviders()
         .then((loaded) => {
           if (!active || current !== revision) return;
-          setProviders(loaded);
+          setProviders(loaded.filter((provider) => provider.id === "kunpo"));
           setError(undefined);
           setLoading(false);
         })
@@ -59,22 +55,11 @@ export function OnboardingMedia({
       window.removeEventListener(MODELS_CHANGED_EVENT, load);
       window.removeEventListener("focus", load);
     };
-  }, [detail, adding, refresh, generation]);
+  }, [detail, refresh, generation]);
 
   const back = () => {
     setDetail(undefined);
   };
-  if (adding)
-    return (
-      <div className="onboarding-media-detail onboarding-media-custom">
-        <h2>{t("onboarding.addProvider")}</h2>
-        <CustomProviderForm
-          onClose={() => setAdding(false)}
-          onSavingChange={onSavingChange}
-          onSaved={() => setAdding(false)}
-        />
-      </div>
-    );
   if (detail)
     return (
       <div className="onboarding-media-detail">
@@ -89,9 +74,7 @@ export function OnboardingMedia({
 
   const available = providers.filter(
     (provider) =>
-      provider.capabilities.includes(capability) &&
-      (provider.id !== HYPER3D_CONNECTION_ID ||
-        !providers.some((item) => item.id === "hyper3d")),
+      provider.capabilities.includes(capability),
   );
   const connected = (provider: ProviderSummary) =>
     mediaConnected(provider, capability);
@@ -165,16 +148,6 @@ export function OnboardingMedia({
             </button>
           ))}
         </div>
-        <button
-          className="onboarding-text-button onboarding-add-provider"
-          type="button"
-          aria-label={t("onboarding.addCustomProvider")}
-          title={t("onboarding.addCustomProvider")}
-          disabled={busy}
-          onClick={() => setAdding(true)}
-        >
-          <Plus size={16} aria-hidden="true" />
-        </button>
       </div>
       {loading ? (
         <p className="onboarding-status" role="status">

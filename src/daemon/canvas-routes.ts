@@ -5,15 +5,27 @@ import { isCanvasDocument } from "../shared/canvas-document-schema.js";
 import { isCanvasBoard, type CanvasBoard } from "../shared/canvas-workspace.js";
 import { CanvasError, CanvasStore } from "./canvas-workspace.js";
 import { ProjectAssetError, type ProjectManager } from "./projects.js";
-import type { AssetLibrary } from "./asset-library.js";
+import { AssetLibraryError, type AssetLibrary } from "./asset-library.js";
 import { ToolRunError, type ToolRunner } from "./tools.js";
 
 export function registerCanvasRoutes(app: FastifyInstance, options: {
   projects: ProjectManager; library: AssetLibrary; tools: ToolRunner;
 }): CanvasStore {
   const store = new CanvasStore(options.projects, options.library, options.tools);
-  const failure = (cause: unknown, reply: FastifyReply) => reply.code(cause instanceof CanvasError || cause instanceof ToolRunError ? cause.statusCode : 500).send({ error: cause instanceof Error ? cause.message : String(cause) });
+  const failure = (cause: unknown, reply: FastifyReply) => reply.code(cause instanceof CanvasError || cause instanceof ToolRunError || cause instanceof AssetLibraryError ? cause.statusCode : 500).send({ error: cause instanceof Error ? cause.message : String(cause) });
   const base = "/projects/:projectId/canvas";
+  app.get<{ Params: { projectId: string; assetId: string } }>(`${base}/assets/:assetId/model-preview`, async (request, reply) => {
+    try {
+      const result = await store.modelPreview(request.params.projectId, request.params.assetId);
+      return reply.type("model/gltf-binary").header("content-length", result.size).header("cache-control", "no-store").header("x-content-type-options", "nosniff").send(result.stream);
+    } catch (cause) { return failure(cause, reply); }
+  });
+  app.post<{ Params: { projectId: string; assetId: string } }>(`${base}/assets/:assetId/model-preview`, async (request, reply) => {
+    try {
+      const result = await store.modelPreview(request.params.projectId, request.params.assetId, true);
+      result.stream.destroy(); return { ready: true };
+    } catch (cause) { return failure(cause, reply); }
+  });
   const documentId = (query: unknown): string | undefined => {
     const value = (query as { documentId?: unknown })?.documentId;
     if (value === undefined) return undefined;
@@ -84,8 +96,18 @@ export function registerCanvasRoutes(app: FastifyInstance, options: {
   app.delete<{ Params: { projectId: string; boardId: string } }>(boardRoute, async (request, reply) => {
     try { return await store.changeBoards(request.params.projectId, { type: "delete", boardId: request.params.boardId }); } catch (cause) { return failure(cause, reply); }
   });
-  app.post<{ Params: { projectId: string; boardId: string; nodeId: string } }>(`${boardRoute}/nodes/:nodeId/generate`, async (request, reply) => {
-    try { return reply.code(202).send(await store.generateNode(request.params.projectId, request.params.boardId, request.params.nodeId)); } catch (cause) { return failure(cause, reply); }
+  app.post<{ Params: { projectId: string; boardId: string; nodeId: string }; Body: { confirmedJobId?: string; confirmedAudioJobId?: string } | undefined }>(`${boardRoute}/nodes/:nodeId/generate`, async (request, reply) => {
+    const body = request.body;
+    // Keep the earlier audio-only field for existing clients.
+    const confirmed = body?.confirmedJobId ?? body?.confirmedAudioJobId;
+    if (body !== undefined) {
+      if (!body || typeof body !== "object" || Array.isArray(body)) return reply.code(400).send({ error: "Invalid generation confirmation" });
+      const keys = Object.keys(body);
+      if (keys.length && (keys.length !== 1 || !["confirmedJobId", "confirmedAudioJobId"].includes(keys[0]!) || typeof confirmed !== "string" || !/^[a-zA-Z0-9_-]{1,120}$/.test(confirmed))) {
+        return reply.code(400).send({ error: "Invalid generation confirmation" });
+      }
+    }
+    try { return reply.code(202).send(await store.generateNode(request.params.projectId, request.params.boardId, request.params.nodeId, confirmed)); } catch (cause) { return failure(cause, reply); }
   });
   app.get<{ Params: { projectId: string } }>(base, async (request, reply) => {
     try { return await store.read(request.params.projectId, documentId(request.query)) ?? null; } catch (cause) { return failure(cause, reply); }

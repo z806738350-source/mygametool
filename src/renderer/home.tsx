@@ -8,7 +8,7 @@ import { AppSidebar } from "./app-sidebar.js";
 import { ProjectCard } from "./project-card.js";
 import { ProjectCreateDialog } from "./project-create-dialog.js";
 import { ProjectRenameDialog } from "./project-rename-dialog.js";
-import { projectDeletionConfirmation } from "./project-deletion.js";
+import { confirmProjectDeletion } from "./project-deletion.js";
 import { ProjectPromptCreator } from "./project-prompt-creator.js";
 import { GAME_PROJECT_TYPES } from "./project-types.js";
 import { createdProjectView, projectsHash, type AppNavigationTarget } from "./routes.js";
@@ -64,7 +64,7 @@ export function Home({ onNavigate, onCreate, onOpen, inert = false }: HomeProps)
   }
 
   async function remove(project: ProjectState) {
-    if (!window.confirm(projectDeletionConfirmation(project))) return;
+    if (!confirmProjectDeletion(project)) return;
     await runProjectAction(() => deleteProject(project.id));
   }
 
@@ -132,7 +132,7 @@ export function Home({ onNavigate, onCreate, onOpen, inert = false }: HomeProps)
                   actions={{ onRename: () => {
                     renameTrigger.current = document.querySelector<HTMLElement>('.project-card-menu[aria-expanded="true"]');
                     setRenameTarget(project);
-                  }, onDuplicate: () => void duplicate(project), onDelete: () => void remove(project) }}
+                  }, onDuplicate: () => void duplicate(project), onDelete: () => remove(project) }}
                 />
               ))}
             </div>

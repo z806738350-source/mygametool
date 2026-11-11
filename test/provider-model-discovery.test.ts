@@ -1,27 +1,32 @@
 import { describe, expect, it, vi } from "vitest";
 import { discoverProviderModels } from "../src/daemon/provider-model-discovery.js";
+import { MESHY_DISABLED_MESSAGE } from "../src/shared/disabled-media-providers.js";
 import { MODEL_3D_PRESETS } from "../src/shared/model3d-presets.js";
 
-const connection = { baseUrl: "https://gateway.example/v1/", api: "openai-completions", authentication: "api_key", apiKey: "test-discovery-key" };
+const connection = { baseUrl: "http://127.0.0.1:43219/v1/", api: "openai-completions", authentication: "api_key", apiKey: "test-discovery-key" };
 
 describe("provider model discovery", () => {
-  it.each(["meshy", "tripo", "hyper3d"] as const)("loads official %s presets without probing a LLM endpoint or claiming key access", async (preset) => {
+  it.each(["meshy", "tripo", "hyper3d"] as const)("retains %s preset metadata but refuses its retired remote endpoint without sending credentials", async (preset) => {
     const request = vi.fn<typeof fetch>();
-    const result = await discoverProviderModels({ ...connection, preset, baseUrl: { meshy: "https://api.meshy.ai/openapi/v1", tripo: "https://openapi.tripo3d.ai/v3", hyper3d: "https://api.hyper3d.com/api/v2" }[preset] }, request);
-    expect(result.source).toBe("presets");
-    expect(result.models).toHaveLength(MODEL_3D_PRESETS[preset].length);
-    expect(result.models.every((model) => model.usages?.["3d"]?.protocol === preset && !model.usages?.language)).toBe(true);
-    expect(result.models.find((model) => model.id === { meshy: "meshy-7.1", tripo: "v3.1-20260211", hyper3d: "Gen-2.5-Low" }[preset])?.usages?.["3d"]?.maxReferenceImages).toBe(preset === "hyper3d" ? 5 : 4);
-    expect(result.warnings?.[0]).toContain("does not check API-key access");
+    await expect(discoverProviderModels({ ...connection, preset, baseUrl: { meshy: "https://api.meshy.ai/openapi/v1", tripo: "https://openapi.tripo3d.ai/v3", hyper3d: "https://api.hyper3d.com/api/v2" }[preset] }, request)).rejects.toThrow(preset === "meshy" ? MESHY_DISABLED_MESSAGE : "reviewed Kunpo endpoint");
+    expect(MODEL_3D_PRESETS[preset].length).toBeGreaterThan(0);
+    expect(MODEL_3D_PRESETS[preset].every(({ settings }) => settings.protocol === preset)).toBe(true);
+    expect(MODEL_3D_PRESETS[preset].find((model) => model.id === { meshy: "meshy-7.1", tripo: "v3.1-20260211", hyper3d: "Gen-2.5-Low" }[preset])?.settings.maxReferenceImages).toBe(preset === "hyper3d" ? 5 : 4);
     expect(request).not.toHaveBeenCalled();
   });
 
-  it("discovers versions from compatible 3D relays and uses known templates for official IDs", async () => {
-    const request = vi.fn<typeof fetch>(async () => Response.json({ data: [{ id: "meshy-7.1" }, { id: "relay-future" }] }));
-    const result = await discoverProviderModels({ ...connection, preset: "meshy" }, request);
-    expect(request.mock.calls[0]?.[0].toString()).toBe("https://gateway.example/v1/models");
-    expect(result.models[0]?.usages?.["3d"]).toMatchObject({ operation: "multi-image-to-3d", maxReferenceImages: 4 });
-    expect(result.models[1]?.usages?.["3d"]?.protocol).toBe("meshy");
+  it.each([
+    { preset: "meshy" }, { providerId: "meshy" },
+    { baseUrl: "https://api.meshy.ai/openapi/v1" },
+  ])("rejects disabled Meshy discovery before any request (%j)", async (patch) => {
+    const request = vi.fn<typeof fetch>();
+    await expect(discoverProviderModels({ ...connection, ...patch }, request)).rejects.toThrow(MESHY_DISABLED_MESSAGE);
+    expect(request).not.toHaveBeenCalled();
+  });
+  it("omits identifiable Meshy models from a shared gateway while retaining other services", async () => {
+    const request = vi.fn<typeof fetch>(async () => Response.json({ data: [{ id: "meshy-7.1" }, { id: "tripo3d/tripo-v3.1" }, { id: "relay-future" }] }));
+    const result = await discoverProviderModels(connection, request);
+    expect(result.models.map(model => model.id)).toEqual(["tripo3d/tripo-v3.1", "relay-future"]);
   });
   it("reads an OpenAI-compatible list and uses reported limits and capabilities", async () => {
     const request = vi.fn<typeof fetch>(async () => Response.json({ data: [
@@ -30,7 +35,7 @@ describe("provider model discovery", () => {
       { id: "image-only", architecture: { output_modalities: ["image"] } },
     ] }));
     const result = await discoverProviderModels(connection, request);
-    expect(request.mock.calls[0]?.[0].toString()).toBe("https://gateway.example/v1/models");
+    expect(request.mock.calls[0]?.[0].toString()).toBe("http://127.0.0.1:43219/v1/models");
     expect(request.mock.calls[0]?.[1]).toMatchObject({ headers: { authorization: `Bearer ${connection.apiKey}` }, redirect: "error" });
     expect(result.models).toHaveLength(3);
     expect(result.models[1].usages).toEqual({});
@@ -64,7 +69,7 @@ describe("provider model discovery", () => {
       }] });
       if (path.endsWith("/videos/models")) return Response.json({ data: [{
         id: "shared-alias", supported_resolutions: ["720p"], supported_aspect_ratios: ["16:9"], supported_durations: [5, 10], supported_frame_images: ["first", "last"],
-      }, { id: "video-alias", description: "reference images", supported_resolutions: ["1080p"], supported_aspect_ratios: ["9:16"], supported_durations: [6] }] });
+      }, { id: "meshy-7.1" }, { id: "video-alias", description: "reference images", supported_resolutions: ["1080p"], supported_aspect_ratios: ["9:16"], supported_durations: [6] }] });
       return Response.json({ data: [{ id: "shared-alias", name: "Multimodal", architecture: { output_modalities: ["text"] } }, { id: "unknown-alias" }] });
     });
     const result = await discoverProviderModels({ ...connection, preset: "openrouter" }, request);
@@ -116,12 +121,12 @@ describe("provider model discovery", () => {
       .mockResolvedValueOnce(Response.json({ data: [{ id: "claude-b" }], has_more: false }));
     const result = await discoverProviderModels({ ...connection, api: "anthropic-messages" }, request);
     expect(request.mock.calls[0]?.[1]?.headers).toEqual({ accept: "application/json", "x-api-key": connection.apiKey, "anthropic-version": "2023-06-01" });
-    expect(request.mock.calls[1]?.[0].toString()).toBe("https://gateway.example/v1/models?limit=100&after_id=claude-a");
+    expect(request.mock.calls[1]?.[0].toString()).toBe("http://127.0.0.1:43219/v1/models?limit=100&after_id=claude-a");
     expect(result.models.map((model) => model.id)).toEqual(["claude-a", "claude-b"]);
     expect(result.models[0].name).toBe("Claude A");
   });
 
-  it("normalizes Google model IDs, follows page tokens and leaves embedding models unassigned", async () => {
+  it("normalizes a local Google-compatible list, follows page tokens and leaves embedding models unassigned", async () => {
     const request = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(Response.json({ models: [{ name: "models/gemini-a", displayName: "Gemini A", inputTokenLimit: 100_000, outputTokenLimit: 8_000, supportedGenerationMethods: ["generateContent"] }, { name: "models/embedding", supportedGenerationMethods: ["embedContent"] }], nextPageToken: "next" }))
       .mockResolvedValueOnce(Response.json({ models: [{ name: "models/gemini-b", supportedGenerationMethods: ["generateContent"] }] }));
@@ -135,7 +140,7 @@ describe("provider model discovery", () => {
 
   it("rejects invalid connections before fetching and returns usable failures without echoing remote secrets", async () => {
     const request = vi.fn<typeof fetch>();
-    for (const patch of [{ baseUrl: "file:///tmp/models" }, { baseUrl: "https://user:secret@example.com" }, { api: "unknown" }, { apiKey: "" }, { api: "google-vertex" }]) await expect(discoverProviderModels({ ...connection, ...patch }, request)).rejects.toThrow();
+    for (const patch of [{ baseUrl: "file:///tmp/models" }, { baseUrl: "https://user:secret@example.com" }, { baseUrl: "https://gateway.example/v1" }, { baseUrl: "https://api.openai.com/v1" }, { baseUrl: "https://llm.ziy.cc/unreviewed" }, { api: "unknown" }, { apiKey: "" }, { api: "google-vertex" }]) await expect(discoverProviderModels({ ...connection, ...patch }, request)).rejects.toThrow();
     expect(request).not.toHaveBeenCalled();
     request.mockResolvedValueOnce(new Response(connection.apiKey, { status: 401 }));
     await expect(discoverProviderModels(connection, request)).rejects.toThrow("HTTP 401");

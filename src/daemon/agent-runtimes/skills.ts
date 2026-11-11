@@ -7,6 +7,7 @@ const STAGED_SKILLS: Record<AgentRuntimeId, string> = {
   "claude-code-cli": path.join("claude-plugin", "skills"),
   "codex-cli": "codex-skills",
   "opencode-cli": "opencode-skills",
+  "qoder-cli": "qoder-skills",
 };
 
 /** Where a session's Skills are staged inside its private folder, the only app data its agent may read. */

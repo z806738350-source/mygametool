@@ -1,10 +1,11 @@
-import { SessionManager, type AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type AgentSessionEvent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
-import { AgentManager, compatibleRuntimeModel, conversationItems, lastAssistantError, loadPiSkills, skillInvocationPrompt, type CodingSession, type RuntimeModel } from "../src/daemon/agent.js";
+import { AgentManager, compatibleRuntimeModel, conversationItems, lastAssistantError, loadPiSkillCatalog, type CodingSession, type RuntimeModel } from "../src/daemon/agent.js";
 import * as gameDesignContext from "../src/daemon/game-design-context.js";
 import { promptContextBlock } from "../src/daemon/prompt-context.js";
 import type { StoredConversation } from "../src/daemon/conversations.js";
@@ -14,6 +15,904 @@ import { createProviderFailureDiagnostic } from "@earendil-works/pi-ai/utils/pro
 import { AGENT_ERROR_ENTRY } from "../src/daemon/agent-errors.js";
 import { CHECKPOINT_ENTRY, CHECKPOINT_UNDONE_ENTRY, TURN_END_ENTRY, turnRange } from "../src/daemon/checkpoint-extension.js";
 import { AssistantTextStreamNormalizer, normalizeAssistantText } from "../src/daemon/assistant-thinking.js";
+import { AUTO_CONTINUE_DELAYS, AUTO_CONTINUE_ENTRY, AUTO_CONTINUE_TOOL_ENTRY, AutoContinueTools, isRecoverableInterruption } from "../src/daemon/agent-auto-continue.js";
+import { getToolPreflightFailure, inheritToolPreflightFailure, toolPreflightError } from "../src/daemon/agent-tool-errors.js";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createIsolatedRepairPending, createIsolatedRepairProof, getIsolatedRepairPending, getIsolatedRepairResolutions, getRepairTargets, inheritIsolatedRepairPending, inheritIsolatedRepairProof, settleIsolatedRepair, getIsolatedOperationReceipts, isolatedInputBudgetError, reportIsolatedOperation, type IsolatedOperationReceipt, type IsolatedRepairProof } from "../src/daemon/isolated-tool-receipts.js";
+import { handoffSummary } from "../src/daemon/agent-runtimes/handoff.js";
+
+describe("continuation tool safety", () => {
+  const result = { content: [{ type: "text" as const, text: "Existing result" }], details: {} };
+  function tool(name: string, execute = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(result)): ToolDefinition {
+    return { name, label: name, description: "Offline test", parameters: Type.Object({}, { additionalProperties: true }), execute };
+  }
+  const run = (tool: ToolDefinition, id: string, input: object = {}, signal?: AbortSignal) => tool.execute(id, input, signal, undefined, {} as never);
+  it.each(["inspect", "capture"])("allows a failed read-only game %s without treating it as an unknown player action", async operation => {
+    const execute = vi.fn<ToolDefinition["execute"]>().mockRejectedValue(new Error("Observation unavailable"));
+    const guard = new AutoContinueTools([tool("game_use", execute)]); guard.reset();
+    await expect(run(guard.wrap()[0]!, "observe", { operation, sessionId: "session-1" })).rejects.toThrow("Observation unavailable");
+    await expect(guard.prepare(new AbortController().signal)).resolves.toBeUndefined();
+  });
+  it("does not settle uncertain player input by inspecting it or using obsolete observation names", async () => {
+    for (const operation of ["act", "snapshot", "screenshot"]) {
+      const execute = vi.fn<ToolDefinition["execute"]>().mockRejectedValueOnce(new Error("Unknown input outcome")).mockResolvedValue({ content: [{ type: "text", text: "Current state" }], details: {} });
+      const guard = new AutoContinueTools([tool("game_use", execute)]); guard.reset(); const game = guard.wrap()[0]!;
+      await expect(run(game, "uncertain", { operation })).rejects.toThrow("Unknown input outcome");
+      await run(game, "inspect", { operation: "inspect", sessionId: "session-1" });
+      await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("unconfirmed");
+    }
+  });
+  const isolated = { scope: "project_command" as const, namespace: "test" as const, projectId: "11111111-1111-4111-8111-111111111111", operationId: "a".repeat(32) };
+  const report = (phase: IsolatedOperationReceipt["phase"], extra: Partial<IsolatedOperationReceipt> = {}, cause?: unknown) => reportIsolatedOperation({ ...isolated, phase, ...extra }, cause);
+  async function budgetRejected(extra: Partial<IsolatedOperationReceipt> = {}): Promise<never> {
+    await report("input_preflight", extra);
+    const cause = isolatedInputBudgetError("Project command source exceeds its input budget");
+    await report("input_rejected", { ...extra, rejection: "input_budget" }, cause);
+    throw cause;
+  }
+  const repairProof: IsolatedRepairProof = { namespace: "test", projectId: isolated.projectId, generation: 1, rawSnapshotId: "b".repeat(64), preparedBatchId: "c".repeat(64), reviewId: "d".repeat(64), preparedSnapshotId: "e".repeat(64), hostTargetFingerprint: "f".repeat(64), publicationId: "22222222-2222-4222-8222-222222222222", recoveryOperationId: "c".repeat(32), originOperations: [], allOriginalsDurable: true, acknowledged: true, released: true };
+  const pendingToken = () => { const { acknowledged: _, ...pending } = repairProof; return createIsolatedRepairPending({ ...pending, publicationVerified: true }); };
+  it.each(["pi-live", "pi-reloaded", "native-live", "native-reloaded"])("settles only exact pending recovery evidence through fresh verify calls (%s)", async scenario => {
+    const manager = SessionManager.inMemory("/tmp/repair-pending-fixture"), user = manager.appendMessage({ role: "user", content: "Repair the existing outputs", timestamp: 1 });
+    let verifyFails = true;
+    const execute = vi.fn<ToolDefinition["execute"]>(async (_id, input) => {
+      const action = (input as { action: string }).action;
+      if (action === "adopt") throw inheritIsolatedRepairPending(new Error("Publication retained; ACK needs verification"), pendingToken());
+      if (action === "capacity" || action === "plan_capacity" || action === "plan_first_allocation" || action === "read_image") return result;
+      expect(getRepairTargets()).toEqual([expect.objectContaining({ taskId: user, userEntryId: user, callId: "adopt-original", mode: "recovery", operationId: repairProof.recoveryOperationId })]);
+      if (action === "inspect") return result;
+      if (verifyFails) { verifyFails = false; throw new Error("Read-only verification is temporarily unavailable"); }
+      const output = inheritIsolatedRepairProof({ ...result }, createIsolatedRepairProof(repairProof)); expect(await settleIsolatedRepair(output)).toBe(1); return output;
+    });
+    const mutation = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(result);
+    const tools = [tool("recover_isolated_changes", execute), tool("write", mutation), tool("read_project_file")];
+    let guard = new AutoContinueTools(tools, { sessionManager: manager }); guard.reset(user);
+    const invoke = async (id: string, name: string, input: object) => {
+      manager.appendMessage({ role: "assistant", ...(scenario.startsWith("native") ? { api: "ohmygame-native" } : {}), content: [{ type: "toolCall", id, name, arguments: input }], timestamp: 2 } as never);
+      let output: Awaited<ReturnType<ToolDefinition["execute"]>>, failed = false;
+      try { output = await run(guard.wrap().find(item => item.name === name)!, id, input); }
+      catch (error) { failed = true; output = inheritIsolatedRepairPending({ content: [{ type: "text", text: error instanceof Error ? error.message : "Failure" }], details: {}, isError: true } as never, error); }
+      manager.appendMessage({ role: "toolResult", toolName: name, toolCallId: id, content: output.content, isError: failed, timestamp: 3, ...(scenario.startsWith("native") ? { isolatedRepairPending: getIsolatedRepairPending(output), isolatedRepairResolutions: getIsolatedRepairResolutions(output) } : {}) } as never);
+      return { failed, output };
+    };
+    expect((await invoke("adopt-original", "recover_isolated_changes", { action: "adopt", reviewId: repairProof.reviewId })).failed).toBe(true);
+    if (scenario.endsWith("reloaded")) { guard = new AutoContinueTools(tools, { sessionManager: manager }); guard.reset(user); }
+    expect(guard.repairable).toBe(true); await guard.prepare(new AbortController().signal); expect(guard.recoverySummary).toContain("Verification-only");
+    expect(handoffSummary(manager.getBranch())).toContain(repairProof.recoveryOperationId);
+    expect(guard.recoverySummary).toContain("inspect/capacity/verify");
+    await run(guard.wrap()[0]!, "capacity-before-verify", { action: "capacity" });
+    await run(guard.wrap()[0]!, "capacity-before-verify", { action: "capacity" });
+    await run(guard.wrap()[0]!, "capacity-fresh", { action: "capacity" });
+    await run(guard.wrap()[0]!, "plan-observation", { action: "plan_capacity", profileId: "capacity-128-v1" });
+    await run(guard.wrap()[0]!, "first-allocation-observation", { action: "plan_first_allocation" });
+    await run(guard.wrap()[0]!, "retained-image-observation", { action: "read_image", reviewId: repairProof.reviewId, path: "public/retained.png", variant: "raw", sha256: "a".repeat(64) });
+    expect(guard.repairOnly).toBe(true);
+    expect(execute.mock.calls.filter(call => (call[1] as { action: string }).action === "capacity")).toHaveLength(2);
+    await expect(run(guard.wrap()[1]!, "blocked-write", { content: "blocked" })).rejects.toThrow("Only controlled reads");
+    await expect(run(guard.wrap()[0]!, "adopt-again", { action: "adopt", reviewId: repairProof.reviewId })).rejects.toThrow("Only controlled reads");
+    expect((await invoke("adopt-original", "recover_isolated_changes", { action: "adopt", reviewId: repairProof.reviewId })).failed).toBe(true);
+    expect((await invoke("verify-first", "recover_isolated_changes", { action: "verify", reviewId: repairProof.reviewId })).failed).toBe(true);
+    expect(guard.repairable).toBe(true);
+    expect((await invoke("verify-fresh", "recover_isolated_changes", { action: "verify", reviewId: repairProof.reviewId })).failed).toBe(false);
+    expect(guard.recoverySummary).toContain("effects_recovered"); expect(handoffSummary(manager.getBranch())).toContain('"state":"effects_recovered"');
+    await run(guard.wrap()[0]!, "capacity-after-verify", { action: "capacity" });
+    await expect(run(guard.wrap()[1]!, "before-read", { content: "blocked" })).rejects.toThrow("Read the current project files");
+    await run(guard.wrap()[2]!, "read-current", { path: "game.txt" }); expect((await invoke("corrected", "write", { content: "corrected" })).failed).toBe(false);
+    expect(mutation).toHaveBeenCalledOnce(); expect(execute.mock.calls.filter(call => (call[1] as { action: string }).action === "adopt")).toHaveLength(1);
+    const restored = new AutoContinueTools(tools, { sessionManager: manager }); restored.reset(user); await restored.prepare(new AbortController().signal); expect(restored.recoverySummary).toContain("effects_recovered");
+  });
+  it.each(["inspect", "capacity", "plan_capacity", "plan_first_allocation"])("keeps %s observations fresh by new ID and reuses only identical pending calls", async action => {
+    const observation = { action, ...(action === "plan_capacity" ? { profileId: "capacity-128-v1" } : {}) };
+    let finish!: (output: typeof result) => void;
+    const pending = new Promise<typeof result>(resolve => { finish = resolve; });
+    const execute = vi.fn<ToolDefinition["execute"]>().mockImplementationOnce(() => pending).mockResolvedValue(result);
+    const mutation = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(result);
+    const guard = new AutoContinueTools([tool("recover_isolated_changes", execute), tool("write", mutation)]), [observe, write] = guard.wrap();
+    const first = run(observe!, "observation", observation), same = run(observe!, "observation", observation);
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+    await expect(run(observe!, "observation", { ...observation, generation: "7" })).rejects.toThrow("different arguments");
+    await expect(run(write!, "observation", { path: "must-not-write" })).rejects.toThrow("different arguments");
+    expect(mutation).not.toHaveBeenCalled(); finish(result);
+    expect(await first).toBe(result); expect(await same).toBe(result);
+    await expect(run(observe!, "observation", observation)).resolves.toBe(result);
+    await run(observe!, "fresh-observation", observation); expect(execute).toHaveBeenCalledTimes(2);
+    const cancelled = new AbortController(); cancelled.abort();
+    await expect(run(observe!, "observation", observation, cancelled.signal)).rejects.toThrow();
+    expect(execute).toHaveBeenCalledTimes(2); expect(guard.recoverySummary).toBeUndefined();
+    await run(write!, "original-effect", { path: "original" });
+    await expect(run(observe!, "original-effect", observation)).rejects.toThrow("different arguments");
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+  it("permits capacity observations in repair-only mode without granting publication or command authority", async () => {
+    const manager = SessionManager.inMemory("/tmp/capacity-repair-fixture"), user = manager.appendMessage({ role: "user", content: "Repair retained work", timestamp: 1 });
+    const shell = vi.fn<ToolDefinition["execute"]>(async () => {
+      for (const phase of ["input_preflight", "prepare_submitting", "prepared", "run_submitting", "running", "captured", "retained", "released"] as const)
+        await report(phase, { mode: "shell", ...(["input_preflight", "prepare_submitting"].includes(phase) ? {} : { generation: 1 }), ...(["captured", "retained", "released"].includes(phase) ? { snapshotId: repairProof.rawSnapshotId } : {}) });
+      throw new Error("Original retained command failed");
+    });
+    let attack: "none" | "settle" | "command" = "none";
+    const capacity = vi.fn<ToolDefinition["execute"]>(async () => {
+      expect(getRepairTargets()).toEqual([expect.objectContaining({ callId: "source", operationId: isolated.operationId })]);
+      if (attack === "settle") await settleIsolatedRepair(inheritIsolatedRepairProof({ ...result }, createIsolatedRepairProof({ ...repairProof, originOperations: [{ operationId: isolated.operationId, mode: "shell", snapshotId: repairProof.rawSnapshotId }] })));
+      if (attack === "command") await report("input_preflight");
+      return result;
+    });
+    const mutation = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(result);
+    const guard = new AutoContinueTools([tool("isolated_shell", shell), tool("recover_isolated_changes", capacity), tool("write", mutation)], { sessionManager: manager }); guard.reset(user);
+    manager.appendMessage({ role: "assistant", api: "ohmygame-native", content: [{ type: "toolCall", id: "source", name: "isolated_shell", arguments: { command: "original" } }], timestamp: 2 } as never);
+    const failure = await run(guard.wrap()[0]!, "source", { command: "original" }).catch(cause => cause);
+    manager.appendMessage({ role: "toolResult", toolName: "isolated_shell", toolCallId: "source", content: [{ type: "text", text: "Original failed" }], isError: true, timestamp: 3, isolatedOperations: getIsolatedOperationReceipts(failure) } as never);
+    await guard.prepare(new AbortController().signal); expect(guard.repairOnly).toBe(true); expect(guard.recoverySummary).toContain("inspect/capacity/review");
+    await run(guard.wrap()[1]!, "capacity", { action: "capacity" });
+    await run(guard.wrap()[1]!, "first-allocation", { action: "plan_first_allocation" });
+    await run(guard.wrap()[1]!, "retained-image", { action: "read_image", reviewId: repairProof.reviewId, path: "public/retained.png", variant: "working", sha256: "a".repeat(64) });
+    expect(guard.recoverySummary).not.toContain("effects_recovered");
+    await expect(run(guard.wrap()[2]!, "write", { content: "blocked" })).rejects.toThrow("Only controlled reads");
+    await run(guard.wrap()[1]!, "plan-capacity", { action: "plan_capacity", profileId: "capacity-128-v1" });
+    attack = "settle";
+    await expect(run(guard.wrap()[1]!, "plan-cannot-settle", { action: "plan_capacity", profileId: "capacity-128-v1" })).rejects.toThrow("cannot settle");
+    await expect(run(guard.wrap()[1]!, "capacity-cannot-settle", { action: "capacity" })).rejects.toThrow("cannot settle");
+    await expect(run(guard.wrap()[1]!, "image-cannot-settle", { action: "read_image", reviewId: repairProof.reviewId, path: "public/retained.png", variant: "raw", sha256: "a".repeat(64) })).rejects.toThrow("cannot settle");
+    attack = "command";
+    await expect(run(guard.wrap()[1]!, "capacity-cannot-submit", { action: "capacity" })).rejects.toThrow();
+    await expect(run(guard.wrap()[1]!, "first-allocation-cannot-submit", { action: "plan_first_allocation" })).rejects.toThrow();
+    await expect(run(guard.wrap()[1]!, "image-cannot-submit", { action: "read_image", reviewId: repairProof.reviewId, path: "public/retained.png", variant: "raw", sha256: "a".repeat(64) })).rejects.toThrow();
+    expect(guard.repairOnly).toBe(true); expect(guard.recoverySummary).not.toContain("effects_recovered");
+    await expect(run(guard.wrap()[0]!, "source", { command: "original" })).rejects.toBe(failure);
+    expect(shell).toHaveBeenCalledOnce(); expect(mutation).not.toHaveBeenCalled();
+  });
+  it.each(["json-only", "old-unknown", "changed-arguments", "native-missing-marker", "wrong-tuple"])("does not clear a pending recovery barrier with %s", async variant => {
+    const manager = SessionManager.inMemory("/tmp/repair-pending-negative"), user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+    const tools = [tool("recover_isolated_changes", vi.fn(async (_id, input) => {
+      if ((input as { action: string }).action === "adopt") throw variant === "json-only" ? Object.assign(new Error("Pending"), { pendingVerification: { ...repairProof, publicationVerified: true } }) : inheritIsolatedRepairPending(new Error("Pending"), pendingToken());
+      const output = inheritIsolatedRepairProof({ ...result }, createIsolatedRepairProof({ ...repairProof, recoveryOperationId: "e".repeat(32) })); expect(await settleIsolatedRepair(output)).toBe(0); return output;
+    }))];
+    if (variant === "old-unknown") manager.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: user, userEntryId: user, callId: "original", tool: "recover_isolated_changes", state: "unknown" });
+    manager.appendMessage({ role: "assistant", api: "ohmygame-native", content: [{ type: "toolCall", id: "original", name: "recover_isolated_changes", arguments: { action: "adopt", reviewId: repairProof.reviewId } }], timestamp: 2 } as never);
+    let guard = new AutoContinueTools(tools, { sessionManager: manager }); guard.reset(user);
+    const failure = await run(guard.wrap()[0]!, "original", { action: "adopt", reviewId: repairProof.reviewId }).catch(error => error);
+    manager.appendMessage({ role: "toolResult", toolName: "recover_isolated_changes", toolCallId: "original", content: [{ type: "text", text: "Pending" }], isError: true, timestamp: 3, ...(variant === "native-missing-marker" ? {} : { isolatedRepairPending: getIsolatedRepairPending(failure) }) } as never);
+    if (variant === "changed-arguments") manager.appendMessage({ role: "assistant", api: "ohmygame-native", content: [{ type: "toolCall", id: "original", name: "recover_isolated_changes", arguments: { action: "adopt", reviewId: "e".repeat(64) } }], timestamp: 4 } as never);
+    guard = new AutoContinueTools(tools, { sessionManager: manager }); guard.reset(user);
+    if (variant === "wrong-tuple") { await guard.prepare(new AbortController().signal); await run(guard.wrap()[0]!, "verify", { action: "verify", reviewId: repairProof.reviewId }); expect(guard.repairable).toBe(true); expect(guard.recoverySummary).not.toContain("effects_recovered"); }
+    else { expect(guard.repairable).toBe(false); await expect(guard.prepare(new AbortController().signal)).rejects.toThrow(); }
+  });
+  it.each(["no-capture", "no-snapshot", "no-mode", "preview", "no-release", "second-unmapped-operation", "old-unknown"])("keeps %s outside automatic isolated repair admission", async variant => {
+    const manager = SessionManager.inMemory("/tmp/repair-source-negative"), user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+    const execute = vi.fn<ToolDefinition["execute"]>(async () => {
+      for (const phase of ["input_preflight", "prepare_submitting", "prepared", "run_submitting", "running", "captured", "retained", "released"] as const) {
+        if (variant === "no-capture" && phase === "captured" || variant === "no-release" && phase === "released") continue;
+        await report(phase, { ...(variant === "no-mode" ? {} : { mode: variant === "preview" ? "preview" : "shell" }), ...(["input_preflight", "prepare_submitting"].includes(phase) ? {} : { generation: 1 }), ...(variant === "no-snapshot" || !["captured", "retained", "released"].includes(phase) ? {} : { snapshotId: "b".repeat(64) }) });
+      }
+      if (variant === "second-unmapped-operation") await report("input_preflight", { operationId: "e".repeat(32), mode: "shell" });
+      throw new Error("Original result is unknown");
+    });
+    const source = tool("isolated_shell", execute), guard = new AutoContinueTools([source], { sessionManager: manager }); guard.reset(user);
+    await run(guard.wrap()[0]!, "source", { command: "original" }).catch(() => {});
+    if (variant !== "old-unknown") { expect(guard.repairable).toBe(false); await expect(guard.prepare(new AbortController().signal)).rejects.toThrow(); return; }
+    const stages = manager.getBranch().filter(entry => entry.type === "custom" && entry.customType === AUTO_CONTINUE_TOOL_ENTRY);
+    const receipt = (stages.at(-1) as { data: { isolatedOperations: IsolatedOperationReceipt[] } }).data.isolatedOperations;
+    const old = SessionManager.inMemory("/tmp/repair-legacy-unknown"), oldUser = old.appendMessage({ role: "user", content: "Legacy task", timestamp: 1 });
+    old.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "source", name: "isolated_shell", arguments: { command: "original" } }], timestamp: 2 } as never);
+    old.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: oldUser, callId: "source", tool: "isolated_shell", state: "unknown" });
+    old.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: oldUser, userEntryId: oldUser, callId: "source", tool: "isolated_shell", state: "unknown", isolatedOperations: receipt });
+    old.appendMessage({ role: "toolResult", toolCallId: "source", toolName: "isolated_shell", content: [{ type: "text", text: "Unknown" }], isError: true, timestamp: 3 } as never);
+    const restored = new AutoContinueTools([source], { sessionManager: old }); restored.reset(oldUser); expect(restored.repairable).toBe(false); await expect(restored.prepare(new AbortController().signal)).rejects.toThrow();
+  });
+  it.each([false, true])("refreshes only local build/open caches after trusted publication and controlled reread (reload=%s)", async reload => {
+    const manager = SessionManager.inMemory("/tmp/repair-publication-cache"), user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+    const build = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(result), game = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(result), paid = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(result);
+    const shell = vi.fn<ToolDefinition["execute"]>(async () => { for (const phase of ["input_preflight", "prepare_submitting", "prepared", "run_submitting", "running", "captured", "retained", "released"] as const)
+      await report(phase, { mode: "shell", ...(["input_preflight", "prepare_submitting"].includes(phase) ? {} : { generation: 1 }), ...(["captured", "retained", "released"].includes(phase) ? { snapshotId: repairProof.rawSnapshotId } : {}) }); throw new Error("Original retained command failed"); });
+    const recovery = vi.fn<ToolDefinition["execute"]>(async () => { const output = inheritIsolatedRepairProof({ ...result }, createIsolatedRepairProof({ ...repairProof, originOperations: [{ operationId: isolated.operationId, mode: "shell", snapshotId: repairProof.rawSnapshotId }] })); expect(await settleIsolatedRepair(output)).toBe(1); return output; });
+    const tools = [tool("build_game", build), tool("game_use", game), tool("generate_image", paid), tool("isolated_shell", shell), tool("recover_isolated_changes", recovery), tool("read_project_file")];
+    let guard = new AutoContinueTools(tools, { sessionManager: manager }); guard.reset(user);
+    const invoke = async (name: string, id: string, input: object) => {
+      manager.appendMessage({ role: "assistant", api: "ohmygame-native", content: [{ type: "toolCall", id, name, arguments: input }], timestamp: 2 } as never);
+      let output: Awaited<ReturnType<ToolDefinition["execute"]>>, isError = false;
+      try { output = await run(guard.wrap().find(item => item.name === name)!, id, input); } catch (cause) { isError = true; output = { content: [{ type: "text", text: String(cause) }], details: {} }; }
+      manager.appendMessage({ role: "toolResult", toolCallId: id, toolName: name, content: output.content, isError, timestamp: 3, isolatedOperations: getIsolatedOperationReceipts(output), isolatedRepairResolutions: getIsolatedRepairResolutions(output) } as never);
+    };
+    for (const [name, id, input] of [["build_game", "build-old", {}], ["game_use", "open-old", { operation: "open" }], ["game_use", "click-old", { operation: "click", x: 1 }], ["generate_image", "paid-old", { prompt: "Original" }]] as const) await invoke(name, id, input);
+    // The canonical failure must preserve the same private-origin receipt as a real bridge.
+    manager.appendMessage({ role: "assistant", api: "ohmygame-native", content: [{ type: "toolCall", id: "source", name: "isolated_shell", arguments: { command: "original" } }], timestamp: 2 } as never);
+    const failure = await run(guard.wrap()[3]!, "source", { command: "original" }).catch(cause => cause);
+    manager.appendMessage({ role: "toolResult", toolCallId: "source", toolName: "isolated_shell", content: [{ type: "text", text: "Original retained command failed" }], isError: true, timestamp: 3, isolatedOperations: getIsolatedOperationReceipts(failure) } as never);
+    await guard.prepare(new AbortController().signal); await invoke("recover_isolated_changes", "adopt", { action: "adopt", reviewId: repairProof.reviewId });
+    if (reload) { guard = new AutoContinueTools(tools, { sessionManager: manager }); guard.reset(user); await guard.prepare(new AbortController().signal); }
+    await expect(run(guard.wrap()[0]!, "build-new", {})).rejects.toThrow("Read the current project files");
+    await run(guard.wrap()[5]!, "read", { path: "game.txt" });
+    for (const [name, id, input] of [["build_game", "build-old", {}], ["game_use", "open-old", { operation: "open" }], ["game_use", "click-old", { operation: "click", x: 1 }], ["generate_image", "paid-old", { prompt: "Original" }], ["build_game", "build-new", {}], ["game_use", "open-new", { operation: "open" }], ["game_use", "click-new", { operation: "click", x: 1 }], ["generate_image", "paid-new", { prompt: "Original" }], ["build_game", "build-again", {}], ["game_use", "open-again", { operation: "open" }]] as const) await invoke(name, id, input);
+    expect(build).toHaveBeenCalledTimes(2); expect(game).toHaveBeenCalledTimes(3); expect(paid).toHaveBeenCalledOnce(); expect(shell).toHaveBeenCalledOnce();
+    await expect(run(guard.wrap()[3]!, "source-new-id", { command: "original" })).rejects.toThrow("Do not replay");
+  });
+  it("does not treat a prepublication read finishing after settlement as a fresh project read", async () => {
+    const manager = SessionManager.inMemory("/tmp/repair-read-race"), user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+    let finishRead!: (value: typeof result) => void; const oldRead = new Promise<typeof result>(resolve => { finishRead = resolve; });
+    const reader = vi.fn<ToolDefinition["execute"]>().mockImplementationOnce(() => oldRead).mockResolvedValue(result), mutation = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(result);
+    const recover = vi.fn<ToolDefinition["execute"]>(async (_id, input) => {
+      if ((input as { action: string }).action === "adopt") throw inheritIsolatedRepairPending(new Error("Pending"), pendingToken());
+      const output = inheritIsolatedRepairProof({ ...result }, createIsolatedRepairProof(repairProof)); expect(await settleIsolatedRepair(output)).toBe(1); return output;
+    });
+    const guard = new AutoContinueTools([tool("recover_isolated_changes", recover), tool("read_project_file", reader), tool("write", mutation)], { sessionManager: manager }); guard.reset(user);
+    const [repair, read, write] = guard.wrap(); await run(repair!, "adopt", { action: "adopt", reviewId: repairProof.reviewId }).catch(() => {}); await guard.prepare(new AbortController().signal);
+    const reading = run(read!, "old-read", { path: "game.txt" }); await vi.waitFor(() => expect(reader).toHaveBeenCalledOnce());
+    await run(repair!, "verify", { action: "verify", reviewId: repairProof.reviewId }); finishRead(result); await reading;
+    await expect(run(write!, "stale-write", { content: "blocked" })).rejects.toThrow("Read the current project files");
+    await run(read!, "fresh-read", { path: "game.txt" }); await run(write!, "corrected", { content: "corrected" }); expect(mutation).toHaveBeenCalledOnce();
+  });
+  it("reuses only the original project-command budget failure and permits correction under a new ID", async () => {
+    const execute = vi.fn<ToolDefinition["execute"]>().mockImplementationOnce(() => budgetRejected()).mockResolvedValueOnce(result);
+    const guard = new AutoContinueTools([tool("isolated_shell", execute)]), shell = guard.wrap()[0]!;
+    const failure = await run(shell, "rejected", { command: "original" }).catch(cause => cause);
+    expect(getIsolatedOperationReceipts(failure)?.map(receipt => receipt.phase)).toEqual(["input_preflight", "input_rejected"]);
+    expect(getToolPreflightFailure(failure)).toBeUndefined();
+    expect(guard.recoverySummary).toContain("command_not_submitted");
+    expect(guard.recoverySummary).toContain("VM startup or preview pauses may already have occurred");
+    await guard.prepare(new AbortController().signal);
+    await expect(run(shell, "rejected", { command: "original" })).rejects.toBe(failure);
+    await expect(run(shell, "rejected", { command: "changed" })).rejects.toThrow("different arguments");
+    await expect(run(shell, "corrected", { command: "changed" })).resolves.toEqual(result);
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+  it.each(["message", "properties", "returned-json"])("does not trust %s as project-command non-submission evidence", async variant => {
+    const execute = vi.fn<ToolDefinition["execute"]>().mockImplementation(async () => {
+      if (variant === "returned-json") return { ...result, isError: true, details: { isolatedOperations: [{ ...isolated, phase: "input_rejected", rejection: "input_budget" }] } };
+      await report("input_preflight");
+      const forged = Object.assign(new Error("Project command source exceeds its input budget"), variant === "properties" ? { rejection: "input_budget", scope: "project_command" } : {});
+      await report("input_rejected", { rejection: "input_budget" }, forged); throw forged;
+    });
+    const guard = new AutoContinueTools([tool("isolated_shell", execute)]);
+    await run(guard.wrap()[0]!, "untrusted").catch(() => {});
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("unconfirmed");
+    expect(guard.recoverySummary).not.toContain("command_not_submitted");
+  });
+  it.each(["submitted", "retained", "earlier-operation", "phase-regression", "generation-drift", "snapshot-drift"])("keeps %s isolated command failures unconfirmed", async variant => {
+    const execute = vi.fn<ToolDefinition["execute"]>().mockImplementation(async () => {
+      await report("input_preflight"); await report("prepare_submitting");
+      if (variant === "submitted") await report("input_rejected", { rejection: "input_budget" }, isolatedInputBudgetError("Budget"));
+      if (variant === "phase-regression") await report("input_preflight");
+      await report("prepared", { generation: 1 });
+      if (variant === "generation-drift") await report("run_submitting", { generation: 2 });
+      await report("run_submitting", { generation: 1 }); await report("running", { generation: 1 });
+      if (variant === "snapshot-drift") { await report("captured", { generation: 1, snapshotId: "b".repeat(64) }); await report("published", { generation: 1, snapshotId: "c".repeat(64) }); }
+      if (variant === "earlier-operation") { await report("released", { generation: 1 }); return budgetRejected({ operationId: "b".repeat(32) }); }
+      await report("retained", { generation: 1 }); throw new Error("The original command has retained changes");
+    });
+    const guard = new AutoContinueTools([tool("isolated_shell", execute)]);
+    await expect(run(guard.wrap()[0]!, "original")).rejects.toThrow();
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("unconfirmed");
+    expect(guard.recoverySummary).not.toContain("command_not_submitted"); expect(execute).toHaveBeenCalledOnce();
+  });
+  it("persists each submission barrier before the backend may submit a project command", async () => {
+    const manager = SessionManager.inMemory("/tmp/isolated-receipt-barrier"), user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+    const append = manager.appendCustomEntry.bind(manager), submit = vi.fn();
+    vi.spyOn(manager, "appendCustomEntry").mockImplementation((name, data) => {
+      if ((data as { isolatedOperations?: IsolatedOperationReceipt[] }).isolatedOperations?.at(-1)?.phase === "prepare_submitting") throw new Error("Journal unavailable");
+      return append(name, data);
+    });
+    const execute = vi.fn<ToolDefinition["execute"]>().mockImplementation(async () => { await report("input_preflight"); await report("prepare_submitting"); submit(); return result; });
+    const guard = new AutoContinueTools([tool("isolated_shell", execute)], { sessionManager: manager }); guard.reset(user);
+    await expect(run(guard.wrap()[0]!, "original")).rejects.toThrow("could not be safely recorded");
+    expect(submit).not.toHaveBeenCalled(); expect(guard.stopRequested).toBe(true);
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("could not be safely recorded");
+  });
+  it("cannot launder a failed receipt write by rethrowing a private budget error", async () => {
+    const manager = SessionManager.inMemory("/tmp/isolated-receipt-laundering"), user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+    const append = manager.appendCustomEntry.bind(manager); let failed = false;
+    vi.spyOn(manager, "appendCustomEntry").mockImplementation((name, data) => {
+      if (!failed && (data as { isolatedOperations?: IsolatedOperationReceipt[] }).isolatedOperations?.at(-1)?.phase === "input_rejected") { failed = true; throw new Error("Journal unavailable"); }
+      return append(name, data);
+    });
+    const execute = vi.fn<ToolDefinition["execute"]>().mockImplementation(async () => {
+      await report("input_preflight"); const original = isolatedInputBudgetError("Budget rejected");
+      await report("input_rejected", { rejection: "input_budget" }, original).catch(() => {}); throw original;
+    });
+    const guard = new AutoContinueTools([tool("isolated_shell", execute)], { sessionManager: manager }); guard.reset(user);
+    await expect(run(guard.wrap()[0]!, "rejected")).rejects.toThrow("could not be safely recorded");
+    expect(guard.recoverySummary).not.toContain("command_not_submitted");
+    expect(manager.getBranch().at(-1)).toMatchObject({ type: "custom", data: { state: "unknown" } });
+  });
+  it("keeps concurrent isolated reporters bound to their own task and call", async () => {
+    const histories: unknown[][] = [[], []], release = deferred<void>();
+    const guards = histories.map((history, index) => {
+      const manager = SessionManager.inMemory(`/tmp/isolated-receipt-owner-${index}`), user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+      const execute = vi.fn<ToolDefinition["execute"]>().mockImplementation(async () => {
+        const binding = { projectId: index === 0 ? isolated.projectId : "22222222-2222-4222-8222-222222222222", operationId: String(index + 1).repeat(32) };
+        await report("input_preflight", binding); await release.promise; return budgetRejected({ ...binding, operationId: String(index + 3).repeat(32) });
+      });
+      const append = manager.appendCustomEntry.bind(manager);
+      vi.spyOn(manager, "appendCustomEntry").mockImplementation((name, data) => { history.push(data); return append(name, data); });
+      const guard = new AutoContinueTools([tool("isolated_shell", execute)], { sessionManager: manager }); guard.reset(user);
+      return { guard, execute, user };
+    });
+    const requests = guards.map(({ guard }) => run(guard.wrap()[0]!, "same-call").catch(cause => cause));
+    await vi.waitFor(() => guards.forEach(({ execute }) => expect(execute).toHaveBeenCalledOnce())); release.resolve(); await Promise.all(requests);
+    histories.forEach((history, index) => {
+      const last = history.at(-1) as { taskId: string; isolatedOperations: IsolatedOperationReceipt[] };
+      expect(last.taskId).toBe(guards[index]!.user);
+      expect(last.isolatedOperations.every(receipt => receipt.projectId === (index === 0 ? isolated.projectId : "22222222-2222-4222-8222-222222222222"))).toBe(true);
+    });
+  });
+  it("records late preview cleanup under its original task without interrupting a new task", async () => {
+    const manager = SessionManager.inMemory("/tmp/isolated-preview-late-cleanup"), user = manager.appendMessage({ role: "user", content: "Preview", timestamp: 1 });
+    let cleanup!: () => Promise<void>;
+    const preview = tool("start_preview", vi.fn(async () => {
+      await report("input_preflight"); await report("prepare_submitting"); await report("prepared", { generation: 1 }); await report("run_submitting", { generation: 1 }); await report("running", { generation: 1 });
+      cleanup = AsyncLocalStorage.bind(() => report("released", { generation: 1 })); return result;
+    }));
+    const write = tool("write"), guard = new AutoContinueTools([preview, write], { sessionManager: manager }); guard.reset(user);
+    const first = await run(guard.wrap()[0]!, "preview-ready");
+    const next = manager.appendMessage({ role: "user", content: "New task", timestamp: 2 }); guard.reset(next);
+    await cleanup();
+    expect(getIsolatedOperationReceipts(first)?.at(-1)?.phase).toBe("released");
+    expect(manager.getBranch().at(-1)).toMatchObject({ type: "custom", data: { taskId: user, callId: "preview-ready", state: "completed" } });
+    expect(guard.stopRequested).toBe(false);
+    await expect(run(guard.wrap()[1]!, "new-write")).resolves.toEqual(result); expect(write.execute).toHaveBeenCalledOnce();
+  });
+  it("retains detached receipt barriers for the original task and refuses submission on a new branch", async () => {
+    const manager = SessionManager.inMemory("/tmp/isolated-detached-receipt"), user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+    const gate = deferred<void>(), ready = deferred<void>(), submit = vi.fn(), detached = vi.fn(async () => true);
+    const execute = vi.fn<ToolDefinition["execute"]>().mockImplementation(async () => { await report("input_preflight"); ready.resolve(); await gate.promise; await report("prepare_submitting"); submit(); return result; });
+    const guard = new AutoContinueTools([tool("isolated_shell", execute)], { sessionManager: manager, onDetachedResult: detached }); guard.reset(user);
+    const request = expect(run(guard.wrap()[0]!, "original-call")).rejects.toThrow(); await ready.promise;
+    manager.branch(user); const leaf = manager.getLeafId(); gate.resolve(); await request;
+    expect(submit).not.toHaveBeenCalled(); expect(manager.getLeafId()).toBe(leaf);
+    expect(detached).toHaveBeenCalledWith(expect.objectContaining({ taskId: user, callId: "original-call", isolatedOperations: expect.arrayContaining([expect.objectContaining({ phase: "prepare_submitting" })]) }), undefined);
+  });
+  it("rehydrates project-command non-submission only from paired host history and the actual failed call", async () => {
+    const manager = SessionManager.inMemory("/tmp/isolated-command-reload"), user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+    manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "rejected", name: "isolated_shell", arguments: { command: "original" } }], timestamp: 2 } as never);
+    const execute = vi.fn<ToolDefinition["execute"]>().mockImplementationOnce(() => budgetRejected()).mockResolvedValueOnce(result), shell = tool("isolated_shell", execute);
+    const guard = new AutoContinueTools([shell], { sessionManager: manager }); guard.reset(user);
+    const failure = await run(guard.wrap()[0]!, "rejected", { command: "original" }).catch(cause => cause);
+    manager.appendMessage({ role: "toolResult", toolName: "isolated_shell", toolCallId: "rejected", content: [{ type: "text", text: failure.message }], isError: true, isolatedOperations: getIsolatedOperationReceipts(failure), timestamp: 3 } as never);
+    const restored = new AutoContinueTools([shell], { sessionManager: manager }); restored.reset(user);
+    await restored.prepare(new AbortController().signal);
+    const replayed = await run(restored.wrap()[0]!, "rejected", { command: "original" }).catch(cause => cause);
+    expect(getIsolatedOperationReceipts(replayed)).toEqual(getIsolatedOperationReceipts(failure));
+    await run(restored.wrap()[0]!, "corrected", { command: "changed" }); expect(execute).toHaveBeenCalledTimes(2);
+  });
+  it("pins a Pi-style random logical task to the actual user entry for reload and handoff", async () => {
+    const manager = SessionManager.inMemory("/tmp/isolated-pi-command-reload"), user = manager.appendMessage({ role: "user", content: "Pi task", timestamp: 1 });
+    const input = { command: "original", userEntryId: "model-forged-user", taskId: "model-forged-task" };
+    manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "pi-rejected", name: "isolated_shell", arguments: input }], timestamp: 2 } as never);
+    const execute = vi.fn<ToolDefinition["execute"]>().mockImplementationOnce(() => budgetRejected()).mockResolvedValueOnce(result), shell = tool("isolated_shell", execute);
+    const guard = new AutoContinueTools([shell], { sessionManager: manager }); guard.reset();
+    const failure = await run(guard.wrap()[0]!, "pi-rejected", input).catch(cause => cause);
+    const stage = manager.getBranch().findLast(entry => entry.type === "custom" && entry.customType === AUTO_CONTINUE_TOOL_ENTRY);
+    expect(stage).toMatchObject({ data: { userEntryId: user, callId: "pi-rejected", state: "command_not_submitted" } });
+    expect(stage?.type === "custom" && (stage.data as { taskId: string }).taskId).not.toMatch(new RegExp(`${user}|model-forged-task`));
+    // Pi's canonical failure is the original thrown Error; the host journal supplies the receipt proof.
+    manager.appendMessage({ role: "toolResult", toolName: "isolated_shell", toolCallId: "pi-rejected", content: [{ type: "text", text: failure.message }], isError: true, timestamp: 3 } as never);
+    expect(handoffSummary(manager.getBranch())).toContain('"state":"command_not_submitted"');
+    const restored = new AutoContinueTools([shell], { sessionManager: manager }); restored.reset(user);
+    await restored.prepare(new AbortController().signal);
+    await expect(run(restored.wrap()[0]!, "pi-rejected", input)).rejects.toThrow("input budget");
+    await run(restored.wrap()[0]!, "pi-corrected", { command: "changed" }); expect(execute).toHaveBeenCalledTimes(2);
+  });
+  it.each(["different-logical-task", "old-unknown-new-user-anchor", "changed-arguments"])("does not use %s to upgrade a Pi-style task", async variant => {
+    const manager = SessionManager.inMemory("/tmp/isolated-pi-task-ambiguity"), user = manager.appendMessage({ role: "user", content: "Pi task", timestamp: 1 });
+    manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "rejected", name: "isolated_shell", arguments: {} }], timestamp: 2 } as never);
+    if (variant === "old-unknown-new-user-anchor") manager.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: "logical-task", callId: "rejected", tool: "isolated_shell", state: "unknown" });
+    const isolatedOperations = [{ ...isolated, phase: "input_preflight" }, { ...isolated, phase: "input_rejected", rejection: "input_budget" }];
+    manager.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: "logical-task", userEntryId: user, callId: "rejected", tool: "isolated_shell", state: "command_not_submitted", isolatedOperations });
+    if (variant === "different-logical-task") manager.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: "another-logical-task", userEntryId: user, callId: "other", tool: "isolated_shell", state: "unknown" });
+    if (variant === "changed-arguments") manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "rejected", name: "isolated_shell", arguments: { command: "different" } }], timestamp: 2 } as never);
+    manager.appendMessage({ role: "toolResult", toolName: "isolated_shell", toolCallId: "rejected", content: [{ type: "text", text: "Budget rejected" }], isError: true, timestamp: 3 } as never);
+    const guard = new AutoContinueTools([tool("isolated_shell")], { sessionManager: manager }); guard.reset(user);
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow(variant === "different-logical-task" ? "multiple logical tool tasks" : "unconfirmed");
+    expect(handoffSummary(manager.getBranch())).not.toContain('"state":"command_not_submitted"');
+  });
+  it("keeps a Pi-style local edit preflight failure visible through its explicit user/task alias", async () => {
+    const manager = SessionManager.inMemory("/tmp/pi-local-edit-handoff"), user = manager.appendMessage({ role: "user", content: "Edit the file", timestamp: 1 });
+    manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "pi-edit", name: "edit", arguments: {} }], timestamp: 2 } as never);
+    const execute = vi.fn<ToolDefinition["execute"]>().mockRejectedValue(toolPreflightError("oldText must match exactly once", "edit_text_not_unique")), guard = new AutoContinueTools([tool("edit", execute)], { sessionManager: manager }); guard.reset();
+    await expect(run(guard.wrap()[0]!, "pi-edit")).rejects.toThrow("oldText");
+    manager.appendMessage({ role: "toolResult", toolName: "edit", toolCallId: "pi-edit", content: [{ type: "text", text: "oldText must match exactly once" }], isError: true, timestamp: 3 } as never);
+    expect(handoffSummary(manager.getBranch())).toContain('"state":"not_executed","reason":"edit_text_not_unique"');
+    const restored = new AutoContinueTools([tool("edit", execute)], { sessionManager: manager }); restored.reset(user);
+    await restored.prepare(new AbortController().signal); await expect(run(restored.wrap()[0]!, "pi-edit")).rejects.toThrow("oldText"); expect(execute).toHaveBeenCalledOnce();
+  });
+  it.each(["old-unknown-new-user-anchor", "different-logical-task", "changed-arguments"])("refuses %s in Pi local preflight aliases", async variant => {
+    const manager = SessionManager.inMemory("/tmp/pi-local-preflight-alias-refusal"), user = manager.appendMessage({ role: "user", content: "Pi edit", timestamp: 1 });
+    manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "pi-edit", name: "edit", arguments: {} }], timestamp: 2 } as never);
+    if (variant === "old-unknown-new-user-anchor") manager.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: "logical-task", callId: "pi-edit", tool: "edit", state: "unknown" });
+    manager.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: "logical-task", userEntryId: user, callId: "pi-edit", tool: "edit", state: "not_executed", preflightFailure: getToolPreflightFailure(toolPreflightError("Not unique", "edit_text_not_unique")) });
+    if (variant === "different-logical-task") manager.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: "another-task", userEntryId: user, callId: "other", tool: "edit", state: "unknown" });
+    if (variant === "changed-arguments") manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "pi-edit", name: "edit", arguments: { path: "different" } }], timestamp: 2 } as never);
+    manager.appendMessage({ role: "toolResult", toolName: "edit", toolCallId: "pi-edit", content: [{ type: "text", text: "Not unique" }], isError: true, timestamp: 3 } as never);
+    const guard = new AutoContinueTools([tool("edit")], { sessionManager: manager }); guard.reset(user);
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow(variant === "different-logical-task" ? "multiple logical tool tasks" : "unconfirmed");
+    expect(handoffSummary(manager.getBranch())).not.toContain('"state":"not_executed"');
+  });
+  it.each(["no-host-stage", "unknown-history", "wrong-call", "changed-arguments", "success-result", "marker-drift", "phase-rollback"])("rejects %s when loading isolated non-submission receipts", async variant => {
+    const manager = SessionManager.inMemory("/tmp/isolated-command-untrusted-reload"), user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+    manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "rejected", name: "isolated_shell", arguments: { command: "original" } }], timestamp: 2 } as never);
+    const receipts = [{ ...isolated, phase: "input_preflight" }, { ...isolated, phase: "input_rejected", rejection: "input_budget" }];
+    if (variant === "unknown-history") manager.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: user, tool: "isolated_shell", callId: "rejected", state: "unknown" });
+    if (variant !== "no-host-stage") manager.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: user, tool: "isolated_shell", callId: "rejected", state: "command_not_submitted", isolatedOperations: variant === "phase-rollback" ? [receipts[0], { ...isolated, phase: "prepare_submitting" }, receipts[1]] : receipts });
+    if (variant === "changed-arguments") manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "rejected", name: "isolated_shell", arguments: { command: "changed" } }], timestamp: 2 } as never);
+    manager.appendMessage({ role: "toolResult", toolName: "isolated_shell", toolCallId: variant === "wrong-call" ? "other" : "rejected", content: [{ type: "text", text: "Budget rejected" }], isError: variant !== "success-result", isolatedOperations: variant === "marker-drift" ? [{ ...isolated, operationId: "b".repeat(32), phase: "input_preflight" }] : receipts, timestamp: 3 } as never);
+    const execute = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(result), guard = new AutoContinueTools([tool("isolated_shell", execute)], { sessionManager: manager }); guard.reset(user);
+    if (variant === "no-host-stage") expect(guard.recoverySummary).toBeUndefined();
+    else { await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("unconfirmed"); expect(guard.recoverySummary).not.toContain("command_not_submitted"); }
+    expect(execute).not.toHaveBeenCalled();
+  });
+  it("deduplicates equivalent completed effects only during automatic continuation", async () => {
+    const write = tool("write"), guard = new AutoContinueTools([write]), wrapped = guard.wrap()[0]!;
+    await run(wrapped, "old", { path: "x", content: "value" }); await guard.prepare(new AbortController().signal);
+    const cached = await run(wrapped, "new", { content: "value", path: "x" });
+    expect(cached.content).toEqual([{ type: "text", text: expect.stringContaining("not a current file snapshot") }, ...result.content]);
+    expect(cached.details).toBe(result.details);
+    expect(write.execute).toHaveBeenCalledOnce();
+    guard.reset(); await run(wrapped, "manual", { path: "x", content: "value" }); expect(write.execute).toHaveBeenCalledTimes(2);
+  });
+  it("refuses continuation while an effect is running or its outcome is unknown", async () => {
+    const pending = deferred<typeof result>(), effect = tool("isolated_shell", vi.fn(() => pending.promise));
+    const guard = new AutoContinueTools([effect]), request = run(guard.wrap()[0]!, "original");
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow(/unconfirmed/);
+    pending.reject(new Error("Unknown return")); await expect(request).rejects.toThrow();
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow(/retained changes/);
+    expect(effect.execute).toHaveBeenCalledOnce();
+  });
+  it("uses only the saved Canvas recovery callback and retains recovered results before another request", async () => {
+    const execute = vi.fn<ToolDefinition["execute"]>().mockRejectedValue(new Error("Unknown delivery")), saved = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(result);
+    const canvas = { ...tool("generate_canvas_media", execute), recoverAfterHttp500: saved }, guard = new AutoContinueTools([canvas]);
+    const wrapped = guard.wrap()[0]!;
+    await expect(run(wrapped, "old-canvas", { boardId: "board", nodeId: "node" })).rejects.toThrow();
+    const persisted = vi.fn(async () => {}); await guard.prepare(new AbortController().signal, persisted);
+    expect(saved).toHaveBeenCalledExactlyOnceWith("old-canvas", { boardId: "board", nodeId: "node" }, expect.any(AbortSignal), undefined, {});
+    expect(persisted).toHaveBeenCalledWith(result, "generate_canvas_media", "old-canvas");
+    await run(wrapped, "repeat", { boardId: "board", nodeId: "node" }); expect(execute).toHaveBeenCalledOnce();
+  });
+  it("keeps reads fresh and honors cancellation even for a cached completed effect", async () => {
+    const read = tool("read"), write = tool("write"), guard = new AutoContinueTools([read, write]), [r, w] = guard.wrap();
+    await run(r!, "r1"); await run(w!, "w1"); await guard.prepare(new AbortController().signal);
+    await run(r!, "r2"); expect(read.execute).toHaveBeenCalledTimes(2);
+    const stop = new AbortController(); stop.abort(); await expect(run(w!, "cached", {}, stop.signal)).rejects.toThrow();
+    expect(write.execute).toHaveBeenCalledOnce();
+  });
+  it("blocks subsequent effects after a new operation becomes uncertain during continuation", async () => {
+    const effect = tool("isolated_shell", vi.fn().mockRejectedValue(new Error("Unknown return"))), write = tool("write");
+    const guard = new AutoContinueTools([effect, write]), [e, w] = guard.wrap();
+    await guard.prepare(new AbortController().signal);
+    await expect(run(e!, "uncertain")).rejects.toThrow();
+    await expect(run(w!, "next")).rejects.toThrow("Automatic continuation stopped");
+    expect(write.execute).not.toHaveBeenCalled(); expect(guard.stopRequested).toBe(true);
+    expect(() => guard.assertSafe()).toThrow("unconfirmed");
+  });
+  it("deduplicates a concurrent call ID and refuses its reuse with different arguments", async () => {
+    const pending = deferred<typeof result>(), effect = tool("write", vi.fn(() => pending.promise));
+    const guard = new AutoContinueTools([effect]), wrapped = guard.wrap()[0]!;
+    const first = run(wrapped, "same", { path: "x" }), repeated = run(wrapped, "same", { path: "x" });
+    await vi.waitFor(() => expect(effect.execute).toHaveBeenCalledOnce());
+    await expect(run(wrapped, "same", { path: "other" })).rejects.toThrow("different arguments");
+    pending.resolve(result); await expect(first).resolves.toEqual(result); await expect(repeated).resolves.toEqual(result);
+  });
+  it("waits for an in-flight continuation effect instead of mistaking parallel new writes for unknown outcomes", async () => {
+    const pending = deferred<typeof result>(), write = tool("write", vi.fn(() => pending.promise)), edit = tool("edit");
+    const guard = new AutoContinueTools([write, edit]), [w, e] = guard.wrap();
+    await guard.prepare(new AbortController().signal);
+    const first = run(w!, "first", { path: "x" }), second = run(e!, "second", { path: "y" });
+    const repeated = run(e!, "second", { path: "y" }), third = run(e!, "third", { path: "z" });
+    await vi.waitFor(() => expect(write.execute).toHaveBeenCalledOnce()); expect(edit.execute).not.toHaveBeenCalled();
+    pending.resolve(result); await expect(first).resolves.toEqual(result); await expect(second).resolves.toEqual(result);
+    expect((await repeated).content).toEqual([{ type: "text", text: expect.stringContaining("Original completed result") }, ...result.content]);
+    await expect(third).resolves.toEqual(result);
+    expect(edit.execute).toHaveBeenCalledTimes(2); expect(guard.stopRequested).toBe(false);
+  });
+  it("rereads attachments and enforces ownership even when a completed effect could be reused", async () => {
+    let current = true;
+    const read = tool("read_attachment"), write = tool("write");
+    const guard = new AutoContinueTools([read, write], { assertCurrent: () => { if (!current) throw new Error("Workspace changed"); } });
+    const [r, w] = guard.wrap();
+    await run(r!, "image-before"); await run(w!, "original"); await guard.prepare(new AbortController().signal);
+    await run(r!, "image-after"); expect(read.execute).toHaveBeenCalledTimes(2);
+    current = false;
+    await expect(run(w!, "stale-cache")).rejects.toThrow("Workspace changed");
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("Workspace changed");
+    expect(write.execute).toHaveBeenCalledOnce();
+  });
+  it("never buys changed media arguments during continuation or alters cached image bytes", async () => {
+    const image = { type: "image" as const, mimeType: "image/png", data: "original-fixture-image-bytes" };
+    const generated = { content: [image], details: { assetId: "original-asset" } };
+    const generate = tool("generate_image", vi.fn().mockResolvedValue(generated)), guard = new AutoContinueTools([generate]);
+    const wrapped = guard.wrap()[0]!;
+    await run(wrapped, "original", { prompt: "original intent" }); await guard.prepare(new AbortController().signal);
+    const reused = await run(wrapped, "new-call", { prompt: "original intent" });
+    expect(reused.content).toEqual([{ type: "text", text: expect.stringContaining("Original completed result") }, image]);
+    expect(generated.content).toEqual([image]);
+    await expect(run(wrapped, "replacement", { prompt: "slightly different intent" })).rejects.toThrow("cannot be proven");
+    expect(generate.execute).toHaveBeenCalledOnce(); expect(guard.stopRequested).toBe(true);
+  });
+  it("allows ordinary local argument correction but keeps the earlier failure unconfirmed for automatic recovery", async () => {
+    const execute = vi.fn<ToolDefinition["execute"]>().mockRejectedValueOnce(new Error("oldText does not match")).mockResolvedValueOnce(result);
+    const guard = new AutoContinueTools([tool("edit", execute)]), edit = guard.wrap()[0]!;
+    await expect(run(edit, "mismatch", { oldText: "wrong" })).rejects.toThrow("does not match");
+    await expect(run(edit, "corrected", { oldText: "right" })).resolves.toEqual(result);
+    expect(execute).toHaveBeenCalledTimes(2);
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("unconfirmed");
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+  it("keeps a trusted correctable rejection as a failure while allowing a new corrected call after preparation", async () => {
+    const failure = toolPreflightError("oldText must match exactly once", "edit_text_not_unique");
+    const execute = vi.fn<ToolDefinition["execute"]>().mockRejectedValueOnce(failure).mockResolvedValue(result), read = tool("read");
+    const guard = new AutoContinueTools([tool("edit", execute), read]), [edit, r] = guard.wrap(), recovered = vi.fn(async () => {});
+    await expect(run(edit!, "rejected", { oldText: "wrong" })).rejects.toBe(failure);
+    await guard.prepare(new AbortController().signal, recovered);
+    expect(recovered).not.toHaveBeenCalled(); expect(guard.stopRequested).toBe(false);
+    expect(guard.recoverySummary).toContain("not_executed (edit_text_not_unique)");
+    await expect(run(edit!, "rejected", { oldText: "wrong" })).rejects.toBe(failure);
+    await expect(run(edit!, "rejected", { oldText: "right" })).rejects.toThrow("different arguments");
+    await run(r!, "inspect"); await expect(run(edit!, "corrected", { oldText: "right" })).resolves.toEqual(result);
+    expect(execute).toHaveBeenCalledTimes(2); expect(read.execute).toHaveBeenCalledOnce();
+    await guard.prepare(new AbortController().signal); expect(guard.stopRequested).toBe(false);
+  });
+  it("allows normal argument correction before a later interruption without treating the failed preflight as a successful edit", async () => {
+    const execute = vi.fn<ToolDefinition["execute"]>().mockRejectedValueOnce(toolPreflightError("Not unique", "edit_text_not_unique")).mockResolvedValueOnce(result);
+    const guard = new AutoContinueTools([tool("edit", execute)]), edit = guard.wrap()[0]!;
+    await expect(run(edit, "mismatch", { oldText: "wrong" })).rejects.toThrow("Not unique");
+    await run(edit, "corrected", { oldText: "right" }); await guard.prepare(new AbortController().signal);
+    expect(execute).toHaveBeenCalledTimes(2); expect(guard.stopRequested).toBe(false);
+    expect(guard.recoverySummary).toContain('"mismatch": not_executed'); expect(guard.recoverySummary).toContain('"corrected": completed');
+  });
+  it("reuses a trusted failed result without turning it into a completed result or losing its host evidence", async () => {
+    const failure = toolPreflightError("Input exceeds the source limit", "text_too_large");
+    const rejected = inheritToolPreflightFailure({ ...result, isError: true }, failure);
+    const execute = vi.fn<ToolDefinition["execute"]>().mockResolvedValueOnce(rejected).mockResolvedValue(result);
+    const guard = new AutoContinueTools([tool("write", execute)]), write = guard.wrap()[0]!;
+    await expect(run(write, "too-large", { content: "large" })).resolves.toBe(rejected);
+    await guard.prepare(new AbortController().signal);
+    const repeated = await run(write, "too-large", { content: "large" });
+    expect(repeated).toEqual(rejected); expect(getToolPreflightFailure(repeated)).toEqual(getToolPreflightFailure(failure));
+    expect(repeated.content).toEqual(result.content); expect(guard.recoverySummary).not.toContain("completed");
+    await run(write, "smaller", { content: "small" }); expect(execute).toHaveBeenCalledTimes(2);
+  });
+  it("deduplicates concurrent failed call IDs, including calls waiting behind another continuation effect", async () => {
+    const pending = deferred<typeof result>(), failure = toolPreflightError("Not unique", "edit_text_not_unique");
+    const execute = vi.fn<ToolDefinition["execute"]>().mockRejectedValue(failure), write = tool("write", vi.fn(() => pending.promise));
+    const guard = new AutoContinueTools([write, tool("edit", execute)]), [w, edit] = guard.wrap();
+    await guard.prepare(new AbortController().signal);
+    const first = run(w!, "write"), failed = expect(run(edit!, "same", { oldText: "wrong" })).rejects.toBe(failure);
+    const repeated = expect(run(edit!, "same", { oldText: "wrong" })).rejects.toBe(failure);
+    await vi.waitFor(() => expect(write.execute).toHaveBeenCalledOnce()); pending.resolve(result);
+    await first; await failed; await repeated;
+    expect(execute).toHaveBeenCalledOnce(); expect(guard.stopRequested).toBe(false);
+    await expect(run(edit!, "same", { oldText: "changed" })).rejects.toThrow("different arguments");
+  });
+  it.each(["unsafe_path", "protected_content", "authorization_denied", "approval_required", "source_review_required"] as const)("never treats the no-effect %s boundary as permission to continue", async reason => {
+    const failure = toolPreflightError("Protected boundary rejected the input", reason), write = tool("write");
+    const execute = vi.fn<ToolDefinition["execute"]>().mockRejectedValue(failure), guard = new AutoContinueTools([tool("edit", execute), write]), [edit, w] = guard.wrap();
+    await expect(run(edit!, "blocked")).rejects.toBe(failure);
+    expect(guard.stopRequested).toBe(true); expect(guard.recoverySummary).toContain("blocked (" + reason + ")");
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("protected tool boundary");
+    await expect(run(w!, "new-effect")).rejects.toThrow("protected tool boundary");
+    await expect(run(edit!, "blocked")).rejects.toBe(failure);
+    expect(write.execute).not.toHaveBeenCalled(); expect(execute).toHaveBeenCalledOnce();
+  });
+  it.each(["throw", "result"])("rechecks read authorization and blocks automatic recovery after a trusted read %s rejection", async mode => {
+    const failure = toolPreflightError("Attachment is not authorized", "authorization_denied");
+    const execute = vi.fn<ToolDefinition["execute"]>().mockResolvedValueOnce(result);
+    if (mode === "throw") execute.mockRejectedValueOnce(failure); else execute.mockResolvedValueOnce(inheritToolPreflightFailure({ ...result, isError: true }, failure));
+    execute.mockResolvedValueOnce(result);
+    const guard = new AutoContinueTools([tool("read_attachment", execute)]), read = guard.wrap()[0]!;
+    await run(read, "same-receipt"); await guard.prepare(new AbortController().signal);
+    if (mode === "throw") await expect(run(read, "same-receipt")).rejects.toBe(failure); else await expect(run(read, "same-receipt")).resolves.toMatchObject({ isError: true });
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("protected tool boundary");
+    await run(read, "same-receipt"); expect(execute).toHaveBeenCalledTimes(3); expect(guard.stopRequested).toBe(true);
+  });
+  it.each(["error-properties", "result-details", "arguments"])("does not trust a preflight descriptor supplied by %s", async source => {
+    const descriptor = { effect: "none", reason: "edit_text_not_unique", disposition: "correctable" };
+    const failure = Object.assign(new Error("oldText must match exactly once"), { preflightFailure: descriptor });
+    const execute = source === "result-details"
+      ? vi.fn<ToolDefinition["execute"]>().mockResolvedValue({ ...result, isError: true, details: { preflightFailure: descriptor } })
+      : vi.fn<ToolDefinition["execute"]>().mockRejectedValue(failure);
+    const guard = new AutoContinueTools([tool("edit", execute)]), request = run(guard.wrap()[0]!, "untrusted", source === "arguments" ? { preflightFailure: descriptor } : {});
+    if (source === "result-details") await request; else await expect(request).rejects.toBe(failure);
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("unconfirmed");
+    expect(guard.recoverySummary).toContain("unknown"); expect(guard.recoverySummary).not.toContain("not_executed");
+  });
+  it("hydrates a trusted not-executed journal only with its original canonical failed call and preserves its error", async () => {
+    const manager = SessionManager.inMemory("/tmp/continuation-preflight-journal"), user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+    manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "rejected", name: "edit", arguments: { oldText: "wrong" } }], stopReason: "toolUse", timestamp: 2 } as never);
+    const failure = toolPreflightError("oldText must match exactly once", "edit_text_not_unique"), execute = vi.fn<ToolDefinition["execute"]>().mockRejectedValueOnce(failure).mockResolvedValue(result);
+    const edit = tool("edit", execute), guard = new AutoContinueTools([edit], { sessionManager: manager }); guard.reset(user);
+    await expect(run(guard.wrap()[0]!, "rejected", { oldText: "wrong" })).rejects.toBe(failure);
+    expect(manager.getBranch().at(-1)).toMatchObject({ type: "custom", data: { version: 1, taskId: user, tool: "edit", callId: "rejected", state: "not_executed", preflightFailure: getToolPreflightFailure(failure) } });
+    manager.appendMessage({ role: "toolResult", toolCallId: "rejected", toolName: "edit", content: [{ type: "text", text: failure.message }], isError: true, timestamp: 3 } as never);
+    const restored = new AutoContinueTools([edit], { sessionManager: manager }); restored.reset(user); await restored.prepare(new AbortController().signal);
+    const wrapped = restored.wrap()[0]!;
+    await expect(run(wrapped, "rejected", { oldText: "wrong" })).rejects.toThrow(failure.message);
+    await expect(run(wrapped, "rejected", { oldText: "right" })).rejects.toThrow("different arguments");
+    await run(wrapped, "corrected", { oldText: "right" }); expect(execute).toHaveBeenCalledTimes(2);
+    expect(restored.recoverySummary).toContain("not_executed");
+  });
+  it.each(["missing-result", "success-result", "wrong-call", "wrong-tool", "missing-call", "wrong-disposition", "old-unknown", "previous-user", "changed-arguments", "changed-tool", "canonical-reason", "canonical-invalid"])("keeps %s journal evidence unconfirmed instead of upgrading it from metadata or error text", async variant => {
+    const manager = SessionManager.inMemory("/tmp/continuation-untrusted-preflight"); let user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+    if (variant !== "missing-call") manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "rejected", name: "edit", arguments: {} }], stopReason: "toolUse", timestamp: 2 } as never);
+    if (variant === "previous-user") user = manager.appendMessage({ role: "user", content: "New task", timestamp: 2 });
+    const preflightFailure = { effect: "none", reason: "edit_text_not_unique", disposition: variant === "wrong-disposition" ? "blocked" : "correctable" };
+    manager.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: user, tool: "edit", callId: "rejected", state: variant === "old-unknown" ? "unknown" : "not_executed", preflightFailure });
+    if (variant === "changed-arguments" || variant === "changed-tool") manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "rejected", name: variant === "changed-tool" ? "write" : "edit", arguments: variant === "changed-arguments" ? { path: "changed" } : {} }], stopReason: "toolUse", timestamp: 3 } as never);
+    if (variant !== "missing-result") manager.appendMessage({ role: "toolResult", toolCallId: variant === "wrong-call" ? "other" : "rejected", toolName: variant === "wrong-tool" ? "write" : "edit", content: [{ type: "text", text: "oldText must match exactly once" }], details: { preflightFailure }, ...(variant === "canonical-reason" ? { preflightFailure: getToolPreflightFailure(toolPreflightError("Too large", "text_too_large")) } : variant === "canonical-invalid" ? { preflightFailure: { ...preflightFailure, disposition: "blocked" } } : {}), isError: variant !== "success-result", timestamp: 3 } as never);
+    const edit = tool("edit"), guard = new AutoContinueTools([edit], { sessionManager: manager }); guard.reset(user);
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("unconfirmed");
+    expect(guard.recoverySummary).not.toContain("not_executed"); expect(edit.execute).not.toHaveBeenCalled();
+  });
+  it("does not let a newer no-effect marker launder an already unknown attempt", async () => {
+    const manager = SessionManager.inMemory("/tmp/continuation-old-unknown"), user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+    manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "old", name: "edit", arguments: {} }], stopReason: "toolUse", timestamp: 2 } as never);
+    manager.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: user, tool: "edit", callId: "old", state: "unknown" });
+    manager.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: user, tool: "edit", callId: "old", state: "started" });
+    manager.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: user, tool: "edit", callId: "old", state: "not_executed", preflightFailure: getToolPreflightFailure(toolPreflightError("Not unique", "edit_text_not_unique")) });
+    manager.appendMessage({ role: "toolResult", toolCallId: "old", toolName: "edit", content: [{ type: "text", text: "Not unique" }], isError: true, timestamp: 3 } as never);
+    const guard = new AutoContinueTools([tool("edit")], { sessionManager: manager }); guard.reset(user);
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("unconfirmed"); expect(guard.recoverySummary).toContain("unknown");
+  });
+  it("retains a blocked journal as blocked across reload even if its canonical result is missing", async () => {
+    for (const canonical of [true, false]) {
+      const manager = SessionManager.inMemory("/tmp/continuation-blocked-journal"), user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+      manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "blocked", name: "write", arguments: {} }], stopReason: "toolUse", timestamp: 2 } as never);
+      manager.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: user, tool: "write", callId: "blocked", state: "blocked", preflightFailure: getToolPreflightFailure(toolPreflightError("Review is required", "source_review_required")) });
+      if (canonical) manager.appendMessage({ role: "toolResult", toolCallId: "blocked", toolName: "write", content: [{ type: "text", text: "Review is required" }], isError: true, timestamp: 3 } as never);
+      const write = tool("write"), guard = new AutoContinueTools([write], { sessionManager: manager }); guard.reset(user);
+      expect(guard.stopRequested).toBe(true); await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("protected tool boundary");
+      await expect(run(guard.wrap()[0]!, "new")).rejects.toThrow("protected tool boundary"); expect(write.execute).not.toHaveBeenCalled();
+    }
+  });
+  it("retains a detached preflight failure with its state and error receipt without writing to the new branch", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-late-preflight-")); onTestFinished(() => rm(directory, { recursive: true, force: true }));
+    const manager = SessionManager.create(directory, directory), user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+    manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "late-rejection", name: "edit", arguments: {} }], stopReason: "toolUse", timestamp: 2 } as never);
+    const pending = deferred<typeof result>(), execute = vi.fn(() => pending.promise), guard = new AutoContinueTools([tool("edit", execute)], { sessionManager: manager }); guard.reset(user);
+    const running = expect(run(guard.wrap()[0]!, "late-rejection")).rejects.toThrow("branch changed");
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce()); manager.branch(user); const leaf = manager.getLeafId();
+    pending.reject(toolPreflightError("oldText must match exactly once", "edit_text_not_unique")); await running;
+    expect(manager.getLeafId()).toBe(leaf); expect(manager.getBranch().some(entry => entry.type === "custom" && entry.customType === AUTO_CONTINUE_TOOL_ENTRY)).toBe(false);
+    const files = (await readdir(directory)).filter(name => name.startsWith(".late-tool-result-")); expect(files).toHaveLength(1);
+    const file = path.join(directory, files[0]!); expect((await lstat(file)).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(await readFile(file, "utf8"))).toMatchObject({ taskId: user, callId: "late-rejection", state: "not_executed", preflightFailure: { effect: "none", reason: "edit_text_not_unique", disposition: "correctable" }, result: { isError: true, content: [{ type: "text", text: "oldText must match exactly once" }] } });
+  });
+  it("fails closed when a trusted no-effect rejection cannot be recorded", async () => {
+    const manager = SessionManager.inMemory("/tmp/continuation-preflight-record-failure"), user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+    const append = manager.appendCustomEntry.bind(manager);
+    vi.spyOn(manager, "appendCustomEntry").mockImplementation((name, value) => { if ((value as { state?: string }).state === "not_executed") throw new Error("Journal failed"); return append(name, value); });
+    const execute = vi.fn<ToolDefinition["execute"]>().mockRejectedValue(toolPreflightError("Not unique", "edit_text_not_unique")), guard = new AutoContinueTools([tool("edit", execute)], { sessionManager: manager }); guard.reset(user);
+    await expect(run(guard.wrap()[0]!, "rejected")).rejects.toThrow("could not be safely recorded");
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("could not be safely recorded"); expect(guard.stopRequested).toBe(true);
+  });
+  it("records started before execution and hydrates only canonical completed results for the same task", async () => {
+    const manager = SessionManager.inMemory("/tmp/continuation-journal-fixture");
+    const user = manager.appendMessage({ role: "user", content: "Original task", timestamp: 1 });
+    manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "original-write", name: "write", arguments: { path: "x" } }], stopReason: "toolUse", timestamp: 2 } as never);
+    const execute = vi.fn(async () => {
+      expect(manager.getBranch().at(-1)).toMatchObject({ type: "custom", customType: AUTO_CONTINUE_TOOL_ENTRY, data: { state: "started", callId: "original-write", taskId: user } });
+      return result;
+    });
+    const write = tool("write", execute), guard = new AutoContinueTools([write], { sessionManager: manager }); guard.reset(user);
+    await run(guard.wrap()[0]!, "original-write", { path: "x" });
+    manager.appendMessage({ role: "toolResult", toolCallId: "original-write", toolName: "write", content: result.content, details: result.details, isError: false, timestamp: 3 } as never);
+    const restored = new AutoContinueTools([write], { sessionManager: manager }); restored.reset(user);
+    await restored.prepare(new AbortController().signal);
+    expect((await run(restored.wrap()[0]!, "resumed-write", { path: "x" })).content[0]).toMatchObject({ text: expect.stringContaining("original-write") });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(restored.recoverySummary).toContain("original-write");
+    const next = manager.appendMessage({ role: "user", content: "A fresh explicit task", timestamp: 4 }); restored.reset(next);
+    execute.mockResolvedValueOnce(result);
+    await run(restored.wrap()[0]!, "fresh-write", { path: "x" }); expect(execute).toHaveBeenCalledTimes(2);
+  });
+  it("does not treat a persisted started attempt or a completed marker without its canonical result as confirmed", async () => {
+    for (const state of ["started", "completed"] as const) {
+      const manager = SessionManager.inMemory("/tmp/continuation-unknown-fixture");
+      const user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+      manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "unknown", name: "write", arguments: { path: "x" } }], stopReason: "toolUse", timestamp: 2 } as never);
+      manager.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: user, tool: "write", callId: "unknown", state });
+      const write = tool("write"), guard = new AutoContinueTools([write], { sessionManager: manager }); guard.reset(user);
+      await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("unconfirmed");
+      await expect(run(guard.wrap()[0]!, "different-call", { path: "different" })).rejects.toThrow();
+      expect(write.execute).not.toHaveBeenCalled();
+    }
+  });
+  it("does not execute without a started record or resume after recording the real outcome fails", async () => {
+    for (const failure of ["started", "completed"]) {
+      const manager = SessionManager.inMemory("/tmp/continuation-record-failure");
+      const user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+      const append = manager.appendCustomEntry.bind(manager);
+      const spy = vi.spyOn(manager, "appendCustomEntry").mockImplementation((name, value) => {
+        if (name === AUTO_CONTINUE_TOOL_ENTRY && (value as { state: string }).state === failure) throw new Error("Journal write failed");
+        return append(name, value);
+      });
+      const write = tool("write"), guard = new AutoContinueTools([write], { sessionManager: manager }); guard.reset(user);
+      try {
+        await expect(run(guard.wrap()[0]!, "original", { path: "x" })).rejects.toThrow(failure === "started" ? "no operation was started" : "could not be safely recorded");
+        expect(write.execute).toHaveBeenCalledTimes(failure === "started" ? 0 : 1);
+        if (failure === "completed") await expect(guard.prepare(new AbortController().signal)).rejects.toThrow();
+      } finally { spy.mockRestore(); }
+    }
+  });
+  it("retains a detached late result in the original session directory without changing the current branch", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-late-tool-")); onTestFinished(() => rm(directory, { recursive: true, force: true }));
+    const manager = SessionManager.create(directory, directory);
+    const user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+    manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "late", name: "write", arguments: { path: "x" } }], stopReason: "toolUse", timestamp: 2 } as never);
+    const pending = deferred<typeof result>(), execute = vi.fn(() => pending.promise), guard = new AutoContinueTools([tool("write", execute)], { sessionManager: manager }); guard.reset(user);
+    const running = run(guard.wrap()[0]!, "late", { path: "x" });
+    const stopped = expect(running).rejects.toThrow("branch changed");
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+    manager.branch(user); const leaf = manager.getLeafId();
+    pending.resolve(result); await stopped;
+    expect(manager.getLeafId()).toBe(leaf);
+    expect(manager.getBranch().some(entry => entry.type === "custom" && entry.customType === AUTO_CONTINUE_TOOL_ENTRY)).toBe(false);
+    const files = (await readdir(directory)).filter(name => name.startsWith(".late-tool-result-")); expect(files).toHaveLength(1);
+    expect((await lstat(path.join(directory, files[0]!))).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(await readFile(path.join(directory, files[0]!), "utf8"))).toMatchObject({ taskId: user, callId: "late", state: "completed", result });
+  });
+  it("does not recreate a deleted session directory or claim an unrecorded late result was safe", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-missing-late-tool-")); onTestFinished(() => rm(directory, { recursive: true, force: true }));
+    const manager = SessionManager.create(directory, directory), user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+    manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "late", name: "write", arguments: { path: "x" } }], stopReason: "toolUse", timestamp: 2 } as never);
+    const pending = deferred<typeof result>(), execute = vi.fn(() => pending.promise), guard = new AutoContinueTools([tool("write", execute)], { sessionManager: manager }); guard.reset(user);
+    const running = run(guard.wrap()[0]!, "late", { path: "x" }), stopped = expect(running).rejects.toThrow("could not be safely recorded");
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce()); manager.branch(user); await rm(directory, { recursive: true });
+    pending.resolve(result); await stopped;
+    await expect(lstat(directory)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(guard.stopRequested).toBe(true); expect(() => guard.assertSafe()).toThrow();
+  });
+  it.each(["user", "host"] as const)("never treats %s cancellation or a hook stop as recoverable", cancelOrigin => {
+    expect(isRecoverableInterruption({ kind: "runtime_interrupted", source: "qoder", cancelOrigin })).toBe(false);
+    expect(isRecoverableInterruption({ kind: "turn_limit", source: "qoder", terminalReason: "hook_stopped" })).toBe(false);
+    expect(isRecoverableInterruption({ kind: "turn_limit", source: "qoder", terminalReason: "max_turns" })).toBe(true);
+    expect(isRecoverableInterruption({ kind: "unknown", source: "codex" })).toBe(false);
+  });
+});
+
+describe("bounded automatic continuation", () => {
+  const failure = (status = 500) => ({ role: "assistant", content: [], stopReason: "error", errorMessage: "Provider request failed",
+    diagnostics: [{ type: "provider_failure", details: { status } }] });
+  function setup() {
+    vi.useFakeTimers();
+    const session = new FakeSession(), events = new RuntimeEventBus(), project = createProject(), conversation = createConversation(project);
+    session.prompt.mockImplementation(async () => { session.messages.push(failure()); });
+    const prepare = vi.fn(async (_signal: AbortSignal) => {});
+    const resume = vi.fn(async () => { session.messages.push({ role: "assistant", stopReason: "stop", content: [] }); });
+    Object.assign(session, { prepareContinuation: prepare, resumeAfterInterruption: resume, prepareHttp500Continuation: prepare, resumeAfterHttp500: resume });
+    const createSession = vi.fn(async () => session), manager = new AgentManager(events, { createSession });
+    onTestFinished(async () => { await manager.close(); vi.useRealTimers(); });
+    return { session, events, project, conversation, manager, prepare, resume, createSession };
+  }
+  async function scheduled(events: RuntimeEventBus, project: ProjectState) {
+    await vi.waitFor(() => expect(events.since(project.id).some(e => e.type === "item.started" && e.data.item.type === "retry")).toBe(true));
+  }
+  it("continues the same turn without resending the original user prompt", async () => {
+    const { manager, session, project, conversation, events, resume } = setup();
+    const turn = manager.prompt(project, conversation, "Build once");
+    await scheduled(events, project);
+    expect(manager.activeTurnId(project.id, conversation.summary.id)).toBe(turn.turnId);
+    await vi.advanceTimersByTimeAsync(AUTO_CONTINUE_DELAYS[0]);
+    await expect(turn.result).resolves.toBe("completed");
+    expect(session.prompt).toHaveBeenCalledExactlyOnceWith("Build once");
+    expect(resume).toHaveBeenCalledOnce();
+    expect(events.since(project.id).filter(e => e.type === "agent.completed")).toHaveLength(1);
+    expect(events.since(project.id).some(e => e.type === "agent.error")).toBe(false);
+    expect(session.appendCustomEntry).toHaveBeenCalledWith(AUTO_CONTINUE_ENTRY, expect.objectContaining({ outcome: "completed" }));
+  });
+  it("stops after three continuations across repeated HTTP 500 responses", async () => {
+    const { manager, session, project, conversation, events, resume } = setup();
+    resume.mockImplementation(async () => { session.messages.push(failure()); });
+    const turn = manager.prompt(project, conversation, "Build once");
+    const result = expect(turn.result).rejects.toThrow("Provider request failed");
+    await scheduled(events, project); await vi.advanceTimersByTimeAsync(65_000); await result;
+    expect(resume).toHaveBeenCalledTimes(3); expect(session.prompt).toHaveBeenCalledOnce();
+    expect(manager.agentState(conversation).status).toBe("error");
+    expect(events.since(project.id).filter(e => e.type === "agent.error")).toHaveLength(1);
+  });
+  it.each([408, 429, 500, 502, 503, 504])("continues a new failed HTTP %s model response within the same bounded budget", async status => {
+    const { manager, session, project, conversation, events, prepare, resume } = setup();
+    session.prompt.mockImplementation(async () => { session.messages.push(failure(status)); });
+    const turn = manager.prompt(project, conversation, "Build once"); await scheduled(events, project);
+    await vi.advanceTimersByTimeAsync(AUTO_CONTINUE_DELAYS[0]); await expect(turn.result).resolves.toBe("completed");
+    expect(prepare).toHaveBeenCalledOnce(); expect(resume).toHaveBeenCalledOnce(); expect(session.prompt).toHaveBeenCalledOnce();
+  });
+  it.each([400, 401, 402, 403, 404, 422])("does not continue HTTP %s", async status => {
+    const { manager, session, project, conversation, resume } = setup();
+    session.prompt.mockImplementation(async () => { session.messages.push(failure(status)); });
+    await expect(manager.prompt(project, conversation, "Build").result).rejects.toThrow();
+    expect(resume).not.toHaveBeenCalled();
+  });
+  it.each(["SSE_IDLE_TIMEOUT", "SSE_CONNECTION_INTERRUPTED", "ECONNRESET"])("continues a new failed model response with finite transport code %s", async code => {
+    const { manager, session, project, conversation, events, resume } = setup();
+    session.prompt.mockImplementation(async () => { session.messages.push({ ...failure(), diagnostics: [{ type: "provider_failure", details: { errorCode: code, transport: "sse" } }] }); });
+    const turn = manager.prompt(project, conversation, "Continue this task"); await scheduled(events, project);
+    await vi.advanceTimersByTimeAsync(AUTO_CONTINUE_DELAYS[0]); await expect(turn.result).resolves.toBe("completed");
+    expect(resume).toHaveBeenCalledOnce(); expect(session.prompt).toHaveBeenCalledOnce();
+  });
+  it.each([[429, "insufficient_quota"], [200, "SSE_VALIDATION_FAILED"]] as const)("does not reinterpret HTTP %s %s as a transient model interruption", async (status, code) => {
+    const { manager, session, project, conversation, prepare, resume } = setup();
+    session.prompt.mockImplementation(async () => { session.messages.push({ ...failure(status), diagnostics: [{ type: "provider_failure", details: { status, errorCode: code, transport: "sse" } }] }); });
+    await expect(manager.prompt(project, conversation, "Build").result).rejects.toThrow();
+    expect(prepare).not.toHaveBeenCalled(); expect(resume).not.toHaveBeenCalled();
+  });
+  it("does not continue a normal completion or a thrown status without a new failed model response", async () => {
+    const { manager, session, project, conversation, resume } = setup();
+    session.prompt.mockResolvedValue();
+    await expect(manager.prompt(project, conversation, "Build").result).resolves.toBe("completed");
+    session.messages.push(failure());
+    session.prompt.mockRejectedValue(Object.assign(new Error("Local operation failed"), { status: 500 }));
+    await expect(manager.prompt(project, conversation, "Build").result).rejects.toThrow("Local operation failed");
+    expect(resume).not.toHaveBeenCalled();
+  });
+  it("gives cancellation priority during backoff", async () => {
+    const { manager, project, conversation, events, resume, session } = setup();
+    const turn = manager.prompt(project, conversation, "Build"); await scheduled(events, project);
+    await manager.cancel(project.id, conversation.summary.id, turn.turnId);
+    await expect(turn.result).resolves.toBe("cancelled");
+    await vi.advanceTimersByTimeAsync(90_000); expect(resume).not.toHaveBeenCalled();
+    expect(session.appendCustomEntry).toHaveBeenCalledWith(AUTO_CONTINUE_ENTRY, expect.objectContaining({ outcome: "cancelled" }));
+  });
+  it("never schedules continuation when the original user stop races with an HTTP 500", async () => {
+    const { manager, session, project, conversation, resume } = setup(), pending = deferred<void>();
+    session.prompt.mockImplementation(() => pending.promise);
+    session.abort.mockImplementation(async () => { session.messages.push(failure()); pending.resolve(); });
+    const turn = manager.prompt(project, conversation, "Build");
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledOnce());
+    await manager.cancel(project.id, conversation.summary.id, turn.turnId);
+    await expect(turn.result).resolves.toBe("cancelled"); await vi.advanceTimersByTimeAsync(90_000);
+    expect(resume).not.toHaveBeenCalled();
+  });
+  it("keeps user cancellation terminal when an in-flight continuation returns HTTP 500", async () => {
+    const { manager, session, project, conversation, events, resume } = setup(), pending = deferred<void>();
+    resume.mockImplementation(() => pending.promise);
+    session.abort.mockImplementation(async () => { session.messages.push(failure()); pending.resolve(); });
+    const turn = manager.prompt(project, conversation, "Build"); await scheduled(events, project);
+    await vi.advanceTimersByTimeAsync(5_000); expect(resume).toHaveBeenCalledOnce();
+    await manager.cancel(project.id, conversation.summary.id, turn.turnId);
+    await expect(turn.result).resolves.toBe("cancelled"); await vi.advanceTimersByTimeAsync(90_000);
+    expect(resume).toHaveBeenCalledOnce();
+    expect(events.since(project.id).some(e => e.type === "agent.error")).toBe(false);
+  });
+  it("stops on a different error after continuation rather than reusing the earlier 500", async () => {
+    const { manager, session, project, conversation, events, resume } = setup();
+    resume.mockImplementation(async () => { session.messages.push(failure(401)); });
+    const turn = manager.prompt(project, conversation, "Build"), result = expect(turn.result).rejects.toThrow();
+    await scheduled(events, project); await vi.advanceTimersByTimeAsync(90_000); await result;
+    expect(resume).toHaveBeenCalledOnce();
+  });
+  it("aborts media recovery when the user cancels before the continuation request", async () => {
+    const { manager, project, conversation, events, resume, prepare } = setup();
+    prepare.mockImplementation(signal => new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })));
+    const turn = manager.prompt(project, conversation, "Build"); await scheduled(events, project);
+    await vi.advanceTimersByTimeAsync(5_000); expect(prepare).toHaveBeenCalledOnce();
+    await manager.cancel(project.id, conversation.summary.id, turn.turnId);
+    await expect(turn.result).resolves.toBe("cancelled"); expect(resume).not.toHaveBeenCalled();
+  });
+  it("stops before requesting a model when a tool outcome cannot be confirmed", async () => {
+    const { manager, project, conversation, events, resume, prepare } = setup();
+    prepare.mockRejectedValue(new Error("Original generation outcome is unknown; recover the existing task"));
+    const turn = manager.prompt(project, conversation, "Build"); const result = expect(turn.result).rejects.toThrow("unknown");
+    await scheduled(events, project); await vi.advanceTimersByTimeAsync(5_000); await result;
+    expect(resume).not.toHaveBeenCalled();
+  });
+  it("closes promptly during backoff and never replays a pending continuation after restart", async () => {
+    const { manager, project, conversation, events, resume, createSession } = setup();
+    const turn = manager.prompt(project, conversation, "Build"); await scheduled(events, project);
+    await manager.close(); await expect(turn.result).resolves.toBe("cancelled"); expect(resume).not.toHaveBeenCalled();
+    const restarted = new AgentManager(new RuntimeEventBus(), { createSession });
+    expect(restarted.agentState(conversation)).toEqual({ status: "idle" });
+    await vi.advanceTimersByTimeAsync(90_000); expect(createSession).toHaveBeenCalledOnce(); await restarted.close();
+    const item = { id: "continuation", type: "retry", status: "inProgress", attempt: 2, delayMs: 15_000, error: { message: "Provider request failed", diagnostics: { statusCode: 500 } } };
+    const entries = [sessionEntry("pending", AUTO_CONTINUE_ENTRY, { version: 1, item })] as never;
+    expect(conversationItems(entries)).toMatchObject([{ type: "retry", status: "failed", attempt: 2, error: { message: expect.stringContaining("restarted") } }]);
+    expect(conversationItems(entries, false)).toMatchObject([{ type: "retry", status: "inProgress" }]);
+  });
+  it("preserves an explicit user cancellation in restored history after stopping between requests", () => {
+    const item = { id: "continuation", type: "retry", status: "completed", attempt: 1, delayMs: 5_000, error: { message: "Provider request failed" } };
+    const entries = [sessionMessage("user", { role: "user", content: "Build" }), sessionMessage("error", failure()),
+      sessionEntry("stopped", AUTO_CONTINUE_ENTRY, { version: 1, item, outcome: "cancelled" })] as never;
+    expect(conversationItems(entries).filter(item => item.type === "agentMessage").at(-1)).toMatchObject({ status: "cancelled", turnId: "user" });
+    expect(conversationItems(entries).filter(item => item.type === "retry")).toHaveLength(1);
+  });
+});
 
 describe("assistant thinking compatibility", () => {
   it("removes only leading leaked thinking blocks", () => {
@@ -40,6 +939,11 @@ describe("assistant thinking compatibility", () => {
 });
 
 describe("lastAssistantError", () => {
+  it("surfaces a Responses incomplete terminal instead of marking the turn complete", () => {
+    expect(lastAssistantError([{ role: "assistant", stopReason: "length", rawStopReason: "incomplete.max_output_tokens" }]))
+      .toMatchObject({ code: "stream_error", message: expect.stringContaining("incomplete") });
+  });
+
   it("surfaces model errors even when Pi resolves the prompt", () => {
     expect(lastAssistantError([
       { role: "user", content: [] },
@@ -49,13 +953,6 @@ describe("lastAssistantError", () => {
 
   it("does not turn a successful assistant response into an error", () => {
     expect(lastAssistantError([{ role: "assistant", stopReason: "stop" }])).toBeUndefined();
-  });
-});
-
-describe("skillInvocationPrompt", () => {
-  it("maps the Composer syntax to Pi's native skill command", () => {
-    expect(skillInvocationPrompt("$review check this change")).toBe("/skill:review check this change");
-    expect(skillInvocationPrompt("Use $review here")).toBe("Use $review here");
   });
 });
 
@@ -78,7 +975,7 @@ describe("compatibleRuntimeModel", () => {
 });
 
 describe("Pi skills", () => {
-  it("loads global and plugin skills consistently for every project type", async () => {
+  it("does not load ambient or plugin skills even when valid files and a resolver exist", async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), "ohmygame-agent-workspace-"));
     const agentDir = await mkdtemp(path.join(tmpdir(), "ohmygame-agent-dir-"));
     const skillDirectory = path.join(agentDir, "skills", "review");
@@ -90,12 +987,12 @@ describe("Pi skills", () => {
       marketplaceDisplayName: "Personal",
     }]);
 
-    await expect(loadPiSkills(
+    await expect(loadPiSkillCatalog(
       workspace,
       agentDir,
       resolvePluginSkills,
-    )).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ name: "review" })]));
-    expect(resolvePluginSkills).toHaveBeenCalledOnce();
+    )).resolves.toEqual([]);
+    expect(resolvePluginSkills).not.toHaveBeenCalled();
   }, 15_000);
 });
 
@@ -794,6 +1691,30 @@ describe("AgentManager", () => {
     prompt.resolve();
     await expect(run).resolves.toBe("completed");
     await manager.close();
+  });
+
+  it("only allows daemon-issued paid confirmations in an execution turn and binds the answer to its active request", async () => {
+    const session = new FakeSession(), prompt = deferred<void>();
+    session.prompt.mockImplementation(() => prompt.promise);
+    const events = new RuntimeEventBus(), manager = new AgentManager(events, { createSession: async () => session });
+    const project = createProject(), conversation = createConversation(project);
+    const run = manager.prompt(project, conversation, "Make a sprite").result!;
+    await vi.waitFor(() => expect(manager.agentState(conversation).status).toBe("running"));
+    const input = { questions: [{ id: "new-paid-media", prompt: "Authorize one replacement?", allowOther: false,
+      options: [{ value: "keep", label: "Keep" }, { value: "new", label: "New" }] }] };
+    try {
+      expect(() => manager.askQuestionnaire(project.id, conversation.summary.id, "untrusted-call", input)).toThrow("active plan");
+      const pending = manager.askQuestionnaire(project.id, conversation.summary.id, "replacement-call", input, undefined, "generate-image");
+      expect(events.since(project.id).at(-1)).toMatchObject({ type: "item.started", data: { item: { requestId: "replacement-call", paidMediaTool: "generate-image" } } });
+      const answers = [{ questionId: "new-paid-media", value: "new" }];
+      expect(() => manager.answerQuestionnaire(project.id, conversation.summary.id, "untrusted-call", answers)).toThrow("no longer active");
+      manager.answerQuestionnaire(project.id, conversation.summary.id, "replacement-call", answers);
+      await expect(pending).resolves.toMatchObject({ cancelled: false, answers: [{ value: "new", custom: false }] });
+    } finally {
+      prompt.resolve();
+      await run;
+      await manager.close();
+    }
   });
 
   it("sends images through Pi prompt options", async () => {
@@ -1548,6 +2469,28 @@ describe("AgentManager", () => {
     await manager.close();
   });
 
+  it("refuses late compaction after lifecycle admission closes during session loading", async () => {
+    const session = new FakeSession();
+    const loaded = deferred<CodingSession>();
+    const createSession = vi.fn(() => loaded.promise);
+    const manager = new AgentManager(new RuntimeEventBus(), { createSession });
+    const project = createProject();
+    const conversation = createConversation(project);
+    let blocked = false;
+    manager.setProjectAdmission(() => { if (blocked) throw new Error("Project deletion is pending"); });
+    const pending = manager.compact(project, conversation);
+    const refused = expect(pending).rejects.toThrow("deletion is pending");
+    await vi.waitFor(() => expect(createSession).toHaveBeenCalledOnce());
+    expect(manager.isProjectBusy(project.id)).toBe(true);
+    blocked = true; loaded.resolve(session);
+    await refused;
+    expect(session.compact).not.toHaveBeenCalled();
+    expect(manager.isProjectBusy(project.id)).toBe(false);
+    await expect(manager.contextUsage(project, createConversation(project, "new-conversation"))).rejects.toThrow("deletion is pending");
+    expect(createSession).toHaveBeenCalledOnce();
+    await manager.close();
+  });
+
   it("runs manual compaction through the native Pi session API", async () => {
     const session = new FakeSession();
     session.compact.mockImplementation(async () => {
@@ -1918,6 +2861,24 @@ describe("AgentManager", () => {
     expect(session.setThinkingLevel).toHaveBeenCalledWith("high");
     expect(reasoning).toBe("high");
     expect(persist).not.toHaveBeenCalled();
+    await manager.close();
+  });
+
+  it.each([false, true])("recreates the session when switching its image capability from %s", async (images) => {
+    const previous = { provider: "kunpo", id: images ? "gpt-5.6-sol" : "gpt-6.1-sol", input: images ? ["text", "image"] : ["text"] } as RuntimeModel;
+    const next = { provider: "kunpo", id: images ? "gpt-6.1-sol" : "gpt-5.6-sol", input: images ? ["text"] : ["text", "image"] } as RuntimeModel;
+    const session = Object.assign(new FakeSession(), { model: previous });
+    const recreated = Object.assign(new FakeSession(), { model: next });
+    const createSession = vi.fn().mockResolvedValueOnce(session).mockResolvedValueOnce(recreated);
+    const manager = new AgentManager(new RuntimeEventBus(), { createSession });
+    const project = createProject(), conversation = createConversation(project);
+    await manager.prompt(project, conversation, "First").result;
+    await manager.setModel(project.id, conversation.summary.id, next, vi.fn());
+    expect(session.setModel).toHaveBeenCalledWith(next);
+    expect(session.dispose).toHaveBeenCalledOnce();
+    await manager.prompt(project, conversation, "Use the selected model's registered tools").result;
+    expect(createSession).toHaveBeenCalledTimes(2);
+    expect(recreated.prompt).toHaveBeenCalledOnce();
     await manager.close();
   });
 
@@ -2722,15 +3683,16 @@ class FakeSession implements CodingSession {
   setThinkingLevel = vi.fn<NonNullable<CodingSession["setThinkingLevel"]>>((level) => { this.thinkingLevel = level; });
   setActiveToolsByName = vi.fn<(toolNames: string[]) => void>();
   appendCustomEntry = vi.fn((customType: string, data: unknown) => {
-    this.#entries.push({ type: "custom", customType, data });
-    return `entry-${this.#entries.length}`;
+    const id = `entry-${this.#entries.length + 1}`;
+    this.#entries.push({ type: "custom", id, customType, data });
+    return id;
   });
   sessionManager = {
     branch: vi.fn(),
     appendCustomEntry: this.appendCustomEntry,
     getBranch: () => this.#entries as never,
   };
-  #entries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
+  #entries: Array<{ type: "custom"; id: string; customType: string; data: unknown }> = [];
   #listener?: (event: AgentSessionEvent) => void;
 
   subscribe(listener: (event: AgentSessionEvent) => void): () => void {

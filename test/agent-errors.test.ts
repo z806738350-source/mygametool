@@ -1,11 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { createProviderFailureDiagnostic } from "@earendil-works/pi-ai/utils/provider-failure";
-import { assistantMessageError, normalizeAgentError, thrownAgentError } from "../src/daemon/agent-errors.js";
+import { assistantMessageError, normalizeAgentError, RepeatedMediaArgumentsError, thrownAgentError } from "../src/daemon/agent-errors.js";
 import { agentErrorDiagnosticText, agentErrorPresentation } from "../src/renderer/agent-error-presentation.js";
 import type { ThreadItemErrorCode } from "../src/shared/contracts.js";
 import { AgentRuntimeCompatibilityError, AgentRuntimeProbeError } from "../src/daemon/agent-runtimes/compatibility.js";
 
 describe("agent error diagnostics", () => {
+  it("shows repeated preflight rejections as a local media tool error", () => {
+    const error = thrownAgentError(new RepeatedMediaArgumentsError("generate_image"));
+    expect(agentErrorPresentation(error).title).toBe("Repeated invalid media call");
+    expect(agentErrorDiagnosticText(error)).not.toContain("Provider response:");
+    expect(thrownAgentError(new Error(error.message)).code).not.toBe("repeated_media_arguments");
+  });
   it("presents local CLI compatibility failures separately in live and replayed errors", () => {
     const cause = new AgentRuntimeCompatibilityError("Codex did not activate the requested permissions");
     for (const error of [
@@ -19,6 +25,36 @@ describe("agent error diagnostics", () => {
       expect(text).toContain("Local CLI details:");
       expect(text).not.toContain("Provider response:");
       expect(text).not.toContain("Network configuration:");
+    }
+  });
+
+  it.each([
+    ["SSE_IDLE_TIMEOUT", "Provider SSE stream timed out locally after 180 seconds without data", "sse_idle_timeout", "Local timeout waiting for stream data"],
+    ["SSE_VALIDATION_FAILED", "Provider SSE response failed local validation", "sse_validation_failed", "Stream failed local validation"],
+    ["SSE_VALIDATION_FAILED", "Provider SSE response exceeded the secure size limit", "sse_validation_failed", "Stream failed local validation"],
+    ["SSE_CONNECTION_INTERRUPTED", "Provider SSE connection was interrupted while reading the response", "sse_connection_interrupted", "Stream connection interrupted"],
+  ])("presents %s without attributing the message to the provider", (code, message, expected, title) => {
+    const cause = Object.assign(new Error(message), { code, transport: "sse" });
+    for (const error of [
+      thrownAgentError(new Error("Connection error.", { cause })),
+      assistantMessageError({ errorMessage: message }),
+      normalizeAgentError(message, { statusCode: 200, errorCode: code }),
+    ]) {
+      expect(error.code).toBe(expected);
+      expect(agentErrorPresentation(error).title).toBe(title);
+      expect(agentErrorDiagnosticText(error)).toContain("Stream details:");
+      expect(agentErrorDiagnosticText(error)).toContain("The request was not resent.");
+      expect(agentErrorDiagnosticText(error)).not.toContain("Provider response:");
+    }
+  });
+
+  it("keeps the earlier ambiguous guard failure neutral and distinguishes a missing SSE terminal event from WebSocket loss", () => {
+    const historical = normalizeAgentError("Provider SSE response could not be safely verified", { statusCode: 200 });
+    expect(historical.code).toBe("stream_error");
+    expect(agentErrorDiagnosticText(historical)).not.toContain("Provider response:");
+    for (const message of ["Anthropic stream ended before message_stop", "Anthropic stream ended without a stop reason", "OpenAI Responses stream ended before a terminal response event"]) {
+      expect(normalizeAgentError(message, { statusCode: 200 }).code).toBe("sse_connection_interrupted");
+      expect(normalizeAgentError(message, { transport: "websocket" }).code).toBe("stream_error");
     }
   });
 

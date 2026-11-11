@@ -6,19 +6,22 @@ import type { DesktopClipboardFile } from "../shared/file-transfer.js";
 import type { WebGamePlayerRequest, WebGamePlayerState, WebGamePreviewLayout } from "../shared/web-game-player.js";
 import type { DaemonRuntime, DesktopRuntimeState } from "../shared/desktop-runtime.js";
 import type { PlayableThumbnailSnapshot } from "../shared/playable-player-protocol.js";
+import type { StorageCleanupScan, StorageCleanupPlan, StorageCleanupPlanRequest, StorageCleanupExecuteRequest, StorageCleanupResult } from "../shared/desktop-storage.js";
 
-function desktopRuntime(): { daemonUrl: string; token: string } {
-  const runtime = ipcRenderer.sendSync("ohmygame:desktop-runtime") as Partial<DaemonRuntime> | null;
+function desktopRuntime(): { daemonUrl: string; token: string; nativeMedia: boolean } {
+  const runtime = ipcRenderer.sendSync("ohmygame:desktop-runtime") as (Partial<DaemonRuntime> & { nativeMedia?: unknown }) | null;
   if (typeof runtime?.url !== "string" || !runtime.url || typeof runtime.token !== "string" || !runtime.token) {
     throw new Error("Missing desktop runtime");
   }
-  return { daemonUrl: runtime.url, token: runtime.token };
+  return { daemonUrl: runtime.url, token: runtime.token, nativeMedia: runtime.nativeMedia === true };
 }
 
 if (process.isMainFrame) {
+  const { nativeMedia, ...runtime } = desktopRuntime();
   contextBridge.exposeInMainWorld("ohMyGameDesktop", Object.freeze({
     platform: process.platform,
-    runtime: Object.freeze(desktopRuntime()),
+    nativeMedia,
+    runtime: Object.freeze(runtime),
     runtimeService: Object.freeze({
       state: () => ipcRenderer.invoke("ohmygame:runtime-state") as Promise<DesktopRuntimeState>,
       restart: () => ipcRenderer.invoke("ohmygame:restart-runtime") as Promise<DesktopRuntimeState>,
@@ -51,6 +54,7 @@ if (process.isMainFrame) {
         ipcRenderer.invoke("ohmygame:popup-window-menu", label, x, y) as Promise<void>,
     }),
     openExternal: (url: string) => ipcRenderer.invoke("ohmygame:open-auth-url", url) as Promise<void>,
+    openCodexLogin: (url: string) => ipcRenderer.invoke("ohmygame:open-codex-login-url", url) as Promise<void>,
     openProjectFile: (projectId: string, filePath: string, mode: ProjectFileOpenMode = "default") =>
       ipcRenderer.invoke("ohmygame:open-project-file", projectId, filePath, mode) as Promise<void>,
     browsePluginDirectory: (pluginId: string) => ipcRenderer.invoke("ohmygame:browse-plugin-directory", pluginId) as Promise<void>,
@@ -59,6 +63,12 @@ if (process.isMainFrame) {
     selectProjectDirectory: () => ipcRenderer.invoke("ohmygame:select-project-directory") as Promise<string | undefined>,
     openLogsDirectory: () => ipcRenderer.invoke("ohmygame:open-logs-directory") as Promise<void>,
     exportDiagnostics: () => ipcRenderer.invoke("ohmygame:export-diagnostics") as Promise<Uint8Array<ArrayBuffer>>,
+    storageCleanup: Object.freeze({
+      scan: () => ipcRenderer.invoke("ohmygame:storage-scan") as Promise<StorageCleanupScan>,
+      plan: (request: StorageCleanupPlanRequest) => ipcRenderer.invoke("ohmygame:storage-plan", request) as Promise<StorageCleanupPlan>,
+      execute: (request: StorageCleanupExecuteRequest) => ipcRenderer.invoke("ohmygame:storage-execute", request) as Promise<StorageCleanupResult>,
+      result: (planId: string) => ipcRenderer.invoke("ohmygame:storage-result", planId) as Promise<StorageCleanupResult | undefined>,
+    }),
     clipboard: Object.freeze({
       files: () => ipcRenderer.invoke("ohmygame:clipboard-files") as Promise<DesktopClipboardFile[]>,
       paste: () => ipcRenderer.invoke("ohmygame:paste-native") as Promise<void>,

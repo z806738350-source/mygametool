@@ -1,9 +1,11 @@
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
-import type { AddressInfo } from "node:net";
+import { createConnection, type AddressInfo } from "node:net";
+import { Duplex, PassThrough } from "node:stream";
+import { registerSensitiveValue } from "../src/shared/sensitive-values.js";
 import { createServer as createViteServer } from "vite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createPreviewProxy } from "../src/daemon/preview-proxy.js";
@@ -15,6 +17,103 @@ afterEach(async () => {
 });
 
 describe("preview content isolation", () => {
+  it("does not retain a load error when the browser cancels a buffered HTML response", async () => {
+    let started!: () => void, disconnected!: () => void;
+    const receiving = new Promise<void>(resolve => { started = resolve; });
+    const closed = new Promise<void>(resolve => { disconnected = resolve; });
+    const server = createServer((_incoming, outgoing) => {
+      outgoing.once("close", disconnected);
+      outgoing.writeHead(200, { "content-type": "text/html" }); outgoing.write("<head></head><body>"); started();
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const diagnostic = vi.fn();
+    const proxy = await createPreviewProxy(`http://127.0.0.1:${(server.address() as AddressInfo).port}`, diagnostic);
+    cleanups.push(() => proxy.close());
+    const client = httpRequest(proxy.url); client.on("error", () => {}); client.end();
+    await receiving; client.destroy(); await closed;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(diagnostic).not.toHaveBeenCalled();
+  });
+  it.each(["client-cancel", "upstream-error"] as const)("distinguishes %s while opening a VM preview transport", async (failure) => {
+    const diagnostic = vi.fn();
+    let connected!: (transport: Duplex) => void;
+    const connection = new Promise<Duplex>(resolve => { connected = resolve; });
+    const proxy = await createPreviewProxy("http://127.0.0.1:9", diagnostic, { createConnection: () => {
+      const transport = new Duplex({ read() {}, write(_chunk, _encoding, callback) { callback(); },
+        destroy(_error, callback) { callback(Object.assign(new Error("The operation was aborted"), { code: "ABORT_ERR" })); } });
+      transport.on("error", () => {}); connected(transport); return transport;
+    } });
+    cleanups.push(() => proxy.close());
+    const response = new Promise<number>(resolve => {
+      const client = httpRequest(proxy.url, incoming => { incoming.resume(); resolve(incoming.statusCode!); });
+      client.on("error", () => {}); client.end();
+      void connection.then(transport => {
+        if (failure === "client-cancel") client.destroy();
+        else transport.destroy(new Error("VM connection failed"));
+      });
+      if (failure === "client-cancel") client.once("close", () => resolve(0));
+    });
+    const transport = await connection;
+    const closed = new Promise<void>(resolve => transport.once("close", resolve));
+    expect(await response).toBe(failure === "client-cancel" ? 0 : 502);
+    await closed;
+    if (failure === "client-cancel") expect(diagnostic).not.toHaveBeenCalled();
+    else expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ kind: "load", message: expect.stringContaining("could not be reached") }));
+  });
+  it("releases completed pipe-backed transports before the next asset burst", async () => {
+    const server = createServer((_request, response) => response.writeHead(200, { "content-type": "text/plain" }).end("asset"));
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
+    const port = (server.address() as AddressInfo).port;
+    const connections = new Set<Duplex>();
+    const proxy = await createPreviewProxy("http://127.0.0.1:9", () => {}, {
+      createConnection: () => {
+        if (connections.size >= 8) throw new Error("connection budget exhausted");
+        const socket = createConnection({ host: "127.0.0.1", port });
+        const input = new PassThrough(), output = new PassThrough();
+        input.pipe(socket);
+        socket.pipe(output);
+        const pipe = Duplex.from({ readable: output, writable: input });
+        pipe.on("error", () => {});
+        pipe.once("close", () => socket.destroy());
+        connections.add(pipe);
+        pipe.once("close", () => connections.delete(pipe));
+        return pipe;
+      },
+    });
+    cleanups.push(() => proxy.close());
+    for (let i = 0; i < 20; i++) {
+      const response = await fetch(`${proxy.url}/asset-${i}`, { headers: { connection: "keep-alive" } });
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("asset");
+      await vi.waitFor(() => expect(connections.size).toBe(0));
+    }
+  });
+
+  it("uses a custom VM transport and strips credentials before forwarding", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const server = createServer((incoming, outgoing) => {
+      requests.push(incoming.headers);
+      outgoing.writeHead(200, { "content-type": "text/plain" }).end("isolated-stream");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
+    const port = (server.address() as AddressInfo).port;
+    const proxy = await createPreviewProxy("http://127.0.0.1:9", () => {}, {
+      createConnection: () => createConnection({ host: "127.0.0.1", port }),
+    });
+    cleanups.push(() => proxy.close());
+    const canary = "preview-vm-key-7a48c922f0be4e5cafed";
+    registerSensitiveValue(canary);
+    expect(await (await fetch(proxy.url, { headers: { authorization: `Bearer ${canary}`, "x-api-key": canary } })).text()).toBe("isolated-stream");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.authorization).toBeUndefined();
+    expect(requests[0]?.["x-api-key"]).toBeUndefined();
+    expect((await fetch(`${proxy.url}/?key=${canary}`)).status).toBe(403);
+    expect(requests).toHaveLength(1);
+  });
+
   it("moves a live document between editor and player without replacing its client or losing diagnostics", async () => {
     const server = createServer((_incoming, outgoing) => outgoing.writeHead(200, { "content-type": "text/html" }).end("<head></head>"));
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -33,7 +132,7 @@ describe("preview content isolation", () => {
     await report({ type: "source", source: "editor", path: "/scene?level=2#boss" });
     expect(diagnostic.mock.calls.at(-1)?.[1]).toEqual([expect.objectContaining({ client: "shared", source: "editor", message: "Game error" })]);
   });
-  it("preserves same-origin framework requests and redirects without rewriting foreign origins", async () => {
+  it("preserves same-origin framework requests and redirects while rejecting foreign origins", async () => {
     let target = "";
     const server = createServer((incoming, outgoing) => {
       if (incoming.url === "/redirect") {
@@ -74,19 +173,14 @@ describe("preview content isolation", () => {
       origin: target,
       referer: `${target}/scene?level=2`,
     });
-    const foreign = await (
-      await fetch(`${proxy.url}/action`, {
-        method: "POST",
-        headers: {
-          origin: "https://foreign.example",
-          referer: "https://foreign.example/scene",
-        },
-      })
-    ).json();
-    expect(foreign).toMatchObject({
-      origin: "https://foreign.example",
-      referer: "https://foreign.example/scene",
+    const foreign = await fetch(`${proxy.url}/action`, {
+      method: "POST",
+      headers: {
+        origin: "https://foreign.example",
+        referer: "https://foreign.example/scene",
+      },
     });
+    expect(foreign.status).toBe(403);
     const redirect = await fetch(
       `${proxy.url}/redirect?__ohmygame_client=editor&__ohmygame_view=editor`,
       { redirect: "manual" },

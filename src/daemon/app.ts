@@ -1,12 +1,17 @@
+import { releaseRetiredProjectRecoverySpace, restoreLocalImageRecoverySpaces, restoreRecoverySpaceReservations } from "./recovery-space.js";
+import { isMeshyIdentifier, isMeshyProviderConfiguration, MESHY_DISABLED_MESSAGE } from "../shared/disabled-media-providers.js";
 import { PluginIntegrationHost } from "./plugin-integration.js";
-import { matchesPluginProject, requireIntegrationPlugin, registerPluginIntegrationRoutes, projectPreviewTool } from "./plugin-integration-routes.js";
+import { matchesPluginProject, requireIntegrationPlugin, registerPluginIntegrationRoutes } from "./plugin-integration-routes.js";
+import { isAllowedLocalOrigin, isLoopbackHostHeader } from "../shared/local-security.js";
 import { CodexImageProvider } from "./agent-runtimes/codex-image-provider.js";
 import { inspectPreviewConfiguration } from "./preview-configuration.js";
 import { CheckpointStore } from "./checkpoints.js";
 import { ProjectWrites } from "./project-writes.js";
+import { ProjectLifecycle, ProjectLifecycleError } from "./project-lifecycle.js";
+import type { ExecutionStorageOverview } from "../shared/execution-storage.js";
 import { registerCheckpointRoutes } from "./checkpoint-routes.js";
 import { registerStoryWebRoutes } from "./story-web-routes.js";
-import { readWorkspaceNotice, readWorkspaceVersion } from "./workspace-notice.js";
+import { readWorkspaceNotice, readWorkspaceVersion, writeWorkspaceNotice } from "./workspace-notice.js";
 import { withCanvasLock } from "./canvas-workspace.js";
 import { validatePreviewSettings } from "../shared/preview-settings.js";
 import { previewPageUrl } from "../shared/preview-page.js";
@@ -16,15 +21,20 @@ import { PluginCapabilities } from "./plugin-capabilities.js";
 import { registerPluginCapabilityRoutes } from "./plugin-capability-routes.js";
 import { isUtf8 } from "node:buffer";
 import { sniffImageType } from "./image-format.js";
-import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { access as fileAccess, readFile, rm } from "node:fs/promises";
+import { validateConversationRaster } from "./image-working-assets.js";
+import { randomUUID } from "node:crypto";
+import { assertNoKnownSecretBytes, SafeProjectFileError } from "./safe-project-file.js";
+import { CheckedMediaSnapshotError, CheckedMediaSnapshotStore, type CheckedMediaSnapshot } from "./checked-media-snapshot.js";
+import { mediaPreviewReadLimit, mediaSnapshotResponse } from "./media-snapshot-response.js";
+import { KUNPO_BASE_URL, KUNPO_DEFAULT_MODEL_REFS, KUNPO_MODEL_ROLES, kunpoModelOption, validateKunpoSelection, type KunpoModelRole } from "../shared/kunpo-models.js";
+import { imageModelsForProvider } from "./image-models.js";
+import { readFile, rm, lstat } from "node:fs/promises";
 import { OnboardingStore } from "./onboarding.js";
 import type { UpdateOnboardingRequest } from "../shared/onboarding.js";
 import path from "node:path";
 import { isWebStory } from "./story-web-project.js";
 import { fileURLToPath } from "node:url";
-import { ModelRuntime, SettingsManager, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { ModelRuntime, SettingsManager, type SessionEntry, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import Fastify, { LogController, type FastifyReply, type FastifyRequest } from "fastify";
 import { daemonLoggerOptions, logFailedRequests } from "./request-log.js";
 import { ActivityLog } from "./activity-log.js";
@@ -38,9 +48,10 @@ import { EXAMPLE_ID_PATTERN } from "../shared/examples.js";
 import { PUBLISH_GAME_TITLE_MAX_LENGTH } from "../shared/publish-v1.js";
 import { clampReasoningLevel, parseReasoningLevel, supportedReasoningLevels } from "../shared/reasoning.js";
 import { matchesBearerToken } from "./access.js";
-import { AgentManager, conversationItems, createPiSession, loadPiSkillCatalog, loadPiSkills, type RuntimeModel, type SessionFactory } from "./agent.js";
+import { AgentManager, authorizeConversationAttachment, conversationItems, createPiSession, loadPiSkillCatalog, type RuntimeModel, type SessionFactory } from "./agent.js";
 import { CHECKPOINT_UNDONE_ENTRY, TURN_END_ENTRY, referencedSnapshots } from "./checkpoint-extension.js";
 import { createAgentTools, projectPiToolNames } from "./agent-tools.js";
+import { createAgentAttachmentReadTool, createLocalAgentFileTools, createProjectFileReadTool } from "./agent-local-files.js";
 import { AgentRuntimeService } from "./agent-runtimes/service.js";
 import { neverTouchPaths } from "./agent-runtimes/policy.js";
 import { skillFolders } from "./agent-runtimes/skills.js";
@@ -66,7 +77,6 @@ import { PlayableDraftServer } from "./playable-draft-server.js";
 import { promptContextBlock } from "./prompt-context.js";
 import { RemotePublisher, RemotePublishError } from "./publish/client.js";
 import { registerCommunityRoutes } from "./publish/community-routes.js";
-import { LocalPublisher } from "./publish/local.js";
 import { LOCAL_DEBUG_ACCESS_TOKEN } from "../shared/local-debug.js";
 import { PreviewManager, PreviewCancelledError } from "./preview.js";
 import { ProjectAssetError, ProjectManager, ProjectLibraryReferenceError, ProjectWorkspaceError } from "./projects.js";
@@ -79,7 +89,6 @@ import { openAIImageConnection, registerOpenAIImageRoutes } from "./openai-image
 import { RESPONSES_TRANSPORT_MODES, type ResponsesTransportSettings } from "../shared/contracts.js";
 import { NetworkSettingsService } from "./network-settings.js";
 import type { NetworkSettings } from "../shared/network-settings.js";
-import { migrateAzureProviderId } from "./azure-provider-migration.js";
 import { normalizeCustomProvider, normalizeCustomProviderModel, ProviderModelSettingsStore } from "./provider-model-settings.js";
 import { discoverProviderModels } from "./provider-model-discovery.js";
 import { customModelCatalog } from "./custom-model-capabilities.js";
@@ -88,31 +97,33 @@ import { Model3DGenerationError, type Model3DGenerator } from "./model3d.js";
 import { CloudModelsClient } from "./cloud-models.js";
 import { MAX_ANIMATION_ACTIONS, MODEL_3D_MAX_POLYCOUNT } from "../shared/generation-config.js";
 import { isNative3DProvider, model3DPreset, normalizeNativeModel3D, MODEL_3D_CATALOG_DOCS, MODEL_3D_CATALOG_REVIEWED } from "../shared/model3d-presets.js";
+import { FBX_MEDIA_TYPE, isFbxArtifact } from "./fbx-preview.js";
 import type { ProviderModelSettings } from "../shared/contracts.js";
 import { MEDIA_CONTENT_TYPES } from "../shared/media-files.js";
-import { MeshyProvider } from "./meshy-provider.js";
 import { MediaProviderKeyStore } from "./media-provider-settings.js";
 import { TripoProvider } from "./tripo-provider.js";
-import { Hyper3DProvider } from "./hyper3d-provider.js";
 import type { ImageGenerator } from "./openai-image.js";
 import { ProviderImages } from "./provider-images.js";
 import { ProviderModels3D } from "./provider-models3d.js";
 import { modelUsageList, modelUsages } from "../shared/custom-models.js";
-import { ToolRunner, ToolRunError } from "./tools.js";
+import { assertSafeGenerationInput, ToolRunner, ToolRunError } from "./tools.js";
+import { inheritToolPreflightFailure } from "./agent-tool-errors.js";
 import type { VideoGenerator } from "./video-generation.js";
 import { ProviderVideos } from "./provider-videos.js";
-import { AudioGenerationError, ProviderAudio, type AudioGenerator } from "./audio-generation.js";
+import { ProviderAudio, type AudioGenerator } from "./audio-generation.js";
+import { createProjectMediaCapabilitiesTool, projectAnimationSelection, projectMediaPreference } from "./project-media-capabilities.js";
 import { VolcengineTtsProvider } from "./volcengine-tts-provider.js";
 import { VolcengineTtsSettingsStore } from "./volcengine-tts-settings.js";
 import { VolcengineSeedAudioProvider } from "./volcengine-seed-audio-provider.js";
 import { VolcengineSeedAudioSettingsStore } from "./volcengine-seed-audio-settings.js";
-import { AUDIO_OUTPUT_FORMATS, AUDIO_SAMPLE_RATES, AUDIO_VOICE_ID_MAX_LENGTH, AUDIO_VOICE_ID_PATTERN, DOUBAO_SEED_AUDIO_PROVIDER_NAME, DOUBAO_SPEECH_PROVIDER_NAME, availableAudioOperations, type AudioOperation } from "../shared/audio.js";
-import { isSeedanceProviderId, SEEDANCE_PROVIDER_IDS, SEEDANCE_PROVIDERS } from "./seedance-models.js";
+import { AUDIO_OUTPUT_FORMATS, AUDIO_SAMPLE_RATES, availableAudioOperations, type AudioOperation } from "../shared/audio.js";
+import { isSeedanceProviderId, SEEDANCE_PROVIDERS } from "./seedance-models.js";
 import { SeedanceSettingsStore } from "./seedance-settings.js";
-import { isMinimaxProviderId, MINIMAX_PROVIDER_IDS, MINIMAX_PROVIDERS } from "./minimax-models.js";
+import { isMinimaxProviderId, MINIMAX_PROVIDERS } from "./minimax-models.js";
 import { MinimaxSettingsStore } from "./minimax-settings.js";
 import { BundledPluginAdapter, LocalPluginAdapter, PluginCatalogService, pluginSummary } from "./plugin-catalog.js";
 import { BundledPluginStore } from "./bundled-plugins.js";
+import { workflowGuideTools } from "./workflow-guide.js";
 import { LocalPluginError, LocalPluginStore } from "./local-plugins.js";
 import { inspectPluginSource, installPlugin } from "./plugin-installer.js";
 import { InvalidPluginSettingsError, PluginSettingsStore } from "./plugin-settings.js";
@@ -125,14 +136,22 @@ import { getWorkspaceMedia, listWorkspaceFiles, locateWorkspaceEntry, readWorksp
 import { listWorkspaceGitChanges, readWorkspaceGitFile } from "./workspace-git.js";
 import { AssetLibrary, AssetLibraryError, isLibraryAssetDerivation } from "./asset-library.js";
 import { exportProjectArchive, importProjectArchive, ProjectArchiveError } from "./project-archive.js";
+import { createLocalModelRuntime } from "./local-model-runtime.js";
+import { LOCAL_EXECUTION_ENABLED, assertLocalExecutionAllowed } from "./local-execution-policy.js";
+import { createBuildGameTool, createIsolatedRecoveryTool, createIsolatedShellTool } from "./isolated-shell-tool.js";
+import { annotateIsolatedRepairPublication, getIsolatedRepairProof, getRepairTargets, settleIsolatedRepair } from "./isolated-tool-receipts.js";
+import { registerSensitiveValue, redactKnownSensitiveValues } from "../shared/sensitive-values.js";
+import { closeRuntimeMediaSnapshots, inspectProjectSourceBudget } from "./isolated-project-files.js";
+import { VolumeMigrationCoordinator } from "./volume-migration-coordinator.js";
+import { inspectExecutionCapacity, planInitialExecutionCapacity, proposeExecutionCapacity } from "./execution-capacity.js";
+import { assertSourcePublicationSettled, pendingSourcePublications } from "./isolated-publication-journal.js";
 import { MAX_PROJECT_COVER_BYTES } from "./project-covers.js";
 import { PROJECT_ARCHIVE_CONTENT_TYPE, PROJECT_ARCHIVE_MAX_BYTES } from "../shared/project-archive.js";
-import { AgentAttachmentError, AgentAttachmentStore, MAX_AGENT_ATTACHMENT_BYTES, MAX_AGENT_ATTACHMENTS_PER_TURN } from "./agent-attachments.js";
+import { MAX_ORIGINAL_TURN_BYTES, SessionImages } from "./session-images.js";
+import { AgentAttachmentError, AgentAttachmentStore, resolveAgentAttachment, MAX_AGENT_ATTACHMENT_BYTES, MAX_AGENT_ATTACHMENTS_PER_TURN } from "./agent-attachments.js";
 import { WEB_GAME_USE_CAPABILITIES, type GameRuntimeAdapter, type GameUseOpenTarget } from "../shared/playtest.js";
 import { EXTERNAL_AGENT_CLIENT_IDS, EXTERNAL_MCP_PATH, EXTERNAL_MCP_ROOTS_HEADER, type ExternalAgentClientId, type ExternalAgentSettings, type ExternalMcpLauncher, type UpdateExternalAgentSettings } from "../shared/external-mcp.js";
-import type { UpdateWebSearchSettings } from "../shared/web-search.js";
 import { WebSearchSettingsStore } from "./web-search-settings.js";
-import { WebSearchService } from "./web-search.js";
 import { buildPlayableProject, validatePlayableProject } from "./playable-project.js";
 import {
   createNodeCodebase,
@@ -155,6 +174,9 @@ import {
 } from "./playable-thumbnails.js";
 
 export interface AppOptions {
+  /** Daemon-only credential profile selected by an explicit local environment file. */
+  localApiKeyFile?: string;
+  projectExecution?: import("./isolated-project-execution.js").IsolatedProjectExecution;
   cloudApiUrl?: string;
   cloudFetch?: typeof fetch;
   dataDirectory?: string;
@@ -186,7 +208,6 @@ export interface AppOptions {
   /** Examples prepared by scripts/prepare-examples.ts; omitted means no examples. */
   examplesDirectory?: string;
   playtestDriver?: GameRuntimeAdapter;
-  webSearchFetch?: typeof fetch;
   networkSettings?: NetworkSettingsService;
   /** How Claude Code and Codex start the `ohmygame-mcp` launcher; the desktop app provides it. */
   externalMcpLauncher?: ExternalMcpLauncher;
@@ -276,23 +297,6 @@ const renameAssetSchema = {
   },
 } as const;
 
-const nullableSecretSchema = { anyOf: [{ type: "string", maxLength: 10_000 }, { type: "null" }] } as const;
-const webSearchSettingsSchema = {
-  body: {
-    type: "object", additionalProperties: false, required: ["enabled", "provider", "fallback"],
-    properties: {
-      enabled: { type: "boolean" }, provider: { enum: ["auto", "exa", "parallel", "custom"] }, fallback: { type: "boolean" },
-      exaApiKey: nullableSecretSchema, parallelApiKey: nullableSecretSchema,
-      custom: {
-        type: "object", additionalProperties: false, required: ["name", "endpoint", "toolName"],
-        properties: {
-          name: { type: "string", minLength: 1, maxLength: 100 }, endpoint: { type: "string", minLength: 1, maxLength: 2_000 },
-          toolName: { type: "string", minLength: 1, maxLength: 200 }, apiKey: nullableSecretSchema,
-        },
-      },
-    },
-  },
-} as const;
 const publishProjectSchema = {
   body: {
     type: "object",
@@ -365,6 +369,7 @@ const promptSchema = {
             mediaType: { enum: ["image/png", "image/jpeg", "image/webp", "image/gif"] },
             data: { type: "string", minLength: 1 },
             name: { type: "string", minLength: 1, maxLength: 255 },
+            libraryAssetId: { type: "string", pattern: "^[a-f0-9-]{36}$" },
           },
         },
       },
@@ -394,6 +399,12 @@ const reviseLastPromptSchema = {
   },
 } as const;
 
+// Both a new/queued prompt and a revision accept free text. A steer only reorders an admitted turn.
+async function rejectRetiredPublishCommand(request: FastifyRequest<{ Body: { prompt?: string } }>, reply: FastifyReply) {
+  if (request.body.prompt?.trim().toLowerCase() === "/publish")
+    return reply.code(410).send({ error: "Cloud publishing is unavailable in this local edition." });
+}
+
 const AGENT_RUNTIME_BRIDGE_PATH = "/agent-runtime-bridge/mcp";
 
 /** Lists game_use for external agents when the daemon runs without the desktop app. */
@@ -418,7 +429,20 @@ const answerApprovalSchema = {
     type: "object",
     additionalProperties: false,
     required: ["decision"],
-    properties: { decision: { enum: ["allow", "allow-session", "deny"] } },
+    properties: { decision: { enum: ["allow", "allow-session", "deny"] }, sourceConfirmation: {
+      type: "object", additionalProperties: false, required: ["reviewId", "filesReviewed"], properties: {
+        reviewId: { type: "string", pattern: "^[a-f0-9]{64}$" }, filesReviewed: { type: "boolean" }, codeReviewed: { type: "boolean" },
+      },
+    }, volumeMigrationConfirmation: {
+      type: "object", additionalProperties: false,
+      required: ["planId", "generation", "sourceImageSha256", "targetProfileId", "capacityReviewed", "oldVolumeRetained"],
+      properties: {
+        planId: { type: "string", pattern: "^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$" },
+        generation: { type: "integer", minimum: 0 },
+        sourceImageSha256: { anyOf: [{ type: "string", pattern: "^[a-f0-9]{64}$" }, { type: "null" }] },
+        targetProfileId: { enum: ["capacity-128-v2", "capacity-128-media64-v3"] }, capacityReviewed: { type: "boolean" }, oldVolumeRetained: { type: "boolean" },
+      },
+    } },
   },
 } as const;
 
@@ -507,9 +531,15 @@ const toolRunSchema = {
       resolution: { type: "string", enum: [...new Set([...IMAGE_RESOLUTIONS, ...VIDEO_RESOLUTIONS])] },
       aspectRatio: { type: "string", enum: [...new Set([...IMAGE_ASPECT_RATIOS, ...VIDEO_ASPECT_RATIOS])] },
       outputs: { type: "integer", enum: [...IMAGE_OUTPUT_COUNTS] },
+      quality: { enum: ["auto", "low", "medium", "high", "xhigh", "max"] },
+      outputFormat: { enum: ["png", "jpeg"] },
+      outputCompression: { type: "integer", minimum: 0, maximum: 100 },
+      background: { enum: ["auto", "opaque", "transparent"] },
+      mask: { type: "object", additionalProperties: false, required: ["mediaType", "data"], properties: {
+        mediaType: { const: "image/png" }, data: { type: "string", minLength: 1, maxLength: 45_000_000 },
+      } },
       duration: { type: "integer", minimum: 1, maximum: 30 },
       durationSeconds: { type: "number", minimum: 0.1, maximum: 600 },
-      voiceId: { type: "string", minLength: 1, maxLength: AUDIO_VOICE_ID_MAX_LENGTH, pattern: AUDIO_VOICE_ID_PATTERN },
       language: { type: "string", minLength: 1, maxLength: 40 },
       style: { type: "string", minLength: 1, maxLength: 2_000 },
       speed: { type: "number", minimum: -50, maximum: 100 },
@@ -518,11 +548,18 @@ const toolRunSchema = {
       lyrics: { type: "string", maxLength: 20_000 },
       negativePrompt: { type: "string", maxLength: 4_000 },
       referenceAssetId: { type: "string", minLength: 1, maxLength: 100 },
+      referenceSha256: { type: "string", pattern: "^[a-f0-9]{64}$" },
+      voiceDesign: { type: "boolean" },
+      voiceDescription: { type: "string", minLength: 1, maxLength: 2000 },
+      // Explicitly forbidden so AJV's extra-property removal cannot silently accept legacy credentials/input bytes.
+      voiceId: false,
+      referenceAudio: false,
+      audioPath: false,
       output: {
         type: "object",
         additionalProperties: false,
         properties: {
-          format: { enum: [...AUDIO_OUTPUT_FORMATS], description: "Must be supported by the selected model; Doubao Speech supports mp3 only." },
+          format: { enum: [...AUDIO_OUTPUT_FORMATS], description: "Must be supported by the selected model; Kunpo SeedAudio supports MP3 or WAV in this client." },
           sampleRate: { type: "integer", enum: [...AUDIO_SAMPLE_RATES] },
           channels: { type: "integer", enum: [1, 2] },
         },
@@ -534,8 +571,18 @@ const toolRunSchema = {
       title: { type: "string", minLength: 1, maxLength: 80 },
       projectId: { type: "string", minLength: 1, maxLength: 200 },
       nodeId: { type: "string", minLength: 1, maxLength: 200 },
+      confirmedJobId: { type: "string", minLength: 1, maxLength: 120 },
       assetId: { type: "string", minLength: 1, maxLength: 100 },
-      actionIds: { type: "array", minItems: 1, maxItems: MAX_ANIMATION_ACTIONS, uniqueItems: true, items: { type: "integer", minimum: 0 } },
+      actionIds: { type: "array", minItems: 1, maxItems: MAX_ANIMATION_ACTIONS, uniqueItems: true, items: { anyOf: [{ type: "integer", minimum: 0 }, { type: "string", minLength: 1, maxLength: 150 }] } },
+      options: { type: "object", additionalProperties: false, properties: {
+        referenceMode: { enum: ["turnaround", "provided-views"] },
+        pose: { enum: ["a-pose", "t-pose"] }, textureModel: { type: "string", maxLength: 100 },
+        textureQuality: { enum: ["fast", "standard", "detailed", "extreme"] },
+        rigModel: { enum: ["v1.0-20240301", "v2.5-20260210", "v3.0-20260909"] },
+        rigType: { enum: ["biped", "quadruped", "hexapod", "octopod", "avian", "serpentine", "aquatic", "others"] },
+        animateInPlace: { type: "boolean" }, quad: { type: "boolean" }, smartUv: { type: "boolean" },
+        geometryQuality: { enum: ["standard", "detailed"] },
+      } },
       heightMeters: { type: "number", exclusiveMinimum: 0, maximum: 100 },
       image: {
         type: "object",
@@ -556,6 +603,7 @@ const toolRunSchema = {
           properties: {
             mediaType: { enum: ["image/png", "image/jpeg", "image/webp"] },
             data: { type: "string", minLength: 1 },
+            libraryAssetId: { type: "string", pattern: "^[a-f0-9-]{36}$" },
           },
         },
       },
@@ -625,31 +673,60 @@ const PLAYABLE_SANDBOX_FILES = new Map([
 ]);
 
 export function createApp(options: AppOptions = {}) {
+  registerSensitiveValue(options.accessToken);
   const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
   const dataDirectory = options.dataDirectory ?? path.join(repositoryRoot, ".data");
   const piAgentDirectory = options.piAgentDirectory ?? process.env.PI_CODING_AGENT_DIR ?? path.join(dataDirectory, "pi-agent");
   const conversationImages = new ConversationImageStore(path.join(dataDirectory, "cache", "conversation-images"));
   const events = new RuntimeEventBus(1_000, (event) => conversationImages.event(event));
-  const library = new AssetLibrary(dataDirectory);
-  const projects = new ProjectManager(dataDirectory, library);
+  const mediaSnapshots = new CheckedMediaSnapshotStore(path.join(dataDirectory, "cache", "checked-media"));
+  const library = new AssetLibrary(dataDirectory, mediaSnapshots);
+  const projects = new ProjectManager(dataDirectory, library, [piAgentDirectory], async project => {
+    if (!options.projectExecution || typeof options.projectExecution.storageOverview !== "function" || project.workspaceLocation === "external") return undefined;
+    // An explicit current guest record can widen the host inventory bound; stopped/stale state cannot.
+    const overview = await options.projectExecution.storageOverview([project]);
+    if (overview.dataStatus !== "current" || !overview.snapshot?.countsTrusted || overview.snapshot.capacityOverviewVersion !== 1 || overview.snapshot.capacityReservations?.length !== 0) return undefined;
+    const entry = overview.snapshot.projects.find(item => item.namespace === options.projectExecution!.namespace && item.projectId === project.id);
+    return (entry?.volumeProfileVersion === 2 && entry.sourceProfileId === "capacity-128-v2") || (entry?.volumeProfileVersion === 3 && entry.sourceProfileId === "capacity-128-media64-v3") ? entry.sourceProfileId : undefined;
+  });
   const attachments = new AgentAttachmentStore();
   const conversations = new ConversationManager(conversationImages);
+  let closing = false;
+  const eventStreams = new Set<() => void>();
+  const trackEventStream = (reply: FastifyReply, unsubscribe: () => void) => {
+    const heartbeat = setInterval(() => { if (!reply.raw.writableEnded && !reply.raw.destroyed) reply.raw.write(": heartbeat\n\n"); }, 15_000);
+    const close = () => {
+      clearInterval(heartbeat);
+      if (!eventStreams.delete(close)) return;
+      try { unsubscribe(); }
+      finally { if (!reply.raw.writableEnded && !reply.raw.destroyed) reply.raw.end(); }
+    };
+    eventStreams.add(close);
+    reply.raw.once("close", close);
+    if (closing) close();
+  };
   const agentPlaytests = new Map<string, OwnedPlaytestDriver>();
   const publishing = new Set<string>();
   const playerDirectory = options.interactiveStoryPlayerDirectory ?? path.join(repositoryRoot, "dist", "player");
-  const artifacts = new ArtifactBuilder(library, playerDirectory);
+  const artifacts = new ArtifactBuilder(library, playerDirectory, options.projectExecution);
   const playableDrafts = new PlayableDraftServer((project) => artifacts.preparePlayableDraft(project));
-  const examples = new ExampleStore(options.examplesDirectory, (workspacePath, exampleId) => artifacts.preparePlayableExample(workspacePath, exampleId));
-  const localPublisher = options.localDebug ? new LocalPublisher() : undefined;
-  const cloudModels = new CloudModelsClient(options.cloudApiUrl ?? options.publishApiUrl ?? process.env.CLOUD_API_URL ?? process.env.PUBLISH_API_URL ?? "http://127.0.0.1:43130", options.cloudFetch);
-  const publisher = localPublisher ?? new RemotePublisher({
-    apiUrl: options.publishApiUrl ?? process.env.CLOUD_API_URL ?? process.env.PUBLISH_API_URL ?? "http://127.0.0.1:43130",
-    fetch: options.publishFetch,
-    visitorTokenFile: path.join(dataDirectory, "community-visitor.json"),
-  });
-  const previews = new PreviewManager(events);
+  const examples = new ExampleStore(undefined, (workspacePath, exampleId) => artifacts.preparePlayableExample(workspacePath, exampleId));
+  // The local edition has no product account, visitor identity, cloud transport or remote publication.
+  const cloudModels = new CloudModelsClient();
+  const publisher = new RemotePublisher();
+  const projectLifecycle = new ProjectLifecycle(dataDirectory);
+  options.projectExecution?.setAdmission((id) => projectLifecycle.assertAvailable(id));
+  const previews = new PreviewManager(events, { execution: options.projectExecution, assertAvailable: (id) => projectLifecycle.assertAvailable(id), mediaSnapshots });
+  const buildGame = (project: ProjectState, signal?: AbortSignal) =>
+    previews.withExecutionSlot(project, () => artifacts.buildLocal(project, signal));
   const checkpoints = new CheckpointStore();
   const projectWrites = new ProjectWrites();
+  const capacityMigrations = options.projectExecution && typeof options.projectExecution.planCapacityMigration === "function" ? new VolumeMigrationCoordinator({
+    namespace: options.projectExecution.namespace,
+    backend: options.projectExecution,
+    localImageAnchor: project => projects.getLocalImageRecoveryAnchor(project.id),
+    backingDevice: project => options.projectExecution!.capacityBackingDevice(project),
+  }) : undefined;
   const webSearchSettings = new WebSearchSettingsStore(dataDirectory);
   const onboarding = new OnboardingStore(dataDirectory);
   const networkSettings = options.networkSettings ?? new NetworkSettingsService(dataDirectory);
@@ -669,7 +746,6 @@ export function createApp(options: AppOptions = {}) {
   });
   /** Whether a model's provider is on: a Pi provider in Providers & Models, or a coding agent turned on there. */
   const modelProviderEnabled = (provider: string) => isAgentRuntimeId(provider) ? agentRuntimes.settings.get(provider).enabled : providerEnabled(provider);
-  const webSearch = new WebSearchService(webSearchSettings, options.webSearchFetch);
   const openAIEndpoint = new ModelEndpointSettingsStore(
     dataDirectory,
     "openai-endpoint.json",
@@ -694,13 +770,18 @@ export function createApp(options: AppOptions = {}) {
   };
   const catalogRefresh = new ModelCatalogRefresh((id) => providerEnabled(id) && !providerModelSettings.isCustom(id));
   let modelRuntimePromise: Promise<ModelRuntime> | undefined;
+  let kunpoApiKey: string | undefined;
+  const refreshKunpoCredential = async (runtime: ModelRuntime) => {
+    kunpoApiKey = runtime.hasConfiguredAuth("kunpo") ? (await runtime.getAuth("kunpo"))?.auth.apiKey : undefined;
+  };
   const getModelRuntime = () => modelRuntimePromise ??= (async () => {
-    const runtime = await (options.createModelRuntime ?? (() => ModelRuntime.create({
-      authPath: path.join(piAgentDirectory, "auth.json"),
-      modelsPath: path.join(piAgentDirectory, "models.json"),
-    })))();
+    const runtime = await (options.createModelRuntime ?? (() => createLocalModelRuntime(
+      options.localApiKeyFile ?? path.join(piAgentDirectory, "local-api-keys.json"),
+      () => providerModelSettings.localRuntimeProviders(),
+      library,
+    )))();
     await syncOpenAIEndpoint(runtime);
-    catalogRefresh.schedule(runtime);
+    await refreshKunpoCredential(runtime);
     return runtime;
   })();
   const resolveModels = (runtime: ModelRuntime, models: RuntimeModel[]) => {
@@ -709,8 +790,16 @@ export function createApp(options: AppOptions = {}) {
     return models.map((model) => providerModelSettings.resolveModel(model, catalog));
   };
   const resolveModel = (runtime: ModelRuntime, model: RuntimeModel | undefined) => model ? resolveModels(runtime, [model])[0] : undefined;
+  // Conversation metadata must remain editable without credentials or an Agent runtime.
+  const localAgentMetadata = async (reference: AgentModelRef): Promise<Pick<RuntimeModel, "reasoning" | "thinkingLevelMap"> | undefined> => {
+    const provider = (await providerModelSettings.localRuntimeProviders()).find((entry) => entry.id === reference.provider);
+    const model = provider?.config.models?.find((entry) => entry.id === reference.id);
+    if (!model || !("reasoning" in model)) return undefined;
+    return { reasoning: model.reasoning, ...("thinkingLevelMap" in model && model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap } : {}) };
+  };
   const availableModel = async (provider: string, id: string) => {
     if (!providerEnabled(provider)) return undefined;
+    if (kunpoModelOption("agent", { provider, id })?.status === "pending") return undefined;
     const runtime = await getModelRuntime();
     return resolveModel(runtime, (await runtime.getAvailable(provider)).find((model) => model.id === id));
   };
@@ -735,10 +824,9 @@ export function createApp(options: AppOptions = {}) {
   const openAIImages = new OpenAIImageSettingsStore(dataDirectory);
   const imageConnection = openAIImageConnection(openAIImages, getModelRuntime);
   const modelAuth = new ModelAuthManager(getModelRuntime, {
-    // Same ID Pi's own CLI uses, persisted in the agent directory's global settings.
-    getDeviceId: () => SettingsManager.create(piAgentDirectory, piAgentDirectory).getOrCreateDeviceId(),
     onCredentialsChanged: async (runtime, providerId) => {
       await syncOpenAIEndpoint(runtime);
+      if (providerId === "kunpo") await refreshKunpoCredential(runtime);
       catalogRefresh.invalidate(providerId);
       void catalogRefresh.refresh(runtime, providerId, true).catch(() => {});
     },
@@ -747,40 +835,43 @@ export function createApp(options: AppOptions = {}) {
     ? providerModelSettings.isEnabled("hyper3d") && providerModelSettings.isEnabled("cloud-hyper3d")
     : providerModelSettings.isEnabled(id);
   const codexImages = new CodexImageProvider(path.join(dataDirectory, "agent-runtimes"), (recheck) => agentRuntimes.codexImageConnection(recheck));
-  const providerImages = new ProviderImages(getModelRuntime, options.imageFetch, () => seedanceSettings.key("volcengine-ark"), providerEnabled, {
+  const providerImages = new ProviderImages(getModelRuntime, options.imageFetch, () => undefined, providerEnabled, {
     codexImages,
-    openAIConnection: () => imageConnection.resolve(),
+    openAIConnection: async () => {
+      await getModelRuntime();
+      if (!kunpoApiKey || !providerEnabled("kunpo") || openAIImages.get().mode === "disabled") return imageConnection.resolve();
+      return { source: { baseUrl: KUNPO_BASE_URL, apiKey: kunpoApiKey }, models: openAIImages.models() ?? imageModelsForProvider("openai", "KunpoAPI", ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare", "Image-GI2.1"]), connected: true };
+    },
     customProviders: () => providerModelSettings.customProviderCatalog(),
     migrateLegacyModels: (id, models) => providerModelSettings.migrateLegacyImageModels(id, models, async () => { await (await getModelRuntime()).refresh({ allowNetwork: false, providers: [id] }); }),
     defaultModel: () => providerModelSettings.defaultImageModel(),
   });
-  const providerVideos = new ProviderVideos(getModelRuntime, options.videoFetch, (providerId) => seedanceSettings.key(providerId), providerEnabled, {
-    customProviders: () => providerModelSettings.customProviderCatalog(), defaultModel: () => providerModelSettings.defaultVideoModel(),
-    minimaxApiKey: (providerId) => minimaxSettings.key(providerId),
+  const providerVideos = new ProviderVideos(getModelRuntime, options.videoFetch, (providerId) => providerId === "volcengine-ark" && providerEnabled("kunpo") ? kunpoApiKey : undefined, providerEnabled, {
+    customProviders: () => providerModelSettings.customProviderCatalog(), defaultModel: () => providerModelSettings.defaultVideoModel() ?? KUNPO_DEFAULT_MODEL_REFS.video,
+    kunpoApiKey: async () => { await getModelRuntime(); return providerEnabled("kunpo") ? kunpoApiKey : undefined; },
   });
   const providerModels3D = new ProviderModels3D({
     runtime: getModelRuntime,
-    meshy: { generator: new MeshyProvider(() => meshySettings.key(), options.model3DFetch, undefined, () => providerEnabled("meshy")), configured: () => meshySettings.get().configured },
-    tripo: { generator: new TripoProvider(() => tripoSettings.key(), options.model3DFetch, undefined, () => providerEnabled("tripo")), configured: () => tripoSettings.get().configured },
-    hyper3d: { generator: new Hyper3DProvider(() => hyper3dSettings.key(), options.model3DFetch, undefined, () => providerEnabled("hyper3d")), configured: () => hyper3dSettings.get().configured },
+    tripo: { generator: new TripoProvider(() => providerEnabled("kunpo") ? kunpoApiKey : undefined, options.model3DFetch, undefined, () => providerEnabled("tripo")), configured: () => providerEnabled("kunpo") && Boolean(kunpoApiKey) },
     customProviders: () => providerModelSettings.customProviderCatalog(),
     nativeModels: (id) => providerModelSettings.models3D(id), isVisible: (model) => providerModelSettings.isVisible(model),
     isEnabled: providerEnabled, request: options.model3DFetch, defaultModel: () => providerModelSettings.defaultModel3D(), cloud: cloudModels,
   });
   const volcengineTtsProvider = new VolcengineTtsProvider(
-    () => volcengineTtsSettings.key(),
+    () => providerEnabled("kunpo") ? kunpoApiKey : undefined,
     options.audioFetch,
     undefined,
     () => providerEnabled("volcengine-tts"),
-    () => volcengineTtsSettings.defaultVoiceId(),
   );
   const volcengineSeedAudioProvider = new VolcengineSeedAudioProvider(
-    () => volcengineSeedAudioSettings.key(),
+    () => providerEnabled("kunpo") ? kunpoApiKey : undefined,
     options.audioFetch,
     undefined,
     () => providerEnabled("volcengine-seed-audio"),
   );
   const providerAudio = new ProviderAudio([volcengineTtsProvider, volcengineSeedAudioProvider]);
+  const mediaDefaultModel = (usage: "image" | "video" | "3d") => usage === "image" ? providerModelSettings.defaultImageModel()
+    : usage === "video" ? providerModelSettings.defaultVideoModel() : providerModelSettings.defaultModel3D();
   const tools = new ToolRunner(
     dataDirectory,
     options.imageGenerator ?? providerImages,
@@ -788,33 +879,44 @@ export function createApp(options: AppOptions = {}) {
     options.videoGenerator ?? providerVideos,
     library,
     async (toolId, input, projectId) => {
-      if (toolId === "animate-3d") return input;
+      await getModelRuntime();
       const project = projectId ? projects.get(projectId) : undefined;
       if (projectId && !project) throw new ToolRunError("Project not found", 404);
+      if (toolId === "animate-3d") {
+        const animation = input as import("../shared/contracts.js").RunAnimate3DToolRequest;
+        return { ...animation, ...projectAnimationSelection(project, animation.model, animation.options) };
+      }
       const audioOperation: AudioOperation | undefined = toolId === "generate-speech" ? "speech"
         : toolId === "generate-sound-effect" ? "sound-effect"
           : toolId === "generate-music" ? "music" : undefined;
       if (audioOperation) {
-        const explicit = (input as { model?: AgentModelRef }).model;
+        const explicit = (input as { model?: AgentModelRef }).model ?? project?.modelSelections?.[audioOperation];
         const selected = providerAudio.resolveModel(audioOperation, explicit);
         if (!selected) {
           if (options.audioGenerator) return input;
-          throw new ToolRunError(`No ${audioOperation === "sound-effect" ? "sound effect" : audioOperation} model is available. Connect an audio provider first.`, 503);
+          const error = providerAudio.selectionError(audioOperation, explicit);
+          throw inheritToolPreflightFailure(new ToolRunError(error.message, error.statusCode, undefined, undefined, undefined, true), error);
         }
         return { ...input, model: { provider: selected.provider, id: selected.id } };
       }
       const usage = toolId === "generate-image" ? "image" : toolId === "generate-video" ? "video" : "3d";
       const key = usage === "image" ? "imageModel" : "model";
       const explicit = (input as { imageModel?: AgentModelRef; model?: AgentModelRef })[key];
-      const globalDefault = usage === "image" ? providerModelSettings.defaultImageModel()
-        : usage === "video" ? providerModelSettings.defaultVideoModel() : providerModelSettings.defaultModel3D();
-      let selected = explicit ?? project?.mediaModelDefaults?.[usage] ?? globalDefault;
+      const globalDefault = mediaDefaultModel(usage);
+      const operation = usage === "3d" && "operation" in input ? input.operation : undefined;
+      const role: KunpoModelRole = usage === "3d" ? operation === "remesh" ? "3d-remesh" : operation === "retexture" ? "3d-texture" : "3d-generation" : usage;
+      // Processing versions are options on a generation provider, never fake geometry model IDs.
+      let selected = explicit ?? projectMediaPreference(project, usage) ?? globalDefault;
+      if (usage !== "3d" && selected && kunpoModelOption(role, selected)) validateKunpoSelection(role, selected, { forExecution: true });
+      if (usage === "3d" && operation === "retexture" && project?.modelSelections?.["3d-texture"] && !(input as import("../shared/contracts.js").Run3DToolRequest).options?.textureModel) {
+        input = { ...input, options: { ...("options" in input ? input.options : {}), textureModel: project.modelSelections["3d-texture"]!.id } } as RunToolRequest;
+      }
       const videoCatalog = usage === "video" && !options.videoGenerator ? await providerVideos.catalog() : undefined;
       if (!selected) {
         const injected = usage === "image" ? options.imageGenerator : usage === "video" ? options.videoGenerator : options.model3DGenerator;
         if (injected) return input;
         const processing3D = usage === "3d" && "operation" in input && (input.operation === "retexture" || input.operation === "remesh");
-        const catalog = processing3D ? { models: (await providerModels3D.operationModels()).filter((model) => model.operations?.includes(input.operation!)) } : videoCatalog ?? await (usage === "image" ? providerImages : providerModels3D).catalog();
+        const catalog = processing3D ? { models: (await providerModels3D.operationModels()).filter((model) => model.operations?.includes(operation as "retexture" | "remesh")) } : videoCatalog ?? await (usage === "image" ? providerImages : providerModels3D).catalog();
         const first = catalog.models[0];
         if (first) selected = { provider: first.provider, id: first.id };
       }
@@ -836,7 +938,7 @@ export function createApp(options: AppOptions = {}) {
   const legacyMcp = new LegacyMcpConfiguration(piAgentDirectory);
   const bundledPlugins = new BundledPluginStore(options.bundledPluginsDirectory ?? path.join(repositoryRoot, "plugins"));
   const preinstalledPlugins = new PreinstalledPluginManager(
-    options.preinstalledPluginsDirectory,
+    undefined,
     dataDirectory,
   );
   const localPlugins = new LocalPluginStore(dataDirectory);
@@ -866,7 +968,7 @@ export function createApp(options: AppOptions = {}) {
   // At most once a day, after a run, the snapshots that no conversation names any more are removed. Removing the
   // project, Undo and Restore hold the workspace exclusively; a prune whose turn comes then is left for later.
   const pruneCheckpoints = async (project: ProjectState) => {
-    const idle = () => !!projects.get(project.id) && !agents.isProjectBusy(project.id) && !projectWrites.isMutating(project.id);
+    const idle = () => !!projects.get(project.id) && !projectLifecycle.pending(project.id) && !agents.isProjectBusy(project.id) && !projectWrites.isMutating(project.id);
     if (!idle()) return;
     try {
       await checkpoints.prune(project, () => referencedSnapshots(sessionDirectory(project)), {
@@ -877,28 +979,258 @@ export function createApp(options: AppOptions = {}) {
       app.log.warn({ err, projectId: project.id }, "Could not prune checkpoints");
     }
   };
+  const enabledMediaTools = () => {
+    const audioOperations = availableAudioOperations(providerAudio.catalog().models);
+    return TOOL_IDS.filter((toolId) => toolId === "generate-speech" ? audioOperations.has("speech")
+      : toolId === "generate-sound-effect" ? audioOperations.has("sound-effect")
+        : toolId === "generate-music" ? audioOperations.has("music") : true);
+  };
+  const isolatedStorageStatus = async (project: ProjectState) => {
+    const entry = await options.projectExecution!.inventoryProject(project);
+    if (!entry && typeof options.projectExecution!.planCapacityMigration === "function") {
+      const overview = await options.projectExecution!.storageOverview(projects.list());
+      if (overview.dataStatus !== "current" || !overview.snapshot)
+        throw new Error("Current capacity reservations are unavailable; an absent volume record does not prove that no migration is pending");
+      const pending = overview.snapshot.capacityReservations?.find(item => item.namespace === options.projectExecution!.namespace && item.projectId === project.id);
+      if (pending) return { supported: true, projectId: project.id, state: "unavailable", dirty: true, recoverable: false,
+        reason: `Native capacity plan ${pending.planId} has an unconfirmed ${pending.phase} outcome. Its ${pending.volumeBytes} byte target remains reserved even though no volume record exists. Use recover_isolated_changes action inspect_capacity_migration for the original plan; do not rerun or allocate another volume.` };
+    }
+    const approved = entry?.dirty ? await options.projectExecution!.approvedSourceReview?.(project, String(entry.generation)) : undefined;
+    const busy = !!entry && (!!entry.active || !!entry.operation || entry.state === "busy" || entry.state === "deleting");
+    let inspection: Awaited<ReturnType<NonNullable<AppOptions["projectExecution"]>["inspectSource"]>> | undefined, inspectionError: string | undefined;
+    let hostPending = false;
+    try {
+      const transactions = await pendingSourcePublications(project.workspacePath);
+      hostPending = transactions.length > 0;
+      if (transactions.some(({ manifest }) => manifest.state === "needs-review" || !entry?.dirty || manifest.context?.generation !== entry.generation || manifest.context?.projectId !== project.id))
+        inspectionError = "An interrupted host publication requires file review. Original and returned versions are retained in isolated-changes; do not rerun or regenerate.";
+    } catch (error) { hostPending = true; inspectionError = error instanceof Error ? error.message : "Host publication inspection is unavailable"; }
+    if (entry?.dirty && !busy) {
+      try {
+        if (!hostPending || inspectionError) {
+          const host = await inspectProjectSourceBudget(project.workspacePath, [], true, undefined, entry?.sourceManifestVersion === 2 ? { profile: entry.sourceProfileId } : undefined);
+          if (!host.complete || Object.values(host.overage).some(value => value > 0))
+            throw new Error(`Host source requires review before recovery: ${host.fileCount} files, ${host.totalBytes} source bytes, ${host.mediaBytes} media bytes. Existing isolation limits still apply; retain originals and inspect the largest files.`);
+        }
+        // A saved approval already binds the full snapshot. Metadata inspection must
+        // remain passive, and cannot open a sleeping volume; recovery rechecks the
+        // approved bytes under its own admitted lifecycle before writing anything.
+        if (!approved) {
+          inspection = await options.projectExecution!.inspectSource?.(project, entry.generation);
+          if (!inspection) throw new Error("Retained source inspection is unavailable; recovery eligibility could not be established. Keep all versions and update the reviewed isolated component before recovery.");
+        }
+      }
+      catch (error) { inspectionError = [inspectionError, error instanceof Error ? error.message : "Retained file inspection is unavailable"].filter(Boolean).join(" "); }
+    }
+    const blocked = inspectionError || inspection && (!inspection.complete || inspection.blockers > 0 && !approved);
+    return { supported: true, projectId: project.id, state: hostPending && !entry?.dirty ? "unavailable" : !entry || entry.state === "deleted" ? "absent" : busy ? "busy" : entry.dirty ? "recovery-pending" : entry.state,
+      dirty: !!entry?.dirty || hostPending, recoverable: !!entry?.dirty && !busy && !blocked,
+      ...(entry ? { generation: String(entry.generation) } : {}),
+      ...(inspection ? { inspection } : {}),
+      ...(inspection ? { recoveryValidation: "metadata-only" as const } : {}),
+      ...(approved ? { approvedReviewId: approved.reviewId } : {}),
+      ...(projectLifecycle.pending(project.id) ? { reason: "Project deletion is pending. Recover retained changes or retry deletion." }
+        : blocked ? { reason: `Retained changes need review before recovery. No files were discarded. ${inspectionError ?? inspection?.changes.filter(change => change.reason).slice(0, 3).map(change => `${change.path}: ${change.reason}`).join("; ")}` }
+        : approved ? { reason: "A trusted approval exists for this exact legacy batch. Recovery rechecks its snapshot, file hashes and host conflicts before resuming; it never reruns the command." }
+        : inspection ? { reason: "Metadata permits a controlled recovery attempt; it does not confirm that files can be returned. Applicable host file and image validation, baseline, original-retention and publication checks still run before recovery. " + (typeof entry?.recoveryReason === "string" ? entry.recoveryReason : "") }
+        : typeof entry?.recoveryReason === "string" ? { reason: entry.recoveryReason } : {}) };
+  };
+  const projectCapacity = (project: ProjectState, signal?: AbortSignal) => inspectExecutionCapacity({
+    projectId: project.id, workspace: project.workspacePath, namespace: options.projectExecution?.namespace,
+    localImageAnchor: () => projects.getLocalImageRecoveryAnchor(project.id),
+    ...(options.projectExecution && project.workspaceLocation !== "external"
+      ? { storageOverview: () => options.projectExecution!.storageOverview(projects.list()) } : {}),
+  }, signal);
+  const reconcileRecoveredEffects = async <T extends object>(project: ProjectState, result: T, version = projectWrites.version(project.id)) => {
+    let reconciled = 0;
+    if (getIsolatedRepairProof(result)) {
+      annotateIsolatedRepairPublication(result, version);
+      if (getRepairTargets().length) reconciled = await settleIsolatedRepair(result);
+    }
+    return Object.assign(result, { reconciledOriginalOperations: reconciled });
+  };
+  const recoverIsolatedChanges = async (project: ProjectState, generation: string, signal?: AbortSignal,
+    published?: (publication: { version: string; changed: string[] }) => void, reviewId?: string) => {
+    let publication: { version: string; changed: string[] } | undefined;
+    let executionStarted = false;
+    try {
+      const result = await projectLifecycle.recover(project.id, async () => {
+        signal?.throwIfAborted();
+        await checkpoints.settled(project);
+        const checkCheckpoint = async () => {
+          signal?.throwIfAborted();
+          if (tools.isProjectBusy(project.id) || canvasStore.isProjectBusy(project.id))
+            throw new ProjectLifecycleError("Wait for project tools to finish before recovering source changes.");
+          if (await checkpoints.unfinished(project)) throw new ProjectLifecycleError("Recover the interrupted file restore before returning isolated source changes.");
+        };
+        await checkCheckpoint();
+        if (!(await pendingSourcePublications(project.workspacePath)).length) {
+          const storage = await options.projectExecution!.inventoryProject(project);
+          const host = await inspectProjectSourceBudget(project.workspacePath, [], true, signal, storage?.sourceManifestVersion === 2 ? { profile: storage.sourceProfileId } : undefined);
+          if (!host.complete || Object.values(host.overage).some(value => value > 0))
+            throw new ProjectLifecycleError("Host source metadata exceeds the existing isolation limits; inspect retained originals before recovery.");
+        }
+        const approved = await options.projectExecution!.approvedSourceReview?.(project, generation);
+        if (reviewId && approved?.reviewId !== reviewId) throw new ProjectLifecycleError("This source review has no trusted user approval");
+        const inspection = approved ? undefined : await options.projectExecution!.inspectSource?.(project, Number(generation));
+        if (!approved && !inspection)
+          throw new ProjectLifecycleError("Retained source inspection is unavailable; recovery eligibility could not be established. Keep all versions and update the reviewed isolated component before recovery.");
+        if (inspection && (!inspection.complete || inspection.blockers > 0 && !approved))
+          throw new ProjectLifecycleError("Retained changes need review before recovery; inspect the reported paths. No files were discarded or acknowledged.");
+        executionStarted = true;
+        return options.projectExecution!.recoverSource(project, (operation) => projectWrites.exclusive(project.id, async () => {
+          await checkCheckpoint();
+          const result = await operation();
+          const paths = result && typeof result === "object" && "changed" in result ? result.changed : undefined;
+          if (Array.isArray(paths) && paths.length && paths.every((file) => typeof file === "string")) {
+            publication = { version: projectWrites.changed(project.id), changed: paths };
+            published?.(publication);
+            try {
+              await writeWorkspaceNotice(project, `Retained isolated source changes were returned. Inspect current files before continuing. Changed workspace paths: ${JSON.stringify(paths)}. Guest acknowledgement may still be pending; inspect execution storage status.`, publication.version);
+            } finally {
+              // Invalidation waits for an active Agent turn to finish before disposing its session.
+              agents.invalidateProjectSessions(project.id);
+              await projects.refreshPreviewReadiness(project.id);
+              await projects.touch(project.id);
+            }
+          }
+          return result;
+        }), generation, reviewId, signal);
+      });
+      return await reconcileRecoveredEffects(project, result, publication?.version);
+    } catch (error) {
+      if (!executionStarted && error instanceof Error) Object.assign(error, { recoveryNotStarted: true });
+      throw error;
+    } finally {
+      if (publication) events.publish(project.id, "workspace.restored", { ...publication, recovery: true });
+    }
+  };
+  const mutateWorkspace = <T>(project: ProjectState, operation: () => Promise<T>) => projectWrites.exclusive(project.id, async () => {
+    await assertSourcePublicationSettled(project.workspacePath);
+    await options.projectExecution?.assertSourceReviewSettled?.(project);
+    return operation();
+  });
   /** OhMyGame's own tools for a conversation, the same for Pi and for a coding agent. */
-  const projectAgentTools = (project: ProjectState, conversation: StoredConversation) => {
+  const projectAgentTools = (project: ProjectState, conversation: StoredConversation, fileTools: ToolDefinition[] = []) => {
     const playtestKey = `${project.id}:${conversation.summary.id}`;
     let playtest = agentPlaytests.get(playtestKey);
     if (!playtest && options.playtestDriver) {
       playtest = new OwnedPlaytestDriver(options.playtestDriver);
       agentPlaytests.set(playtestKey, playtest);
     }
-    return [...createAgentTools(
+    return [...fileTools, ...workflowGuideTools(project.type, bundledPlugins, pluginSettings), createProjectMediaCapabilitiesTool(() => projects.get(project.id), {
+      images: providerImages, videos: providerVideos, models3D: providerModels3D, audio: providerAudio, defaultModel: mediaDefaultModel,
+    }), ...(options.projectExecution && project.workspaceLocation !== "external" ? [createIsolatedShellTool(async (command, timeout, signal) => {
+      signal?.throwIfAborted();
+      return previews.withExecutionSlot(project, () => options.projectExecution!.shell(project, command, timeout, (operation) => projectWrites.exclusive(project.id, operation), signal));
+    }), createIsolatedRecoveryTool(() => isolatedStorageStatus(project), (generation, signal) =>
+      previews.withExecutionSlot(project, () => recoverIsolatedChanges(project, generation, signal)), {
+      capacity: signal => projectWrites.snapshot(project.id, () => withCanvasLock(project.workspacePath, () => projectCapacity(project, signal))),
+      planCapacity: (profileId, signal) => projectWrites.snapshot(project.id, () => withCanvasLock(project.workspacePath, async () => proposeExecutionCapacity(await projectCapacity(project, signal), profileId))),
+      planFirstAllocation: signal => projectWrites.snapshot(project.id, () => withCanvasLock(project.workspacePath, async () => planInitialExecutionCapacity(await projectCapacity(project, signal)))),
+      inspectCapacityMigration: signal => {
+        if (!capacityMigrations) throw new Error("Native capacity migration is unavailable");
+        return projectWrites.snapshot(project.id, () => capacityMigrations.inspectUpgrade(project, signal));
+      },
+      upgradeCapacity: (toolCallId, signal, targetProfileId) => {
+        if (!capacityMigrations) throw new Error("Native capacity migration is unavailable");
+        return previews.withExecutionSlot(project, () => projectWrites.exclusive(project.id, () => withCanvasLock(project.workspacePath, async () => {
+          projectLifecycle.assertAvailable(project.id);
+          signal?.throwIfAborted();
+          if (tools.isProjectBusy(project.id) || canvasStore.isProjectBusy(project.id)) throw new ProjectLifecycleError("Wait for project media operations before changing capacity");
+          await checkpoints.settled(project);
+          if (await checkpoints.unfinished(project)) throw new ProjectLifecycleError("Resolve the unfinished restore before changing capacity");
+          await assertSourcePublicationSettled(project.workspacePath);
+          await options.projectExecution!.assertSourceReviewSettled(project);
+          return capacityMigrations.requestUpgrade(project, async review => {
+            const decision = await agents.askApproval(project.id, conversation.summary.id, toolCallId, {
+              kind: "volumeMigration", tool: "recover_isolated_changes", title: "Change project storage capacity", canAllowSession: false, volumeMigration: review,
+            }, signal);
+            // AgentManager returns allow only after validating this exact native six-field confirmation.
+            return { decision, ...(decision === "allow" ? { volumeMigrationConfirmation: {
+              planId: review.planId, generation: review.generation, sourceImageSha256: review.source.imageSha256,
+              targetProfileId: review.target.profileId, capacityReviewed: true, oldVolumeRetained: true,
+            } } : {}) };
+          }, signal, targetProfileId);
+        })), false);
+      },
+      review: (generation, signal) => {
+        signal?.throwIfAborted();
+        if (tools.isProjectBusy(project.id) || canvasStore.isProjectBusy(project.id)) throw new ProjectLifecycleError("A project media task is still finishing; wait before reviewing retained changes.");
+        return projectLifecycle.inspectRecovery(project.id, () => options.projectExecution!.reviewSource(project, generation, operation => projectWrites.snapshot(project.id, operation), signal));
+      },
+      optimize: (reviewId, input, signal) => {
+        signal?.throwIfAborted();
+        if (tools.isProjectBusy(project.id) || canvasStore.isProjectBusy(project.id)) throw new ProjectLifecycleError("A project media task is still finishing; wait before preparing retained images.");
+        return projectLifecycle.inspectRecovery(project.id, () => options.projectExecution!.optimizeSourceReview(project, reviewId, input, operation => projectWrites.snapshot(project.id, operation), signal));
+      },
+      readImage: (reviewId, imagePath, variant, sha256, signal) => {
+        signal?.throwIfAborted();
+        return projectLifecycle.inspectRecovery(project.id, () => projectWrites.snapshot(project.id, () =>
+          options.projectExecution!.readRetainedImage(project, reviewId, imagePath, variant, sha256, signal)));
+      },
+      verify: async (reviewId, signal) => {
+        signal?.throwIfAborted();
+        const result = await projectLifecycle.inspectRecovery(project.id, () => projectWrites.snapshot(project.id, () => options.projectExecution!.verifySourceReview(project, reviewId, signal)));
+        return reconcileRecoveredEffects(project, result);
+      },
+      adopt: async (reviewId, toolCallId, signal) => {
+        let recoveryStarted = false;
+        try {
+          const review = await options.projectExecution!.sourceReview(project, reviewId);
+          if (review.completed) {
+            if (review.reviewVersion !== 2) return { changed: [] };
+            const result = await projectLifecycle.inspectRecovery(project.id, () => projectWrites.snapshot(project.id, () => options.projectExecution!.verifySourceReview(project, reviewId, signal)));
+            return await reconcileRecoveredEffects(project, result);
+          }
+          if (review.blockers.length) throw new Error("This source review is blocked or superseded; inspect its file risks before requesting approval");
+          if (!review.approved) {
+            const decision = await agents.askApproval(project.id, conversation.summary.id, toolCallId, {
+              kind: "tool", tool: "recover_isolated_changes", title: "Adopt reviewed retained source", canAllowSession: false,
+              isolatedSourceReview: review,
+            }, signal);
+            if (decision !== "allow") throw new Error("The retained batch was not approved; no project files were written");
+            signal?.throwIfAborted();
+          }
+          signal?.throwIfAborted();
+          await options.projectExecution!.approveSourceReview(project, reviewId, operation => projectWrites.snapshot(project.id, operation));
+          signal?.throwIfAborted();
+          recoveryStarted = true;
+          return await previews.withExecutionSlot(project, () => recoverIsolatedChanges(project, review.generation, signal, undefined, reviewId));
+        } catch (error) {
+          if (!recoveryStarted && error instanceof Error) Object.assign(error, { recoveryNotStarted: true });
+          throw error;
+        }
+      },
+    }),
+    ...(isWebRuntimeProjectType(project.type) ? [createBuildGameTool(signal => buildGame(project, signal))] : [])] : []), ...createAgentTools(
       project,
       tools,
       projects,
-      (toolCallId, input, signal) => agents.askQuestionnaire(project.id, conversation.summary.id, toolCallId, input, signal),
-      async (sourcePath) => {
-        const installed = await localPlugins.install(sourcePath);
-        invalidatePluginSessions();
-        return await plugins.read(installed.id) ?? installed;
-      },
+      (toolCallId, input, signal, paidMediaTool) => agents.askQuestionnaire(project.id, conversation.summary.id, toolCallId, input, signal, paidMediaTool),
       playtest ? { driver: playtest, resolveOpenTarget: () => playtestTarget(project) } : undefined,
-      webSearch.enabled() ? (input, signal) => webSearch.search(conversation.summary.id, input, signal) : undefined,
       canvasStore,
-    ), ...(project.integration?.preview === "external" ? [projectPreviewTool(project, plugins, pluginIntegrations)] : [])];
+      conversation.summary.id,
+      enabledMediaTools,
+      (reference, signal) => {
+        signal?.throwIfAborted();
+        return authorizeConversationAttachment(conversations.open(project, conversation), reference);
+      },
+    )].map(tool => {
+      if (tool.name === "recover_isolated_changes") return tool;
+      const execute = (tool as ToolDefinition).execute;
+      const assertAllowed = async () => {
+        await assertSourcePublicationSettled(project.workspacePath);
+        if (!["read", "read_project_file", "ls", "find", "grep", "read_attachment", "recall_image", "read_workflow_guide", "list_media_capabilities", "canvas_check", "playable_check", "questionnaire", "update_plan"].includes(tool.name))
+          await options.projectExecution?.assertSourceReviewSettled?.(project);
+      };
+      const recover = (tool as ToolDefinition & { recoverAfterHttp500?: ToolDefinition["execute"] }).recoverAfterHttp500;
+      return { ...tool, execute: async (...args: Parameters<typeof execute>) => {
+        await assertAllowed(); return execute(...args);
+      }, ...(recover ? { recoverAfterHttp500: async (...args: Parameters<typeof execute>) => {
+        await assertAllowed(); return recover(...args);
+      } } : {}) };
+    });
   };
   const playtestTarget = async (project: ProjectState): Promise<GameUseOpenTarget> => ({
     runtime: "web",
@@ -919,9 +1251,9 @@ export function createApp(options: AppOptions = {}) {
         agentPlaytests.set(playtestKey, playtest);
       }
       return createAgentTools(
-        project, tools, projects, undefined, undefined,
+        project, tools, projects, undefined,
         playtest ? { driver: playtest, resolveOpenTarget: () => playtestTarget(project) } : undefined,
-        undefined, canvasStore,
+        canvasStore, sessionId, enabledMediaTools,
       );
     },
     catalog: () => {
@@ -929,7 +1261,7 @@ export function createApp(options: AppOptions = {}) {
       // full game_use input is listed; a story's own game_use accepts a subset.
       const placeholder: ProjectState = { id: "", name: "", type: "interactive-story", updatedAt: "", workspacePath: "", preview: { status: "stopped" } };
       return [
-        ...createAgentTools(placeholder, tools, projects, undefined, undefined, undefined, undefined, canvasStore),
+        ...createAgentTools(placeholder, tools, projects, undefined, undefined, canvasStore),
         createGameUseTool(options.playtestDriver ?? UNAVAILABLE_GAME_RUNTIME, () => playtestTarget(placeholder)),
       ];
     },
@@ -953,24 +1285,33 @@ export function createApp(options: AppOptions = {}) {
   });
   /** A conversation run by a coding agent CLI, kept in the same session file and checkpoints as Pi's. */
   const createNativeSession = async (project: ProjectState, conversation: StoredConversation, runtime: AgentRuntimeId, modelId: string) => {
+    if (runtime !== "codex-cli" && runtime !== "qoder-cli") assertLocalExecutionAllowed("Native CLI execution");
     const resolvePlugins = () => resolvePluginSkills([bundledPlugins, localPlugins], pluginSettings, project.type);
     const [pluginSkills, ownSkills, catalog, effectiveMcp, reasoningLevel] = await Promise.all([
       resolvePlugins(),
       skillFolders(path.join(piAgentDirectory, "skills")),
-      loadPiSkills(project.workspacePath, piAgentDirectory, resolvePlugins).catch(() => []),
+      loadPiSkillCatalog(),
       pluginCapabilities.effective(project.type),
       conversations.nativeReasoningLevel(project, conversation, { provider: runtime, id: modelId }),
     ]);
     const model = await agentRuntimes.model(runtime, modelId);
     const effort = nativeEffort(model, reasoningLevel);
+    const sessionManager = conversations.open(project, conversation);
+    const authorizeAttachment = (reference: Parameters<typeof authorizeConversationAttachment>[1]) => authorizeConversationAttachment(sessionManager, reference);
+    const sessionImages = new SessionImages(sessionManager, path.join(piAgentDirectory, "request-image-previews"));
     return agentRuntimes.createSession({
       runtime,
       model: modelId,
       ...(effort ? { reasoningLevel: effort } : {}),
       ...(model?.contextWindow ? { contextWindow: model.contextWindow } : {}),
       workspacePath: project.workspacePath,
-      sessionManager: conversations.open(project, conversation),
-      tools: projectAgentTools(project, conversation),
+      sessionManager,
+      tools: projectAgentTools(project, conversation, [
+        ...(runtime === "qoder-cli" ? createLocalAgentFileTools(project.workspacePath, (operation) => mutateWorkspace(project, operation), model?.supportsImages === true, authorizeAttachment) : []),
+        ...(runtime === "codex-cli" ? [createProjectFileReadTool(project.workspacePath, model?.supportsImages === true)] : []),
+        createAgentAttachmentReadTool(project.workspacePath, model?.supportsImages === true, authorizeAttachment),
+        ...(model?.supportsImages ? [sessionImages.recallTool as ToolDefinition] : []),
+      ]),
       saveGeneratedImage: (fileName, bytes, prompt) => projects.addGeneratedAsset(project.id, fileName, bytes, { prompt }),
       pluginMcp: { config: effectiveMcp, host: pluginCapabilities.host, agentDir: piAgentDirectory },
       skillDirectories: [...pluginSkillFolders(pluginSkills), ...ownSkills],
@@ -991,23 +1332,23 @@ export function createApp(options: AppOptions = {}) {
       return { network: { source: route.source, ...(route.httpsProxy ? { proxyUrl: route.httpsProxy } : {}) } };
     },
     ...(options.createSession ? {} : {
-      loadSkills: (project) => loadPiSkills(
-        project.workspacePath,
-        piAgentDirectory,
-        () => resolvePluginSkills([bundledPlugins, localPlugins], pluginSettings, project.type),
-      ),
+      loadSkills: () => loadPiSkillCatalog(),
     }),
     createSession: options.createSession ?? (async (project, conversation) => {
+      await assertSourcePublicationSettled(project.workspacePath);
       const selected = await conversations.model(project, conversation);
       if (!selected) throw new Error("Select an available model before sending a prompt.");
+      if (kunpoModelOption("agent", selected)) validateKunpoSelection("agent", selected, { forExecution: true });
       if (isAgentRuntimeId(selected.provider)) return createNativeSession(project, conversation, selected.provider, selected.id);
       const modelRuntime = await getModelRuntime();
       if (!providerEnabled(selected.provider)) throw new Error(`Provider ${selected.provider} is disabled. Enable it in Settings to continue.`);
       const model = resolveModel(modelRuntime, modelRuntime.getModel(selected.provider, selected.id));
+      if (selected.provider === "kunpo" && !modelRuntime.hasConfiguredAuth(selected.provider)) {
+        throw new Error("Configure the KunpoAPI key in Providers before sending a prompt.");
+      }
       if (!model || !modelRuntime.hasConfiguredAuth(selected.provider)) {
         throw new Error(`The selected model ${selected.provider}/${selected.id} is not available`);
       }
-      const effectiveMcp = await pluginCapabilities.effective(project.type);
       return createPiSession(
         project,
         conversations.open(project, conversation),
@@ -1015,19 +1356,15 @@ export function createApp(options: AppOptions = {}) {
         modelRuntime,
         model,
         piAgentDirectory,
-        () => resolvePluginSkills([bundledPlugins, localPlugins], pluginSettings, project.type),
-        Object.keys(effectiveMcp.mcpServers).length ? { factory: await pluginCapabilities.host.extension(effectiveMcp), host: pluginCapabilities.host } : undefined,
+        undefined,
         (provider) => providerModelSettings.responsesTransport(provider),
         () => snapshotWorkspace(project),
+        (operation) => mutateWorkspace(project, operation),
       );
     }),
-    activeToolNames: (project, mode, session) => {
+    activeToolNames: (_project, mode, session) => {
       const registered = session.getAllTools?.().map((tool) => tool.name) ?? [];
-      const audioOperations = availableAudioOperations(providerAudio.catalog().models);
-      const enabledTools = TOOL_IDS.filter((toolId) => toolId === "generate-speech" ? audioOperations.has("speech")
-        : toolId === "generate-sound-effect" ? audioOperations.has("sound-effect")
-          : toolId === "generate-music" ? audioOperations.has("music") : true);
-      return projectPiToolNames(mode, enabledTools, registered, webSearch.enabled());
+      return projectPiToolNames(mode, enabledMediaTools(), registered);
     },
     onRunFinished: async (project, conversationId) => {
       await agentPlaytests.get(`${project.id}:${conversationId}`)?.cleanup();
@@ -1041,6 +1378,7 @@ export function createApp(options: AppOptions = {}) {
       void pruneCheckpoints(project);
     },
   });
+  agents.setProjectAdmission((id) => projectLifecycle.assertAvailable(id));
   const invalidatePluginSessions = () => {
     for (const project of projects.list()) agents.invalidateProjectSessions(project.id);
   };
@@ -1051,6 +1389,60 @@ export function createApp(options: AppOptions = {}) {
     pluginTimeout: 60_000,
     ajv: { customOptions: { coerceTypes: false } },
   });
+  app.addHook("preValidation", async (request, reply) => {
+    const route = `${request.method} ${request.routeOptions.url}`;
+    let fields: string[][] = [];
+    if (route === "PUT /settings/web-search") fields = [["exaApiKey"], ["parallelApiKey"], ["custom", "apiKey"]];
+    else if ([
+      "POST /settings/models/providers/custom", "PUT /settings/models/providers/:providerId/custom",
+      "POST /settings/models/providers/discover", "PUT /settings/models/providers/openai/images",
+      "POST /settings/models/providers/openai/images/discover", "PUT /settings/models/providers/meshy",
+      "PUT /settings/models/providers/tripo", "PUT /settings/models/providers/hyper3d",
+      "PUT /settings/models/providers/volcengine-tts", "PUT /settings/models/providers/volcengine-seed-audio",
+      "PUT /settings/models/providers/:providerId/seedance-key", "PUT /settings/models/providers/:providerId/minimax-key",
+    ].includes(route)) fields = [["apiKey"]];
+    else if (route === "POST /settings/model-auth/:operationId/respond") {
+      const { operationId } = request.params as { operationId: string };
+      const promptId = (request.body as { promptId?: unknown })?.promptId;
+      if (typeof promptId === "string" && modelAuth.acceptsSecretResponse(operationId, promptId)) fields = [["value"]];
+    }
+    for (const field of fields) {
+      let value: unknown = request.body;
+      for (const part of field) value = value && typeof value === "object" ? (value as Record<string, unknown>)[part] : undefined;
+      if (typeof value === "string") registerSensitiveValue(value);
+    }
+    try {
+      assertSafeGenerationInput({ url: request.url, params: request.params, query: request.query });
+      // Raw uploads and streams have their own file policy; inspect parsed JSON and text here.
+      const body = request.body;
+      if (!body || typeof body !== "object" || Array.isArray(body) || Object.getPrototypeOf(body) === Object.prototype || Object.getPrototypeOf(body) === null)
+        assertSafeGenerationInput(body, (path) => fields.some((field) => field.length === path.length && field.every((part, index) => part === path[index])));
+    } catch (cause) {
+      if (cause instanceof ToolRunError) return reply.code(400).send({ error: cause.message.replace(/^Generation input/, "Public input") });
+      throw cause;
+    }
+  });
+  app.addHook("preSerialization", async (_request, _reply, payload) => {
+    const sanitize = (value: unknown): unknown => {
+      if (typeof value === "string") return redactKnownSensitiveValues(value);
+      if (!value || typeof value !== "object" || Buffer.isBuffer(value)) return value;
+      if (Array.isArray(value)) return value.map(sanitize);
+      if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return value;
+      return Object.fromEntries(Object.entries(value).map(([name, entry]) => [redactKnownSensitiveValues(name), sanitize(entry)]));
+    };
+    return sanitize(payload);
+  });
+  // In-process injection may omit a token; opening a socket never may.
+  app.listen = new Proxy(app.listen, {
+    apply(listen, instance, args: unknown[]) {
+      if (!options.accessToken) throw new Error("A daemon access token is required for network listening");
+      const configured = args[0];
+      if (configured !== undefined && (typeof configured !== "object" || configured === null)) throw new Error("Use explicit loopback listener options");
+      const address = (configured ?? {}) as { host?: string; path?: string };
+      if (address.path || address.host && !isLoopbackHostHeader(address.host === "::1" ? "[::1]" : address.host)) throw new Error("The daemon must listen on loopback");
+      return Reflect.apply(listen, instance, [{ ...address, host: "127.0.0.1" }, ...args.slice(1)]);
+    },
+  });
   if (options.logger) {
     logFailedRequests(app);
     const activity = new ActivityLog(app.log);
@@ -1058,6 +1450,26 @@ export function createApp(options: AppOptions = {}) {
     events.subscribeAll((event) => activity.event(event));
   }
   projectWrites.install(app);
+  tools.setProjectAdmission((id) => projectLifecycle.assertAvailable(id));
+  app.addHook("preHandler", async (request, reply) => {
+    const params = (request.params ?? {}) as { projectId?: string; jobId?: string };
+    let id = params.projectId;
+    if (request.routeOptions.url === "/tools/:toolId/jobs") id = (request.body as { projectId?: string } | undefined)?.projectId;
+    if (request.routeOptions.url === "/tool-jobs/:jobId/retry") id = tools.jobs().find((job) => job.id === params.jobId)?.context?.projectId;
+    if (!id) return;
+    const route = request.routeOptions.url ?? "";
+    if (request.method === "DELETE" && route === "/projects/:projectId" ||
+      request.method === "GET" && route === "/projects/:projectId" ||
+      route.includes("/execution-storage") || /\/cancel$/.test(route) || /\/events$/.test(route)) return;
+    try {
+      projectLifecycle.assertAvailable(id);
+      const project = projects.get(id);
+      if (project && request.method !== "GET" && request.method !== "HEAD") await assertSourcePublicationSettled(project.workspacePath);
+    }
+    catch (error) {
+      return reply.code(409).send({ error: (error as Error).message, code: "project_lifecycle_pending" });
+    }
+  });
   const canvasStore = registerCanvasRoutes(app, { projects, library, tools });
   // Selecting or clearing an integration changes the project's preview, tools and prompt.
   const changeProjectIntegration = async (project: ProjectState, change: () => Promise<ProjectState>): Promise<ProjectState> => {
@@ -1108,32 +1520,43 @@ export function createApp(options: AppOptions = {}) {
   // Damaged or newer image settings fall back to the default connection instead of blocking startup.
   const loadOpenAIImages = () => openAIImages.load().catch((err) => app.log.warn({ err }, "Could not load OpenAI image settings"));
   app.addHook("onReady", async () => {
+    const skippedProjectDirectories = new Set<string>();
     await networkSettings.load();
-    // Runs before any model lookup so saved Azure sign-ins resolve under Pi's current provider ID.
-    await migrateAzureProviderId(piAgentDirectory, dataDirectory).catch((err) => app.log.warn({ err }, "Could not migrate Azure provider settings"));
     // A damaged welcome preference must not prevent projects from opening.
     await onboarding.load().catch((err) => app.log.warn({ err }, "Could not load onboarding state"));
     await Promise.all([library.load(), projects.load((projectDirectory, cause) => {
+      skippedProjectDirectories.add(projectDirectory);
       app.log.warn({ err: cause, projectDirectory }, "Could not load project; skipped during startup");
-    }), tools.load(), pluginSettings.load(), pluginCapabilities.configuration.load(), bundledPlugins.load(), preinstalledPlugins.load(), webSearchSettings.load(), openAIEndpoint.load(), loadOpenAIImages(), meshySettings.load(), tripoSettings.load(), hyper3dSettings.load(), seedanceSettings.load(), minimaxSettings.load(), volcengineTtsSettings.load(), volcengineSeedAudioSettings.load(), providerModelSettings.load(), externalMcp.load(), externalClients.load(), agentRuntimes.load().catch((err) => app.log.warn({ err }, "Could not load coding agent settings"))]);
+    }), tools.load(), pluginSettings.load(), pluginCapabilities.configuration.load(), bundledPlugins.load(), preinstalledPlugins.load(), webSearchSettings.load(), openAIEndpoint.load(), loadOpenAIImages(), meshySettings.load(), tripoSettings.load(), hyper3dSettings.load(), seedanceSettings.load(), minimaxSettings.load(), volcengineTtsSettings.load(), volcengineSeedAudioSettings.load(), providerModelSettings.load(), externalMcp.load(), agentRuntimes.load().catch((err) => app.log.warn({ err }, "Could not load coding agent settings"))]);
+    const reservationWorkspaces = projects.list().map(project => project.workspacePath);
+    // A damaged project card cannot hide a durable allocation promise from the
+    // volume ledger. Inspect only its fixed private reservation location.
+    for (const directory of skippedProjectDirectories) {
+      try { await lstat(path.join(directory, "isolated-space-reservations")); }
+      catch (cause) { if ((cause as NodeJS.ErrnoException).code === "ENOENT") continue; }
+      reservationWorkspaces.push(path.join(directory, "workspace"));
+    }
+    await restoreRecoverySpaceReservations(reservationWorkspaces).catch(err => app.log.warn({ err }, "Recovery space reservations require review; new recovery allocations are blocked"));
+    await restoreLocalImageRecoverySpaces(() => projects.localImageRecoveryAnchors()).catch(err => app.log.warn({ err }, "Local image reservations require review; new recovery allocations are blocked"));
+    await projectLifecycle.load();
     await Promise.all(projects.list().map(async (project) => { projectWrites.initialize(project.id, await readWorkspaceVersion(project)); }));
-    for (const error of await preinstalledPlugins.seed(localPlugins)) app.log.warn(error);
-    // Updates the Skill and launcher path in connected clients without holding up startup.
-    void externalClients.refresh();
-    const examplesWarning = await examples.load();
-    if (examplesWarning) app.log.warn(examplesWarning);
+    await getModelRuntime();
+    // Retain local catalogs without seeding external resources or modifying other tools' configurations.
     await localPlugins.list();
     await pluginCapabilities.migrate(legacyMcp);
   });
 
   const allowedOrigins = new Set(options.allowedOrigins ?? []);
   app.addHook("onRequest", async (request, reply) => {
+    if (closing) return reply.header("connection", "close").code(503).send({ error: "The local service is shutting down" });
+    if (!isLoopbackHostHeader(request.headers.host)) return reply.code(403).send({ error: "Invalid local host" });
     const origin = request.headers.origin;
+    if (!isAllowedLocalOrigin(origin, request.headers.host, allowedOrigins)) return reply.code(403).send({ error: "Origin is not allowed" });
     if (origin && allowedOrigins.has(origin)) {
       reply.header("access-control-allow-origin", origin);
-      reply.header("access-control-allow-headers", "authorization, content-type, last-event-id, x-workspace-version, x-publish-access-token");
-      reply.header("access-control-expose-headers", "x-workspace-version");
-      reply.header("access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+      reply.header("access-control-allow-headers", "authorization, content-type, last-event-id, x-workspace-version, x-publish-access-token, range, if-range");
+      reply.header("access-control-expose-headers", "x-workspace-version, content-length, content-range, accept-ranges, etag");
+      reply.header("access-control-allow-methods", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS");
       reply.header("vary", "Origin");
     }
     if (request.method === "OPTIONS") return reply.code(204).send();
@@ -1148,6 +1571,22 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.get("/health", async () => ({ status: "ok" }));
+
+  // Retired product services and unisolated executors are denied before parsing bodies or creating work.
+  app.addHook("onRequest", async (request, reply) => {
+    const pathname = request.url.split("?", 1)[0]!;
+    if (/^\/(?:cloud|community)(?:\/|$)/.test(pathname) || /^\/projects\/[^/]+\/publish$/.test(pathname)) {
+      return reply.code(410).send({ error: "Account cloud, Community and remote publishing are not provided by the local secure edition." });
+    }
+    const controlledAgentRoute = (request.method === "GET" && pathname === "/agent-runtimes")
+      || (request.method === "PATCH" && /^\/agent-runtimes\/(?:codex-cli|qoder-cli)$/.test(pathname))
+      || (request.method === "POST" && /^\/agent-runtimes\/(?:codex-cli|qoder-cli)\/(?:login|recheck)$/.test(pathname));
+    if (!controlledAgentRoute && /^\/(?:agent-runtimes|settings\/external-agents)(?:\/|$)/.test(pathname)
+      || pathname === AGENT_RUNTIME_BRIDGE_PATH || pathname === EXTERNAL_MCP_PATH
+      || /^\/settings\/models\/providers\/(?!kunpo\/login$)[^/]+\/login$/.test(pathname)) {
+      return reply.code(403).send({ error: "External execution and provider sign-in are unavailable until separately isolated. Configure an explicit API-key provider instead." });
+    }
+  });
 
   registerCheckpointRoutes(app, {
     store: checkpoints,
@@ -1213,15 +1652,9 @@ export function createApp(options: AppOptions = {}) {
     return externalAgentSettings();
   });
 
-  app.put<{ Body: UpdateWebSearchSettings }>("/settings/web-search", { schema: webSearchSettingsSchema }, async (request, reply) => {
-    try {
-      const settings = await webSearchSettings.update(request.body);
-      invalidatePluginSessions();
-      return settings;
-    } catch (cause) {
-      return reply.code(400).send({ error: cause instanceof Error ? cause.message : String(cause) });
-    }
-  });
+  app.put("/settings/web-search", async (_request, reply) =>
+    reply.code(410).send({ error: "Web search configuration has been retired in local secure mode." }));
+  app.delete("/settings/web-search/credentials", async () => webSearchSettings.clearCredentials());
 
   const pluginInstallRequestSchema = {
     body: {
@@ -1271,11 +1704,7 @@ export function createApp(options: AppOptions = {}) {
   app.get("/composer/capabilities", async () => {
     const [catalog, skills] = await Promise.all([
       plugins.list(),
-      loadPiSkillCatalog(
-        path.join(dataDirectory, "home-composer"),
-        piAgentDirectory,
-        () => resolvePluginSkills([bundledPlugins, localPlugins], pluginSettings),
-      ),
+      loadPiSkillCatalog(),
     ]);
     return {
       plugins: enabledPluginMentions(catalog.plugins),
@@ -1373,18 +1802,20 @@ export function createApp(options: AppOptions = {}) {
 
   app.get("/tool-jobs", async () => tools.jobs());
 
-  app.post<{ Params: { toolId: string }; Body: RunToolRequest & { title?: string; projectId?: string; nodeId?: string } }>(
+  app.post<{ Params: { toolId: string }; Body: RunToolRequest & { title?: string; projectId?: string; nodeId?: string; confirmedJobId?: string } }>(
     "/tools/:toolId/jobs",
     { schema: toolRunSchema, bodyLimit: TOOL_RUN_BODY_LIMIT },
     async (request, reply) => {
       try {
-        const { title, projectId, nodeId, ...input } = request.body;
+        const { title, projectId, nodeId, confirmedJobId, ...input } = request.body;
         if (Boolean(projectId) !== Boolean(nodeId)) {
           throw new ToolRunError("Project and node context must be provided together", 400);
         }
         if (projectId && !projects.get(projectId)) throw new ToolRunError("Project not found", 404);
+        await tools.assertMediaAvailable(request.params.toolId, input as RunToolRequest);
         return reply.code(202).send(tools.start(request.params.toolId, input as RunToolRequest, {
           title: title?.trim(),
+          ...(confirmedJobId ? { confirmedJobId } : {}),
           ...(projectId && nodeId ? { context: { projectId, nodeId } } : {}),
         }));
       } catch (cause) {
@@ -1405,7 +1836,7 @@ export function createApp(options: AppOptions = {}) {
 
   app.post<{ Params: { jobId: string } }>("/tool-jobs/:jobId/retry", async (request, reply) => {
     try {
-      return reply.code(202).send(tools.retryJob(request.params.jobId));
+      return reply.code(202).send(await tools.retryJob(request.params.jobId));
     } catch (cause) {
       if (cause instanceof ToolRunError) return reply.code(cause.statusCode).send({ error: cause.message });
       throw cause;
@@ -1714,7 +2145,7 @@ export function createApp(options: AppOptions = {}) {
     }
     const reasoningLevel = effectiveReasoningLevel(model, request.body.reasoningLevel, defaultReasoningLevel(project.workspacePath, piAgentDirectory));
     try {
-      const references = request.body.referenceSource ? await resolveCanvasTextReferences(project.workspacePath, request.body.referenceSource, request.params.documentId) : [];
+      const references = request.body.referenceSource ? await resolveCanvasTextReferences(project.workspacePath, request.body.referenceSource, request.params.documentId, library) : [];
       if (document) {
         const result = await generateDesignDocumentMarkdown(runtime, model, document.document, request.body.instruction, reasoningLevel, references);
         return { ...result, model: selected, revision: document.revision };
@@ -1832,6 +2263,29 @@ export function createApp(options: AppOptions = {}) {
     },
   );
 
+  app.patch<{ Params: { projectId: string }; Body: import("../shared/contracts.js").ProjectModelSelectionPatch }>(
+    "/projects/:projectId/model-selections",
+    { schema: { body: { type: "object", additionalProperties: true,
+      properties: Object.fromEntries(KUNPO_MODEL_ROLES.map((role) => [role, { anyOf: [{ ...modelRefSchema, additionalProperties: true }, { type: "null" }] }])),
+    } } },
+    async (request, reply) => {
+      const project = projects.get(request.params.projectId);
+      if (!project) return reply.code(404).send({ error: "Project not found" });
+      try {
+        for (const [role, ref] of Object.entries(request.body)) {
+          if (!(KUNPO_MODEL_ROLES as readonly string[]).includes(role)) throw new Error("Unknown project model role");
+          if (ref !== null) {
+            if (!ref || Object.keys(ref).some((key) => key !== "provider" && key !== "id")) throw new Error("Invalid project model reference");
+            validateKunpoSelection(role as KunpoModelRole, ref);
+          }
+        }
+        const updated = await projects.setModelSelections(project.id, request.body);
+        events.publish(project.id, "project.updated", { project: structuredClone(updated) });
+        return updated;
+      } catch (cause) { return reply.code(400).send({ error: cause instanceof Error ? cause.message : "Invalid project model selection" }); }
+    },
+  );
+
   app.post<{ Querystring: { name?: string }; Body: unknown }>("/projects/import", {
     schema: { querystring: { type: "object", additionalProperties: false, properties: { name: { type: "string", maxLength: 255 } } } },
   }, async (request, reply) => {
@@ -1861,27 +2315,112 @@ export function createApp(options: AppOptions = {}) {
   app.delete<{ Params: { projectId: string } }>("/projects/:projectId", async (request, reply) => {
     const project = projects.get(request.params.projectId);
     if (!project) return reply.code(404).send({ error: "Project not found" });
-    // A project reads as idle from the end of a run, a little before its turn is closed; what is asked of it then waits.
-    await agents.turnsClosed(project.id);
-    if (agents.isProjectBusy(project.id)) return reply.code(409).send({ error: "Wait for the agent to finish before deleting this project" });
-    if (project.integration) await pluginIntegrations.forget(project.integration.pluginId, project.id);
-    return projectWrites.exclusive(project.id, async () => {
-    await previews.forget(project);
-    agents.forgetProject(project.id);
-    conversations.forget(project);
-    for (const [key, driver] of agentPlaytests) {
-      if (!key.startsWith(`${project.id}:`)) continue;
-      await driver.cleanup();
-      agentPlaytests.delete(key);
-    }
-    await conversationImages.removeProject(project.id);
-    await canvasStore.cancelProject(project.id);
-    await canvasStore.waitForProject(project.id);
-    // A snapshot that is still being taken writes into the folder that is about to be removed.
-    await checkpoints.settled(project);
-    await projects.delete(project.id);
-    return reply.code(204).send();
-    });
+    try {
+      await projectLifecycle.delete(project.id, async (stage) => {
+        await assertSourcePublicationSettled(project.workspacePath);
+        await projects.assertRecoveryPreserved(project.id);
+        // Close admission before waiting: no new turn or contextual tool may race the busy check.
+        await agents.turnsClosed(project.id);
+        if (agents.isProjectBusy(project.id) || tools.isProjectBusy(project.id) || publishing.has(project.id))
+          throw new ProjectLifecycleError("Wait for project tasks and generation cleanup to finish before deleting this project.");
+        await options.projectExecution?.quiesceProject(project.id);
+        await previews.forget(project);
+        for (const [key, driver] of agentPlaytests) {
+          if (!key.startsWith(`${project.id}:`)) continue;
+          await driver.cleanup(); agentPlaytests.delete(key);
+        }
+        await canvasStore.cancelProject(project.id);
+        await canvasStore.waitForProject(project.id);
+        await checkpoints.settled(project);
+        await projectWrites.exclusive(project.id, async () => {
+          if (agents.isProjectBusy(project.id) || tools.isProjectBusy(project.id))
+            throw new ProjectLifecycleError("A project task is still finishing; no project files were deleted.");
+          if (await checkpoints.unfinished(project))
+            throw new ProjectLifecycleError("Recover the interrupted file restore before deleting this project.");
+          // Journal guest retirement only after the VM and its current inventory are verified.
+          const retirement = await options.projectExecution?.retireProject(project, () => stage("retiring-volume"));
+          if (options.projectExecution && retirement?.deleted !== true)
+            throw new ProjectLifecycleError("Isolated storage retirement is unconfirmed; project data was retained.");
+          await stage("volume-retired");
+          if (project.integration) await pluginIntegrations.forget(project.integration.pluginId, project.id);
+          await stage("deleting-host");
+          const imageAnchor = await projects.getLocalImageRecoveryAnchor(project.id);
+          await releaseRetiredProjectRecoverySpace(project.workspacePath, {
+            namespace: options.projectExecution?.namespace ?? "manual",
+            projectId: project.id,
+            sourceRetired: retirement?.deleted === true,
+            ...(imageAnchor ? { imageStorage: imageAnchor.storage } : {}),
+          });
+          await conversationImages.removeProject(project.id);
+          await projects.delete(project.id);
+          agents.forgetProject(project.id); conversations.forget(project);
+        });
+      });
+      return reply.code(204).send();
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error && error.code === "EXECUTION_RETIREMENT_UNAVAILABLE"
+        ? "execution_retirement_unavailable" : "project_lifecycle_pending";
+      return reply.code(409).send({ error: error instanceof Error ? error.message : String(error), code });
+    } finally { if (projects.get(project.id)) options.projectExecution?.resumeProject(project.id); }
+  });
+
+  app.get("/execution-storage", async (_request, reply): Promise<ExecutionStorageOverview> => {
+    reply.header("cache-control", "no-store");
+    if (!options.projectExecution) return { supported: false, vmState: "unknown", dataStatus: "unavailable",
+      checkedAt: new Date().toISOString(), reason: "not-configured", snapshot: null, unallocatedProjects: null };
+    return options.projectExecution.storageOverview(projects.list());
+  });
+
+  app.get<{ Params: { projectId: string } }>("/projects/:projectId/execution-storage", async (request, reply) => {
+    const project = projects.get(request.params.projectId);
+    if (!project) return reply.code(404).send({ error: "Project not found" });
+    if (!options.projectExecution) return { supported: false, projectId: project.id, state: "unavailable", dirty: false, recoverable: false };
+    try {
+      return await isolatedStorageStatus(project);
+    } catch (error) { return reply.code(409).send({ error: error instanceof Error ? error.message : String(error), code: "execution_storage_unavailable" }); }
+  });
+
+  app.get<{ Params: { projectId: string } }>("/projects/:projectId/execution-storage/capacity", async (request, reply) => {
+    reply.header("cache-control", "no-store");
+    const project = projects.get(request.params.projectId);
+    if (!project) return reply.code(404).send({ error: "Project not found" });
+    if (project.workspaceLocation === "external") return reply.code(409).send({ error: "Controlled execution capacity diagnostics are unavailable for an external workspace" });
+    // The ordinary GET read lease already coordinates this request with restores;
+    // taking a snapshot here would wait for its own HTTP lease to drain.
+    return withCanvasLock(project.workspacePath, () => projectCapacity(project));
+  });
+
+  app.post<{ Params: { projectId: string }; Body: Record<string, never> }>("/projects/:projectId/execution-storage/open", {
+    schema: { body: { type: "object", additionalProperties: false } },
+  }, async (request, reply) => {
+    const project = projects.get(request.params.projectId);
+    if (!project) return reply.code(404).send({ error: "Project not found" });
+    if (!options.projectExecution?.openRecoveryStorage || project.workspaceLocation === "external") return reply.code(409).send({ error: "Controlled execution storage is unavailable for this project" });
+    if (agents.isProjectBusy(project.id) || tools.isProjectBusy(project.id) || canvasStore.isProjectBusy(project.id)) return reply.code(409).send({ error: "Wait for project tasks to finish before opening recovery storage" });
+    try {
+      await projectLifecycle.inspectRecovery(project.id, () => options.projectExecution!.openRecoveryStorage());
+      return reply.code(204).send();
+    } catch (error) { return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+
+  app.post<{ Params: { projectId: string }; Body: { generation: string } }>("/projects/:projectId/execution-storage/recover", {
+    preValidation: async (request, reply) => {
+      const body = request.body;
+      if (!body || Array.isArray(body) || typeof body.generation !== "string" || Object.keys(body).some((key) => key !== "generation"))
+        return reply.code(400).send({ error: "Choose the current retained execution generation before recovering." });
+    },
+    schema: { body: { type: "object", additionalProperties: false, required: ["generation"], properties: { generation: { type: "string", pattern: "^[0-9]+$", maxLength: 32 } } } },
+  }, async (request, reply) => {
+    const project = projects.get(request.params.projectId);
+    if (!project) return reply.code(404).send({ error: "Project not found" });
+    if (!options.projectExecution) return reply.code(409).send({ error: "Isolated execution is not configured" });
+    if (agents.isProjectBusy(project.id) || tools.isProjectBusy(project.id) || canvasStore.isProjectBusy(project.id))
+      return reply.code(409).send({ error: "Wait for project tasks to finish before recovering source changes." });
+    try {
+      return await recoverIsolatedChanges(project, request.body.generation, undefined,
+        (publication) => reply.header("x-workspace-version", publication.version));
+    } catch (error) { return reply.code(409).send({ error: error instanceof Error ? error.message : String(error),
+      code: error && typeof error === "object" && "recoveryNotStarted" in error && error.recoveryNotStarted === true ? "execution_recovery_not_started" : "execution_recovery_required" }); }
   });
 
   registerCommunityRoutes(app, publisher, projects);
@@ -1995,19 +2534,28 @@ export function createApp(options: AppOptions = {}) {
     }
   });
 
-  app.get<{ Params: { assetId: string } }>("/library/assets/:assetId/content", async (request, reply) => {
-    try {
-      const { asset, absolutePath } = await library.content(request.params.assetId);
-      return reply.type(asset.contentType)
-        .header("content-length", asset.size)
-        .header("cache-control", "private, max-age=31536000, immutable")
-        .header("x-content-type-options", "nosniff")
-        .send(createReadStream(absolutePath));
-    } catch (cause) {
-      const error = cause instanceof Error ? cause.message : String(cause);
-      return reply.code(cause instanceof AssetLibraryError ? cause.statusCode : 500).send({ error });
-    }
+  app.post<{ Params: { assetId: string } }>("/library/assets/:assetId/model-preview", async (request, reply) => {
+    try { return await library.rebuildModelPreview(request.params.assetId); }
+    catch (cause) { return reply.code(cause instanceof AssetLibraryError ? cause.statusCode : 422).send({ error: "The local GLB preview could not be rebuilt. The FBX original is retained; no generation was submitted." }); }
   });
+  app.route<{ Params: { assetId: string }; Querystring: { preview?: string; sha256?: string } }>({ method: ["GET", "HEAD"], url: "/library/assets/:assetId/content", handler: async (request, reply) => {
+    const expectedSha256 = request.query.sha256;
+    if (expectedSha256 !== undefined && (typeof expectedSha256 !== "string" || !/^[a-f0-9]{64}$/.test(expectedSha256))) return reply.code(400).send({ error: "Invalid media content binding" });
+    let snapshot: CheckedMediaSnapshot | undefined;
+    try {
+      const preview = request.query.preview === "true";
+      const signal = mediaRequestSignal(request, reply);
+      const limit = library.get(request.params.assetId)?.mediaType === "video" ? 256 * 1024 * 1024 : 200 * 1024 * 1024;
+      const opened = await library.openSnapshot(request.params.assetId, limit, preview, signal);
+      snapshot = opened.snapshot;
+      if (expectedSha256 !== undefined && snapshot.sha256 !== expectedSha256) throw new CheckedMediaSnapshotError("The media content changed. Refresh this preview before reading further ranges.", 409, "CHECKED_MEDIA_CHANGED");
+      return await sendMediaSnapshot(request, reply, snapshot, opened.asset.contentType, signal);
+    } catch (cause) {
+      await snapshot?.release();
+      const error = cause instanceof Error ? cause.message : String(cause);
+      return reply.code(cause instanceof AssetLibraryError || cause instanceof CheckedMediaSnapshotError ? cause.statusCode : 500).send({ error });
+    }
+  } });
 
   app.patch<{ Params: { assetId: string }; Body: { name: string } }>(
     "/library/assets/:assetId",
@@ -2023,8 +2571,14 @@ export function createApp(options: AppOptions = {}) {
   );
 
   app.get<{ Params: { assetId: string } }>("/library/assets/:assetId/references", async (request, reply) => {
+    reply.header("cache-control", "no-store");
     if (!library.get(request.params.assetId)) return reply.code(404).send({ error: "Library asset not found" });
-    return (await projects.referencesLibraryAsset(request.params.assetId)).map(({ id, name, type }) => ({ id, name, type }));
+    try {
+      return (await projects.referencesLibraryAsset(request.params.assetId)).map(({ id, name, type }) => ({ id, name, type }));
+    } catch (cause) {
+      const error = cause instanceof Error ? cause.message : String(cause);
+      return reply.code(cause instanceof ProjectLibraryReferenceError ? 409 : 500).send({ error });
+    }
   });
 
   app.delete<{ Params: { assetId: string }; Querystring: { force?: string } }>("/library/assets/:assetId", {
@@ -2124,10 +2678,12 @@ export function createApp(options: AppOptions = {}) {
     },
   );
 
-  app.get<{ Params: { projectId: string } }>("/projects/:projectId/files", async (request, reply) => {
+  app.get<{ Params: { projectId: string }; Querystring: { assets?: string } }>("/projects/:projectId/files", {
+    schema: { querystring: { type: "object", additionalProperties: false, properties: { assets: { type: "string", enum: ["true", "false"] } } } },
+  }, async (request, reply) => {
     const project = projects.get(request.params.projectId);
     if (!project) return reply.code(404).send({ error: "Project not found" });
-    const files = await listWorkspaceFiles(project.workspacePath);
+    const files = await listWorkspaceFiles(project.workspacePath, { assets: request.query.assets === "true" });
     let usage: Map<string, boolean> | undefined;
     if (files.some((file) => (file.libraryAssetId ? library.get(file.libraryAssetId)?.purpose : file.purpose) === "reference")) {
       try { usage = await canvasLibraryAssetUsage(project.workspacePath); }
@@ -2234,6 +2790,17 @@ export function createApp(options: AppOptions = {}) {
     },
   );
 
+  app.get<{ Params: { projectId: string } }>("/projects/:projectId/model-assets", async (request, reply) => {
+    try { return await projects.modelAssetResources(request.params.projectId, undefined, mediaRequestSignal(request, reply)); }
+    catch (cause) { return reply.code(cause instanceof ProjectAssetError ? cause.statusCode : 409).send({ error: cause instanceof Error ? cause.message : "Model resources are unavailable" }); }
+  });
+  app.post<{ Params: { projectId: string }; Body: { assetId?: string; path?: string; rebuildPreview?: boolean } }>("/projects/:projectId/model-assets/resolve", {
+    schema: { body: { type: "object", additionalProperties: false, properties: { assetId: { type: "string", pattern: "^[a-zA-Z0-9_-]{1,128}$" }, path: { type: "string", minLength: 1, maxLength: 1000 }, rebuildPreview: { type: "boolean" } } } },
+  }, async (request, reply) => {
+    try { return await projects.modelAssetResources(request.params.projectId, request.body, mediaRequestSignal(request, reply)); }
+    catch (cause) { return reply.code(cause instanceof ProjectAssetError || cause instanceof AssetLibraryError ? cause.statusCode : 409).send({ error: cause instanceof Error ? cause.message : "Local model resources are unavailable; the original is retained" }); }
+  });
+
   app.post<{ Params: { projectId: string; assetId: string } }>(
     "/projects/:projectId/library-assets/:assetId",
     async (request, reply) => {
@@ -2266,26 +2833,30 @@ export function createApp(options: AppOptions = {}) {
     },
   );
 
-  app.get<{ Params: { projectId: string }; Querystring: { path?: string } }>(
-    "/projects/:projectId/files/raw",
-    async (request, reply) => {
+  app.route<{ Params: { projectId: string }; Querystring: { path?: string; sha256?: string } }>({
+    method: ["GET", "HEAD"], url: "/projects/:projectId/files/raw",
+    handler: async (request, reply) => {
       const project = projects.get(request.params.projectId);
       if (!project) return reply.code(404).send({ error: "Project not found" });
       if (!request.query.path) return reply.code(400).send({ error: "File path is required" });
+      const expectedSha256 = request.query.sha256;
+      if (expectedSha256 !== undefined && (typeof expectedSha256 !== "string" || !/^[a-f0-9]{64}$/.test(expectedSha256))) return reply.code(400).send({ error: "Invalid media content binding" });
+      let snapshot: CheckedMediaSnapshot | undefined;
       try {
+        const signal = mediaRequestSignal(request, reply);
         const media = await getWorkspaceMedia(project.workspacePath, request.query.path);
-        return reply
-          .type(media.contentType)
-          .header("content-length", media.size)
-          .header("cache-control", "no-store")
-          .header("x-content-type-options", "nosniff")
-          .send(createReadStream(media.absolutePath));
+        snapshot = await mediaSnapshots.acquire(project.workspacePath, media.absolutePath, {
+          maxBytes: mediaPreviewReadLimit(media.contentType), signal, expectedSha256, scope: `project:${project.id}`,
+        });
+        return await sendMediaSnapshot(request, reply, snapshot, media.contentType, signal);
       } catch (cause) {
+        await snapshot?.release();
+        if (cause instanceof SafeProjectFileError || cause instanceof CheckedMediaSnapshotError) return reply.code(cause.statusCode).send({ error: cause.message });
         if (cause instanceof WorkspaceError) return reply.code(400).send({ error: cause.message });
         throw cause;
       }
     },
-  );
+  });
 
   app.get<{ Params: { projectId: string } }>("/projects/:projectId/conversations", async (request, reply) => {
     const project = projects.get(request.params.projectId);
@@ -2306,6 +2877,7 @@ export function createApp(options: AppOptions = {}) {
       id: model.id,
       name: model.name,
       reasoningLevels: supportedReasoningLevels(model),
+      supportsImages: model.input?.includes("image") ?? false,
     });
     // Conversations also list coding agents' models; canvas text and other one-off generation use Pi's only.
     const agents = request.query.runtimes === "1" ? await agentRuntimes.models() : { models: [], loading: [] };
@@ -2371,77 +2943,17 @@ export function createApp(options: AppOptions = {}) {
           configured,
           ...(provider.id === "openai" ? { languageConfigured: provider.configured, imageConfigured } : {}),
           enabled: providerEnabled(provider.id),
-          custom: providerModelSettings.isCustom(provider.id),
+          custom: provider.id !== "kunpo" && providerModelSettings.isCustom(provider.id),
           ...(custom?.preset ? { preset: custom.preset } : {}),
           status: configured ? "connected" as const : "not_configured" as const,
-          capabilities: custom?.modelConfigurationVersion === 2
+          capabilities: provider.id === "kunpo" ? ["language", "image", "video", "audio", "3d"] as const : custom?.modelConfigurationVersion === 2
             ? [...new Set(custom.models.flatMap(modelUsageList))]
             : provider.id === "openrouter"
             ? ["language", "image", "video"] as const
             : provider.id === "openai" || customImageProviders.has(provider.id) ? ["language", "image"] as const : ["language"] as const,
         };
-      })
-      .sort((left, right) => left.name.localeCompare(right.name));
-    const directProviders = [...native3DProviders.map(([id, name, settings]) => ({
-      id, name, enabled: providerEnabled(id), custom: false, configured: settings.get().configured,
-      status: settings.get().configured ? "connected" as const : "not_configured" as const,
-      methods: [{ type: "api_key" as const, label: `${name} API key` }],
-      credentialType: "api_key" as const, capabilities: ["3d"] as const,
-    })), ...SEEDANCE_PROVIDER_IDS.map((providerId) => {
-      const definition = SEEDANCE_PROVIDERS[providerId];
-      const configured = seedanceSettings.get(providerId).configured;
-      return {
-        id: definition.id,
-        name: definition.name,
-        configured,
-        enabled: providerEnabled(providerId),
-        custom: false,
-        status: configured ? "connected" as const : "not_configured" as const,
-        methods: [{ type: "api_key" as const, label: `${definition.name} API key` }],
-        credentialType: "api_key" as const,
-        capabilities: providerId === "volcengine-ark" ? ["image", "video"] as const : ["video"] as const,
-      };
-    }), ...MINIMAX_PROVIDER_IDS.map((providerId) => {
-      const definition = MINIMAX_PROVIDERS[providerId];
-      const configured = minimaxSettings.get(providerId).configured;
-      return {
-        id: definition.id,
-        name: definition.name,
-        configured,
-        enabled: providerEnabled(providerId),
-        custom: false,
-        status: configured ? "connected" as const : "not_configured" as const,
-        methods: [{ type: "api_key" as const, label: `${definition.name} API key` }],
-        credentialType: "api_key" as const,
-        capabilities: ["video"] as const,
-      };
-    }), {
-      id: "volcengine-tts",
-      name: DOUBAO_SPEECH_PROVIDER_NAME,
-      configured: volcengineTtsSettings.get().configured,
-      enabled: providerEnabled("volcengine-tts"),
-      custom: false,
-      status: volcengineTtsSettings.get().configured ? "connected" as const : "not_configured" as const,
-      methods: [{ type: "api_key" as const, label: `${DOUBAO_SPEECH_PROVIDER_NAME} API key` }],
-      credentialType: "api_key" as const,
-      capabilities: ["audio"] as const,
-    }, {
-      id: "volcengine-seed-audio",
-      name: DOUBAO_SEED_AUDIO_PROVIDER_NAME,
-      configured: volcengineSeedAudioSettings.get().configured,
-      enabled: providerEnabled("volcengine-seed-audio"),
-      custom: false,
-      status: volcengineSeedAudioSettings.get().configured ? "connected" as const : "not_configured" as const,
-      methods: [{ type: "api_key" as const, label: `${DOUBAO_SEED_AUDIO_PROVIDER_NAME} API key` }],
-      credentialType: "api_key" as const,
-      capabilities: ["audio"] as const,
-    }];
-    // Cloud quota/catalog verification can take tens of seconds. Refresh it in
-    // the background and serve the last known snapshot so opening Settings does
-    // not wait on the cloud service.
-    void cloudModels.refresh();
-    const codex = codexImages.summarySnapshot(providerEnabled("codex-cli"));
-    return [...providers, ...directProviders, codex, ...cloudModels.providersSnapshot(providerEnabled)].sort((left, right) => left.name.localeCompare(right.name));
+      });
+    return providers.filter((provider) => !isMeshyIdentifier(provider.id) && !isMeshyProviderConfiguration(customModels.get(provider.id)) && (provider.id === "kunpo" || provider.custom)).sort((left, right) => left.name.localeCompare(right.name));
   };
   app.get("/settings/providers", providerSummaries);
   registerDiagnosticsRoutes(app, {
@@ -2495,11 +3007,7 @@ export function createApp(options: AppOptions = {}) {
     schema: { body: { anyOf: [{ type: "null" }, { type: "object", additionalProperties: false, required: ["accessToken", "userId"], properties: {
       accessToken: { type: "string", minLength: 1, maxLength: 16_384 }, userId: { type: "string", minLength: 1, maxLength: 128 },
     } }] } },
-  }, async (request, reply) => {
-    // Update identity immediately; cloud verification runs when catalogs are requested.
-    void cloudModels.setSession(options.localDebug ? null : request.body);
-    return reply.code(204).send();
-  });
+  }, async (_request, reply) => reply.code(410).send({ error: "Product accounts and Cloud are unavailable in the local secure edition." }));
   app.get("/cloud/quotas", async () => cloudModels.quotas());
   app.get("/cloud/jobs", async (_request, reply) => {
     try { return await cloudModels.jobs(); }
@@ -2523,6 +3031,7 @@ export function createApp(options: AppOptions = {}) {
   });
 
   const saveCustomProvider = async (value: unknown, id: string) => {
+    if (isMeshyIdentifier(id) || value && typeof value === "object" && isMeshyProviderConfiguration(value)) throw new Error(MESHY_DISABLED_MESSAGE);
     const runtime = await getModelRuntime();
     const catalog = customModelCatalog(runtime.getModels());
     const settings = normalizeCustomProvider(value, catalog);
@@ -2545,6 +3054,9 @@ export function createApp(options: AppOptions = {}) {
 
   app.post<{ Body: DiscoverProviderModelsRequest }>("/settings/models/providers/discover", async (request, reply) => {
     try {
+      if (request.body && (isMeshyIdentifier(request.body.providerId) || isMeshyProviderConfiguration(request.body))) return reply.code(410).send({ error: MESHY_DISABLED_MESSAGE });
+      const previous = request.body?.providerId ? await providerModelSettings.customProvider(request.body.providerId) : undefined;
+      if (isMeshyProviderConfiguration(previous)) return reply.code(410).send({ error: MESHY_DISABLED_MESSAGE });
       const runtime = await getModelRuntime();
       const catalog = customModelCatalog(runtime.getModels());
       let connection = request.body;
@@ -2575,23 +3087,25 @@ export function createApp(options: AppOptions = {}) {
     try { return await saveCustomProvider(request.body, request.params.providerId); }
     catch (cause) { return reply.code(400).send({ error: cause instanceof Error ? cause.message : String(cause) }); }
   });
+  const retiredMediaKeys = [
+    ...native3DProviders.map(([id, name, settings]) => ({ id, name, get: () => settings.get(), clear: () => settings.clear() })),
+    ...Object.values(SEEDANCE_PROVIDERS).map(({ id, name }) => ({ id, name: id === "volcengine-ark" ? "Volcengine Ark" : name, get: () => seedanceSettings.get(id), clear: () => seedanceSettings.clear(id) })),
+    ...Object.values(MINIMAX_PROVIDERS).map(({ id, name }) => ({ id, name, get: () => minimaxSettings.get(id), clear: () => minimaxSettings.clear(id) })),
+  ];
   const removeProvider = async (providerId: string) => {
     const runtime = await getModelRuntime();
-    const native = native3DProviders.find(([id]) => id === providerId);
-    const seedance = isSeedanceProviderId(providerId);
-    const minimax = isMinimaxProviderId(providerId);
+    if (providerId === "kunpo") { await modelAuth.logout(providerId); await refreshKunpoCredential(runtime); return; }
+    const retiredKey = retiredMediaKeys.find((key) => key.id === providerId);
     const volcengineTts = providerId === "volcengine-tts";
     const volcengineSeedAudio = providerId === "volcengine-seed-audio";
-    if (!native && !seedance && !minimax && !volcengineTts && !volcengineSeedAudio && !runtime.getProvider(providerId)) throw new ModelAuthError("Model provider not found", 404);
+    if (!retiredKey && !volcengineTts && !volcengineSeedAudio && !runtime.getProvider(providerId)) throw new ModelAuthError("Model provider not found", 404);
     catalogRefresh.invalidate(providerId);
     const previousEndpoint = providerId === "openai" ? openAIEndpoint.override() : undefined;
     try {
       await providerModelSettings.removeProviderSettings(providerId, async () => {
         await runtime.refresh({ allowNetwork: false });
         if (previousEndpoint) await openAIEndpoint.update(openAIEndpoint.defaultBaseUrl);
-        if (native) await native[2].clear();
-        else if (seedance) await seedanceSettings.clear(providerId);
-        else if (minimax) await minimaxSettings.clear(providerId);
+        if (retiredKey) await retiredKey.clear();
         else if (volcengineTts) await volcengineTtsSettings.clear();
         else if (volcengineSeedAudio) await volcengineSeedAudioSettings.clear();
         else await runtime.logout(providerId);
@@ -2621,95 +3135,49 @@ export function createApp(options: AppOptions = {}) {
     return reply.code(204).send();
   });
 
+  app.get("/settings/models/legacy-media-keys", async () => retiredMediaKeys.filter((key) => key.get().configured).map(({ id, name }) => ({ id, name })));
+  app.delete<{ Params: { providerId: string } }>("/settings/models/legacy-media-keys/:providerId", async (request, reply) => {
+    const key = retiredMediaKeys.find(({ id }) => id === request.params.providerId);
+    if (!key) return reply.code(404).send({ error: "Legacy provider not found" });
+    await key.clear();
+    return reply.code(204).send();
+  });
+
+  const retiredMediaKeyError = { error: "Independent credentials for this media provider are retired. Configure KunpoAPI or a supported custom provider in Models." };
   for (const [id, , settings] of native3DProviders) {
-    app.get(`/settings/models/providers/${id}`, async () => settings.get());
-    app.put<{ Body: { apiKey: string } }>(`/settings/models/providers/${id}`, { schema: apiKeySettingsSchema }, async (request, reply) => {
-      try { return await settings.update(request.body.apiKey); }
-      catch (cause) { return reply.code(400).send({ error: cause instanceof Error ? cause.message : String(cause) }); }
+    app.get(`/settings/models/providers/${id}`, async () => ({ configured: false, hasSavedKey: settings.get().configured }));
+    app.put(`/settings/models/providers/${id}`, { schema: apiKeySettingsSchema }, async (_request, reply) => reply.code(410).send(id === "meshy" ? { error: MESHY_DISABLED_MESSAGE } : retiredMediaKeyError));
+  }
+  for (const [suffix, accepts] of [["seedance-key", isSeedanceProviderId], ["minimax-key", isMinimaxProviderId]] as const) {
+    const url = `/settings/models/providers/:providerId/${suffix}`;
+    app.put<{ Params: { providerId: string } }>(url, { schema: apiKeySettingsSchema }, async (request, reply) => {
+      if (!accepts(request.params.providerId)) return reply.code(404).send({ error: "Legacy provider not found" });
+      return reply.code(410).send(retiredMediaKeyError);
+    });
+    app.delete<{ Params: { providerId: string } }>(url, async (request, reply) => {
+      const id = request.params.providerId;
+      const key = retiredMediaKeys.find((item) => item.id === id);
+      if (!key || !accepts(id)) return reply.code(404).send({ error: "Legacy provider not found" });
+      await key.clear();
+      return reply.code(204).send();
     });
   }
 
-  app.put<{ Params: { providerId: string }; Body: { apiKey: string } }>(
-    "/settings/models/providers/:providerId/seedance-key",
-    { schema: apiKeySettingsSchema },
-    async (request, reply) => {
-      if (!isSeedanceProviderId(request.params.providerId)) return reply.code(404).send({ error: "Seedance provider not found" });
-      try { return await seedanceSettings.update(request.params.providerId, request.body.apiKey); }
-      catch (cause) { return reply.code(400).send({ error: cause instanceof Error ? cause.message : String(cause) }); }
-    },
-  );
-  app.delete<{ Params: { providerId: string } }>("/settings/models/providers/:providerId/seedance-key", async (request, reply) => {
-    if (!isSeedanceProviderId(request.params.providerId)) return reply.code(404).send({ error: "Seedance provider not found" });
-    await seedanceSettings.clear(request.params.providerId);
-    return reply.code(204).send();
-  });
-
-  app.put<{ Params: { providerId: string }; Body: { apiKey: string } }>(
-    "/settings/models/providers/:providerId/minimax-key",
-    { schema: apiKeySettingsSchema },
-    async (request, reply) => {
-      if (!isMinimaxProviderId(request.params.providerId)) return reply.code(404).send({ error: "MiniMax provider not found" });
-      try { return await minimaxSettings.update(request.params.providerId, request.body.apiKey); }
-      catch (cause) { return reply.code(400).send({ error: cause instanceof Error ? cause.message : String(cause) }); }
-    },
-  );
-  app.delete<{ Params: { providerId: string } }>("/settings/models/providers/:providerId/minimax-key", async (request, reply) => {
-    if (!isMinimaxProviderId(request.params.providerId)) return reply.code(404).send({ error: "MiniMax provider not found" });
-    await minimaxSettings.clear(request.params.providerId);
-    return reply.code(204).send();
-  });
-
-  app.get("/settings/models/providers/volcengine-tts", async () => volcengineTtsSettings.get());
-  app.put<{ Body: { apiKey?: string; defaultVoiceId?: string | null } }>("/settings/models/providers/volcengine-tts", { schema: { body: {
-    type: "object", additionalProperties: false, minProperties: 1,
-    properties: { apiKey: { type: "string", minLength: 1, maxLength: 10_000 }, defaultVoiceId: { anyOf: [{ type: "string", minLength: 1, maxLength: AUDIO_VOICE_ID_MAX_LENGTH, pattern: AUDIO_VOICE_ID_PATTERN }, { type: "null" }] } },
-  } } }, async (request, reply) => {
-    try { return await volcengineTtsSettings.update(request.body.apiKey, request.body.defaultVoiceId); }
-    catch (cause) { return reply.code(400).send({ error: cause instanceof Error ? cause.message : String(cause) }); }
-  });
-  app.post<{ Body: { text: string; voiceId?: string; language?: string; style?: string; speed?: number } }>(
-    "/settings/models/providers/volcengine-tts/preview",
-    { schema: { body: {
-      type: "object", additionalProperties: false, required: ["text"],
-      properties: {
-        text: { type: "string", minLength: 1, maxLength: 500 },
-        voiceId: { type: "string", minLength: 1, maxLength: AUDIO_VOICE_ID_MAX_LENGTH, pattern: AUDIO_VOICE_ID_PATTERN },
-        language: { type: "string", minLength: 1, maxLength: 40 },
-        style: { type: "string", minLength: 1, maxLength: 500 },
-        speed: { type: "number", minimum: -50, maximum: 100 },
-      },
-    } } },
-    async (request, reply) => {
-      try {
-        const generated = await volcengineTtsProvider.generate({
-          operation: "speech",
-          model: { provider: "volcengine-tts", id: "seed-tts-2.0" },
-          text: request.body.text,
-          voiceId: request.body.voiceId,
-          language: request.body.language,
-          style: request.body.style,
-          speed: request.body.speed,
-          output: { format: "mp3", sampleRate: 24_000 },
-        });
-        reply.header("content-type", generated.mediaType);
-        reply.header("cache-control", "no-store");
-        if (generated.metadata?.providerRequestId) reply.header("x-provider-request-id", generated.metadata.providerRequestId);
-        return reply.send(Buffer.from(generated.bytes));
-      } catch (cause) {
-        if (cause instanceof AudioGenerationError) return reply.code(cause.statusCode).send({ error: cause.message });
-        throw cause;
-      }
-    },
-  );
+  const speechSettings = async () => { await getModelRuntime(); return { configured: Boolean(kunpoApiKey) }; };
+  app.get("/settings/models/providers/volcengine-tts", speechSettings);
+  app.put("/settings/models/providers/volcengine-tts", async (_request, reply) => reply.code(410).send({ error: "Speech uses reference audio. Configure the shared KunpoAPI key and select audio in a speech node." }));
+  app.post("/settings/models/providers/volcengine-tts/preview", async (_request, reply) => reply.code(410).send({ error: "Select reference audio in a speech node. This retired preview never generates audio." }));
   app.delete("/settings/models/providers/volcengine-tts", async (_request, reply) => {
     await volcengineTtsSettings.clear();
     return reply.code(204).send();
   });
 
-  app.get("/settings/models/providers/volcengine-seed-audio", async () => volcengineSeedAudioSettings.get());
-  app.put<{ Body: { apiKey: string } }>("/settings/models/providers/volcengine-seed-audio", { schema: apiKeySettingsSchema }, async (request, reply) => {
-    try { return await volcengineSeedAudioSettings.update(request.body.apiKey); }
-    catch (cause) { return reply.code(400).send({ error: cause instanceof Error ? cause.message : String(cause) }); }
+  app.get("/settings/models/providers/volcengine-seed-audio", async () => {
+    await getModelRuntime();
+    return { configured: Boolean(kunpoApiKey) };
+  });
+  app.put<{ Body: { apiKey: string } }>("/settings/models/providers/volcengine-seed-audio", { schema: apiKeySettingsSchema }, async (_request, reply) => {
+    return reply.code(410).send({ error: "Native audio credentials are retired. Configure the shared KunpoAPI key instead." });
   });
   app.delete("/settings/models/providers/volcengine-seed-audio", async (_request, reply) => {
     await volcengineSeedAudioSettings.clear();
@@ -2739,13 +3207,14 @@ export function createApp(options: AppOptions = {}) {
   const hasModelProvider = async (runtime: ModelRuntime, id: string) => isNative3DProvider(id) || Boolean(runtime.getProvider(id))
     || id.startsWith("cloud-") && cloudModels.hasProvider(id);
   const providerModels = async (runtime: ModelRuntime, providerId: string): Promise<ProviderModelSettings> => {
+    if (isMeshyIdentifier(providerId)) return { models: [], defaultApi: "meshy", canAddCustomModel: false, catalogNotice: MESHY_DISABLED_MESSAGE };
     if (isNative3DProvider(providerId)) {
       const native = native3DProviders.find(([id]) => id === providerId)!;
       return { models: providerModelSettings.models3D(providerId).map((definition) => ({
         provider: providerId, providerName: native[1], id: definition.id, name: definition.name, reasoningLevels: [], capabilities: ["3d"],
         visible: providerModelSettings.isVisible({ provider: providerId, id: definition.id }), custom: !model3DPreset(providerId, definition.id),
         source: model3DPreset(providerId, definition.id) ? "preset" : "custom", model3d: definition,
-      })), defaultApi: providerId, canAddCustomModel: native[2].get().configured, model3DProtocol: providerId,
+      })), defaultApi: providerId, canAddCustomModel: false, model3DProtocol: providerId,
       catalogNotice: `Official presets · reviewed ${MODEL_3D_CATALOG_REVIEWED}. No model-list API; new versions arrive with app updates or can be added manually. Key access is determined by the provider.`,
       catalogDocsUrl: MODEL_3D_CATALOG_DOCS[providerId] };
     }
@@ -2889,6 +3358,7 @@ export function createApp(options: AppOptions = {}) {
     { schema: modelAuthLoginSchema },
     async (request, reply) => {
       try {
+        if (request.params.providerId !== "kunpo" || request.body.method !== "api_key") return reply.code(403).send({ error: "Only local Kunpo API-key setup is available" });
         return reply.code(202).send({ operationId: await modelAuth.start(request.params.providerId, request.body.method) });
       } catch (cause) {
         if (cause instanceof ModelAuthError) return reply.code(cause.statusCode).send({ error: cause.message });
@@ -2933,7 +3403,7 @@ export function createApp(options: AppOptions = {}) {
 
   app.get("/image-models", async () => providerImages.models());
   app.get("/video-models", async () => providerVideos.models());
-  app.get("/audio-models/catalog", async () => providerAudio.catalog());
+  app.get("/audio-models/catalog", async () => { await getModelRuntime(); return providerAudio.catalog(); });
   for (const [path, usage, generator] of [
     ["image-models", "image", providerImages], ["video-models", "video", providerVideos], ["model3d-models", "3d", providerModels3D],
   ] as const) {
@@ -2978,6 +3448,17 @@ export function createApp(options: AppOptions = {}) {
       if (!isCreateConversationRequest(request.body)) {
         return reply.code(400).send({ error: "Invalid conversation request" });
       }
+      const localChoice = request.body?.model ?? project.modelSelections?.agent;
+      if (localChoice && kunpoModelOption("agent", localChoice)) {
+        if (request.body?.nativeReasoningLevel !== undefined) return reply.code(400).send({ error: "Native reasoning is only available for coding agents" });
+        const metadata = await localAgentMetadata(localChoice);
+        if (request.body?.reasoningLevel && (!metadata || !supportedReasoningLevels(metadata).includes(request.body.reasoningLevel))) {
+          return reply.code(400).send({ error: "Reasoning level is not available for this model" });
+        }
+        const level = request.body?.reasoningLevel ?? (metadata ? effectiveReasoningLevel(metadata, undefined, defaultReasoningLevel(dataDirectory, piAgentDirectory)) : undefined);
+        const conversation = await conversations.create(project, { ...localChoice }, level);
+        return reply.code(201).send(conversation.summary);
+      }
       const defaults = agentRuntimes.settings.defaultModel();
       const defaultModel = !request.body?.model && defaults ? await agentRuntimes.model(defaults.model.provider, defaults.model.id) : undefined;
       const requestedModel = request.body?.model ?? (defaultModel ? defaults?.model : undefined);
@@ -3000,11 +3481,15 @@ export function createApp(options: AppOptions = {}) {
         selectedModel = await availableModel(requestedModel.provider, requestedModel.id);
       } else {
         const runtime = await getModelRuntime();
-        selectedModel = preferredAgentModel(
+        const projectChoice = project.modelSelections?.agent;
+        if (projectChoice) {
+          try { validateKunpoSelection("agent", projectChoice, { forExecution: true }); }
+          catch (cause) { return reply.code(409).send({ error: cause instanceof Error ? cause.message : "The project Agent is unavailable" }); }
+          selectedModel = resolveModels(runtime, [...runtime.getModels()]).find((model) => model.provider === projectChoice.provider && model.id === projectChoice.id);
+          if (!selectedModel) return reply.code(409).send({ error: "The selected project Agent is unavailable" });
+        } else selectedModel = preferredAgentModel(
           resolveModels(runtime, (await runtime.getAvailable()).filter((model) => providerEnabled(model.provider) && providerModelSettings.isVisible(model))),
-          undefined,
-          configuredDefaultModel(dataDirectory, piAgentDirectory),
-        );
+          undefined, configuredDefaultModel(dataDirectory, piAgentDirectory));
       }
       if (requestedModel && !selectedModel) {
         return reply.code(400).send({ error: "Model is not available" });
@@ -3012,7 +3497,7 @@ export function createApp(options: AppOptions = {}) {
       if (request.body?.reasoningLevel && selectedModel && !supportedReasoningLevels(selectedModel).includes(request.body.reasoningLevel)) {
         return reply.code(400).send({ error: "Reasoning level is not available for this model" });
       }
-      const model = selectedModel ? { provider: selectedModel.provider, id: selectedModel.id } : undefined;
+      const model = selectedModel ? { provider: selectedModel.provider, id: selectedModel.id } : project.modelSelections?.agent;
       const reasoningLevel = request.body?.reasoningLevel ?? (!requestedModel && selectedModel
         ? effectiveReasoningLevel(selectedModel, undefined, defaultReasoningLevel(dataDirectory, piAgentDirectory))
         : undefined);
@@ -3057,8 +3542,9 @@ export function createApp(options: AppOptions = {}) {
       const planState = await conversations.planState(project, conversation);
       agents.restorePlanState(conversation, planState);
       const agentRuntime = modelRef && isAgentRuntimeId(modelRef.provider) ? modelRef.provider : undefined;
-      const runtime = modelRef && !agentRuntime ? await getModelRuntime() : undefined;
-      const model = runtime && modelRef ? resolveModel(runtime, runtime.getModel(modelRef.provider, modelRef.id)) : undefined;
+      const localChoice = modelRef && kunpoModelOption("agent", modelRef);
+      const runtime = modelRef && !agentRuntime && !localChoice ? await getModelRuntime() : undefined;
+      const model = localChoice && modelRef ? await localAgentMetadata(modelRef) : runtime && modelRef ? resolveModel(runtime, runtime.getModel(modelRef.provider, modelRef.id)) : undefined;
       // A coding agent's models load from its CLI; a slow one leaves the level to the picker rather than delay the conversation.
       const agentModel = agentRuntime && modelRef ? await Promise.race([agentRuntimes.model(agentRuntime, modelRef.id), new Promise<undefined>((resolve) => setTimeout(resolve, 2_000))]) : undefined;
       const storedLevel = model || agentModel ? await conversations.reasoningLevel(project, conversation) : undefined;
@@ -3161,6 +3647,9 @@ export function createApp(options: AppOptions = {}) {
       const agentModel = isAgentRuntimeId(request.body.provider) ? await agentRuntimes.model(request.body.provider, request.body.id) : undefined;
       const model = agentModel ? undefined : await availableModel(request.body.provider, request.body.id);
       if (!model && !agentModel) return reply.code(400).send({ error: "Model is not available" });
+      if (model && !model.input?.includes("image") && await conversations.hasImageHistory(project, conversation)) {
+        return reply.code(400).send({ code: "image_history_incompatible", error: "This conversation contains images. Image input is not enabled for the selected connection. Choose an image-enabled connection or start a new text conversation." });
+      }
       try {
         const persist = () => conversations.setModel(project, conversation, request.body);
         // A session runs one agent: moving to or from a coding agent starts the next message in a new session.
@@ -3308,7 +3797,7 @@ export function createApp(options: AppOptions = {}) {
 
   app.post<{ Params: { projectId: string; conversationId: string }; Body: PromptRequest }>(
     "/projects/:projectId/conversations/:conversationId/turns",
-    { schema: promptSchema, bodyLimit: Number.MAX_SAFE_INTEGER },
+    { schema: promptSchema, bodyLimit: MAX_ORIGINAL_TURN_BYTES, preHandler: rejectRetiredPublishCommand },
     async (request, reply) => {
       const project = projects.get(request.params.projectId);
       if (!project) return reply.code(404).send({ error: "Project not found" });
@@ -3333,7 +3822,7 @@ export function createApp(options: AppOptions = {}) {
           if (plugin?.projectTypes?.length && !plugin.projectTypes.includes(project.type)) throw new LocalPluginError("A referenced plugin requires a different project type", 409);
           if (plugin?.integration && project.integration?.pluginId !== plugin.id) throw new LocalPluginError("Connect this plugin to the project before sending a prompt", 409);
         }
-        if (project.integration) {
+        if (project.integration && LOCAL_EXECUTION_ENABLED) {
           const plugin = await requireIntegrationPlugin(plugins, project.integration.pluginId, project);
           if (plugin.integration!.projectFiles?.length && !await matchesPluginProject(plugin, project.workspacePath)) throw new LocalPluginError("Connect the project in its plugin setup before sending a prompt", 409);
           let status = pluginIntegrations.state(plugin.id, project.id);
@@ -3373,27 +3862,37 @@ export function createApp(options: AppOptions = {}) {
           return reply.code(cause instanceof CanvasError ? cause.statusCode : 500).send({ error: cause instanceof Error ? cause.message : String(cause) });
         }
       }
-      let resolvedAttachments;
+      const resolvedAttachments: Awaited<ReturnType<typeof resolveAgentAttachment>>[] = [];
+      const images: PromptImage[] = [...(request.body.images ?? [])];
+      let remainingImageBytes = MAX_ORIGINAL_TURN_BYTES - images.reduce((sum, image) => sum + image.data.length, 0);
       try {
-        resolvedAttachments = await Promise.all((request.body.attachments ?? []).map((attachment) => attachments.resolve(project, attachment)));
+        const seen = new Set<string>();
+        for (const reference of request.body.attachments ?? []) {
+          const key = `${reference.batchId}/${reference.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const attachment = await resolveAgentAttachment(project.workspacePath, reference);
+          resolvedAttachments.push(attachment);
+          const image = await attachments.promptImage(project, attachment, remainingImageBytes);
+          if (image) {
+            remainingImageBytes -= image.data.length;
+            images.push(image);
+          }
+        }
       } catch (cause) {
-        const error = cause instanceof Error ? cause.message : String(cause);
-        return reply.code(cause instanceof AgentAttachmentError ? cause.statusCode : 400).send({ error });
+        const status = cause instanceof AgentAttachmentError || cause instanceof SafeProjectFileError ? cause.statusCode : 400;
+        return reply.code(status).send({ error: cause instanceof Error ? cause.message : String(cause) });
       }
-      let attachmentImages: PromptImage[];
       try {
-        attachmentImages = (await Promise.all(resolvedAttachments.map((attachment) => attachments.promptImage(attachment))))
-          .flatMap((image) => image ? [image] : []);
+        for (const image of images) {
+          if (image.name) assertNoKnownSecretBytes(Buffer.from(image.name));
+          if (!validBase64(image.data)) throw new Error("Image data is invalid");
+          const contents = Buffer.from(image.data, "base64");
+          if (!isLibraryMediaOfType(contents, image.mediaType)) throw new Error("Image data does not match its media type");
+          await validateConversationRaster(contents);
+        }
       } catch (cause) {
-        return reply.code(400).send({ error: cause instanceof Error ? cause.message : String(cause) });
-      }
-      try {
-        await Promise.all([...(request.body.images ?? []), ...attachmentImages].map((image, index) => (
-          addConversationImageToProject(library, projects, project.id, image, index)
-        )));
-      } catch (cause) {
-        const statusCode = cause instanceof AssetLibraryError ? cause.statusCode : 400;
-        return reply.code(statusCode).send({ error: cause instanceof Error ? cause.message : String(cause) });
+        return reply.code(cause instanceof SafeProjectFileError ? cause.statusCode : 400).send({ error: cause instanceof Error ? cause.message : String(cause) });
       }
       await projects.touch(project.id);
       let turn;
@@ -3403,11 +3902,11 @@ export function createApp(options: AppOptions = {}) {
           conversation,
           request.body.prompt,
           references,
-          [...(request.body.images ?? []), ...attachmentImages],
+          images,
           request.body.mode ?? "normal",
           mentions,
           undefined,
-          `${attachments.promptContext(project, resolvedAttachments)}${promptContextBlock(contexts)}`,
+          `${attachments.promptContext(resolvedAttachments)}${promptContextBlock(contexts)}`,
           attachments.conversationAttachments(resolvedAttachments),
         );
       } catch (cause) {
@@ -3561,7 +4060,7 @@ export function createApp(options: AppOptions = {}) {
       const conversation = await conversations.get(project, request.params.conversationId);
       if (!conversation) return reply.code(404).send({ error: "Conversation not found" });
       try {
-        agents.answerApproval(project.id, conversation.summary.id, request.params.requestId, request.body.decision);
+        agents.answerApproval(project.id, conversation.summary.id, request.params.requestId, request.body.decision, request.body.sourceConfirmation, request.body.volumeMigrationConfirmation);
         return reply.code(204).send();
       } catch (cause) {
         return reply.code(409).send({ error: cause instanceof Error ? cause.message : String(cause) });
@@ -3627,7 +4126,7 @@ export function createApp(options: AppOptions = {}) {
 
   app.post<{ Params: { projectId: string; conversationId: string }; Body: ReviseLastPromptRequest }>(
     "/projects/:projectId/conversations/:conversationId/revise-last",
-    { schema: reviseLastPromptSchema },
+    { schema: reviseLastPromptSchema, preHandler: rejectRetiredPublishCommand },
     async (request, reply) => {
       const project = projects.get(request.params.projectId);
       if (!project) return reply.code(404).send({ error: "Project not found" });
@@ -3705,7 +4204,7 @@ export function createApp(options: AppOptions = {}) {
       const project = projects.get(request.params.projectId);
       if (!project) return reply.code(404).send({ error: "Project not found" });
       if (project.integration) return reply.code(409).send({ error: "This project uses plugin publishing. Follow its plugin's publishing workflow." });
-      if (!localPublisher && request.body.accessToken === LOCAL_DEBUG_ACCESS_TOKEN) {
+      if (request.body.accessToken === LOCAL_DEBUG_ACCESS_TOKEN) {
         return reply.code(401).send({ error: "Local debug sign-in is unavailable outside local development" });
       }
       if (agents.isProjectBusy(project.id)) {
@@ -3796,12 +4295,11 @@ export function createApp(options: AppOptions = {}) {
     });
     reply.raw.write(": connected\n\n");
     const send = (event: RuntimeEvent) => {
-      reply.raw.write(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      if (!reply.raw.writableEnded && !reply.raw.destroyed) reply.raw.write(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
     };
     for (const event of events.since(project.id, cursor)) send(event);
     const unsubscribe = events.subscribe(project.id, send);
-    const heartbeat = setInterval(() => reply.raw.write(": heartbeat\n\n"), 15_000);
-    request.raw.once("close", () => { clearInterval(heartbeat); unsubscribe(); });
+    trackEventStream(reply, unsubscribe);
   });
 
   app.get<{ Params: { operationId: string }; Querystring: { cursor?: string } }>("/settings/model-auth/:operationId/events", async (request, reply) => {
@@ -3820,6 +4318,7 @@ export function createApp(options: AppOptions = {}) {
       });
       reply.raw.write(": connected\n\n");
       const send = (event: ReturnType<typeof modelAuth.eventsSince>[number]) => {
+        if (reply.raw.writableEnded || reply.raw.destroyed) return;
         reply.raw.write(`id: ${event.id}\nevent: model-auth\ndata: ${JSON.stringify(event)}\n\n`);
         if (event.type === "completed" || event.type === "cancelled" || event.type === "error") reply.raw.end();
       };
@@ -3828,8 +4327,7 @@ export function createApp(options: AppOptions = {}) {
         if (reply.raw.writableEnded) return;
       }
       const unsubscribe = modelAuth.subscribe(request.params.operationId, send);
-      const heartbeat = setInterval(() => reply.raw.write(": heartbeat\n\n"), 15_000);
-      request.raw.once("close", () => { clearInterval(heartbeat); unsubscribe(); });
+      trackEventStream(reply, unsubscribe);
     } catch (cause) {
       if (cause instanceof ModelAuthError) return reply.code(cause.statusCode).send({ error: cause.message });
       throw cause;
@@ -3841,29 +4339,76 @@ export function createApp(options: AppOptions = {}) {
     if (address && typeof address === "object") await externalMcp.listening(`http://127.0.0.1:${address.port}${EXTERNAL_MCP_PATH}`);
   });
 
+  app.post<{ Params: { projectId: string } }>("/projects/:projectId/build", async (request, reply) => {
+    const project = projects.get(request.params.projectId);
+    if (!project) return reply.code(404).send({ error: "Project not found" });
+    const directory = await buildGame(project);
+    return { status: "succeeded", directory };
+  });
+
+  const closeFailures: unknown[] = [];
+  const stop = async (operation: () => unknown | Promise<unknown>) => {
+    try { await operation(); } catch (cause) { closeFailures.push(cause); }
+  };
+  let quiescing: Promise<void> | undefined;
+  const quiesce = () => quiescing ??= (async () => {
+    closing = true;
+    // Hijacked SSE responses must end before Fastify can finish closing its HTTP server.
+    for (const close of [...eventStreams]) await stop(close);
+    // Media responses hold project read slots; release them before waiting for Agent checkpoints.
+    await stop(() => mediaSnapshots.close());
+    await stop(() => closeRuntimeMediaSnapshots());
+    await stop(() => tools.close());
+    await stop(() => agents.close());
+    await stop(() => previews.stopAll());
+  })();
+  app.addHook("preClose", async () => { await quiesce(); });
   app.addHook("onClose", async () => {
-    catalogRefresh.close();
-    await pluginIntegrations.close();
-    await externalMcp.close();
-    codexImages.close();
-    await projectNaming.close();
-    await pluginCapabilities.host.close();
-    await cloudModels.setSession(null);
-    await canvasStore.close();
-    await tools.close();
-    modelAuth.close();
-    await agents.close();
-    await agentRuntimes.close();
-    await Promise.allSettled([...agentPlaytests.values()].map((driver) => driver.cleanup()));
-    options.playtestDriver?.close();
-    await conversationImages.flush();
-    await previews.stopAll();
-    await artifacts.close();
-    await playableDrafts.close();
-    await examples.close();
-    await localPublisher?.close();
+    await quiesce();
+    // A failed VM stop must not prevent the remaining local services from closing.
+    await stop(() => options.projectExecution?.close());
+    await stop(() => catalogRefresh.close());
+    await stop(() => pluginIntegrations.close());
+    await stop(() => externalMcp.close());
+    await stop(() => codexImages.close());
+    await stop(() => projectNaming.close());
+    await stop(() => pluginCapabilities.host.close());
+    await stop(() => cloudModels.setSession(null));
+    await stop(() => canvasStore.close());
+    await stop(() => modelAuth.close());
+    await stop(() => agentRuntimes.close());
+    await stop(() => Promise.allSettled([...agentPlaytests.values()].map((driver) => driver.cleanup())));
+    await stop(() => options.playtestDriver?.close());
+    await stop(() => conversationImages.flush());
+    await stop(() => artifacts.close());
+    await stop(() => playableDrafts.close());
+    await stop(() => examples.close());
+    await stop(() => mediaSnapshots.close());
+    await stop(() => closeRuntimeMediaSnapshots());
+    if (closeFailures.length) throw new AggregateError(closeFailures, "Some local services could not close cleanly");
   });
   return app;
+}
+
+/** Cancel a scan or response when its authenticated HTTP client disconnects. */
+function mediaRequestSignal(request: FastifyRequest, reply: FastifyReply): AbortSignal {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  request.raw.once("aborted", abort);
+  reply.raw.once("close", () => { request.raw.off("aborted", abort); abort(); });
+  if (request.raw.aborted || reply.raw.destroyed) abort();
+  return controller.signal;
+}
+
+async function sendMediaSnapshot(request: FastifyRequest, reply: FastifyReply, snapshot: CheckedMediaSnapshot, contentType: string, signal: AbortSignal) {
+  const response = mediaSnapshotResponse(snapshot, {
+    method: request.method, range: firstHeader(request.headers.range), ifRange: firstHeader(request.headers["if-range"]),
+    contentType, cacheControl: "no-store", signal,
+  });
+  if (!response.body) await snapshot.release();
+  snapshot.assertCurrentPolicy();
+  signal.throwIfAborted();
+  return reply.code(response.status).headers(response.headers).header("x-content-type-options", "nosniff").send(response.body);
 }
 
 function isExternalAgentClientId(value: string): value is ExternalAgentClientId {
@@ -3899,6 +4444,7 @@ function isImageOfType(value: Buffer, mediaType: CreateLibraryImageRequest["imag
 }
 
 function isLibraryMediaOfType(value: Buffer, mediaType: LibraryUploadMediaType): boolean {
+  if (mediaType === FBX_MEDIA_TYPE) return isFbxArtifact(value);
   if (mediaType === "image/png" || mediaType === "image/jpeg" || mediaType === "image/webp") return isImageOfType(value, mediaType);
   if (mediaType === "image/svg+xml") {
     if (!isUtf8(value)) return false;
@@ -3927,28 +4473,7 @@ function isLibraryMediaOfType(value: Buffer, mediaType: LibraryUploadMediaType):
 }
 
 function validBase64(value: string): boolean {
-  return value.length % 4 === 0 && /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value);
-}
-
-async function addConversationImageToProject(
-  library: AssetLibrary,
-  projects: ProjectManager,
-  projectId: string,
-  image: PromptImage,
-  index: number,
-): Promise<void> {
-  const contents = Buffer.from(image.data, "base64");
-  const extension = {
-    "image/png": ".png",
-    "image/jpeg": ".jpg",
-    "image/webp": ".webp",
-    "image/gif": ".gif",
-  }[image.mediaType];
-  const originalName = path.basename(image.name ?? `Image ${index + 1}`);
-  const stem = path.basename(originalName, path.extname(originalName)).trim() || `Image ${index + 1}`;
-  const digest = createHash("sha256").update(contents).digest("hex");
-  const asset = await library.add(`${stem}${extension}`, contents, { origin: "uploaded", purpose: "reference", sourceKey: `conversation-image:${image.mediaType}:${digest}` });
-  await projects.materializeLibraryAsset(projectId, asset.id);
+  return value.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(value);
 }
 
 function isCreateConversationRequest(value: unknown): value is CreateConversationRequest | undefined {
@@ -3979,7 +4504,7 @@ function isAgentModelRef(value: unknown): value is AgentModelRef {
 }
 
 function effectiveReasoningLevel(
-  model: RuntimeModel,
+  model: Pick<RuntimeModel, "reasoning" | "thinkingLevelMap">,
   requested: AgentReasoningLevel | undefined,
   fallback: AgentReasoningLevel,
 ): AgentReasoningLevel {

@@ -133,6 +133,12 @@ export class ModelAuthManager {
     pending.resolve(operation.method === "api_key" ? value.trim() : value);
   }
 
+  /** Server-side validation only; the caller never receives credentials or prompt metadata. */
+  acceptsSecretResponse(operationId: string, promptId: string): boolean {
+    const operation = this.#operations.get(operationId);
+    return Boolean(operation && !operation.finished && operation.providerId === "kunpo" && operation.method === "api_key" && operation.pending?.secret && operation.pending.id === promptId);
+  }
+
   cancel(operationId: string): void {
     const operation = this.#operation(operationId);
     if (operation.finished) return;

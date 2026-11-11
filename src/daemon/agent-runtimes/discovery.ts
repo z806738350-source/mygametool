@@ -8,7 +8,6 @@ import {
   realpath,
   rm,
   stat,
-  writeFile,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -78,7 +77,7 @@ export async function resolveBinary(
     !(id === "codex-cli" && isCodexNpmShim(override))
   )
     return undefined;
-  if (recheck) await loginShellPath(true);
+  if (recheck && id !== "codex-cli") await loginShellPath(true);
   if (recheck)
     for (const key of versionCache.keys())
       if (key.startsWith(`${id}:`)) versionCache.delete(key);
@@ -86,7 +85,7 @@ export async function resolveBinary(
   const candidates = override
     ? [{ path: override, source: "manual" as const }]
     : [
-        ...(await searchCandidates(definition.binaries)),
+        ...(await searchCandidates(definition.binaries, id !== "codex-cli")),
         ...(definition.bundledPaths?.[process.platform] ?? []).map(
           (candidate) => ({
             ...candidate,
@@ -153,7 +152,7 @@ export async function resolveBinary(
       continue;
     }
   }
-  if (found.length <= 1) return found[0];
+  if (found.length <= 1 || id === "codex-cli") return found[0];
   const versions = await Promise.all(
     found.map((binary) => cachedVersion(binary, id)),
   );
@@ -223,8 +222,9 @@ function cachedVersion(
 
 async function searchCandidates(
   names: readonly string[],
+  useLoginShell = true,
 ): Promise<Array<{ path: string; source: AgentRuntimeBinarySource }>> {
-  const shell = await loginShellPath();
+  const shell = useLoginShell ? await loginShellPath() : undefined;
   const directories = new Map<string, AgentRuntimeBinarySource>();
   for (const [folders, source] of [
     [(process.env.PATH ?? "").split(path.delimiter), "path"],
@@ -287,6 +287,7 @@ export async function probeVersion(
     binaryPath,
     AGENT_RUNTIME_DEFINITIONS[id].versionArgs,
     env,
+    id === "codex-cli" ? env.HOME : undefined,
   );
   return code === 0 ? parseVersion(`${stdout}\n${stderr}`) : undefined;
 }
@@ -333,8 +334,9 @@ export async function probeAuth(
   if (id === "codex-cli") {
     const { stdout, stderr } = await runCli(
       binaryPath,
-      ["login", "status"],
+      ["-c", 'cli_auth_credentials_store="file"', "login", "status"],
       env,
+      env.HOME,
     );
     const text = `${stdout}\n${stderr}`;
     if (/not logged in/i.test(text))
@@ -408,8 +410,8 @@ export async function probeModels(
         .filter(
           (entry) => entry.hidden !== true && typeof entry.id === "string",
         )
-        .map((entry) =>
-          model(
+        .map((entry) => ({
+          ...model(
             String(entry.id),
             typeof entry.displayName === "string"
               ? entry.displayName
@@ -422,7 +424,8 @@ export async function probeModels(
                 )
               : [],
           ),
-        );
+          supportsImages: Array.isArray(entry.inputModalities) && entry.inputModalities.includes("image"),
+        }));
       return {
         models,
         ...(typeof account?.account?.email === "string"

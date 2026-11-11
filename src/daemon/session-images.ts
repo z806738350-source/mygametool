@@ -2,17 +2,23 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { ImageContent, Model, Api, TranscriptContext, Message } from "@earendil-works/pi-ai";
-import { defineTool, type SessionManager } from "@earendil-works/pi-coding-agent";
+import { defineTool, type SessionManager, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { isDeepSeekFileModel } from "./deepseek-image-files.js";
 import { PNG_SIGNATURE } from "./image-format.js";
+import type { PromptImage } from "../shared/contracts.js";
+import { containsKnownSensitiveValue } from "../shared/sensitive-values.js";
+export { prepareSessionImageDisplay } from "./retained-image-display.js";
 
 export const IMAGE_OFFLOAD_ENTRY = "ohmygame-image-offload-v1";
+export const IMAGE_ORIGINS_ENTRY = "ohmygame-image-origins-v1";
 export const INLINE_IMAGE_HIGH_BYTES = 20 * 1024 * 1024;
 export const INLINE_IMAGE_LOW_BYTES = 10 * 1024 * 1024;
 export const INLINE_IMAGE_HIGH_COUNT = 64;
 export const INLINE_IMAGE_LOW_COUNT = 32;
 export const MODEL_REQUEST_HIGH_BYTES = 32 * 1024 * 1024;
+// Allow room for the original images before the smaller outbound model budget is applied.
+export const MAX_ORIGINAL_TURN_BYTES = 4 * MODEL_REQUEST_HIGH_BYTES;
 export type Json = Record<string, unknown>;
 export const object = (value: unknown): value is Json => !!value && typeof value === "object" && !Array.isArray(value);
 
@@ -22,6 +28,56 @@ interface ImageOccurrence {
   protected: boolean;
 }
 interface OffloadData { scope: string; images: string[] }
+interface ImageOrigins { version: 1; messageHash: string; assetIds: Array<string | null> }
+const originId = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value) && !containsKnownSensitiveValue(value);
+
+function originMessageHash(message: { role: string; timestamp: number; content: unknown }): string | undefined {
+  if (message.role !== "user" || !Number.isFinite(message.timestamp) || !Array.isArray(message.content)) return undefined;
+  const normalized = [];
+  let bytes = 0;
+  for (const block of message.content) {
+    if (!object(block)) return undefined;
+    if (block.type === "text" && typeof block.text === "string") normalized.push({ type: "text", text: block.text });
+    else if (block.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string") {
+      bytes += block.data.length;
+      if (bytes > MAX_ORIGINAL_TURN_BYTES) return undefined;
+      normalized.push({ type: "image", mimeType: block.mimeType, dataHash: createHash("sha256").update(block.data).digest("hex") });
+    } else return undefined;
+  }
+  return createHash("sha256").update(JSON.stringify([message.role, message.timestamp, normalized])).digest("hex");
+}
+
+function imageOrigins(value: unknown): ImageOrigins | undefined {
+  if (!object(value) || Object.keys(value).sort().join(",") !== "assetIds,messageHash,version" || value.version !== 1 || typeof value.messageHash !== "string" || !/^[a-f0-9]{64}$/.test(value.messageHash)
+    || !Array.isArray(value.assetIds) || !value.assetIds.length || value.assetIds.length > INLINE_IMAGE_HIGH_COUNT || !value.assetIds.every(id => id === null || originId(id))) return undefined;
+  return value as unknown as ImageOrigins;
+}
+
+/** Called for the application's actual started turn, before Pi persists its user message. No URL or image data is stored here. */
+export function recordSessionImageOrigins(manager: Pick<SessionManager, "appendCustomEntry"> | undefined, message: { role: string; timestamp: number; content: unknown }, originals: readonly PromptImage[]): boolean {
+  if (!manager || !originals.length || originals.length > INLINE_IMAGE_HIGH_COUNT) return false;
+  const actual = imageBlocks(message.content);
+  if (actual.length !== originals.length || !actual.every((image, index) => image.mimeType === originals[index]!.mediaType && image.data === originals[index]!.data)) return false;
+  const assetIds = originals.map(image => originId(image.libraryAssetId) ? image.libraryAssetId : null);
+  if (!assetIds.some(Boolean)) return false;
+  const messageHash = originMessageHash(message); if (!messageHash) return false;
+  try { manager.appendCustomEntry(IMAGE_ORIGINS_ENTRY, { version: 1, messageHash, assetIds } satisfies ImageOrigins); return true; }
+  catch { return false; } // Do not discard user work for optional provenance; a missing receipt after restart stays inline.
+}
+
+/** Bind only to the next canonical message on this branch, never to a global pixel/hash lookup. */
+export function sessionImageOrigins(entries: readonly SessionEntry[]): Map<string, Array<string | null>> {
+  const result = new Map<string, Array<string | null>>();
+  let pending: ImageOrigins | undefined;
+  for (const entry of entries) {
+    if (entry.type === "custom" && entry.customType === IMAGE_ORIGINS_ENTRY) { pending = imageOrigins(entry.data); continue; }
+    if (entry.type !== "message") continue;
+    if (pending && entry.message.role === "user" && pending.messageHash === originMessageHash(entry.message)
+      && imageBlocks(entry.message.content).length === pending.assetIds.length) result.set(entry.id, pending.assetIds);
+    pending = undefined;
+  }
+  return result;
+}
 
 export class ImageBudgetError extends Error {
   readonly status = 413;
@@ -144,6 +200,27 @@ const imageText = (id: string) => `Session image: ${id}. Use recall_image with t
 const omittedText = (id?: string) => id ? `[Image omitted from model context. ${imageText(id)}]` : "[Image omitted from model context.]";
 const imageBlocks = (content: unknown): ImageContent[] => Array.isArray(content)
   ? content.filter((block): block is ImageContent => object(block) && block.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string") : [];
+const entryImages = (entry: SessionEntry | undefined): ImageContent[] => imageBlocks(
+  entry?.type === "message" && "content" in entry.message ? entry.message.content
+    : entry?.type === "custom_message" ? entry.content : undefined,
+);
+
+/** A branch-local inventory of recallable originals; image pixels and provenance stay in the session. */
+export function sessionImageReferences(entries: readonly SessionEntry[]): Array<{ imageId: string; mimeType: string }> {
+  return entries.flatMap(entry => entryImages(entry).map((image, index) => ({ imageId: `${entry.id}:${index}`, mimeType: image.mimeType })));
+}
+
+export function sessionImageReferenceContext(entries: readonly SessionEntry[]): string | undefined {
+  const references = sessionImageReferences(entries);
+  if (!references.length) return undefined;
+  const latest = references.slice(-64), omitted = references.length - latest.length;
+  return [
+    "Retained image references on the current conversation branch:",
+    ...latest.map(reference => JSON.stringify(reference)),
+    ...(omitted ? [`${omitted} older image references are omitted from this list.`] : []),
+    "This list contains no image pixels. This applies only to the reference list, not to the separate image content blocks returned by recall_image. Use recall_image with the exact imageId to read the original before making visual claims. Text descriptions are not visual evidence.",
+  ].join("\n");
+}
 const messageKey = (message: { role: string; timestamp: number; toolCallId?: string }) =>
   JSON.stringify([message.role === "custom" ? "user" : message.role, message.timestamp, message.toolCallId]);
 
@@ -152,6 +229,10 @@ export class SessionImages {
   private occurrences = new Map<string, ImageOccurrence>();
   constructor(private readonly manager: SessionManager, private readonly cacheDir: string) {}
 
+  private originRecords(): Map<string, Array<string | null>> {
+    return sessionImageOrigins(this.manager.getBranch());
+  }
+
   readonly recallTool = defineTool({
     name: "recall_image", label: "Recall Image",
     description: "Read an original image retained in this conversation, including screenshots omitted from model context. Use the imageId shown in its placeholder.",
@@ -159,11 +240,10 @@ export class SessionImages {
     execute: async (_callId, { imageId }) => {
       const [entryId, index] = imageId.split(":");
       const entry = this.manager.getBranch().find((item) => item.id === entryId);
-      const content = entry?.type === "message" && "content" in entry.message ? entry.message.content
-        : entry?.type === "custom_message" ? entry.content : undefined;
-      const image = imageBlocks(content)[Number(index)];
+      const image = entryImages(entry)[Number(index)];
       if (!image) throw new Error("The image is not available on this conversation branch.");
-      return { content: [{ type: "text" as const, text: `Original ${imageText(imageId)}` }, { ...image }], details: undefined };
+      const assetId = this.originRecords().get(entryId)?.[Number(index)];
+      return { content: [{ type: "text" as const, text: `Original ${imageText(imageId)} The original is included as a separate image content block. OhMyGame did not generate a text caption; provider-side processing is not visible to this tool.` }, { ...image, ...(assetId ? { libraryAssetId: assetId } : {}) }], details: undefined };
     },
   });
 
@@ -181,6 +261,7 @@ export class SessionImages {
       bucket.push({ id: entry.id, images }); sources.set(key, bucket);
     }
     const used = new Set<string>();
+    const origins = this.originRecords();
     const messages: Message[] = [];
     const occurrences = new Map<string, ImageOccurrence>();
     const lastUser = context.messages.findLastIndex((message) => message.role === "user");
@@ -201,10 +282,12 @@ export class SessionImages {
       for (const block of message.content) {
         if (block.type !== "image") { content.push(block); continue; }
         const id = source ? `${source.id}:${index}` : undefined;
+        const assetId = source ? origins.get(source.id)?.[index] : undefined;
         index++;
         const game = message.role === "toolResult" && message.toolName === "game_use";
         const read = message.role === "toolResult" && message.toolName === "read" && resizeReadImages;
-        const image = game || read ? await this.preview(block, game) : block;
+        const preview = game || read ? await this.preview(block, game) : block;
+        const image = assetId && preview.data === block.data && preview.mimeType === block.mimeType ? { ...preview, libraryAssetId: assetId } : preview;
         if (read && image.mimeType !== block.mimeType) convertedRead = true;
         if (id) {
           occurrences.set(id, { image, game, protected: messageIndex === lastUser || recentImages.includes(messageIndex) });

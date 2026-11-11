@@ -23,6 +23,11 @@ const predicates = {
 };
 
 describe("provider groups", () => {
+  it("keeps the reviewed Kunpo connection directly visible ahead of optional providers", () => {
+    const groups = groupProviders([summary("cerebras"), summary("openai"), summary("kunpo")], predicates);
+    expect(ids(groups.popular)).toEqual(["kunpo", "openai"]);
+    expect(ids(groups.more)).toEqual(["cerebras"]);
+  });
   it("puts every working connection first, including free cloud and local services", () => {
     const groups = groupProviders(
       [

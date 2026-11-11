@@ -24,7 +24,7 @@ import {
   updateAgentRuntime,
 } from "./api.js";
 import { PROVIDER_ICONS } from "./provider-icons.js";
-import { openModelAuthExternal } from "./use-model-provider-auth.js";
+import { openAgentRuntimeAuthExternal, openModelAuthExternal } from "./use-model-provider-auth.js";
 import { SegmentedControl } from "./segmented-control.js";
 import { AgentUsageDetails, AgentUsageInline } from "./agent-usage.js";
 import { t } from "./i18n.js";
@@ -118,7 +118,7 @@ export function CodingAgentsGroup({
           {t("codingAgents.checking")}
         </div>
       ) : null}
-      {(agents ?? []).map((agent) => {
+      {(agents ?? []).filter((agent) => agent.id === "codex-cli" || agent.id === "qoder-cli").map((agent) => {
         const action = agent.installed
           ? t("codingAgents.manage", { name: agent.name })
           : t("codingAgents.setUp", { name: agent.name });
@@ -236,11 +236,25 @@ export function CodingAgentDetail({
     });
   const signIn = () =>
     run("login", async () => {
+      setLogin(undefined);
       const started = await loginAgentRuntime(id);
+      if (id === "qoder-cli") {
+        if (!started.command) throw new Error(t("codingAgents.qoderLoginUnavailable"));
+        setLogin({ command: started.command });
+        return;
+      }
+      if (!started.url && !started.command) throw new Error(t("codingAgents.loginLinkUnavailable"));
       setLogin(started);
-      if (started.url)
-        await openModelAuthExternal(started.url).catch(() => undefined);
+      if (started.url) await openLogin(started.url);
     });
+  async function openLogin(url: string): Promise<void> {
+    setError(undefined);
+    try {
+      await openAgentRuntimeAuthExternal(url, id);
+    } catch {
+      setError(t("codingAgents.loginOpenFailed"));
+    }
+  }
   const update = (change: Parameters<typeof updateAgentRuntime>[1]) =>
     run("save", async () => {
       const status = await updateAgentRuntime(id, change);
@@ -279,7 +293,13 @@ export function CodingAgentDetail({
     );
   }
   const signedOut = agent.auth.status === "signed-out";
+  const controlled = agent.id === "codex-cli" || agent.id === "qoder-cli";
   const problems = agent.diagnostics;
+  const qoderNeedsCheck = agent.id === "qoder-cli" && agent.installed && (
+    agent.auth.status === "unknown" || problems.some((diagnostic) =>
+      ["check-required", "probe-failed", "models-unavailable"].includes(diagnostic.code),
+    )
+  );
   return (
     <section className="settings-panel settings-provider-detail coding-agent-detail">
       <header className="settings-provider-detail-header">
@@ -318,6 +338,7 @@ export function CodingAgentDetail({
           </div>
         ) : null}
       </header>
+      {error ? <p className="settings-error" role="alert">{error}</p> : null}
       <div className="settings-provider-connection">
         <div className="settings-provider-setting-row">
           <span className="settings-search-field-label">
@@ -326,7 +347,7 @@ export function CodingAgentDetail({
           <span className="settings-provider-setting-value">
             {agentSummary(agent)}
           </span>
-          <button
+          {!qoderNeedsCheck ? <button
             type="button"
             className="icon-button settings-provider-setting-edit"
             disabled={busy !== undefined}
@@ -339,7 +360,7 @@ export function CodingAgentDetail({
               className={busy === "recheck" ? "spin" : undefined}
               aria-hidden="true"
             />
-          </button>
+          </button> : null}
         </div>
         {agent.installed && agent.testedVersion ? (
           <div className="settings-provider-setting-row">
@@ -365,17 +386,22 @@ export function CodingAgentDetail({
               <button
                 type="button"
                 className={
-                  signedOut
+                  qoderNeedsCheck || signedOut
                     ? "settings-add-button"
                     : "settings-secondary-button"
                 }
                 disabled={busy !== undefined}
-                onClick={() => void signIn()}
+                aria-label={qoderNeedsCheck ? t("codingAgents.recheck") : undefined}
+                onClick={() => void (qoderNeedsCheck ? recheck() : signIn())}
               >
-                {busy === "login" ? (
+                {busy === "login" || (qoderNeedsCheck && busy === "recheck") ? (
                   <LoaderCircle className="spin" size={13} />
                 ) : null}
-                {signedOut
+                {qoderNeedsCheck
+                  ? t("codingAgents.recheck")
+                  : agent.id === "qoder-cli"
+                  ? t("codingAgents.qoderSignIn")
+                  : signedOut
                   ? t("common.signIn")
                   : t("codingAgents.switchAccount")}
               </button>
@@ -398,7 +424,9 @@ export function CodingAgentDetail({
               {t("codingAgents.sandbox")}
             </span>
             <span className="settings-provider-setting-value">
-              {agent.permissionMode === "full"
+              {controlled
+                ? t("codingAgents.controlledSandbox")
+                : agent.permissionMode === "full"
                 ? t("codingAgents.sandboxOff")
                 : agent.commandSandbox === "os"
                   ? t("codingAgents.sandboxOs")
@@ -407,7 +435,15 @@ export function CodingAgentDetail({
           </div>
         ) : null}
       </div>
-      {login ? <LoginHint login={login} /> : null}
+      {qoderNeedsCheck ? (
+        <p className="settings-detail-hint">
+          <button type="button" className="coding-agent-link" disabled={busy !== undefined} onClick={() => void signIn()}>
+            {t("codingAgents.qoderSignIn")}
+          </button>
+        </p>
+      ) : null}
+      {busy === "login" ? <p className="settings-detail-hint" role="status">{t(agent.id === "qoder-cli" ? "codingAgents.qoderLoginStarting" : "codingAgents.loginStarting")}</p> : null}
+      {login ? <LoginHint key={login.url ?? login.command} login={login} onOpen={openLogin} commandLabel={agent.id === "qoder-cli" ? t("codingAgents.qoderLoginCommand") : undefined} /> : null}
       {agent.installed && agent.id !== "opencode-cli" ? (
         // OpenCode bills each model provider; its account has no quota of its own.
         <section className="settings-detail-section">
@@ -438,7 +474,7 @@ export function CodingAgentDetail({
       {agent.installed ? (
         <section className="settings-detail-section">
           <h4>{t("codingAgents.configuration")}</h4>
-          <div className="coding-agent-permission">
+          {!controlled ? <div className="coding-agent-permission">
             <span className="settings-search-field-label">
               {t("codingAgents.permissions")}
             </span>
@@ -449,14 +485,14 @@ export function CodingAgentDetail({
               value={agent.permissionMode}
               onChange={(permissionMode) => void update({ permissionMode })}
             />
-          </div>
-          {agent.permissionMode === "full" ? (
+          </div> : null}
+          {!controlled && agent.permissionMode === "full" ? (
             <p className="coding-agent-warning" role="note">
               {t("codingAgents.permissionFullHint", { name: agent.name })}
             </p>
           ) : null}
           <p className="settings-detail-hint">
-            {t("codingAgents.cliConfigHint", { name: agent.name })}
+            {agent.id === "qoder-cli" ? t("codingAgents.qoderControlledHint") : agent.id === "codex-cli" ? t("codingAgents.controlledHint") : t("codingAgents.cliConfigHint", { name: agent.name })}
           </p>
         </section>
       ) : null}
@@ -502,33 +538,40 @@ export function CodingAgentDetail({
           </p>
         ) : null}
       </section>
-      {error ? (
-        <p className="settings-error" role="alert">
-          {error}
-        </p>
-      ) : null}
     </section>
   );
 }
 
-function LoginHint({ login }: { login: { url?: string; command?: string } }) {
+function LoginHint({ login, onOpen, commandLabel }: { login: { url?: string; command?: string }; onOpen: (url: string) => Promise<void>; commandLabel?: string }) {
+  const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
   if (login.url) {
     return (
       <p className="settings-detail-hint" role="status">
         {t("codingAgents.loginOpened")}{" "}
-        <button
-          type="button"
+        <a
+          href={login.url}
+          target="_blank"
+          rel="noopener noreferrer"
           className="coding-agent-link"
-          onClick={() => void openModelAuthExternal(login.url!)}
+          onClick={(event) => { event.preventDefault(); void onOpen(login.url!); }}
         >
           {t("codingAgents.openAgain")}
-        </button>
+        </a>{" "}
+        <button type="button" className="coding-agent-link" onClick={() => {
+          setCopyFailed(false);
+          void Promise.resolve().then(() => navigator.clipboard.writeText(login.url!)).then(
+            () => setCopied(true),
+            () => { setCopied(false); setCopyFailed(true); },
+          );
+        }}>{copied ? t("codingAgents.copied") : t("codingAgents.copyLoginLink")}</button>
+        {copyFailed ? <span role="alert">{t("codingAgents.copyLoginFailed")}</span> : null}
       </p>
     );
   }
   return login.command ? (
     <div className="settings-detail-hint" role="status">
-      {t("codingAgents.loginCommand")} <CommandText command={login.command} />
+      {commandLabel ?? t("codingAgents.loginCommand")} <CommandText command={login.command} />
     </div>
   ) : null;
 }
@@ -671,6 +714,10 @@ function agentSummary(agent: AgentRuntimeStatus): string {
 }
 
 function accountLabel(agent: AgentRuntimeStatus): string {
+  if (agent.id === "qoder-cli") {
+    if (agent.diagnostics.some((diagnostic) => diagnostic.code === "check-required")) return t("codingAgents.accountNotChecked");
+    if (agent.auth.status === "unknown") return t("codingAgents.accountUnknown");
+  }
   if (agent.auth.status === "signed-out") return t("codingAgents.signedOut");
   if (agent.auth.account) return agent.auth.account;
   if (agent.id === "opencode-cli") return t("codingAgents.openCodeAccounts");
@@ -697,6 +744,8 @@ function diagnosticText(
   diagnostic: AgentRuntimeDiagnostic,
 ): string {
   switch (diagnostic.code) {
+    case "check-required":
+      return t("codingAgents.diagnostic.checkRequired");
     case "not-installed":
       return t("codingAgents.diagnostic.notInstalled", { name: agent.name });
     case "invalid-executable":
@@ -728,6 +777,9 @@ function diagnosticText(
       return t("codingAgents.diagnostic.modelsUnavailable", {
         name: agent.name,
       });
+    case "probe-failed":
+      if (agent.id === "qoder-cli") return t("codingAgents.diagnostic.qoderProbeFailed");
+      return t("codingAgents.diagnostic.probeFailed", { name: agent.name });
     default:
       return t("codingAgents.diagnostic.probeFailed", { name: agent.name });
   }

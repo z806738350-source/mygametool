@@ -1,11 +1,7 @@
-import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
-import type { ApprovalRequestDetails } from "../../shared/agent-runtimes.js";
+import { mkdir } from "node:fs/promises";
 import type {
   NativeDriver,
-  NativeToolResult,
   NativeTurnInput,
   NativeTurnOutcome,
   NativeTurnSink,
@@ -17,7 +13,6 @@ import {
   requireCodexPermissionProfile,
 } from "./codex-app-server.js";
 import {
-  BridgeResults,
   number,
   record,
   textResult,
@@ -28,13 +23,16 @@ import {
   type CodexServerLease,
 } from "./codex-server-pool.js";
 import { NativeSessionExpiredError } from "./native-session.js";
-import { canonicalPath, judgeApproval } from "./policy.js";
-import { sandboxedPath, sessionCaches, toolchainRoots } from "./environment.js";
+import { canonicalPath } from "./policy.js";
 import type { AgentContextUsage } from "../../shared/contracts.js";
 import { runtimeStartupError } from "./compatibility.js";
-import { importCodexImage } from "./codex-images.js";
+import type { AgentInterruption } from "../agent-auto-continue.js";
 import { BRIDGE_SERVER_NAME } from "./tool-bridge.js";
-import { EXTERNAL_MCP_SERVER_NAME } from "../../shared/external-mcp.js";
+import {
+  CODEX_TOOL_NAMESPACE,
+  CODEX_CONTROLLED_CONFIG,
+  requireControlledCodexConfig,
+} from "./controlled-codex.js";
 
 /** A turn on a shared server must stop on its own: the process outlives the conversation. */
 const INTERRUPT_TIMEOUT_MS = 5_000;
@@ -46,36 +44,34 @@ interface CodexTurn {
   resolve: (outcome: NativeTurnOutcome) => void;
   turnId?: string;
   error?: string;
-  readOnly?: boolean;
-  images: Map<string, Promise<void>>;
   imageError?: string;
   finishing?: boolean;
+  interruption?: AgentInterruption;
 }
 
 /**
  * Codex through its app server: one thread per conversation, one turn per
  * message. OhMyGame's tools are the thread's dynamic tools, answered over the
- * same pipe; commands run in Codex's own workspace sandbox, and what it asks
- * to do beyond it comes back as an approval request.
+ * same pipe. Project operations run only in the host tool bridge; native tools
+ * have a read-only private directory and cannot request additional permissions.
  */
 export class CodexDriver implements NativeDriver {
   #disposed = false;
   readonly #profile = `ohmygame-${randomUUID()}`;
   readonly #readProfile = `${this.#profile}-read`;
-  /** Full access is Codex's own unsandboxed profile; planning keeps the read-only one. */
+  /** Both normal and planning turns deny native writes. */
   readonly #writeProfile: string;
   #limits: NonNullable<AgentContextUsage["limits"]> = [];
   #lease?: CodexServerLease;
   #starting?: Promise<CodexAppServer>;
   #threadId?: string;
   #turn?: CodexTurn;
-  #bridged = new BridgeResults();
+  #toolCalls = new Map<string, { input: string; result: Promise<unknown>; settled: boolean }>();
+  #completedTurns = new Set<string>();
 
   constructor(private readonly context: DriverContext) {
     this.#threadId = context.resume;
-    this.#writeProfile = context.policy.fullAccess
-      ? ":danger-full-access"
-      : this.#profile;
+    this.#writeProfile = this.#profile;
   }
 
   async runTurn(
@@ -83,6 +79,7 @@ export class CodexDriver implements NativeDriver {
     sink: NativeTurnSink,
     signal: AbortSignal,
   ): Promise<NativeTurnOutcome> {
+    if (this.#turn) throw new Error("A Codex turn is already running");
     if (signal.aborted) return { status: "aborted" };
     let server: CodexAppServer;
     let threadId: string;
@@ -100,13 +97,12 @@ export class CodexDriver implements NativeDriver {
         error: runtimeStartupError(cause).message,
       };
     }
+    this.#toolCalls.clear();
     return new Promise<NativeTurnOutcome>((resolve) => {
       const turn: CodexTurn = {
         sink,
         signal,
         resolve,
-        readOnly: input.readOnly,
-        images: new Map(),
       };
       this.#turn = turn;
       server
@@ -152,7 +148,7 @@ export class CodexDriver implements NativeDriver {
     const threadId = await this.#thread(server, sink);
     sink.compaction("start");
     const outcome = await new Promise<NativeTurnOutcome>((resolve) => {
-      const turn: CodexTurn = { sink, signal, resolve, images: new Map() };
+      const turn: CodexTurn = { sink, signal, resolve };
       this.#turn = turn;
       server.request("thread/compact/start", { threadId }).catch((cause) => {
         if (this.#turn !== turn) return;
@@ -201,7 +197,7 @@ export class CodexDriver implements NativeDriver {
             binaryPath: this.context.binaryPath,
             env: this.context.env,
             processDirectory: this.context.processDirectory,
-            skillDirectories: this.context.skillDirectories,
+            skillDirectories: [],
           },
           {
             notification: (method, params) =>
@@ -214,7 +210,7 @@ export class CodexDriver implements NativeDriver {
               turn?.resolve(
                 turn.signal.aborted
                   ? { status: "aborted" }
-                  : { status: "failed", error: failure },
+                  : { status: "failed", error: failure, interruption: { kind: "transient", source: "codex", code: "codex_process_exited", phase: "stream", terminalReason: "process_exited" } },
               );
             },
           },
@@ -235,7 +231,7 @@ export class CodexDriver implements NativeDriver {
 
   async #thread(server: CodexAppServer, sink: NativeTurnSink): Promise<string> {
     const settings = {
-      cwd: this.context.workspacePath,
+      cwd: this.context.privateDirectory,
       // Never approve unrestricted sandbox escapes. Scoped permission requests
       // can still be reviewed without removing the protected-read boundary.
       approvalPolicy: CODEX_APPROVAL_POLICY,
@@ -277,7 +273,17 @@ export class CodexDriver implements NativeDriver {
     const started = await server.request<{
       thread?: { id?: string };
       activePermissionProfile?: { id?: string };
-    }>("thread/start", { ...settings, dynamicTools: tools });
+    }>("thread/start", {
+      ...settings,
+      dynamicTools: [
+        {
+          type: "namespace",
+          name: CODEX_TOOL_NAMESPACE,
+          description: "OhMyGame's controlled project and Kunpo asset tools.",
+          tools,
+        },
+      ],
+    });
     requireCodexPermissionProfile(started, this.#writeProfile);
     const id = started.thread?.id;
     if (!id) throw new Error("Codex did not start a thread");
@@ -289,89 +295,45 @@ export class CodexDriver implements NativeDriver {
 
   /** Permission overrides and prevention of a recursive OhMyGame MCP connection. */
   async #config(server: CodexAppServer): Promise<Record<string, unknown>> {
-    // An explicit root deny prevents even scoped grants. Unlisted paths are
-    // restricted by default; only protected roots get an explicit deny.
-    // Windows' sandbox requires `:root` read access; `:minimal` is rejected.
-    const filesystem: Record<string, unknown> =
-      process.platform === "win32" ? { ":root": "read" } : { ":minimal": "read" };
-    const temporary = path.join(this.context.privateDirectory, "tmp");
-    await mkdir(temporary, { recursive: true, mode: 0o700 });
-    filesystem[canonicalPath(temporary)] = "write";
-    const workspace = canonicalPath(this.context.workspacePath);
-    // The person's toolchains run, as for OhMyGame's own agent; protected roots below stay denied.
-    for (const root of toolchainRoots(this.context.env.PATH ?? ""))
-      filesystem[canonicalPath(root)] ??= "read";
-    // Private staged Skills remain readable; the rest of app data stays denied.
-    if (this.#lease?.skillsRoot)
-      filesystem[canonicalPath(this.#lease.skillsRoot)] = "read";
-    for (const protectedPath of this.context.policy.neverTouch) {
-      const target = canonicalPath(protectedPath);
-      // The app may own the workspace's parent; its narrower workspace grant wins.
-      if (target !== workspace) filesystem[target] = "deny";
-    }
-    // Codex's minimal access reads the shared temporary folders, where other
-    // programs and people leave files; commands get their own temporary
-    // folder instead. A workspace inside one keeps its narrower grant.
-    if (process.platform !== "win32")
-      for (const shared of ["/tmp", "/var/tmp"])
-        filesystem[canonicalPath(shared)] ??= "deny";
-    const profile = (readOnly: boolean) => ({
+    // Native tools see only the empty session directory. Project access is through the host bridge.
+    const directory = canonicalPath(this.context.privateDirectory);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const profile = {
       filesystem: {
-        ...filesystem,
-        ":workspace_roots": {
-          ".": readOnly ? "read" : "write",
-          ".git": "read",
-          ".agents": "read",
-          ".codex": "read",
-          ".aws": "read",
-        },
-      },
-      network: { enabled: true },
-    });
-    const config: Record<string, unknown> = {
-      default_permissions: this.#writeProfile,
-      "features.request_permissions_tool": true,
-      "features.shell_snapshot": false,
-      // A login shell would rebuild PATH with macOS's path_helper and read
-      // startup files the profile denies; the PATH given here already holds
-      // the login shell's folders.
-      allow_login_shell: false,
-      // Parent instructions can live in app data denied by the permission profile.
-      project_root_markers: [],
-      permissions: {
-        [this.#profile]: profile(false),
-        [this.#readProfile]: profile(true),
-      },
-      // A child must not inherit authentication tokens or proxy secrets from the CLI.
-      "shell_environment_policy.inherit": "none",
-      "shell_environment_policy.set": {
+        ":minimal": "read",
         ...Object.fromEntries(
-          Object.entries(this.context.env).filter(
-            ([name]) => name !== "CLAUDE_CODE_OAUTH_TOKEN",
-          ),
+          [
+            "/tmp",
+            "/var/tmp",
+            this.context.env.HOME,
+            this.context.env.CODEX_HOME,
+            ...this.context.policy.neverTouch,
+            this.context.workspacePath,
+          ]
+            .filter((value): value is string => Boolean(value))
+            .map((value) => [canonicalPath(value), "deny"]),
         ),
-        PATH: sandboxedPath(this.context.env.PATH ?? ""),
-        TMPDIR: temporary,
-        TMP: temporary,
-        TEMP: temporary,
-        ...sessionCaches(temporary),
-        // ~/.gitconfig may hold credential helpers; commands get only the person's identity.
-        GIT_CONFIG_GLOBAL: await privateGitConfig(temporary, this.context.env),
+        [directory]: "read",
       },
+      network: { enabled: false },
     };
-    let servers: Record<string, unknown>;
-    try {
-      const read = await server.request<{ config?: Record<string, unknown> }>(
-        "config/read",
-        { cwd: this.context.workspacePath },
-      );
-      servers = record(read.config?.mcp_servers) ?? {};
-    } catch {
-      return config;
-    }
-    // Avoid recursively reconnecting to OhMyGame through the person's own MCP config.
-    if (servers[EXTERNAL_MCP_SERVER_NAME])
-      config[`mcp_servers.${EXTERNAL_MCP_SERVER_NAME}.enabled`] = false;
+    const config: Record<string, unknown> = {
+      ...CODEX_CONTROLLED_CONFIG,
+      default_permissions: this.#writeProfile,
+      allow_login_shell: false,
+      project_root_markers: [],
+      permissions: { [this.#profile]: profile, [this.#readProfile]: profile },
+      "shell_environment_policy.inherit": "none",
+      "shell_environment_policy.set": {},
+    };
+    // Fail closed: discovery of inherited MCP configuration must succeed before starting a thread.
+    const read = await server.request<{ config?: Record<string, unknown> }>(
+      "config/read",
+      { cwd: directory },
+    );
+    requireControlledCodexConfig(read.config);
+    for (const name of Object.keys(record(read.config?.mcp_servers) ?? {}))
+      config[`mcp_servers.${name}.enabled`] = false;
     return config;
   }
 
@@ -383,6 +345,16 @@ export class CodexDriver implements NativeDriver {
     }
     const turn = this.#turn;
     if (!turn) return;
+    const eventTurnId =
+      typeof params.turnId === "string"
+        ? params.turnId
+        : record(params.turn)?.id;
+    if (
+      typeof eventTurnId === "string" &&
+      (this.#completedTurns.has(eventTurnId) ||
+        (turn.turnId && turn.turnId !== eventTurnId))
+    )
+      return;
     if (typeof params.turnId === "string") turn.turnId ??= params.turnId;
     const sink = turn.sink;
     switch (method) {
@@ -440,7 +412,10 @@ export class CodexDriver implements NativeDriver {
         return;
       case "error": {
         const error = record(params.error);
-        if (params.willRetry !== true) turn.error = codexError(error?.message);
+        if (params.willRetry !== true) {
+          turn.error = codexError(error?.message);
+          turn.interruption = codexInterruption(error);
+        }
         return;
       }
       case "turn/completed": {
@@ -459,12 +434,24 @@ export class CodexDriver implements NativeDriver {
     turn: CodexTurn,
     completed: Record<string, unknown>,
   ): Promise<void> {
-    // Image imports must reach the shared transcript before checkpoints and turn-end are recorded.
-    await Promise.all(turn.images.values());
     if (this.#turn !== turn) return;
     this.#turn = undefined;
-    if (completed.status === "interrupted" || turn.signal.aborted)
+    if (turn.turnId) {
+      this.#completedTurns.add(turn.turnId);
+      if (this.#completedTurns.size > 200)
+        this.#completedTurns.delete(
+          this.#completedTurns.values().next().value!,
+        );
+    }
+    const terminalInterruption = turn.interruption ?? codexInterruption(record(completed.error));
+    if (turn.signal.aborted)
       turn.resolve({ status: "aborted" });
+    else if (turn.imageError || terminalInterruption.kind === "blocked" || completed.error !== undefined && terminalInterruption.kind === "unknown")
+      turn.resolve({ status: "failed", error: turn.imageError || "Codex stopped because the request could not safely continue.", interruption: turn.imageError ? { kind: "blocked", source: "codex", code: "codex_image_delivery", phase: "result" } : terminalInterruption });
+    else if ([...this.#toolCalls.values()].some(call => !call.settled))
+      turn.resolve({ status: "failed", error: "Codex ended before a controlled tool result was confirmed. Recover or review the original operation.", interruption: { kind: "runtime_interrupted", source: "codex", code: "codex_pending_tool_result", phase: "tools", terminalReason: "runtime_interrupted" } });
+    else if (completed.status === "interrupted")
+      turn.resolve({ status: "failed", error: "Codex interrupted the turn before completing the task.", interruption: { kind: "runtime_interrupted", source: "codex", code: "codex_runtime_interrupted", phase: "result", terminalReason: "runtime_interrupted", cancelOrigin: "runtime" } });
     else if (completed.status === "failed" || turn.imageError)
       turn.resolve({
         status: "failed",
@@ -473,8 +460,10 @@ export class CodexDriver implements NativeDriver {
           codexError(record(completed.error)?.message) ||
           turn.error ||
           "Codex could not finish the turn",
+        interruption: turn.imageError ? { kind: "blocked", source: "codex", code: "codex_image_delivery", phase: "result" } : turn.interruption ?? codexInterruption(record(completed.error)),
       });
-    else turn.resolve({ status: "completed" });
+    else if (completed.status === "completed") turn.resolve({ status: "completed" });
+    else turn.resolve({ status: "failed", error: "Codex returned an unknown terminal state.", interruption: { kind: "unknown", source: "codex", code: "codex_unknown_terminal", phase: "result", terminalReason: "unknown" } });
   }
 
   #itemStarted(sink: NativeTurnSink, item: Record<string, unknown>): void {
@@ -510,12 +499,7 @@ export class CodexDriver implements NativeDriver {
         return;
       }
       case "dynamicToolCall":
-        sink.toolCall(
-          id,
-          this.#bridgeToolName(item.tool ?? "tool"),
-          record(item.arguments) ?? {},
-        );
-        sink.toolStarted(id);
+        // The validated item/tool/call request owns these events; notifications repeat it.
         return;
       case "mcpToolCall":
         sink.toolCall(
@@ -541,43 +525,11 @@ export class CodexDriver implements NativeDriver {
     const id = typeof item.id === "string" ? item.id : undefined;
     if (!id) return;
     switch (item.type) {
-      case "imageGeneration": {
-        const turn = this.#turn;
-        if (
-          !turn ||
-          turn.finishing ||
-          turn.signal.aborted ||
-          turn.images.has(id)
-        )
-          return;
-        // Some versions only emit the completed item. The sink deduplicates starts by call id.
-        this.#itemStarted(sink, item);
-        const importing = (async () => {
-          try {
-            if (turn.readOnly)
-              throw new Error(
-                "Cannot import generated images during a planning turn",
-              );
-            if (item.status !== "completed" || item.failure)
-              throw new Error(
-                `Codex image generation failed (${String(item.status)})`,
-              );
-            const result = await importCodexImage(
-              item,
-              this.#threadId!,
-              this.context,
-            );
-            if (this.#turn === turn && !turn.signal.aborted)
-              sink.toolResult(id, result, false);
-          } catch (cause) {
-            if (this.#turn !== turn || turn.signal.aborted) return;
-            turn.imageError = `Codex image could not be delivered: ${cause instanceof Error ? cause.message : String(cause)}`;
-            sink.toolResult(id, textResult(turn.imageError), true);
-          }
-        })();
-        turn.images.set(id, importing);
+      case "imageGeneration":
+        this.#turn!.imageError =
+          "Codex native image generation is disabled. Use OhMyGame's Kunpo media tools.";
+        sink.toolResult(id, textResult(this.#turn!.imageError), true);
         return;
-      }
       case "agentMessage":
         sink.textDone(
           id,
@@ -622,15 +574,9 @@ export class CodexDriver implements NativeDriver {
         );
         return;
       }
-      case "dynamicToolCall": {
-        const stored = this.#bridged.take(id);
-        sink.toolResult(
-          id,
-          stored?.result ?? dynamicResult(item.contentItems),
-          stored ? stored.isError : item.success === false,
-        );
+      case "dynamicToolCall":
+        // Keep the host's single structured result, including its Kunpo artifact metadata.
         return;
-      }
       case "mcpToolCall": {
         const result = record(item.result);
         sink.toolResult(
@@ -674,25 +620,58 @@ export class CodexDriver implements NativeDriver {
     const turn = this.#turn;
     if (method === "item/tool/call") {
       if (!turn || turn.signal.aborted) throw new Error("No turn is running");
-      const callId = String(params.callId ?? "");
-      const outcome = await this.context.bridge.call(
-        this.#bridgeToolName(params.tool),
-        params.arguments,
-        callId,
-        turn?.signal,
-      );
-      this.#bridged.record(callId, outcome);
-      return {
-        contentItems: outcome.result.content.map((part) =>
-          part.type === "text"
-            ? { type: "inputText", text: part.text }
-            : {
-                type: "inputImage",
-                imageUrl: `data:${part.mimeType};base64,${part.data}`,
-              },
-        ),
-        success: !outcome.isError,
-      };
+      if (
+        params.threadId !== this.#threadId ||
+        typeof params.turnId !== "string" ||
+        (turn.turnId && turn.turnId !== params.turnId)
+      )
+        throw new Error("Tool call does not belong to the active Codex turn");
+      const callId = typeof params.callId === "string" ? params.callId : "";
+      if (
+        !callId ||
+        params.namespace !== CODEX_TOOL_NAMESPACE ||
+        !String(params.tool).startsWith(TOOL_PREFIX)
+      )
+        throw new Error("Invalid OhMyGame tool call");
+      const input = JSON.stringify([params.tool, params.arguments]);
+      const previous = this.#toolCalls.get(callId);
+      if (previous) {
+        if (previous.input !== input)
+          throw new Error(
+            "A Codex tool call ID was reused with different arguments",
+          );
+        return previous.result;
+      }
+      const call = { input, result: undefined as unknown as Promise<unknown>, settled: false };
+      const result = (async () => {
+        const name = this.#bridgeToolName(params.tool);
+        turn.sink.toolCall(callId, name, record(params.arguments) ?? {});
+        turn.sink.toolStarted(callId);
+        const outcome = await this.context.bridge.call(
+          name,
+          params.arguments,
+          callId,
+          turn.signal,
+        );
+        call.settled = true;
+        if (this.#turn === turn && !turn.signal.aborted)
+          turn.sink.toolResult(callId, outcome.result, outcome.isError);
+        else turn.sink.toolSettled?.(callId, outcome.result, outcome.isError);
+        return {
+          contentItems: outcome.result.content.map((part) =>
+            part.type === "text"
+              ? { type: "inputText", text: part.text }
+              : {
+                  type: "inputImage",
+                  imageUrl: `data:${part.mimeType};base64,${part.data}`,
+                },
+          ),
+          success: !outcome.isError && !turn.signal.aborted,
+        };
+      })();
+      call.result = result.finally(() => { call.settled = true; });
+      this.#toolCalls.set(callId, call);
+      return call.result;
     }
     if (!turn || turn.signal.aborted)
       return method === "item/permissions/requestApproval"
@@ -712,98 +691,8 @@ export class CodexDriver implements NativeDriver {
     ) {
       return { decision: "decline" };
     }
-    if (method === "item/permissions/requestApproval") {
-      const permissions = record(params.permissions);
-      const files = record(permissions?.fileSystem);
-      let paths: NonNullable<ApprovalRequestDetails["paths"]> = [];
-      for (const access of ["read", "write"] as const) {
-        const requested = files?.[access];
-        if (
-          requested != null &&
-          (!Array.isArray(requested) ||
-            requested.some((value) => typeof value !== "string"))
-        )
-          return { permissions: {}, scope: "turn" };
-        for (const value of (requested ?? []) as string[])
-          paths.push({ path: value, access });
-      }
-      if (files?.entries != null) {
-        if (!Array.isArray(files.entries))
-          return { permissions: {}, scope: "turn" };
-        for (const value of files.entries) {
-          const entry = record(value);
-          const location = record(entry?.path);
-          if (
-            location?.type !== "path" ||
-            typeof location.path !== "string" ||
-            (entry?.access !== "read" && entry?.access !== "write")
-          )
-            return { permissions: {}, scope: "turn" };
-          paths.push({ path: location.path, access: entry.access });
-        }
-      }
-      // New CLIs can send both legacy lists and entries for the same grant.
-      paths = [
-        ...new Map(
-          paths.map((entry) => [
-            JSON.stringify([entry.path, entry.access]),
-            entry,
-          ]),
-        ).values(),
-      ];
-      if (
-        !permissions ||
-        (turn.readOnly && paths.some((entry) => entry.access === "write")) ||
-        paths.length > 100 ||
-        paths.some(
-          (entry) =>
-            !path.isAbsolute(entry.path) ||
-            /[*?\[\]{}\0]/.test(entry.path) ||
-            judgeApproval(
-              {
-                kind: "file",
-                tool: entry.access === "read" ? "Read" : "Write",
-                path: entry.path,
-                canAllowSession: false,
-              },
-              this.context.policy,
-            ) === "deny",
-        )
-      )
-        return { permissions: {}, scope: "turn" };
-      const details: ApprovalRequestDetails = {
-        kind: "other",
-        tool: "permissions",
-        ...(typeof params.reason === "string" ? { reason: params.reason } : {}),
-        canAllowSession: false,
-        ...(paths.length ? { paths } : {}),
-        ...(record(permissions.network)?.enabled === true
-          ? { network: true }
-          : {}),
-      };
-      const decision = await turn.sink.requestApproval(details, {
-        signal: turn.signal,
-      });
-      return decision === "deny"
-        ? { permissions: {}, scope: "turn" }
-        : {
-            permissions: {
-              ...(files
-                ? {
-                    fileSystem: {
-                      read: Array.isArray(files.read) ? files.read : null,
-                      write: Array.isArray(files.write) ? files.write : null,
-                      ...(Array.isArray(files.entries)
-                        ? { entries: files.entries }
-                        : {}),
-                    },
-                  }
-                : {}),
-              ...(details.network ? { network: { enabled: true } } : {}),
-            },
-            scope: "turn",
-          };
-    }
+    if (method === "item/permissions/requestApproval")
+      return { permissions: {}, scope: "turn" };
     if (method === "item/tool/requestUserInput") return { answers: {} };
     if (method === "mcpServer/elicitation/request")
       return { action: "decline" };
@@ -837,18 +726,6 @@ function changeKind(kind: unknown): string {
   return type === "add" ? "Added" : type === "delete" ? "Deleted" : "Updated";
 }
 
-function dynamicResult(items: unknown): NativeToolResult {
-  if (!Array.isArray(items)) return { content: [] };
-  return {
-    content: items.flatMap((item): NativeToolResult["content"] => {
-      const value = record(item);
-      if (value?.type === "inputText" && typeof value.text === "string")
-        return [{ type: "text", text: value.text }];
-      return [];
-    }),
-  };
-}
-
 function codexError(message: unknown): string {
   if (typeof message !== "string") return "";
   // Codex passes the model service's error body through as JSON text.
@@ -861,33 +738,13 @@ function codexError(message: unknown): string {
   return message;
 }
 
-/**
- * A Git configuration for sandboxed commands with the person's name and email
- * and nothing else from ~/.gitconfig, which may name credential helpers and
- * is outside the permission profile.
- */
-async function privateGitConfig(
-  directory: string,
-  env: Record<string, string>,
-): Promise<string> {
-  const file = path.join(directory, "gitconfig");
-  const identity: string[] = [];
-  for (const key of ["user.name", "user.email"]) {
-    const value = await new Promise<string>((resolve) =>
-      execFile(
-        "git",
-        ["config", "--global", "--get", key],
-        { env, timeout: 3_000, encoding: "utf8" },
-        (error, stdout) => resolve(error ? "" : stdout.trim()),
-      ),
-    );
-    if (value && !/[\r\n"\\]/.test(value))
-      identity.push(`\t${key.slice(5)} = "${value}"`);
-  }
-  await writeFile(
-    file,
-    identity.length ? `[user]\n${identity.join("\n")}\n` : "",
-    { mode: 0o600 },
-  );
-  return file;
+function codexInterruption(error: Record<string, unknown> | undefined): AgentInterruption {
+  const info = error?.codexErrorInfo;
+  const allowedTransient = new Set(["internalServerError", "httpConnectionFailed", "responseStreamConnectionFailed", "responseStreamDisconnected"]);
+  const key = typeof info === "string" ? info : Object.keys(record(info) ?? {}).find(value => allowedTransient.has(value));
+  if (key && allowedTransient.has(key))
+    return { kind: "transient", source: "codex", code: `codex_${key}`, phase: "result", terminalReason: "transport_lost" };
+  if (typeof info === "string" && ["contextWindowExceeded", "usageLimitExceeded", "badRequest", "unauthorized", "sandboxError"].includes(info))
+    return { kind: "blocked", source: "codex", code: `codex_${info}`, phase: "result", terminalReason: "execution_error" };
+  return { kind: "unknown", source: "codex", code: "codex_execution_error", phase: "result", terminalReason: "unknown" };
 }

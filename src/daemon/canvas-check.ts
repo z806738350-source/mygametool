@@ -41,13 +41,13 @@ export async function checkCanvasWorkspace(workspace: string): Promise<CanvasChe
     for (const node of detail.board.nodes) {
       const outputId = "assetId" in node.data ? node.data.assetId : undefined;
       const output = outputId ? assets.get(outputId) : undefined;
-      const expected = node.type === "asset" ? node.data.mediaType : node.type === "model-3d" || node.type === "animate-3d" ? "model" : node.type === "speech" || node.type === "sound-effect" || node.type === "music" ? "audio" : node.type;
+      const expected = node.type === "asset" ? node.data.mediaType : node.type === "model-3d" || node.type === "animate-3d" ? "model" : node.type === "speech" || node.type === "voice" || node.type === "sound-effect" || node.type === "music" ? "audio" : node.type;
       if (output && output.mediaType !== expected) issues.push({ file, message: `Node ${node.id}: output asset must be ${expected}, found ${output.mediaType}` });
-      const references = node.type === "model-3d" ? [...node.data.images, ...(node.data.source ? [node.data.source] : [])] : node.type === "image" ? node.data.images : node.type === "video" || node.type === "text" || node.type === "document" ? node.data.references ?? [] : node.type === "animate-3d" && node.data.source ? [node.data.source] : [];
+      const references = node.type === "model-3d" ? [...node.data.images, ...(node.data.source ? [node.data.source] : [])] : node.type === "image" ? [...node.data.images, ...(node.data.mask ? [node.data.mask] : [])] : node.type === "video" || node.type === "text" || node.type === "document" ? node.data.references ?? [] : node.type === "animate-3d" && node.data.source ? [node.data.source] : [];
       for (const reference of references) {
         const id = resolveAssetCanvasAssetId(detail.board.nodes, reference), asset = id ? assets.get(id) : undefined;
         if (!asset) continue;
-        const allowed = node.type === "animate-3d" || node.type === "model-3d" && reference === node.data.source ? asset.contentType === "model/gltf-binary" : node.type === "video" ? asset.mediaType === "image" : node.type === "model-3d" ? ["image/png", "image/jpeg", "image/webp"].includes(asset.contentType) : ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(asset.contentType);
+        const allowed = node.type === "animate-3d" || node.type === "model-3d" && reference === node.data.source ? asset.contentType === "model/gltf-binary" || asset.contentType === "application/vnd.autodesk.fbx" && asset.model3d?.preview?.status === "ready" : node.type === "video" ? asset.mediaType === "image" : node.type === "model-3d" ? ["image/png", "image/jpeg", "image/webp"].includes(asset.contentType) : ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(asset.contentType);
         if (!allowed) issues.push({ file, message: `Node ${node.id}: reference ${id} has unsupported media type ${asset.contentType}` });
       }
     }

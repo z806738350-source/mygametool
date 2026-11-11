@@ -11,6 +11,9 @@ export interface CanvasChipOption<Value extends string> {
   shortLabel?: string;
   /** Options sharing a group are listed under its heading, like the Home model picker's providers. */
   group?: string;
+  /** Listed for discovery, but unavailable until its integration is ready. */
+  disabled?: boolean;
+  title?: string;
 }
 
 /** A line under a group heading, such as why a connected provider has no models. */
@@ -110,6 +113,7 @@ export function CanvasChipSelect<Value extends string>({ label, value, options, 
   }, [open, position, searchable]);
 
   function choose(option: CanvasChipOption<Value>): void {
+    if (option.disabled) return;
     setOpen(false);
     trigger.current?.focus();
     if (option.value !== value) onChange(option.value);
@@ -120,7 +124,7 @@ export function CanvasChipSelect<Value extends string>({ label, value, options, 
       ref={trigger}
       className={`canvas-chip${wide ? " is-wide" : ""}`}
       type="button"
-      title={`${label}: ${current?.group ? `${current.group} · ` : ""}${current?.label ?? text}`}
+      title={current?.title ?? `${label}: ${current?.group ? `${current.group} · ` : ""}${current?.label ?? text}`}
       aria-label={`${label}: ${current?.label ?? text}`}
       aria-haspopup={optionAction ? "menu" : "listbox"}
       aria-expanded={open}
@@ -155,7 +159,7 @@ export function CanvasChipSelect<Value extends string>({ label, value, options, 
             onKeyDown={(event) => {
               if (event.key !== "Enter") return;
               event.preventDefault();
-              const first = visible[0];
+              const first = visible.find((option) => !option.disabled);
               if (first) choose(first);
             }}
           />
@@ -166,7 +170,7 @@ export function CanvasChipSelect<Value extends string>({ label, value, options, 
               {group.name && (groups.length > 1 || group.notes.length) ? <div className="canvas-chip-menu-heading">{group.name}</div> : null}
               {group.options.map((option) => {
                 const selected = option.value === value;
-                const choice = <button type="button" role={optionAction ? "menuitemradio" : "option"} aria-selected={optionAction ? undefined : selected} aria-checked={optionAction ? selected : undefined} key={option.value} onClick={() => choose(option)}>
+                const choice = <button type="button" role={optionAction ? "menuitemradio" : "option"} title={option.title} disabled={option.disabled} aria-selected={optionAction ? undefined : selected} aria-checked={optionAction ? selected : undefined} key={option.value} onClick={() => choose(option)}>
                   <span>{option.label}</span>
                   {selected ? <Check size={13} /> : null}
                 </button>;
@@ -217,7 +221,7 @@ function groupOptions<Value extends string>(options: readonly CanvasChipOption<V
 function moveFocus(event: React.KeyboardEvent, menu: HTMLDivElement | null, search: HTMLInputElement | null): void {
   if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
   event.preventDefault();
-  const items = [...(menu?.querySelectorAll<HTMLButtonElement>('[role="option"], [role="menuitemradio"], [role="menuitem"], .canvas-chip-menu-action') ?? [])];
+  const items = [...(menu?.querySelectorAll<HTMLButtonElement>('[role="option"]:not(:disabled), [role="menuitemradio"]:not(:disabled), [role="menuitem"]:not(:disabled), .canvas-chip-menu-action:not(:disabled)') ?? [])];
   const index = items.indexOf(document.activeElement as HTMLButtonElement);
   if (event.key === "ArrowUp" && index <= 0) {
     search?.focus();

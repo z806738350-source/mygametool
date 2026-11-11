@@ -11,7 +11,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import sharp from "sharp";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createProviderImageReadTool,
   DEEPSEEK_FILE_VERIFICATION_TTL_MS,
@@ -20,6 +20,14 @@ import {
   installDeepSeekImageFiles,
   isDeepSeekFileModel,
 } from "../src/daemon/deepseek-image-files.js";
+
+const legacyProtocol = vi.hoisted(() => ({ enabled: true }));
+vi.mock("../src/daemon/provider-network.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/daemon/provider-network.js")>();
+  const { legacyImageFilesFetch } = await import("./legacy-image-files-fixture.js");
+  return { ...actual, guardedProviderFetch: (delegate: typeof fetch) => legacyProtocol.enabled ? legacyImageFilesFetch(delegate) : actual.guardedProviderFetch(delegate) };
+});
+beforeEach(() => { legacyProtocol.enabled = true; });
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -128,6 +136,15 @@ class FakeDeepSeek {
 }
 
 describe("DeepSeek image file transport", () => {
+  it("denies real original-provider and undocumented Kunpo Files requests before transport", async () => {
+    legacyProtocol.enabled = false;
+    const delegate = vi.fn<typeof fetch>();
+    const files = new DeepSeekImageFiles(await temporaryDirectory());
+    await expect(send(files.wrapFetch(delegate), { messages: [] })).rejects.toThrow();
+    const actual = await vi.importActual<typeof import("../src/daemon/provider-network.js")>("../src/daemon/provider-network.ts");
+    await expect(actual.guardedProviderFetch(delegate)("https://llm.ziy.cc/v1/files", { method: "POST", headers: { authorization: "Bearer fake-only-key" } })).rejects.toThrow("Invalid provider API path");
+    expect(delegate).not.toHaveBeenCalled();
+  });
   it("passes the exact original text-only JSON through without uploading files", async () => {
     const original = JSON.stringify(
       {
@@ -926,7 +943,7 @@ describe("DeepSeek image file transport", () => {
       payload,
       "key-a",
       undefined,
-      "https://gateway.example/v1/chat/completions",
+      "http://127.0.0.1:43200/v1/chat/completions",
     );
     expect(api.uploads).toHaveLength(0);
     expect(api.modelBodies[0]).toEqual(payload);

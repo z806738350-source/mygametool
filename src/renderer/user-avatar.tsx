@@ -1,3 +1,5 @@
+import { isLocalImageSource } from "./local-resources.js";
+
 interface UserAvatarProps {
   avatarUrl?: string;
   className: string;
@@ -5,7 +7,7 @@ interface UserAvatarProps {
 }
 
 export function UserAvatar({ avatarUrl, className, name }: UserAvatarProps) {
-  return avatarUrl
+  return isLocalImageSource(avatarUrl)
     ? <img className={className} src={avatarUrl} alt="" referrerPolicy="no-referrer" />
     : <span className={className} aria-hidden="true">{initials(name)}</span>;
 }

@@ -7,11 +7,12 @@ import { exportProject, getProjectCover } from "./api.js";
 import { ProjectTypeIcon, projectTypeLabel } from "./project-types.js";
 import { language, t } from "./i18n.js";
 import { ProjectPlaceholder } from "./project-placeholder.js";
+import { ProjectExecutionStorageDialog } from "./project-execution-storage.js";
 
 export interface ProjectCardActions {
   onRename: () => void;
   onDuplicate: () => void;
-  onDelete: () => void;
+  onDelete: () => void | Promise<void>;
 }
 
 interface ProjectCardProps {
@@ -27,7 +28,10 @@ export function ProjectCard({ project, onOpen, actions, agentStatus }: ProjectCa
   const [menuPosition, setMenuPosition] = useState<{ top: number; left: number }>();
   const [openingFolder, setOpeningFolder] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const deletePending = useRef(false);
   const [menuError, setMenuError] = useState<string>();
+  const [executionStorageOpen, setExecutionStorageOpen] = useState(false);
   const openProjectFile = typeof window !== "undefined" ? window.ohMyGameDesktop?.openProjectFile : undefined;
   const trigger = useRef<HTMLButtonElement>(null);
   const menu = useRef<HTMLDivElement>(null);
@@ -68,6 +72,23 @@ export function ProjectCard({ project, onOpen, actions, agentStatus }: ProjectCa
     }
   }
 
+  async function remove(): Promise<void> {
+    if (!actions || deletePending.current) return;
+    deletePending.current = true;
+    setDeleting(true);
+    setMenuOpen(false);
+    setMenuError(undefined);
+    try {
+      await actions.onDelete();
+    } catch (cause) {
+      setMenuError(cause instanceof Error ? cause.message : String(cause));
+      setMenuOpen(true);
+    } finally {
+      deletePending.current = false;
+      setDeleting(false);
+    }
+  }
+
   useEffect(() => {
     if (!menuOpen) return;
     const close = () => setMenuOpen(false);
@@ -103,7 +124,7 @@ export function ProjectCard({ project, onOpen, actions, agentStatus }: ProjectCa
   }, [menuOpen, menuError]);
 
   return (
-    <article className="project-card">
+    <article className="project-card" aria-busy={deleting}>
       <button className="project-card-open" type="button" onClick={onOpen} aria-label={t("projectCard.open", { name: project.name })}>
         <ProjectCover projectId={project.id} />
         <span className="project-card-meta">
@@ -130,6 +151,7 @@ export function ProjectCard({ project, onOpen, actions, agentStatus }: ProjectCa
             aria-label={t("projectCard.actions", { name: project.name })}
             aria-haspopup="menu"
             aria-expanded={menuOpen}
+            disabled={deleting}
             onClick={() => { setMenuError(undefined); setMenuOpen((current) => !current); }}
           >
             <MoreHorizontal size={16} />
@@ -146,7 +168,8 @@ export function ProjectCard({ project, onOpen, actions, agentStatus }: ProjectCa
               <button type="button" role="menuitem" onClick={() => { setMenuOpen(false); actions.onRename(); }}>{t("common.rename")}</button>
               <button type="button" role="menuitem" onClick={() => { setMenuOpen(false); actions.onDuplicate(); }}>{t("common.duplicate")}</button>
               <button type="button" role="menuitem" disabled={exporting} onClick={() => void exportArchive()}>{exporting ? t("projectCard.exporting") : t("projectCard.export")}</button>
-              <button className="project-card-actions-delete" type="button" role="menuitem" onClick={() => { setMenuOpen(false); actions.onDelete(); }}>
+              {project.workspaceLocation !== "external" ? <button type="button" role="menuitem" onClick={() => { setMenuOpen(false); setExecutionStorageOpen(true); }}>{t("projects.executionStorage.menu")}</button> : null}
+              <button className="project-card-actions-delete" type="button" role="menuitem" disabled={deleting} onClick={() => void remove()}>
                 {project.workspaceLocation === "external" ? t("projectCard.remove") : t("common.delete")}
               </button>
               {menuError ? <p className="project-card-folder-error" role="alert">{menuError}</p> : null}
@@ -155,6 +178,11 @@ export function ProjectCard({ project, onOpen, actions, agentStatus }: ProjectCa
           ) : null}
         </div>
       ) : null}
+      {deleting ? <p className="project-card-activity project-card-time" role="status">
+        <LoaderCircle className="spin" size={11} aria-hidden="true" />
+        <span>{t("projectCard.deleting")}</span>
+      </p> : null}
+      {executionStorageOpen ? createPortal(<ProjectExecutionStorageDialog project={project} returnFocus={trigger.current} onClose={() => setExecutionStorageOpen(false)} />, document.body) : null}
     </article>
   );
 }

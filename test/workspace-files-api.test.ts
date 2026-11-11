@@ -1,11 +1,15 @@
 import { link, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/daemon/app.js";
 import { readAssetMetadata, writeAssetMetadata } from "../src/daemon/asset-metadata.js";
 import type { CanvasBoardDetail } from "../src/shared/canvas-workspace.js";
 import type { LibraryAsset, ProjectState, WorkspaceFile } from "../src/shared/contracts.js";
+import { registerSensitiveValue } from "../src/shared/sensitive-values.js";
+import { CheckedMediaSnapshotStore } from "../src/daemon/checked-media-snapshot.js";
+import { AgentManager } from "../src/daemon/agent.js";
 
 const fixtures: { app: ReturnType<typeof createApp>; directory: string }[] = [];
 afterEach(async () => {
@@ -25,6 +29,105 @@ async function setup() {
 }
 
 describe("project file management", () => {
+  it("binds repeated media ranges to checked content without using the digest as authorization", async () => {
+    const { app, project } = await setup();
+    const bytes = Buffer.from("RIFF-content-version-one"), file = path.join(project.workspacePath, "pinned.wav");
+    await writeFile(file, bytes);
+    const base = `/projects/${project.id}/files/raw?path=pinned.wav`;
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    const url = `${base}&sha256=${digest}`;
+    const head = await app.inject({ method: "HEAD", url });
+    expect(head.statusCode).toBe(200); expect(head.headers.etag).toBe(`"${digest}"`);
+    const first = await app.inject({ url, headers: { range: "bytes=0-3" } });
+    expect(first.statusCode).toBe(206); expect(first.rawPayload).toEqual(bytes.subarray(0, 4));
+    await writeFile(file, "RIFF-content-version-two");
+    for (const method of ["GET", "HEAD"] as const) {
+      const stale = await app.inject({ method, url, headers: { range: "bytes=4-" } });
+      expect(stale.statusCode).toBe(409); expect(stale.headers.etag).toBeUndefined();
+      expect(stale.body).not.toContain("version-two");
+    }
+    for (const query of ["not-a-hash", `${digest}&sha256=${digest}`]) expect((await app.inject(`${base}&sha256=${query}`)).statusCode).toBe(400);
+  });
+
+  it("closes media before waiting for Agent work that can depend on a media read slot", async () => {
+    const { app } = await setup();
+    let mediaClosed!: () => void;
+    const checkpointCanDrain = new Promise<void>(resolve => { mediaClosed = resolve; });
+    const closeStore = CheckedMediaSnapshotStore.prototype.close, closeAgent = AgentManager.prototype.close;
+    const store = vi.spyOn(CheckedMediaSnapshotStore.prototype, "close").mockImplementation(async function (this: CheckedMediaSnapshotStore) {
+      await closeStore.call(this); mediaClosed();
+    });
+    const agents = vi.spyOn(AgentManager.prototype, "close").mockImplementation(async function (this: AgentManager) {
+      await checkpointCanDrain; await closeAgent.call(this);
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const closing = app.close();
+    try {
+      const completed = await Promise.race([
+        closing.then(() => true), new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), 2_000); }),
+      ]);
+      expect(completed).toBe(true);
+    } finally {
+      clearTimeout(timer); mediaClosed();
+      try { await closing; }
+      finally { store.mockRestore(); agents.mockRestore(); }
+    }
+  });
+
+  it("rechecks the inspection policy after releasing a HEAD lease before sending metadata", async () => {
+    const { app, project } = await setup();
+    const secret = "workspace-head-release-policy-canary-20261110";
+    await writeFile(path.join(project.workspacePath, "sample.wav"), `RIFF${secret}`);
+    const acquire = CheckedMediaSnapshotStore.prototype.acquire;
+    const intercepted = vi.spyOn(CheckedMediaSnapshotStore.prototype, "acquire").mockImplementation(async function (this: CheckedMediaSnapshotStore, ...args) {
+      const snapshot = await acquire.apply(this, args);
+      return { ...snapshot, release: async () => { await snapshot.release(); registerSensitiveValue(secret); } };
+    });
+    try {
+      const response = await app.inject({ method: "HEAD", url: `/projects/${project.id}/files/raw?path=sample.wav` });
+      expect(response.statusCode).toBe(409);
+      expect(response.headers.etag).toBeUndefined();
+      expect(response.body).not.toContain(secret);
+    } finally { intercepted.mockRestore(); }
+  });
+
+  it("checks complete media before bounded ranges and invalidates snapshots after a source change", async () => {
+    const { app, project } = await setup();
+    const file = path.join(project.workspacePath, "sample.wav"), url = `/projects/${project.id}/files/raw?path=sample.wav`;
+    const initial = Buffer.from("RIFF-original-media-content");
+    await writeFile(file, initial);
+    const response = await app.inject({ url, headers: { range: "bytes=5-12" } });
+    expect(response.statusCode, response.body).toBe(206);
+    expect(response.rawPayload).toEqual(initial.subarray(5, 13));
+    expect(response.headers).toMatchObject({ "cache-control": "no-store", "accept-ranges": "bytes", "content-range": `bytes 5-12/${initial.length}` });
+    const next = Buffer.from("RIFF-updated--media-content");
+    await writeFile(file, next);
+    const changed = await app.inject({ url, headers: { range: "bytes=0-3", "if-range": response.headers.etag! } });
+    expect(changed.statusCode).toBe(200); expect(changed.rawPayload).toEqual(next);
+    const secret = "workspace-range-complete-scan-canary-20261110";
+    registerSensitiveValue(secret);
+    await writeFile(file, `RIFF${"x".repeat(70_000)}${secret}`);
+    for (const method of ["GET", "HEAD"] as const) expect((await app.inject({ method, url, headers: { range: "bytes=0-3" } })).statusCode).toBe(403);
+  });
+
+  it("checks raw binary media before sending bytes and keeps ordinary game assets byte-exact", async () => {
+    const { app, project } = await setup();
+    const secret = "workspace-raw-media-fake-key-canary-20261028";
+    registerSensitiveValue(secret);
+    const file = path.join(project.workspacePath, "gold-key.png");
+    await writeFile(file, Buffer.concat([Buffer.from([0x89, 0x50, 0, 0xff]), Buffer.from(secret), Buffer.from([0, 1, 2])]));
+    const refused = await app.inject({ method: "GET", url: `/projects/${project.id}/files/raw?path=gold-key.png` });
+    expect(refused.statusCode, refused.body).toBe(403);
+    expect(refused.body).not.toContain(secret);
+    const safe = Buffer.from([0x89, 0x50, 0, 0xff, 1, 2, 3]);
+    await writeFile(file, safe);
+    const normal = await app.inject({ method: "GET", url: `/projects/${project.id}/files/raw?path=gold-key.png` });
+    expect(normal.statusCode, normal.body).toBe(200);
+    expect(normal.rawPayload).toEqual(safe);
+    await link(file, path.join(project.workspacePath, "alias.png"));
+    expect((await app.inject({ method: "GET", url: `/projects/${project.id}/files/raw?path=alias.png` })).statusCode).toBe(403);
+  });
+
   it("creates, renames and deletes files and folders without overwriting other files", async () => {
     const { app, project, base } = await setup();
     expect((await app.inject({ method: "POST", url: base, payload: { name: "src", kind: "folder" } })).statusCode).toBe(201);
@@ -113,8 +216,13 @@ describe("project file management", () => {
     expect((await app.inject({ method: "PUT", url: boardUrl, payload: board })).statusCode).toBe(200);
     expect((await app.inject({ method: "GET", url: base })).json<WorkspaceFile[]>().find((file) => file.path === "ref.png")).toMatchObject({ origin: "uploaded", purpose: "asset" });
     expect((await app.inject({ method: "PATCH", url: `${base}?path=ref.png`, payload: { name: "portrait.png" } })).statusCode).toBe(200);
-    expect((await app.inject({ method: "GET", url: `${canvas}/workspace` })).json().assets[0].path).toBe("portrait.png");
+    const candidate = (await app.inject({ method: "GET", url: `${canvas}/workspace` })).json().assets[0].path;
+    expect(candidate).toBe("assets/canvas/ref.png");
     expect((await app.inject({ method: "DELETE", url: `${base}?path=portrait.png` })).statusCode).toBe(204);
+    expect((await app.inject({ method: "GET", url: `${canvas}/workspace` })).json().assets[0].path).toBe(candidate);
+    expect((await app.inject({ method: "PATCH", url: `${base}?path=${candidate}`, payload: { name: "portrait.png" } })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: `${canvas}/workspace` })).json().assets[0].path).toBe("assets/canvas/portrait.png");
+    expect((await app.inject({ method: "DELETE", url: `${base}?path=assets/canvas/portrait.png` })).statusCode).toBe(204);
     const after = await app.inject({ method: "GET", url: `${canvas}/workspace` });
     expect(after.statusCode, after.body).toBe(200);
     expect(after.json().assets).toEqual([]);

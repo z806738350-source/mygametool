@@ -70,33 +70,8 @@ await prepareDesktopConfig();
 console.log(`Node.js ${version} runtime is ready`);
 
 async function prepareDesktopConfig() {
-  try {
-    process.loadEnvFile(path.resolve(".env.local"));
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-  }
-  const cloudApiUrl = (process.env.CLOUD_API_URL ?? process.env.PUBLISH_API_URL)?.trim();
-  const sentryDsn = process.env.SENTRY_DSN?.trim();
-  if (cloudApiUrl) {
-    const parsed = new URL(cloudApiUrl);
-    if (!/^https?:$/.test(parsed.protocol) || parsed.username || parsed.password) {
-      throw new Error("CLOUD_API_URL must be an HTTP(S) URL without credentials");
-    }
-  }
-  if (sentryDsn) {
-    const parsed = new URL(sentryDsn);
-    if (parsed.protocol !== "https:" || !parsed.hostname || !parsed.username) {
-      throw new Error("SENTRY_DSN must be a valid HTTPS Sentry DSN");
-    }
-  }
-  await writeFile(
-    path.join(runtimeRoot, "desktop-config.json"),
-    `${JSON.stringify({
-      ...(cloudApiUrl ? { cloudApiUrl } : {}),
-      ...(sentryDsn ? { sentryDsn } : {}),
-    }, null, 2)}\n`,
-    "utf8",
-  );
+  // Remove stale author service configuration; environment variables cannot restore it.
+  await rm(path.join(runtimeRoot, "desktop-config.json"), { force: true });
 }
 
 async function exists(file) {

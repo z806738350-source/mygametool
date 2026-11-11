@@ -19,6 +19,7 @@ import { composerDrafts, type ComposerDraft } from "./composer-drafts.js";
 import { t } from "./i18n.js";
 import type { AgentContextUsage } from "../shared/contracts.js";
 import { isAgentRuntimeId } from "../shared/agent-runtimes.js";
+import { agentModelImageInput } from "../shared/agent-models.js";
 
 export type { ComposerDraft } from "./composer-drafts.js";
 
@@ -39,6 +40,7 @@ interface ComposerProps {
   reasoningLevel?: AgentReasoningLevel;
   nativeReasoningLevel?: string;
   modelChanging: boolean;
+  hasImageHistory?: boolean;
   promptHistory: Array<{ prompt: string; mentions: PluginMention[] }>;
   capabilities: ConversationCapabilities;
   initialDraft?: ComposerDraft;
@@ -57,8 +59,6 @@ interface ComposerProps {
   /** Editor context the next message carries, such as the open Node. */
   contexts?: ChatContextChip[];
   onRemoveContext?: (key: string) => void;
-  canPublish?: boolean;
-  onPublish?: () => void;
 }
 
 export function Composer({
@@ -78,6 +78,7 @@ export function Composer({
   reasoningLevel,
   nativeReasoningLevel,
   modelChanging,
+  hasImageHistory = false,
   promptHistory,
   capabilities,
   initialDraft,
@@ -95,8 +96,6 @@ export function Composer({
   onEditPending,
   contexts = [],
   onRemoveContext,
-  canPublish,
-  onPublish,
 }: ComposerProps) {
   const [draftSession] = useState(() => composerDrafts.get(
     projectId && conversationId ? { projectId, conversationId } : undefined,
@@ -105,6 +104,11 @@ export function Composer({
   ));
   const draft = useSyncExternalStore(draftSession.subscribe, draftSession.getSnapshot, draftSession.getSnapshot);
   const { prompt, selectedSkill, selectedPlugin, mentions: pluginMentions, attachments, designReference, reference, planning, submitting } = draft;
+  const textOnly = agentModelImageInput(models.find((entry) => entry.provider === model?.provider && entry.id === model?.id) ?? model) === false;
+  const visualInputUnsupported = textOnly && (attachments.some(({ file }) => file.type.startsWith("image/") || /\.(?:png|jpe?g|webp|gif|bmp|svg|avif|tiff?|heic|ico)$/i.test(file.name))
+    || contexts.some(({ kind }) => kind === "playable-element" || kind === "playable-drawing" || kind === "playable-asset" || kind === "playable-moment"));
+  const inputIssue = visualInputUnsupported ? t("kunpoModels.textOnlyDraft")
+    : !selectedSkill && !selectedPlugin && prompt.trim().toLowerCase() === "/publish" ? t("localEdition.cloudUnavailable") : undefined;
   const updateDraft = draftSession.update;
   const [referencingDesign, setReferencingDesign] = useState(false);
   const [attachmentError, setAttachmentError] = useState<string>();
@@ -127,7 +131,7 @@ export function Composer({
 
   async function submit() {
     const value = formatComposerPrompt(selectedSkill, selectedPlugin, prompt.trim());
-    if (!conversationReady || (!value && attachments.length === 0) || stopping || draftSession.getSnapshot().submitting || !projectId) return;
+    if (!conversationReady || (!value && attachments.length === 0) || stopping || draftSession.getSnapshot().submitting || !projectId || inputIssue) return;
     setAttachmentError(undefined);
     updateDraft({ submitting: true });
     try {
@@ -137,6 +141,10 @@ export function Composer({
         uploaded = await uploadAttachments(projectId, batchId, attachments);
       } catch (error) {
         setAttachmentError(error instanceof Error ? error.message : String(error));
+        return;
+      }
+      if (textOnly && uploaded.some((attachment) => attachment.kind === "image")) {
+        setAttachmentError(t("kunpoModels.textOnlyDraft"));
         return;
       }
       const submitted = await onSubmit(
@@ -268,7 +276,6 @@ export function Composer({
   // Backspace (delete the selected Node) would take the next keystrokes.
   const textareaReadOnly = submitting || referencingDesign;
   const inputDisabled = textareaDisabled || textareaReadOnly;
-  const publishAvailable = Boolean(canPublish && onPublish && !running && !stopping);
   useEffect(() => {
     const requestId = draft.focusRequestId;
     if (!requestId || inputDisabled) return;
@@ -297,12 +304,10 @@ export function Composer({
     onDesignReference: supportsDesign ? () => { void referenceDesign(); } : undefined,
     onTogglePlanning: () => { void togglePlanning(false); },
     onCompact: conversationReady && !running && !stopping && !selectedSkill && !selectedPlugin ? () => { void runCompact(compactInstructions(prompt) ?? undefined); } : undefined,
-    onPublish,
     onMention: selectMention,
     onChange: changePrompt,
     onSelectionChange: setMentionCursor,
     contextPercent,
-    canPublish: publishAvailable,
     usageLimits: isAgentRuntimeId(model?.provider) ? runtimeUsage?.limits : undefined,
   });
 
@@ -338,12 +343,6 @@ export function Composer({
   }
 
   function submitOrRunCommand() {
-    if (publishAvailable && !inputDisabled && !selectedSkill && !selectedPlugin && prompt.trim().toLowerCase() === "/publish") {
-      changePrompt("");
-      setMentionCursor(0);
-      onPublish?.();
-      return;
-    }
     const instructions = compactInstructions(prompt);
     if (showCompactCommand && instructions !== null && !running && !stopping) {
       void runCompact(instructions ?? undefined);
@@ -415,15 +414,16 @@ export function Composer({
         onSteer={(turnId) => { void onSteerPending(turnId); }}
         onEdit={(item) => { void editPending(item); }}
       />
-      {notice || attachmentError ? <p className="composer-error" role="alert">{attachmentError ?? notice}</p> : null}
+      {notice || attachmentError || inputIssue ? <p className="composer-error" role="alert">{attachmentError ?? inputIssue ?? notice}</p> : null}
       <PromptBox
         actions={<ComposerActions
           models={models} status={modelStatus} value={model} reasoningLevel={reasoningLevel}
           nativeReasoningLevel={nativeReasoningLevel} onNativeReasoningChange={onNativeReasoningChange}
           disabled={!conversationReady || running || stopping || modelChanging}
+          hasImageHistory={hasImageHistory || attachments.some(({ file }) => file.type.startsWith("image/") || /\.(?:png|jpe?g|webp|gif|bmp|svg|avif|tiff?|heic|ico)$/i.test(file.name)) || contexts.some(({ kind }) => kind === "playable-element" || kind === "playable-drawing" || kind === "playable-asset" || kind === "playable-moment")}
           onChange={onModelChange} onReasoningChange={onReasoningChange}
           showStop={showStop} stopping={stopping} onStop={onStop}
-          sendDisabled={inputDisabled || (!selectedSkill && !selectedPlugin && !prompt.trim() && attachments.length === 0) || stopping}
+          sendDisabled={inputDisabled || (!selectedSkill && !selectedPlugin && !prompt.trim() && attachments.length === 0) || stopping || Boolean(inputIssue)}
           sendLabel={running ? t("composer.queue") : t("composer.send")}
         />}
         content={<>

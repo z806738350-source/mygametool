@@ -1,5 +1,5 @@
 import type { CanvasTableDetail, CanvasTableGenerationRequest, CanvasTableGenerationResponse } from "../shared/canvas-table.js";
-import type { AgentModelRef, AgentReasoningLevel, AssetCanvasTextGenerationResponse, AssetCanvasTextGenerationSource, ToolJob } from "../shared/contracts.js";
+import type { AgentModelRef, AgentReasoningLevel, AssetCanvasTextGenerationResponse, AssetCanvasTextGenerationSource, ImageDownloadNetworkStatus, ToolJob } from "../shared/contracts.js";
 import type { CanvasDocumentDetail, CanvasDocumentGenerationRequest, CanvasDocumentGenerationResponse } from "../shared/canvas-document.js";
 import type { CanvasBoardDetail, CanvasWorkspaceDetail, CanvasWorkspaceIndex } from "../shared/canvas-workspace.js";
 import { request } from "./api.js";
@@ -8,6 +8,7 @@ import { t } from "./i18n.js";
 
 const base = (projectId: string) => `/projects/${encodeURIComponent(projectId)}/canvas`;
 const query = (documentId?: string) => documentId ? `?documentId=${encodeURIComponent(documentId)}` : "";
+export const inspectImageDownloadNetwork = (): Promise<ImageDownloadNetworkStatus> => canvasRequest("/settings/models/providers/openai/images/download-status");
 export const getCanvasWorkspace = (id: string): Promise<CanvasWorkspaceDetail> => canvasRequest(`${base(id)}/workspace`);
 export const exportCanvasAsset = (id: string, assetId: string): Promise<{ assetId: string }> => canvasRequest(`${base(id)}/assets/${encodeURIComponent(assetId)}/library`, { method: "POST" });
 export const setMainCanvasDocument = (id: string, documentId: string, version?: string): Promise<void> => canvasRequest(`${base(id)}/main-document`, { method: "PUT", body: JSON.stringify({ documentId }), workspaceVersion: version });
@@ -21,8 +22,10 @@ export const getCanvasDocument = (id: string, documentId?: string): Promise<Canv
 export const saveCanvasDocument = (id: string, detail: CanvasDocumentDetail, documentId?: string, version?: string): Promise<CanvasDocumentDetail> => canvasRequest(`${base(id)}${query(documentId)}`, { method: "PUT", body: JSON.stringify(detail), workspaceVersion: version });
 export const insertCanvasImage = (id: string, documentId: string, assetId: string, version?: string): Promise<CanvasDocumentDetail> => canvasRequest(`${base(id)}/documents/${encodeURIComponent(documentId)}/images`, { method: "POST", body: JSON.stringify({ assetId }), workspaceVersion: version });
 export const listCanvasJobs = (id: string): Promise<ToolJob[]> => canvasRequest(`${base(id)}/jobs`);
-export const generateCanvasMedia = (id: string, boardId: string, nodeId: string, version?: string): Promise<ToolJob> => request(`${base(id)}/boards/${encodeURIComponent(boardId)}/nodes/${encodeURIComponent(nodeId)}/generate`, { method: "POST", workspaceVersion: version });
+export const generateCanvasMedia = (id: string, boardId: string, nodeId: string, version?: string, confirmedJobId?: string): Promise<ToolJob> => request(`${base(id)}/boards/${encodeURIComponent(boardId)}/nodes/${encodeURIComponent(nodeId)}/generate`, { method: "POST", workspaceVersion: version, ...(confirmedJobId ? { body: JSON.stringify({ confirmedJobId }) } : {}) });
 export const cancelCanvasJob = (id: string, jobId: string): Promise<ToolJob> => canvasRequest(`${base(id)}/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
+export const recoverCanvasImage = (id: string, jobId: string, version?: string): Promise<ToolJob> => canvasRequest(`${base(id)}/jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST", workspaceVersion: version });
+export const resumeCanvasVideo = recoverCanvasImage;
 export const generateCanvasText = (id: string, instruction: string, model: AgentModelRef, reasoningLevel?: AgentReasoningLevel, referenceSource?: AssetCanvasTextGenerationSource, version?: string): Promise<AssetCanvasTextGenerationResponse> => request(`${base(id)}/text/generate`, { method: "POST", body: JSON.stringify({ instruction, model, reasoningLevel, referenceSource }), workspaceVersion: version });
 export const generateCanvasDocument = (id: string, documentId: string, input: CanvasDocumentGenerationRequest, version?: string): Promise<CanvasDocumentGenerationResponse> => request(`${base(id)}/documents/${encodeURIComponent(documentId)}/generate`, { method: "POST", body: JSON.stringify(input), workspaceVersion: version });
 

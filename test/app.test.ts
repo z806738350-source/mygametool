@@ -1,17 +1,22 @@
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/daemon/app.js";
+import { AgentAttachmentStore, resolveAgentAttachment } from "../src/daemon/agent-attachments.js";
+import { createLocalAgentFileTools } from "../src/daemon/agent-local-files.js";
 import type { CodingSession } from "../src/daemon/agent.js";
 import { CHECKPOINT_ENTRY, TURN_END_ENTRY } from "../src/daemon/checkpoint-extension.js";
 import { ConversationManager } from "../src/daemon/conversations.js";
 import { writePlayableFixtureWorkspace } from "./playable-fixture.js";
-import { MODEL_3D_MODELS } from "../src/shared/generation-config.js";
+import { registerSensitiveValue } from "../src/shared/sensitive-values.js";
+import { LocalApiKeyStore } from "../src/daemon/local-model-runtime.js";
+import { isolatedPreviewFixture } from "./isolated-preview-fixture.js";
 
 const apps: ReturnType<typeof createApp>[] = [];
 const TEST_VIDEO_MODEL = { provider: "openrouter", id: "example/video-model" } as const;
+const REFERENCE_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAYAAACddGYaAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAEUlEQVQImWMIbrGaCcMMyBwAgE4J/ZR8Jv0AAAAASUVORK5CYII=";
 afterEach(async () => { await Promise.all(apps.splice(0).map((app) => app.close())); });
 
 async function saveProjectAsset(app: Awaited<ReturnType<typeof createApp>>, projectId: string, filePath: string) {
@@ -21,6 +26,32 @@ async function saveProjectAsset(app: Awaited<ReturnType<typeof createApp>>, proj
 }
 
 describe("daemon", () => {
+  it("lists retained project models only for the asset catalog and serves their original and preview separately", async () => {
+    const app = createApp({ dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-project-assets-")) });
+    apps.push(app);
+    const project = (await app.inject({ method: "POST", url: "/projects", payload: { name: "Assets" } })).json();
+    const other = (await app.inject({ method: "POST", url: "/projects", payload: { name: "Other" } })).json();
+    const folder = `.data/model-assets/${"a".repeat(64)}`, original = `${folder}/original.fbx`, preview = `${folder}/${"b".repeat(64)}.glb`;
+    await mkdir(path.join(project.workspacePath, folder), { recursive: true });
+    await writeFile(path.join(project.workspacePath, original), "original quad model");
+    await writeFile(path.join(project.workspacePath, preview), "triangulated model");
+    await writeFile(path.join(project.workspacePath, ".data/assets.json"), JSON.stringify({ version: 1, prompts: {}, previews: { [original]: preview }, libraryAssets: { [original]: "quad" }, origins: { [original]: "generated" }, purposes: { [original]: "asset" } }));
+    for (const file of ["picture.png", "sound.mp3", "movie.mp4", "small.glb"]) await writeFile(path.join(project.workspacePath, file), file);
+    const normal = (await app.inject({ method: "GET", url: `/projects/${project.id}/files` })).json();
+    expect(normal.some((file: { path: string }) => file.path.startsWith(".data/"))).toBe(false);
+    const catalog = await app.inject({ method: "GET", url: `/projects/${project.id}/files?assets=true` });
+    expect(catalog.statusCode, catalog.body).toBe(200);
+    expect(catalog.json().filter((file: { mediaType?: string }) => file.mediaType)).toHaveLength(5);
+    expect(catalog.json()).toContainEqual(expect.objectContaining({ path: original, libraryAssetId: "quad", previewPath: preview, mediaType: "model", origin: "generated" }));
+    expect((await app.inject({ method: "GET", url: `/projects/${other.id}/files?assets=true` })).json()).toEqual([]);
+    expect((await app.inject({ method: "GET", url: `/projects/missing/files?assets=true` })).statusCode).toBe(404);
+    for (const [file, expected, type] of [[original, "original quad model", "application/vnd.autodesk.fbx"], [preview, "triangulated model", "model/gltf-binary"]]) {
+      const response = await app.inject({ method: "GET", url: `/projects/${project.id}/files/raw?path=${encodeURIComponent(file!)}` });
+      expect(response.statusCode).toBe(200); expect(response.body).toBe(expected); expect(response.headers["content-type"]).toBe(type);
+      expect((await app.inject({ method: "GET", url: `/projects/${other.id}/files/raw?path=${encodeURIComponent(file!)}` })).statusCode).toBe(400);
+    }
+  });
+
   it("exposes project activity without requiring a conversation event subscription", async () => {
     let finish!: () => void;
     const completion = new Promise<void>((resolve) => { finish = resolve; });
@@ -291,8 +322,10 @@ describe("daemon", () => {
   });
 
   it.each([false, true])("respects General Web preview policy when browser output is generated: %s", async (webPreviewEnabled) => {
+    const guest = await isolatedPreviewFixture("General ready");
     const app = createApp({
       dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-general-auto-preview-")),
+      projectExecution: guest.execution,
       createSession: async (project) => ({
         messages: [], abort: async () => {}, dispose: () => {}, subscribe: () => () => {},
         prompt: async () => {
@@ -497,7 +530,7 @@ describe("daemon", () => {
     apps.push(app);
     const source = (await app.inject({ method: "POST", url: "/projects", payload: { name: "Source" } })).json();
     const target = (await app.inject({ method: "POST", url: "/projects", payload: { name: "Target" } })).json();
-    await writeFile(path.join(source.workspacePath, "sprite.png"), "image bytes");
+    await writeFile(path.join(source.workspacePath, "sprite.png"), Buffer.from(REFERENCE_PNG, "base64"));
     await saveProjectAsset(app, source.id, "sprite.png");
     const [asset] = (await app.inject({ method: "GET", url: "/library/assets" })).json();
 
@@ -902,10 +935,10 @@ describe("daemon", () => {
       "read",
       "write",
       "edit",
-      "bash",
-      "web_search",
+      "ls",
+      "find",
+      "grep",
       "update_plan",
-      "install_plugin",
       "generate_image",
       "generate_3d_asset",
       "generate_video",
@@ -916,8 +949,12 @@ describe("daemon", () => {
   it("offers only the audio operations supported by configured providers", async () => {
     const setActiveToolsByName = vi.fn();
     const prompt = vi.fn<CodingSession["prompt"]>(async () => {});
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "ohmygame-audio-tools-"));
+    await new LocalApiKeyStore(path.join(dataDirectory, "local-api-keys.json")).modify("kunpo", async () => ({ type: "api_key", key: "sk-audio-tools-kunpo-fixture" }));
+    const registered = ["read", "write", "edit", "ls", "find", "grep", "update_plan", "generate_image", "generate_3d_asset", "generate_video", "animate_3d_asset", "generate_speech", "generate_sound_effect", "generate_music"];
     const app = createApp({
-      dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-audio-tools-")),
+      dataDirectory,
+      piAgentDirectory: dataDirectory,
       createSession: async () => ({
         messages: [],
         prompt,
@@ -925,21 +962,15 @@ describe("daemon", () => {
         dispose: () => {},
         subscribe: () => () => {},
         setActiveToolsByName,
+        getAllTools: () => registered.map((name) => ({ name })),
       }),
     });
     apps.push(app);
-    const settings = await app.inject({
-      method: "PUT",
-      url: "/settings/models/providers/volcengine-tts",
-      payload: { apiKey: "test-key" },
-    });
-    expect(settings.statusCode).toBe(200);
-    const seedAudioSettings = await app.inject({
-      method: "PUT",
-      url: "/settings/models/providers/volcengine-seed-audio",
-      payload: { apiKey: "seed-audio-key" },
-    });
-    expect(seedAudioSettings.statusCode).toBe(200);
+    const catalog = (await app.inject({ method: "GET", url: "/audio-models/catalog" })).json();
+    expect(catalog.models).toEqual(expect.arrayContaining([
+      expect.objectContaining({ provider: "volcengine-tts", id: "seed-audio-1.0", capabilities: expect.objectContaining({ operationStatus: { speech: "unverified" } }) }),
+      expect.objectContaining({ provider: "volcengine-seed-audio", id: "seed-audio-1.0", capabilities: expect.objectContaining({ operationStatus: { "sound-effect": "documented", music: "unverified" } }) }),
+    ]));
     const project = (await app.inject({ method: "POST", url: "/projects", payload: {} })).json();
     const conversation = (await app.inject({ method: "POST", url: `/projects/${project.id}/conversations` })).json();
 
@@ -950,25 +981,14 @@ describe("daemon", () => {
     });
 
     await vi.waitFor(() => expect(prompt).toHaveBeenCalled());
-    expect(setActiveToolsByName).toHaveBeenCalledWith([
-      "read",
-      "write",
-      "edit",
-      "bash",
-      "web_search",
-      "update_plan",
-      "install_plugin",
-      "generate_image",
-      "generate_3d_asset",
-      "generate_video",
-      "animate_3d_asset",
-      "generate_speech",
-      "generate_sound_effect",
-      "generate_music",
-    ]);
+    expect(setActiveToolsByName).toHaveBeenCalledWith(registered);
+    expect(setActiveToolsByName.mock.calls.at(-1)?.[0]).not.toEqual(expect.arrayContaining(["bash", "web_search", "install_plugin"]));
   });
 
-  it("accepts an image without text and passes it to Pi", async () => {
+  it.each([
+    ["png", REFERENCE_PNG],
+    ["gif", "R0lGODlhAwACAIAAAExpcVOEOiH5BAUAAAAALAAAAAADAAIAAAICjF8AOw=="],
+  ])("accepts a %s reference without text and keeps it in the conversation only", async (extension, data) => {
     const prompt = vi.fn<CodingSession["prompt"]>(async () => {});
     const app = createApp({
       dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-image-prompt-")),
@@ -983,7 +1003,7 @@ describe("daemon", () => {
     apps.push(app);
     const project = (await app.inject({ method: "POST", url: "/projects", payload: {} })).json();
     const conversation = (await app.inject({ method: "POST", url: `/projects/${project.id}/conversations` })).json();
-    const image = { name: "狗大王.PNG", mediaType: "image/png", data: "aW1hZ2U=" };
+    const image = { name: `狗大王.${extension.toUpperCase()}`, mediaType: `image/${extension}`, data };
 
     const response = await app.inject({
       method: "POST",
@@ -991,21 +1011,42 @@ describe("daemon", () => {
       payload: { prompt: "", images: [image] },
     });
 
-    expect(response.statusCode).toBe(202);
+    expect(response.statusCode, response.body).toBe(202);
     await vi.waitFor(() => expect(prompt).toHaveBeenCalledWith("", {
-      images: [{ type: "image", mimeType: "image/png", data: "aW1hZ2U=" }],
+      images: [expect.objectContaining({ type: "image", mimeType: image.mediaType, data })],
     }));
     await vi.waitFor(async () => {
       const detail = await app.inject({ method: "GET", url: `/projects/${project.id}/conversations/${conversation.id}` });
       expect(detail.json().agent.status).toBe("idle");
     });
     expect((await app.inject({ method: "POST", url: `/projects/${project.id}/conversations/${conversation.id}/turns`, payload: { prompt: "Again", images: [image] } })).statusCode).toBe(202);
-    expect((await app.inject({ method: "GET", url: "/library/assets" })).json()).toEqual([
-      expect.objectContaining({ name: "狗大王.png", mediaType: "image" }),
-    ]);
-    expect((await app.inject({ method: "GET", url: `/projects/${project.id}/files` })).json()).toEqual(expect.arrayContaining([
-      expect.objectContaining({ path: "assets/imported/狗大王.png", mediaType: "image" }),
-    ]));
+    expect((await app.inject({ method: "GET", url: "/library/assets" })).json()).toEqual([]);
+    expect((await app.inject({ method: "GET", url: `/projects/${project.id}/files` })).json()).toEqual([]);
+  });
+
+  it("rejects malformed or credential-bearing conversation images before starting the agent", async () => {
+    const createSession = vi.fn(async (): Promise<CodingSession> => { throw new Error("Unexpected agent request"); });
+    const app = createApp({ dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-rejected-reference-")), createSession });
+    apps.push(app);
+    const project = (await app.inject({ method: "POST", url: "/projects", payload: {} })).json();
+    const conversation = (await app.inject({ method: "POST", url: `/projects/${project.id}/conversations` })).json();
+    const png = Buffer.from(REFERENCE_PNG, "base64");
+    const marker = "CANARY_CHAT_IMAGE_PROTECTED_CONTENT";
+    registerSensitiveValue(marker);
+    for (const [mediaType, bytes, status] of [
+      ["image/jpeg", png, 400],
+      ["image/png", png.subarray(0, 8), 400],
+      ["image/png", Buffer.concat([png, Buffer.from(marker)]), 403],
+    ] as const) {
+      const response = await app.inject({
+        method: "POST", url: `/projects/${project.id}/conversations/${conversation.id}/turns`,
+        payload: { prompt: "Inspect", images: [{ mediaType, data: bytes.toString("base64") }] },
+      });
+      expect(response.statusCode, response.body).toBe(status);
+      expect(response.body).not.toContain(marker);
+    }
+    expect(createSession).not.toHaveBeenCalled();
+    expect((await app.inject({ method: "GET", url: "/library/assets" })).json()).toEqual([]);
   });
 
   it("stores dropped files outside the game workspace and gives the agent an attachment manifest", async () => {
@@ -1041,15 +1082,24 @@ describe("daemon", () => {
     const sent = await app.inject({
       method: "POST",
       url: `/projects/${project.id}/conversations/${conversation.id}/turns`,
-      payload: { prompt: "", attachments: [{ id: uploaded.json().id, batchId }] },
+      payload: { prompt: "", attachments: [{ id: uploaded.json().id, batchId }, { id: uploaded.json().id, batchId }] },
     });
 
     expect(sent.statusCode, sent.body).toBe(202);
     await vi.waitFor(() => expect(prompt).toHaveBeenCalledWith(expect.stringContaining("references/dialogue.json")));
     expect(prompt).toHaveBeenCalledWith(expect.stringContaining("untrusted reference material"));
+    const reference = `attachment:${batchId}/${uploaded.json().id}`;
+    expect(prompt).toHaveBeenCalledWith(expect.stringContaining(reference));
+    const [read, write] = createLocalAgentFileTools(project.workspacePath, undefined, false, (receipt) => receipt.batchId === batchId && receipt.id === uploaded.json().id);
+    expect((await read!.execute("inspect", { path: reference }, undefined, undefined, {} as never)).content)
+      .toEqual([{ type: "text", text: '{"opening":"Hello"}' }]);
+    await expect(write!.execute("replace", { path: reference, content: "changed" }, undefined, undefined, {} as never)).rejects.toThrow();
+    const file = path.join(project.workspacePath, ".data", "agent-attachments", batchId, "files", "references", "dialogue.json");
+    await link(file, path.join(project.workspacePath, "other.json"));
+    await expect(read!.execute("linked", { path: reference }, undefined, undefined, {} as never)).rejects.toThrow("Invalid stored attachment");
   });
 
-  it("passes a verified image attachment to a vision-capable agent", async () => {
+  it("passes an uploaded reference to a vision-capable agent when the game exceeds its source limit", async () => {
     const prompt = vi.fn<CodingSession["prompt"]>(async () => {});
     const app = createApp({
       dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-agent-attachment-image-")),
@@ -1065,7 +1115,14 @@ describe("daemon", () => {
     const project = (await app.inject({ method: "POST", url: "/projects", payload: {} })).json();
     const conversation = (await app.inject({ method: "POST", url: `/projects/${project.id}/conversations` })).json();
     const batchId = "ae4a9775-641e-4595-bbc8-1f1de5fb889b";
-    const image = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const image = Buffer.from(REFERENCE_PNG, "base64");
+    await writeFile(path.join(project.workspacePath, "existing.png"), Buffer.alloc(2 * 1024 * 1024 + 1));
+    const saved = await app.inject({ method: "POST", url: "/library/assets", payload: {
+      name: "Library original.png", purpose: "asset", image: { mediaType: "image/png", data: REFERENCE_PNG },
+    } });
+    expect(saved.statusCode, saved.body).toBe(201);
+    const before = (await app.inject({ method: "GET", url: "/library/assets" })).json();
+    expect(before).toMatchObject([{ id: saved.json().id, purpose: "asset", referenceOnly: false, projects: [] }]);
     const uploaded = await app.inject({
       method: "POST",
       url: `/projects/${project.id}/attachments?batchId=${batchId}&name=hero.png`,
@@ -1075,6 +1132,10 @@ describe("daemon", () => {
 
     expect(uploaded.statusCode).toBe(201);
     expect(uploaded.json()).toMatchObject({ kind: "image", mediaType: "image/png" });
+    const stored = await resolveAgentAttachment(project.workspacePath, uploaded.json());
+    await expect(new AgentAttachmentStore().promptImage(project, stored, REFERENCE_PNG.length - 1))
+      .rejects.toMatchObject({ statusCode: 413 });
+
     const sent = await app.inject({
       method: "POST",
       url: `/projects/${project.id}/conversations/${conversation.id}/turns`,
@@ -1083,14 +1144,20 @@ describe("daemon", () => {
 
     expect(sent.statusCode, sent.body).toBe(202);
     await vi.waitFor(() => expect(prompt).toHaveBeenCalledWith(expect.stringContaining("hero.png"), {
-      images: [{ type: "image", mimeType: "image/png", data: image.toString("base64") }],
+      images: [expect.objectContaining({ type: "image", mimeType: "image/png", data: REFERENCE_PNG })],
     }));
-    expect((await app.inject({ method: "GET", url: "/library/assets" })).json()).toEqual([
-      expect.objectContaining({ name: "hero.png", mediaType: "image" }),
-    ]);
-    expect((await app.inject({ method: "GET", url: `/projects/${project.id}/files` })).json()).toEqual(expect.arrayContaining([
-      expect.objectContaining({ path: "assets/imported/hero.png", mediaType: "image" }),
-    ]));
+    const reference = `attachment:${batchId}/${uploaded.json().id}`;
+    expect(prompt).toHaveBeenCalledWith(expect.stringContaining(reference), expect.anything());
+    const read = createLocalAgentFileTools(project.workspacePath, undefined, true, (receipt) => receipt.batchId === batchId && receipt.id === uploaded.json().id)[0]!;
+    expect((await read.execute("reference", { path: reference }, undefined, undefined, {} as never)).content)
+      .toEqual([{ type: "image", mimeType: "image/png", data: REFERENCE_PNG }]);
+    expect(await readFile(stored.absolutePath)).toEqual(image);
+    expect((await app.inject({ method: "GET", url: "/library/assets" })).json()).toEqual(before);
+    expect((await app.inject({ method: "GET", url: `/projects/${project.id}/files` })).json()).toMatchObject([{ path: "existing.png" }]);
+    const imported = await app.inject({ method: "POST", url: `/projects/${project.id}/library-assets/${saved.json().id}` });
+    expect(imported.statusCode, imported.body).toBe(400);
+    expect(imported.json().error).toContain("isolated source limits");
+    await expect(stat(path.join(project.workspacePath, "assets/imported/Library original.png"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("rejects unsafe folder paths in agent attachments", async () => {
@@ -1108,6 +1175,26 @@ describe("daemon", () => {
 
     expect(response.statusCode).toBe(400);
     expect(response.json()).toEqual({ error: "Invalid attachment path" });
+  });
+
+  it("rejects linked attachment storage before writing uploads or pruning expired batches", async () => {
+    const data = await mkdtemp(path.join(tmpdir(), "ohmygame-attachment-links-"));
+    const app = createApp({ dataDirectory: data });
+    apps.push(app);
+    const project = (await app.inject({ method: "POST", url: "/projects", payload: {} })).json();
+    const outside = path.join(data, "outside");
+    const batchId = "f8b3c92d-5017-4d83-bf05-946208ee2b1a";
+    const expired = path.join(outside, "agent-attachments", "17d3e762-a161-4ab3-bc3c-9e28673f17e4");
+    await mkdir(expired, { recursive: true });
+    await writeFile(path.join(expired, "keep.txt"), "keep");
+    await utimes(expired, new Date(0), new Date(0));
+    await rm(path.join(project.workspacePath, ".data"), { recursive: true, force: true });
+    await symlink(outside, path.join(project.workspacePath, ".data"), "junction");
+    const result = await app.inject({ method: "POST", url: `/projects/${project.id}/attachments?batchId=${batchId}&name=notes.txt`,
+      headers: { "content-type": "application/vnd.ohmygame.attachment" }, payload: "sample" });
+    expect(result.statusCode).toBe(409);
+    expect(await readdir(path.join(outside, "agent-attachments"))).toEqual([path.basename(expired)]);
+    expect(await readFile(path.join(expired, "keep.txt"), "utf8")).toBe("keep");
   });
 
   it("rejects attachment metadata that no longer matches its file", async () => {
@@ -1200,7 +1287,7 @@ describe("daemon", () => {
     apps.push(app);
     const project = (await app.inject({ method: "POST", url: "/projects", payload: {} })).json();
     const conversation = (await app.inject({ method: "POST", url: `/projects/${project.id}/conversations` })).json();
-    const image = { mediaType: "image/png", data: "aW1hZ2U=" };
+    const image = { mediaType: "image/png", data: REFERENCE_PNG };
     const turn = await app.inject({
       method: "POST",
       url: `/projects/${project.id}/conversations/${conversation.id}/turns`,
@@ -1419,15 +1506,16 @@ describe("daemon", () => {
   });
 
   it("opens an idle event stream immediately", async () => {
-    const app = createApp({ dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-sse-")) });
+    const headers = { authorization: "Bearer local-stream-test" };
+    const app = createApp({ dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-sse-")), accessToken: "local-stream-test" });
     apps.push(app);
     const address = await app.listen({ host: "127.0.0.1", port: 0 });
-    const project = (await app.inject({ method: "POST", url: "/projects", payload: {} })).json();
+    const project = (await app.inject({ method: "POST", url: "/projects", payload: {}, headers })).json();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 2_000);
 
     try {
-      const response = await fetch(`${address}/projects/${project.id}/events`, { signal: controller.signal });
+      const response = await fetch(`${address}/projects/${project.id}/events`, { signal: controller.signal, headers });
       const chunk = await response.body?.getReader().read();
       expect(response.status).toBe(200);
       expect(new TextDecoder().decode(chunk?.value)).toBe(": connected\n\n");
@@ -1473,7 +1561,7 @@ describe("daemon", () => {
     expect(unchangedProject.json().name).toBe(project.name);
   });
 
-  it("lists Pi models and stores a conversation model without starting a session", async () => {
+  it("stores explicit conversation choices and retains project defaults independently of configured models", async () => {
     const first = { provider: "provider-one", id: "model-one", name: "Model One", reasoning: true };
     const second = { provider: "provider-one", id: "model-two", name: "Model Two", reasoning: true };
     const runtime = fakeModelRuntime([first, second]);
@@ -1500,6 +1588,15 @@ describe("daemon", () => {
       url: `/projects/${project.id}/conversations`,
       payload: {},
     });
+    expect(createdWithDefaults.statusCode, createdWithDefaults.body).toBe(201);
+    const projectDefault = await app.inject({ method: "GET", url: `/projects/${project.id}/conversations/${createdWithDefaults.json().id}` });
+    expect(projectDefault.json().settings).toEqual({ model: project.modelSelections.agent, reasoningLevel: "off" });
+    const createdWithExplicitModel = await app.inject({
+      method: "POST",
+      url: `/projects/${project.id}/conversations`,
+      payload: { model: { provider: second.provider, id: second.id } },
+    });
+    expect(createdWithExplicitModel.statusCode).toBe(201);
     const changed = await app.inject({
       method: "PUT",
       url: `/projects/${project.id}/conversations/${created.json().id}/model`,
@@ -1511,7 +1608,7 @@ describe("daemon", () => {
     });
     const defaultDetail = await app.inject({
       method: "GET",
-      url: `/projects/${project.id}/conversations/${createdWithDefaults.json().id}`,
+      url: `/projects/${project.id}/conversations/${createdWithExplicitModel.json().id}`,
     });
     const reasoning = await app.inject({
       method: "PUT",
@@ -1521,8 +1618,8 @@ describe("daemon", () => {
 
     expect(models.json()).toEqual({
       models: [
-        { provider: first.provider, providerName: first.provider, id: first.id, name: first.name, reasoningLevels: ["off", "minimal", "low", "medium", "high"] },
-        { provider: second.provider, providerName: second.provider, id: second.id, name: second.name, reasoningLevels: ["off", "minimal", "low", "medium", "high"] },
+        { provider: first.provider, providerName: first.provider, id: first.id, name: first.name, reasoningLevels: ["off", "minimal", "low", "medium", "high"], supportsImages: false },
+        { provider: second.provider, providerName: second.provider, id: second.id, name: second.name, reasoningLevels: ["off", "minimal", "low", "medium", "high"], supportsImages: false },
       ],
       defaultReasoningLevel: "medium",
     });
@@ -1600,18 +1697,15 @@ describe("daemon", () => {
     expect(unregisterProvider).not.toHaveBeenCalled();
   });
 
-  it("drops the custom OpenAI endpoint once ChatGPT sign-in completes", async () => {
+  it("refuses retired ChatGPT sign-in without invoking the SDK or changing stored endpoint metadata", async () => {
     const registerProvider = vi.fn();
     const unregisterProvider = vi.fn();
-    let credentials: Array<{ providerId: string; type: string }> = [];
+    const loginProvider = vi.fn(async () => ({ type: "oauth" }));
     const runtime = {
       ...fakeModelRuntime([]),
       getProvider: (provider: string) => ({ name: provider, auth: { oauth: {}, apiKey: { login: true } } }),
-      listCredentials: async () => credentials,
-      login: async () => {
-        credentials = [{ providerId: "openai", type: "oauth" }];
-        return { type: "oauth" };
-      },
+      listCredentials: async () => [],
+      login: loginProvider,
       registerProvider,
       unregisterProvider,
     } as unknown as ModelRuntime;
@@ -1625,8 +1719,10 @@ describe("daemon", () => {
     expect(registerProvider).toHaveBeenCalledWith("openai", { baseUrl: "https://relay.example/v1" });
 
     const login = await app.inject({ method: "POST", url: "/settings/models/providers/openai/login", payload: { method: "oauth" } });
-    expect(login.statusCode).toBe(202);
-    await vi.waitFor(() => expect(unregisterProvider).toHaveBeenCalledWith("openai"));
+    expect(login.statusCode).toBe(403);
+    expect(loginProvider).not.toHaveBeenCalled();
+    expect(unregisterProvider).not.toHaveBeenCalled();
+    expect((await app.inject({ method: "GET", url: "/settings/models/providers/openai/endpoint" })).json()).toEqual({ baseUrl: "https://relay.example/v1" });
   });
 
   it("does not expose the removed Cloud model connection", async () => {
@@ -1636,205 +1732,126 @@ describe("daemon", () => {
     expect(connected.statusCode).toBe(404);
   });
 
-  it("stores and clears Meshy credentials", async () => {
-    const app = createApp({ dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-meshy-settings-")) });
+  it("rejects new legacy media credentials, lists only stored key names, and clears a key without changing model defaults", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-retired-media-"));
+    const ids = ["meshy", "tripo", "hyper3d", "volcengine-ark", "byteplus-modelark", "minimax-video-cn", "minimax-video-global"];
+    const preferences = { version: 1, hidden: {}, defaultModel3D: { provider: "meshy", id: "my-model" } };
+    await Promise.all(Object.entries({
+      "meshy.json": { version: 1, apiKey: "legacy-shared-test" },
+      "minimax.json": { version: 1, cnApiKey: "legacy-cn-test", globalApiKey: "legacy-global-test" },
+      "model-visibility.json": preferences,
+    }).map(([file, contents]) => writeFile(path.join(directory, file), JSON.stringify(contents))));
+    const request = vi.fn<typeof fetch>();
+    const app = createApp({ dataDirectory: directory, videoFetch: request, model3DFetch: request });
     apps.push(app);
-
-    expect((await app.inject({ method: "GET", url: "/settings/models/providers/meshy" })).json())
-      .toEqual({ configured: false });
-    expect((await app.inject({
-      method: "PUT",
-      url: "/settings/models/providers/meshy",
-      payload: { apiKey: "meshy-key" },
-    })).json()).toEqual({ configured: true });
-    expect((await app.inject({ method: "DELETE", url: "/settings/models/providers/meshy" })).statusCode).toBe(204);
-    expect((await app.inject({ method: "GET", url: "/settings/models/providers/meshy" })).json())
-      .toEqual({ configured: false });
-    expect((await app.inject({ method: "PUT", url: "/settings/models/providers/meshy", payload: {} })).statusCode).toBe(400);
+    const url = "/settings/models/legacy-media-keys";
+    for (const id of ids) {
+      const suffix = id.startsWith("minimax") ? "/minimax-key" : ["volcengine-ark", "byteplus-modelark"].includes(id) ? "/seedance-key" : "";
+      const denied = await app.inject({ method: "PUT", url: `/settings/models/providers/${id}${suffix}`, payload: { apiKey: "rejected-test-key" } });
+      expect(denied.statusCode, denied.body).toBe(410);
+      expect(denied.body).not.toContain("rejected-test-key");
+    }
+    expect((await app.inject("/settings/models/providers/meshy")).json()).toEqual({ configured: false, hasSavedKey: true });
+    const listed = (await app.inject(url)).json();
+    expect(listed).toEqual([{ id: "meshy", name: "Meshy" }, { id: "minimax-video-cn", name: "MiniMax China" }, { id: "minimax-video-global", name: "MiniMax Global" }]);
+    expect((await app.inject("/model3d-models/catalog")).json()).toMatchObject({ models: [], providers: [] });
+    const videos = await app.inject("/video-models/catalog");
+    expect(videos.statusCode).toBe(200);
+    expect(videos.json().providers).not.toContainEqual(expect.objectContaining({ provider: "minimax-video-cn" }));
+    expect((await app.inject({ method: "DELETE", url: `${url}/minimax-video-cn` })).statusCode).toBe(204);
+    expect((await app.inject({ method: "DELETE", url: `${url}/meshy` })).statusCode).toBe(204);
+    expect((await app.inject({ method: "DELETE", url: `${url}/kunpo` })).statusCode).toBe(404);
+    expect((await app.inject(url)).json()).toEqual([listed[2]]);
+    expect(JSON.parse(await readFile(path.join(directory, "minimax.json"), "utf8"))).toEqual({ version: 1, globalApiKey: "legacy-global-test" });
+    expect(JSON.parse(await readFile(path.join(directory, "model-visibility.json"), "utf8"))).toEqual(preferences);
+    expect((await app.inject("/settings/models/providers/meshy")).json()).toEqual({ configured: false, hasSavedKey: false });
+    expect(request).not.toHaveBeenCalled();
   });
 
-  it("stores official Seedance credentials independently without exposing their values", async () => {
-    const app = createApp({ dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-seedance-settings-")) });
+  it("does not expose legacy Seedance connections or use their keys to configure Kunpo", async () => {
+    const request = vi.fn<typeof fetch>();
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "ohmygame-seedance-settings-"));
+    await writeFile(path.join(dataDirectory, "seedance.json"), JSON.stringify({ version: 1, volcengineApiKey: "volc-key", byteplusApiKey: "byteplus-key" }));
+    const app = createApp({ dataDirectory, videoFetch: request });
     apps.push(app);
 
     const initial = await app.inject({ method: "GET", url: "/settings/providers" });
-    expect(initial.json()).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: "volcengine-ark", configured: false, status: "not_configured", capabilities: ["image", "video"] }),
-      expect.objectContaining({ id: "byteplus-modelark", configured: false, status: "not_configured", capabilities: ["video"] }),
-    ]));
+    expect(initial.json()).toContainEqual(expect.objectContaining({ id: "kunpo", configured: false }));
+    expect(initial.json().some((provider: { id: string }) => ["volcengine-ark", "byteplus-modelark"].includes(provider.id))).toBe(false);
     expect(initial.body).not.toContain("volc-key");
 
-    expect((await app.inject({
-      method: "PUT",
-      url: "/settings/models/providers/volcengine-ark/seedance-key",
-      payload: { apiKey: "volc-key" },
-    })).json()).toEqual({ configured: true });
-    expect((await app.inject({
-      method: "PUT",
-      url: "/settings/models/providers/byteplus-modelark/seedance-key",
-      payload: { apiKey: "byteplus-key" },
-    })).json()).toEqual({ configured: true });
-
     const configured = await app.inject({ method: "GET", url: "/settings/providers" });
-    expect(configured.json()).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: "volcengine-ark", configured: true, status: "connected" }),
-      expect.objectContaining({ id: "byteplus-modelark", configured: true, status: "connected" }),
-    ]));
+    expect(configured.json()).toContainEqual(expect.objectContaining({ id: "kunpo", configured: false }));
+    expect(configured.json().some((provider: { id: string }) => ["volcengine-ark", "byteplus-modelark"].includes(provider.id))).toBe(false);
     expect(configured.body).not.toContain("volc-key");
     expect(configured.body).not.toContain("byteplus-key");
 
+    const submitted = await app.inject({ method: "POST", url: "/tools/generate-video/jobs", payload: {
+      prompt: "No native key migration", model: { provider: "volcengine-ark", id: "doubao-seedance-2-5-260628" },
+    } });
+    expect(submitted.statusCode).toBe(202);
+    await vi.waitFor(async () => {
+      const jobs = (await app.inject({ url: "/tool-jobs" })).json();
+      expect(jobs.find((job: { id: string }) => job.id === submitted.json().id)?.status).toBe("failed");
+    });
+    expect(request).not.toHaveBeenCalled();
+
     expect((await app.inject({ method: "DELETE", url: "/settings/models/providers/volcengine-ark/seedance-key" })).statusCode).toBe(204);
     const afterDomesticClear = (await app.inject({ method: "GET", url: "/settings/providers" })).json();
-    expect(afterDomesticClear).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: "volcengine-ark", configured: false }),
-      expect.objectContaining({ id: "byteplus-modelark", configured: true }),
-    ]));
-    expect((await app.inject({ method: "PUT", url: "/settings/models/providers/openrouter/seedance-key", payload: { apiKey: "wrong" } })).statusCode).toBe(404);
+    expect(afterDomesticClear).toContainEqual(expect.objectContaining({ id: "kunpo", configured: false }));
+    expect(afterDomesticClear.some((provider: { id: string }) => ["volcengine-ark", "byteplus-modelark"].includes(provider.id))).toBe(false);
+    expect((await app.inject({ method: "PUT", url: "/settings/models/providers/openrouter/seedance-key", payload: { apiKey: "sk-rejected-native-seedance-unique-canary-only" } })).statusCode).toBe(404);
     expect((await app.inject({ method: "DELETE", url: "/settings/models/providers/openrouter/seedance-key" })).statusCode).toBe(404);
   });
 
-  it("stores the Doubao Speech key and default voice without exposing them", async () => {
-    const app = createApp({ dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-volcengine-tts-settings-")) });
-    apps.push(app);
-
-    expect((await app.inject({ method: "GET", url: "/settings/models/providers/volcengine-tts" })).json())
-      .toEqual({ configured: false });
-    expect((await app.inject({ method: "GET", url: "/audio-models/catalog" })).json()).toEqual({
-      models: [],
-      providers: [
-        expect.objectContaining({ provider: "volcengine-tts", configured: false, state: "not_configured" }),
-        expect.objectContaining({ provider: "volcengine-seed-audio", configured: false, state: "not_configured" }),
-      ],
-    });
-    expect((await app.inject({
-      method: "PUT",
-      url: "/settings/models/providers/volcengine-tts",
-      payload: { defaultVoiceId: "zh_female_vv_uranus_bigtts" },
-    })).statusCode).toBe(400);
-
-    expect((await app.inject({
-      method: "PUT",
-      url: "/settings/models/providers/volcengine-tts",
-      payload: { apiKey: "doubao-key" },
-    })).json()).toEqual({ configured: true });
-    expect((await app.inject({
-      method: "PUT",
-      url: "/settings/models/providers/volcengine-tts",
-      payload: { defaultVoiceId: "zh_female_vv_uranus_bigtts" },
-    })).json()).toEqual({ configured: true, defaultVoiceId: "zh_female_vv_uranus_bigtts" });
-    expect((await app.inject({ method: "GET", url: "/settings/models/providers/volcengine-tts" })).json())
-      .toEqual({ configured: true, defaultVoiceId: "zh_female_vv_uranus_bigtts" });
-
-    const providers = (await app.inject({ method: "GET", url: "/settings/providers" })).json();
-    expect(providers).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: "volcengine-tts", configured: true, capabilities: ["audio"] }),
-    ]));
-    expect(JSON.stringify(providers)).not.toContain("doubao-key");
-
-    expect((await app.inject({ method: "GET", url: "/audio-models/catalog" })).json()).toEqual({
-      models: [expect.objectContaining({ provider: "volcengine-tts", id: "seed-tts-2.0" })],
-      providers: [
-        expect.objectContaining({ provider: "volcengine-tts", state: "ready" }),
-        expect.objectContaining({ provider: "volcengine-seed-audio", state: "not_configured" }),
-      ],
-    });
-
-    expect((await app.inject({
-      method: "PUT",
-      url: "/settings/models/providers/volcengine-tts",
-      payload: { defaultVoiceId: null },
-    })).json()).toEqual({ configured: true });
-    expect((await app.inject({ method: "DELETE", url: "/settings/models/providers/volcengine-tts" })).statusCode).toBe(204);
-    expect((await app.inject({ method: "GET", url: "/settings/models/providers/volcengine-tts" })).json())
-      .toEqual({ configured: false });
-    expect((await app.inject({ method: "GET", url: "/audio-models/catalog" })).json()).toEqual({
-      models: [],
-      providers: [
-        expect.objectContaining({ provider: "volcengine-tts", state: "not_configured" }),
-        expect.objectContaining({ provider: "volcengine-seed-audio", state: "not_configured" }),
-      ],
-    });
-  });
-
-  it("stores the Doubao Seed Audio key independently and exposes compatible models", async () => {
-    const app = createApp({ dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-volcengine-seed-audio-settings-")) });
-    apps.push(app);
-
-    expect((await app.inject({ method: "GET", url: "/settings/models/providers/volcengine-seed-audio" })).json())
-      .toEqual({ configured: false });
-    expect((await app.inject({
-      method: "PUT",
-      url: "/settings/models/providers/volcengine-seed-audio",
-      payload: { apiKey: "seed-audio-key" },
-    })).json()).toEqual({ configured: true });
-
-    const providers = (await app.inject({ method: "GET", url: "/settings/providers" })).json();
-    expect(providers).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: "volcengine-seed-audio", configured: true, capabilities: ["audio"] }),
-      expect.objectContaining({ id: "volcengine-tts", configured: false }),
-    ]));
-    expect(JSON.stringify(providers)).not.toContain("seed-audio-key");
-
-    const catalog = (await app.inject({ method: "GET", url: "/audio-models/catalog" })).json();
-    expect(catalog.models).toEqual([
-      expect.objectContaining({
-        provider: "volcengine-seed-audio",
-        id: "seed-audio-1.0",
-        capabilities: expect.objectContaining({ operations: ["sound-effect", "music"] }),
-      }),
-    ]);
-    expect(catalog.providers).toEqual(expect.arrayContaining([
-      expect.objectContaining({ provider: "volcengine-seed-audio", state: "ready" }),
-      expect.objectContaining({ provider: "volcengine-tts", state: "not_configured" }),
-    ]));
-
-    expect((await app.inject({ method: "DELETE", url: "/settings/models/providers/volcengine-seed-audio" })).statusCode).toBe(204);
-    expect((await app.inject({ method: "GET", url: "/settings/models/providers/volcengine-seed-audio" })).json())
-      .toEqual({ configured: false });
-  });
-
-  it("previews Doubao Speech audio through the saved connection", async () => {
+  it.each([false, true])("retires global Speaker settings and preview without sending audio (connected=%s)", async (connected) => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-retired-speech-"));
+    const credential = "sk-retired-speech-route-canary";
+    const legacyFile = path.join(directory, "volcengine-tts.json");
+    const legacy = { version: 1, defaultVoiceId: "old-speaker" };
+    await writeFile(legacyFile, JSON.stringify(legacy), { mode: 0o600 });
+    if (connected) await new LocalApiKeyStore(path.join(directory, "local-api-keys.json")).modify("kunpo", async () => ({ type: "api_key", key: credential }));
     const audioFetch = vi.fn<typeof fetch>();
-    const app = createApp({
-      dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-volcengine-tts-preview-")),
-      audioFetch,
-    });
-    apps.push(app);
-
-    const unconfigured = await app.inject({
-      method: "POST",
-      url: "/settings/models/providers/volcengine-tts/preview",
-      payload: { text: "hello" },
-    });
-    expect(unconfigured.statusCode).toBe(503);
-
-    await app.inject({ method: "PUT", url: "/settings/models/providers/volcengine-tts", payload: { apiKey: "doubao-key" } });
-    audioFetch.mockResolvedValue(new Response(
-      `${JSON.stringify({ code: 0, data: Buffer.from("preview audio").toString("base64") })}\n`,
-      { status: 200, headers: { "x-tt-logid": "preview-log-1" } },
-    ));
-    const preview = await app.inject({
-      method: "POST",
-      url: "/settings/models/providers/volcengine-tts/preview",
-      payload: { text: "你好，雾港", voiceId: "zh_female_vv_uranus_bigtts" },
-    });
-    expect(preview.statusCode).toBe(200);
-    expect(preview.headers["content-type"]).toBe("audio/mpeg");
-    expect(preview.headers["x-provider-request-id"]).toBe("preview-log-1");
-    expect(preview.body).toBe("preview audio");
-    expect(audioFetch).toHaveBeenCalledTimes(1);
+    const app = createApp({ dataDirectory: directory, piAgentDirectory: directory, audioFetch });
+    const url = "/settings/models/providers/volcengine-tts";
+    try {
+      expect((await app.inject({ url })).json()).toEqual({ configured: connected });
+      const retired = [
+        await app.inject({ method: "PUT", url, payload: { defaultVoiceId: "new-speaker" } }),
+        await app.inject({ method: "PUT", url, payload: { apiKey: credential } }),
+        await app.inject({ method: "POST", url: url + "/preview", payload: { text: "hello" } }),
+      ];
+      for (const response of retired) {
+        expect(response.statusCode).toBe(410);
+        expect(response.json().error).toContain("speech node");
+        expect(response.body).not.toContain(credential);
+      }
+      expect(audioFetch).not.toHaveBeenCalled();
+      expect(JSON.parse(await readFile(legacyFile, "utf8"))).toEqual(legacy);
+      expect((await app.inject({ method: "DELETE", url })).statusCode).toBe(204);
+      await expect(stat(legacyFile)).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await app.inject({ url })).json()).toEqual({ configured: connected });
+    } finally {
+      await app.close();
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
-  it("offers 3D models once Meshy is configured", async () => {
-    const app = createApp({ dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-model3d-catalog-")) });
+  it("does not activate Kunpo audio with a retired native audio credential", async () => {
+    const app = createApp({ dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-kunpo-audio-settings-")) });
     apps.push(app);
-
-    expect((await app.inject({ method: "GET", url: "/model3d-models/catalog" })).json()).toEqual({ models: [], providers: [expect.objectContaining({ provider: "cloud-hyper3d", cloud: { availability: "sign_in_required" } })] });
-    await app.inject({ method: "PUT", url: "/settings/models/providers/meshy", payload: { apiKey: "meshy-key" } });
-    expect((await app.inject({ method: "GET", url: "/model3d-models/catalog" })).json()).toEqual({
-      models: MODEL_3D_MODELS.filter((model) => model.provider === "meshy"),
-      providers: [{ provider: "meshy", providerName: "Meshy", state: "ready" }, expect.objectContaining({ provider: "cloud-hyper3d", cloud: { availability: "sign_in_required" } })],
-    });
+    const settingsUrl = "/settings/models/providers/volcengine-seed-audio";
+    expect((await app.inject({ method: "GET", url: settingsUrl })).json()).toEqual({ configured: false });
+    const retired = await app.inject({ method: "PUT", url: settingsUrl, payload: { apiKey: "sk-retired-audio-canary" } });
+    expect(retired.statusCode).toBe(410);
+    expect(retired.json().error).toContain("KunpoAPI");
+    expect(retired.body).not.toContain("sk-retired-audio-canary");
+    expect((await app.inject({ method: "GET", url: "/audio-models/catalog" })).json().models).toEqual([]);
+    expect((await app.inject({ method: "GET", url: "/settings/providers" })).json()).toEqual([
+      expect.objectContaining({ id: "kunpo", configured: false, capabilities: ["language", "image", "video", "audio", "3d"] }),
+    ]);
+    expect((await app.inject({ method: "DELETE", url: settingsUrl })).statusCode).toBe(204);
+    expect((await app.inject({ method: "GET", url: settingsUrl })).json()).toEqual({ configured: false });
   });
 
   it("validates request bodies before they reach a manager", async () => {
@@ -2160,10 +2177,12 @@ function sessionEntry(id: string, parentId: string | null, timestamp: string, me
 
 function fakeModelRuntime(models: Array<{ provider: string; id: string; name: string }>): ModelRuntime {
   return {
+    getModels: (provider?: string) => models.filter((model) => !provider || model.provider === provider),
     getAvailable: async (provider?: string) => models.filter((model) => !provider || model.provider === provider),
     getProvider: (provider: string) => ({ name: provider }),
     getModel: (provider: string, id: string) => models.find((model) => model.provider === provider && model.id === id),
     hasConfiguredAuth: () => true,
+    getAuth: async () => undefined,
   } as unknown as ModelRuntime;
 }
 
@@ -2454,7 +2473,7 @@ describe("Playable Nodes projects", () => {
     const exported = await app.inject({ method: "POST", url: `/projects/${story.id}/export` });
     const webExport = await app.inject({ method: "POST", url: `/projects/${webGame.id}/export` });
 
-    expect(exported.statusCode).toBe(200);
+    expect(exported.statusCode, exported.body).toBe(200);
     expect(exported.headers["content-type"]).toBe("application/zip");
     expect(exported.rawPayload.subarray(0, 2).toString()).toBe("PK");
     expect(webExport.statusCode).toBe(200);

@@ -47,6 +47,7 @@ vi.doMock(path.resolve("src/renderer/api.ts"), async (original) => ({
   ...(await original<typeof import("../src/renderer/api.js")>()),
   listImageModelCatalog: async () => ({ models: [], providers: [] }),
   listVideoModelCatalog: async () => ({ models: [], providers: [] }),
+  listAudioModelCatalog: async () => ({ models: [], providers: [] }),
   listModel3DCatalog: async () => ({ models: [], providers: [] }),
   listModel3DOperations: async () => [],
 }));
@@ -103,6 +104,7 @@ beforeEach(async () => {
     generate: async () => {
       throw new Error("Not used in selection tests");
     },
+    recoverImage: vi.fn(),
     cancel: async () => {
       throw new Error("Not used in selection tests");
     },
@@ -241,4 +243,28 @@ it("leaves Enter and Space in node controls to those controls", async () => {
     await press(target, " ");
     expect(flowNode("image").data.panelOpen).toBe(false);
   }
+});
+
+
+it("selects unselected nodes when clicking nondraggable areas without stealing input focus or collapsing modifier selection", async () => {
+  for (const area of ["blank", "button", "input"] as const) {
+    await select(["video"]);
+    const node = nodeElement("image");
+    const target = area === "button" ? node.querySelector("button")! : area === "input" ? node.querySelector("textarea")! : node;
+    if (area === "input") target.focus();
+    let actions = 0;
+    const action = () => actions++;
+    target.addEventListener("click", action);
+    await act(async () => {
+      target.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      captured.props!.onNodeClick!({ target, shiftKey: false, ctrlKey: false, metaKey: false } as never, flowNode("image"));
+    });
+    expect(flowNode("image").selected).toBe(true); expect(flowNode("image").data.panelOpen).toBe(true);
+    expect(flowNode("video").selected).toBe(false); expect(actions).toBe(1);
+    if (area === "input") expect(document.activeElement).toBe(target);
+    target.removeEventListener("click", action);
+  }
+  await select(["image", "video"]);
+  await act(async () => captured.props!.onNodeClick!({ target: nodeElement("image"), shiftKey: true } as never, flowNode("image")));
+  expect(flowNode("image").selected).toBe(true); expect(flowNode("video").selected).toBe(true);
 });

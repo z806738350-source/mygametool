@@ -1,11 +1,12 @@
-import { useEffect, useRef, useState, type ReactNode, type Ref, type RefObject } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type Ref, type RefObject } from "react";
 import { X } from "./icons.js";
 import { ModelPreview } from "./model-preview.js";
 import { t } from "./i18n.js";
+import { releaseImage, releaseMedia } from "./release-media.js";
 
 export type AssetMediaType = "image" | "video" | "audio" | "model";
 
-export function useNearViewport<T extends Element>(): readonly [RefObject<T | null>, boolean] {
+export function useNearViewport<T extends Element>(trackExit = false): readonly [RefObject<T | null>, boolean] {
   const target = useRef<T>(null);
   const [visible, setVisible] = useState(false);
 
@@ -16,13 +17,13 @@ export function useNearViewport<T extends Element>(): readonly [RefObject<T | nu
       return;
     }
     const observer = new IntersectionObserver(([entry]) => {
-      if (!entry?.isIntersecting) return;
-      setVisible(true);
-      observer.disconnect();
+      if (!entry) return;
+      setVisible(entry.isIntersecting);
+      if (entry.isIntersecting && !trackExit) observer.disconnect();
     }, { rootMargin: "160px" });
     observer.observe(node);
     return () => observer.disconnect();
-  }, []);
+  }, [trackExit]);
 
   return [target, visible] as const;
 }
@@ -118,9 +119,14 @@ export function AssetDialogShell({ title, subtitle, preview, footer, headerActio
   </div>;
 }
 
-export function AssetMedia({ type, url, label }: { type: AssetMediaType; url: string; label: string }) {
-  if (type === "image") return <img src={url} alt={label} />;
-  if (type === "video") return <video src={url} controls preload="metadata" />;
-  if (type === "audio") return <audio src={url} controls />;
-  return <ModelPreview source={url} label={label} minHeight={420} />;
+export function AssetMedia({ type, url, label, onModelError }: { type: AssetMediaType; url: string; label: string; onModelError?: () => void }) {
+  const image = useRef<HTMLImageElement>(null), video = useRef<HTMLVideoElement>(null), audio = useRef<HTMLAudioElement>(null);
+  useLayoutEffect(() => {
+    const imageElement = image.current, videoElement = video.current, audioElement = audio.current;
+    return () => { releaseImage(imageElement, url); releaseMedia(videoElement, url); releaseMedia(audioElement, url); };
+  }, [type, url]);
+  if (type === "image") return <img ref={image} src={url} alt={label} />;
+  if (type === "video") return <video ref={video} src={url} controls preload="metadata" />;
+  if (type === "audio") return <audio ref={audio} src={url} controls />;
+  return <ModelPreview source={url} label={label} minHeight={420} onError={onModelError} />;
 }

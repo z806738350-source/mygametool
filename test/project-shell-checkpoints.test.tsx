@@ -100,7 +100,7 @@ async function openProject(
     ComponentProps<
       typeof import("../src/renderer/project-shell.js").ProjectShell
     >,
-    "initialPrompt" | "onInitialPromptHandled" | "onOpenConversation"
+    "initialPrompt" | "onInitialPromptHandled" | "onOpenConversation" | "onHome"
   >> = {},
 ) {
   Object.defineProperty(window, "ohMyGameDesktop", {
@@ -244,6 +244,44 @@ async function click(name: string) {
 }
 
 describe("checkpoints in the project shell", () => {
+  it("shows an asynchronous no-key bootstrap error without changing hook order or losing navigation", async () => {
+    const onHome = vi.fn();
+    let finish!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => { finish = resolve; });
+    const empty = detail("unused");
+    empty.turns = []; empty.conversation.messageCount = 0;
+    await openProject((route, init) => {
+      if (route === "/projects/project/conversations") return init.method === "POST" ? pending : Response.json([]);
+    }, empty, { onHome });
+    expect(container.querySelector(".pane-error-boundary")).toBeNull();
+    await act(async () => finish(Response.json({ error: "Configure KunpoAPI before sending messages." }, { status: 409 })));
+    await settle();
+    expect(container.textContent).toContain("Configure KunpoAPI before sending messages.");
+    expect(container.querySelector(".pane-error-boundary")).toBeNull();
+    await click("Back to Projects");
+    expect(onHome).toHaveBeenCalledOnce();
+  });
+
+  it("loads an unconfigured Kunpo conversation asynchronously while keeping the local project editable", async () => {
+    let finish!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => { finish = resolve; });
+    const empty = detail("unused");
+    empty.turns = []; empty.conversation.messageCount = 0;
+    empty.settings = { model: { provider: "kunpo", id: "gpt-5.6-sol" } };
+    const daemon = await openProject((route, init) => {
+      if (route === "/projects/project") return Response.json({ id: "project", name: "Blank local game", type: "web-game", workspacePath: "/tmp/project", updatedAt: new Date(0).toISOString(), preview: { status: "stopped" }, modelSelections: { agent: empty.settings.model } });
+      if (route === "/projects/project/conversations") return init.method === "POST" ? pending : Response.json([]);
+    }, empty);
+    expect(container.querySelector<HTMLTextAreaElement>("textarea")?.disabled).toBe(true);
+    await act(async () => finish(Response.json(empty.conversation, { status: 201 })));
+    await settle();
+    expect(container.querySelector(".pane-error-boundary")).toBeNull();
+    expect(container.querySelector<HTMLTextAreaElement>("textarea")?.disabled).toBe(false);
+    expect(container.querySelector(".model-selector-trigger")?.textContent).toContain("gpt-5.6-sol");
+    expect(JSON.parse(daemon.requests.find((request) => request.route === "/projects/project/conversations" && request.method === "POST")!.body!)).toMatchObject({ model: empty.settings.model });
+    expect(daemon.requests.some((request) => request.route.endsWith("/turns") && request.method === "POST")).toBe(false);
+  });
+
   it("retains the initial message after cancelling plugin setup and allows sending it after connection", async () => {
     let ready = false;
     const handled = vi.fn();

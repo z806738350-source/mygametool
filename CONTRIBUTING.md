@@ -7,6 +7,13 @@ This guide covers the path from choosing work to getting a PR reviewed.
 See the [documentation index](docs/README.md) for module guides and the
 [中文快速指引](docs/contributing.zh-CN.md) for a short introduction in Chinese.
 
+This checkout is a local secure source edition. Start with
+[local security policy](docs/local-security.md): upstream feature guides retain
+framework contracts that may be disabled here. Environment variables cannot
+restore accounts, cloud publishing/quotas, telemetry, remote updates, or arbitrary
+execution. Selected isolated local workflows have passed runtime verification;
+see that policy for the current limits.
+
 ## Choose something to work on
 
 - Search [existing issues](https://github.com/WhiteTowerAI/ohmygame/issues)
@@ -59,50 +66,46 @@ CI pins Bun 1.4.2 and Node.js 22.19.0. Use those versions when investigating a
 difference between local checks and CI.
 
 ```bash
-bun install --frozen-lockfile
-bun run dev            # web renderer + local daemon
-# or
-bun run dev:desktop    # Electron app + local daemon
+ELECTRON_SKIP_BINARY_DOWNLOAD=1 bun install --frozen-lockfile --ignore-scripts
 ```
 
-For browser development, open <http://127.0.0.1:43120>. Vite forwards API
-requests to the daemon at `127.0.0.1:43110`.
+Use this modified checkout; a fresh clone of upstream does not include these
+security changes. Installation downloads locked packages without lifecycle
+scripts. Do not rerun install scripts to resolve an error without reviewing
+their contents and separately approving that execution. Native binaries may
+remain unavailable; Electron's executable is not installed by this step.
 
-No `.env.local`, Supabase setup, cloud repository access, or model credentials
-are needed to start the app and work on its interface or run the public checks.
-Development on localhost uses a local debug account when either Supabase value
-is missing. Click **Sign in** to use it. Local publishing builds the game and
-serves a temporary snapshot in Community while the daemon runs.
+The local security work has also run separately approved checks and isolated
+development acceptance. Review downloaded code before extending that scope.
+After those gates, `bun run dev` is the browser development entry point at
+<http://127.0.0.1:43120>, forwarding API requests to the authenticated loopback
+daemon at `127.0.0.1:43110`. Desktop startup additionally needs a separately
+reviewed Electron binary. No model credentials or account configuration are
+required to inspect the interface.
 
-New installations show three steps: welcome, AI connection, and optional creative
-tools. OhMyGame (Pi) is enabled by default and needs a model provider; an installed
-coding agent CLI can also supply the conversation model. Choose the default model
-on the connection screen and click **Next**. The final screen connects image,
-video, 3D, and audio providers; **Start creating** enters without requiring media setup.
-**Skip and start** on the connection screen enters without a language model.
-Providers and models can also be set up in **Settings → Providers & Models**, and
-coding agent CLIs in **Settings → Agents**. Public tests use fixtures and simulated
-providers.
+### Local edition limits and preparation
 
-Bun installs dependencies and runs the build/test toolchain. The standalone
-daemon and pinned plugin preparation use Node; desktop development runs the
-daemon with Electron's Node. Game workspaces retain their own package-manager
-choices. See [runtime.md](docs/runtime.md) for these boundaries.
-
-### First-start preparation and common problems
-
-- The development commands prepare pinned plugins and examples under `.runtime/`.
-  First startup needs network access to GitHub and package registries; prepared
-  resources are reused on later starts.
-- Plugin preparation is required. If its download or checksum check fails,
-  check the connection and run `bun run prepare:preinstalled-plugins` again.
-- Example preparation clones and builds a separate repository using npm. A
-  failed preparation reports unavailable examples; retry with
-  `bun run prepare:examples` when the connection or npm setup is fixed.
-- Browser development uses fixed ports. Stop another local instance if either
-  port is occupied. Desktop development chooses a free daemon port.
-- Browser development does not provide Electron's `game_use` playtest tool.
-  Use `bun run dev:desktop` for desktop windows and agent playtesting.
+- No account login, debug identity, Community, cloud publishing or hosted model
+  quota is available. No environment variable enables these features.
+- Application Sentry/PostHog initialization, uploads and author update feeds are
+  removed or disabled. This is not a guarantee about every dependency or binary.
+- Startup no longer downloads remote examples or preinstalled plugins. Explicit
+  `prepare:examples` and `prepare:preinstalled-plugins` commands fail with a local
+  edition explanation; retrying them does not enable downloads.
+- External MCP servers, plugin code, host shell commands and other coding
+  agents remain disabled. The optional pinned, controlled Codex and first-stage
+  Qoder main-agent connections use separate sign-in; see [coding agents](docs/coding-agents.md). Controlled public npm dev/build is verified only in the explicitly
+  registered VM test/manual stores, which also offer guarded isolated_shell; ordinary stores remain disabled.
+- Model requests require an explicitly configured, reviewed endpoint and a
+  guarded protocol. Upstream model/provider listings are metadata, not proof of
+  support. Full KunpoAPI media compatibility remains unverified.
+- Browser and game resource restrictions are application policies, not an OS
+  network sandbox or verified WebRTC isolation.
+- Bun supplies the build/test toolchain. The standalone daemon uses Node;
+  desktop development uses Electron's Node. Browser development does not provide
+  Electron's `game_use` tool. See [runtime.md](docs/runtime.md) for upstream
+  architecture, with [local security policy](docs/local-security.md) taking
+  precedence for this edition.
 
 Browser development stores project data under `.data/`. Desktop development
 uses the app's user-data directory. Set `OHMYGAME_DATA_DIR` and
@@ -110,6 +113,9 @@ uses the app's user-data directory. Set `OHMYGAME_DATA_DIR` and
 isolated projects and agent settings. Neither directory belongs in a PR.
 
 ## Make and check your change
+
+Vitest gives each run a private temporary directory and removes it after all workers finish. Use the system temporary directory for generated project fixtures.
+
 
 Keep each PR focused on one feature, bug fix, documentation change, chore, or
 refactor. Use the [module map](docs/README.md#where-to-change-things) to find
@@ -126,37 +132,43 @@ changes in the PR description so they can be summarized for the next release.
 | Application behavior, dependencies, or CI | Run the public checks below. Add or update tests for new behavior and bug fixes; use a focused test while developing.                                        |
 | UI or desktop behavior                    | Run the public checks and exercise the affected flow in the browser or Electron as appropriate. Include screenshots or a short recording for visual changes. |
 | Plugin instructions or examples           | Check the relevant package/file contract and try the affected workflow in a project. If host behavior changes, run the public checks too.                    |
-| Cloud publishing integration              | Run the public checks and describe any cloud verification still needed. Maintainers with cloud access complete the remote contract and staging checks.       |
+| Disabled integration boundaries           | Test that the boundary fails closed without network requests or process execution; do not enable upstream services to make an old success test pass.        |
 
-For changes that need the public checks, run:
+After dependency review and explicit authorization for this security work,
+start with type checking, focused local boundary tests and the renderer build:
 
 ```bash
-bun run prepare:preinstalled-plugins
-bun run changelog:check
 bun run typecheck
-bun run test
+bun run test -- test/auth.test.ts test/cloud-models.test.ts test/desktop-updater.test.ts test/desktop-update-scheduler.test.ts test/model-network-policy.test.ts test/provider-network.test.ts
 bun run build:renderer
-bun run test:node-runtime
 ```
 
-For example, run a focused suite with `bun run test -- test/preview.test.ts`.
-The [CI workflow](.github/workflows/ci.yml) runs on PRs and pushes to `dev` and
-`main`, including documentation PRs. It checks the changelog, plugin preparation,
-types, tests, the renderer build, and the Node daemon/player build and startup.
-`test:node-runtime` builds the host and player before checking Node startup, so
-this sequence covers the full application build without building them twice.
-These checks run on Ubuntu. Plugin preparation, types, tests and the Node
-startup check also run on macOS and Windows, the platforms the app ships for.
-When a test cannot hold on one platform, skip only the assertion that does not
-apply there, as the file permission checks do on Windows.
-CLI integration cases that execute POSIX script fixtures run on Ubuntu and macOS;
-Windows still runs the in-process adapter and protocol tests.
+These commands execute downloaded tooling and project configuration. Selected
+checks have run for this edition. The focused tests use mocked transports, not paid
+APIs. The renderer build writes `dist/renderer` and may require native tooling
+left uninitialized by `--ignore-scripts`; stop and inspect failures rather than
+enabling lifecycle scripts. No daemon, Electron app, game or model API startup
+is part of this first check group.
 
-Remote publishing contract tests in `test/publish.test.ts` skip when the private
-cloud repository or its dependencies are unavailable. That is expected for
-public-only checkouts; mention the skips in your PR. A passing public suite
-does not verify the hosted service. See [cloud integration](#cloud-integration)
-and the [maintainer guide](docs/maintaining.md#review-and-merge).
+Broader checks (`bun run changelog:check`, `bun run test`,
+`bun run test:node-runtime`) need a separate review of process, filesystem,
+network and native-tool behavior. `test:node-runtime` builds and starts the
+daemon/player. Full tests include process fixtures and are not a read-only
+operation. Some upstream success contracts no longer apply to disabled features;
+record failures and skips instead of claiming the entire upstream suite passes.
+
+The [CI workflow](.github/workflows/ci.yml) runs on PRs and pushes to `dev` and
+`main`, including documentation PRs. Its template uses script-free dependency
+installation and checks the changelog, types, tests, the renderer build, and the
+Node daemon/player build and startup. It has not been triggered or validated as
+part of this local work. Types, tests and the Node startup check also run on
+macOS and Windows. CLI integration cases that execute POSIX script fixtures run
+on Ubuntu and macOS; Windows still runs in-process adapter and protocol tests.
+
+Remote publishing contracts in `test/publish.test.ts` document upstream private
+services, which are unavailable in this edition. Do not provide cloud credentials
+or an adjacent private checkout to enable them. Passing local boundary tests
+does not verify those services. Record remaining checks in the PR.
 
 ### Keep tests and documentation focused
 
@@ -222,47 +234,12 @@ review scope, behavior, and verification before merging. See
 ## Configuration
 
 Local development works with the defaults above. Use [.env.example](.env.example)
-as a reference when an integration needs configuration; put only the settings
-you need in an ignored `.env.local` and restart development after changing them.
-
-### Sign-in (Supabase)
-
-To test real authentication, use a Supabase project with Google and GitHub Auth
-enabled. Add the renderer URL to its allowed redirect URLs and set these public
-values:
-
-```dotenv
-VITE_SUPABASE_URL=https://your-project.supabase.co
-VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_your-key
-```
-
-Configuring both values disables debug sign-in and local debug publishing.
-Production builds never enable the debug fallback. Real cloud publishing also
-requires a matching Cloud API deployment.
-
-For desktop OAuth, allow `http://127.0.0.1:*/auth/callback/**`. The app opens
-the system browser and receives the result through a temporary loopback server.
-
-### Cloud integration
-
-The Community website and hosted Publish service are in
-[`ohmygame-cloud`](https://github.com/WhiteTowerAI/ohmygame-cloud), which is
-currently private. Access is optional for contributing to this repository.
-The public client contract is [src/shared/publish-v1.ts](src/shared/publish-v1.ts);
-[free cloud models](docs/free-cloud-models.md) documents the model/quota boundary.
-
-If you have access, point the client at your local or preview Cloud API:
-
-```dotenv
-CLOUD_API_URL=http://127.0.0.1:43130
-```
-
-Cloud setup and the server contract are in that repository's
-[`docs/publish-v1.md`](https://github.com/WhiteTowerAI/ohmygame-cloud/blob/main/docs/publish-v1.md).
-Remote contract tests use an adjacent `ohmygame-cloud` checkout with its
-dependencies installed, or a checkout selected by `OHMYGAME_CLOUD_ROOT`.
-Contributors without access can describe the required cloud verification in
-their PR so a maintainer can complete it.
+for optional local data directories; do not commit their contents. There are no
+login, telemetry, Cloud API or updater variables for this edition. Adding legacy
+variables cannot re-enable these paths. Configure reviewed model endpoints and
+API keys through the application; OAuth, ambient credentials and executable
+credential resolvers are unavailable. See [local security
+policy](docs/local-security.md) before configuring model access.
 
 ### Projects, proxies, and desktop packaging
 
@@ -274,8 +251,9 @@ their PR so a maintainer can complete it.
   [network proxy](docs/runtime.md#network-proxy).
 - The desktop app manages its own authenticated daemon; the renderer has no
   Node.js access.
-- Signing, hosted update feeds, and release credentials are maintainer tasks.
-  See [desktop releases](docs/desktop-releases.md).
+- Local packaging retains license notices and does not publish to author feeds.
+  The retained upstream signing/update instructions do not apply to this edition;
+  see [desktop releases](docs/desktop-releases.md).
 
 ## Security and license
 

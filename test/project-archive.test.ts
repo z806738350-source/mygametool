@@ -1,5 +1,6 @@
 import {
   chmod,
+  link,
   mkdir,
   mkdtemp,
   readdir,
@@ -9,7 +10,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import type { ReadStream } from "node:fs";
+import { writeFileSync, type ReadStream } from "node:fs";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -28,6 +29,8 @@ import { ProjectManager } from "../src/daemon/projects.js";
 import { writeWorkspaceNotice } from "../src/daemon/workspace-notice.js";
 import { PROJECT_ARCHIVE_CONTENT_TYPE } from "../src/shared/project-archive.js";
 import { createStarterCodebaseWithScene } from "./playable-fixture.js";
+import { registerSensitiveValue } from "../src/shared/sensitive-values.js";
+import { KUNPO_DEFAULT_MODEL_REFS } from "../src/shared/kunpo-models.js";
 
 const directories: string[] = [];
 const apps: ReturnType<typeof createApp>[] = [];
@@ -49,9 +52,36 @@ const webp = (label: string) =>
   ]);
 
 describe("project archive export", () => {
+  it("checks the bytes actually packed if a file changes to an equal-length UTF-8 credential after sizing", async () => {
+    const projects = new ProjectManager(await temporaryDirectory());
+    const project = await projects.create("Changed during export", "web-game");
+    const key = "archive-secret-生成后更改";
+    registerSensitiveValue(key);
+    const filename = path.join(project.workspacePath, "ordinary.txt");
+    const prefix = Buffer.alloc(65_520, 120);
+    await writeFile(filename, Buffer.concat([prefix, Buffer.alloc(Buffer.byteLength(key), 97)]));
+    const original = ZipFile.prototype.addReadStreamLazy;
+    const intercept = vi.spyOn(ZipFile.prototype, "addReadStreamLazy").mockImplementation(function (this: ZipFile, ...args) {
+      if (args[0].endsWith("/ordinary.txt")) writeFileSync(filename, Buffer.concat([prefix, Buffer.from(key)]));
+      return original.apply(this, args);
+    });
+    try { await expect(exportProjectArchive(project)).rejects.toMatchObject({ statusCode: 409, message: expect.stringContaining("known local credential") }); }
+    finally { intercept.mockRestore(); }
+  });
+  it("refuses a known credential embedded in an ordinary file across stream chunks", async () => {
+    const projects = new ProjectManager(await temporaryDirectory());
+    const project = await projects.create("Secret boundary", "web-game");
+    const key = "archive-known-canary-681429f83a8a";
+    registerSensitiveValue(key);
+    await writeFile(path.join(project.workspacePath, "ordinary.txt"), "x".repeat(65530) + key + "ordinary");
+    await expect(exportProjectArchive(project)).rejects.toMatchObject({ statusCode: 409, message: expect.stringContaining("known local credential") });
+  });
   it("packs the manifest, cover and workspace without dependencies, build output or secrets", async () => {
     const projects = new ProjectManager(await temporaryDirectory());
     const project = await projects.create("Moon Garden", "web-game");
+    const modelSelections = { ...KUNPO_DEFAULT_MODEL_REFS,
+      agent: { provider: "kunpo", id: "claude-opus-5-5" }, image: { provider: "openai", id: "gpt-image-2.5-flare" } };
+    await projects.setModelSelections(project.id, modelSelections);
     await projects.setMediaModelDefaults(project.id, {
       image: { provider: "openai", id: "gpt-image-1" },
     });
@@ -64,6 +94,7 @@ describe("project archive export", () => {
       ".data/asset-previews/hero.png": "preview",
       "canvas/board.json": "{}",
       "canvas/jobs.json": "[]",
+      "canvas/.job-inputs/private.json": "private generation inputs",
       "node_modules/pkg/index.js": "dependency",
       "src/node_modules/pkg/index.js": "nested dependency",
       ".git/HEAD": "ref",
@@ -75,6 +106,14 @@ describe("project archive export", () => {
       ".data/agent-attachments/a.txt": "attachment",
       ".env": "SECRET=1",
       "config/.env.local": "SECRET=2",
+      "auth.json": "fake-key-canary-local-only",
+      "config/credentials.json": "fake-key-canary-local-only",
+      ".data/local-api-keys.json": "fake-key-canary-local-only",
+      "config/daemon-runtime.json": "fake-key-canary-local-only",
+      "config/private.pem.bak": "fake-key-canary-local-only",
+      "pi-agent/models.json": "fake-key-canary-local-only",
+      "agent-runtimes/codex/auth.json": "fake-key-canary-local-only",
+      "library/provider-image-sources/receipt.json": "fake-key-canary-local-only",
     };
     for (const [file, contents] of Object.entries(files)) {
       await mkdir(path.dirname(path.join(project.workspacePath, file)), {
@@ -82,14 +121,6 @@ describe("project archive export", () => {
       });
       await writeFile(path.join(project.workspacePath, file), contents);
     }
-    // Creating symbolic links needs extra privileges on Windows.
-    if (process.platform !== "win32") {
-      await symlink(
-        path.join(project.workspacePath, "index.html"),
-        path.join(project.workspacePath, "link.html"),
-      );
-    }
-
     const archive = await readArchive(
       await exportProjectArchive(project, {
         cover: { contents: webp("cover"), mode: "custom" },
@@ -108,6 +139,7 @@ describe("project archive export", () => {
       "workspace/src/main.js",
     ]);
     expect(archive["cover.webp"]).toEqual(webp("cover"));
+    expect(Buffer.concat(Object.values(archive)).toString()).not.toContain("fake-key-canary-local-only");
     expect(JSON.parse(archive["ohmygame-project.json"]!.toString())).toEqual({
       format: "ohmygame-project",
       version: 1,
@@ -117,9 +149,31 @@ describe("project archive export", () => {
         mediaModelDefaults: {
           image: { provider: "openai", id: "gpt-image-1" },
         },
+        modelSelections,
       },
       cover: { mode: "custom" },
     });
+  });
+
+  it("rejects a hard-linked export file before returning a download", async () => {
+    const projects = new ProjectManager(await temporaryDirectory());
+    const project = await projects.create("Game");
+    await writeFile(path.join(project.workspacePath, ".env"), "fake-key-canary-local-only");
+    await link(path.join(project.workspacePath, ".env"), path.join(project.workspacePath, "public.txt"));
+    await expect(exportProjectArchive(project)).rejects.toThrow("Linked");
+  });
+
+  it.skipIf(process.platform === "win32")("rejects symbolic export files and a replaced workspace root", async () => {
+    const projects = new ProjectManager(await temporaryDirectory());
+    const project = await projects.create("Game");
+    await writeFile(path.join(project.workspacePath, ".env"), "fake-key-canary-local-only");
+    const alias = path.join(project.workspacePath, "public.txt");
+    await symlink(path.join(project.workspacePath, ".env"), alias);
+    await expect(exportProjectArchive(project)).rejects.toThrow("Symbolic links");
+    await rm(alias);
+    const rootAlias = path.join(await temporaryDirectory(), "workspace");
+    await symlink(project.workspacePath, rootAlias);
+    await expect(exportProjectArchive({ ...project, workspacePath: rootAlias })).rejects.toThrow("symbolic links");
   });
 
   it("copies an Interactive Story's Library assets into the workspace", async () => {
@@ -295,17 +349,19 @@ describe("project archive export", () => {
   it("checks the actual ZIP overhead before offering a download", async () => {
     const projects = new ProjectManager(await temporaryDirectory());
     const project = await projects.create("Game");
+    // A small legacy manifest keeps compression savings from hiding ZIP overhead.
+    const exportable = { ...project, modelSelections: undefined };
     await writeFile(
       path.join(project.workspacePath, "image.png"),
       Buffer.alloc(900),
     );
-    const files = await readArchive(await exportProjectArchive(project));
+    const files = await readArchive(await exportProjectArchive(exportable));
     const extractedBytes = Object.values(files).reduce(
       (size, contents) => size + contents.length,
       0,
     );
     await expect(
-      exportProjectArchive(project, {
+      exportProjectArchive(exportable, {
         limits: { maxBytes: extractedBytes, maxEntries: 10 },
       }),
     ).rejects.toMatchObject({ statusCode: 409 });
@@ -391,6 +447,9 @@ describe("project archive import", () => {
         payload: { type: "general", name: "Engine game" },
       })
     ).json();
+    const selected = { agent: { provider: "kunpo", id: "claude-opus-5-5" }, image: { provider: "openai", id: "Image-GI2.1" }, video: { provider: "kunpo", id: "tencent-vod-vs-2.5" } };
+    const selection = await source.inject({ method: "PATCH", url: `/projects/${original.id}/model-selections`, payload: selected });
+    expect(selection.statusCode, selection.body).toBe(200);
     await mkdir(path.join(original.workspacePath, "scenes"));
     await writeFile(
       path.join(original.workspacePath, "scenes/main.tscn"),
@@ -416,7 +475,7 @@ describe("project archive import", () => {
       payload: archive,
     });
 
-    expect(response.statusCode).toBe(201);
+    expect(response.statusCode, response.body).toBe(201);
     const imported = response.json();
     expect(imported).toMatchObject({
       name: "Engine game",
@@ -424,6 +483,7 @@ describe("project archive import", () => {
       type: "general",
       webPreviewEnabled: true,
       workspaceLocation: "managed",
+      modelSelections: { ...KUNPO_DEFAULT_MODEL_REFS, ...selected },
     });
     expect(imported.id).not.toBe(original.id);
     expect(
@@ -482,6 +542,7 @@ describe("project archive import", () => {
           },
         }),
         "workspace/canvas/jobs.json": JSON.stringify([job]),
+        "workspace/canvas/.job-inputs/private.json": "untrusted recovery input",
         "workspace/.git/config": "[core]",
         "workspace/art/node_modules/pkg.js": "dependency",
         "workspace/art/node_modules/.bin/tool": {
@@ -496,6 +557,7 @@ describe("project archive import", () => {
 
     expect(project.id).not.toBe("original");
     expect(project.publication).toBeUndefined();
+    expect(project.modelSelections).toBeUndefined();
     expect(project.workspacePath).toBe(
       path.join(dataDirectory, "projects", project.id, "workspace"),
     );
@@ -518,6 +580,9 @@ describe("project archive import", () => {
       type: "asset-canvas",
       mediaModelDefaults: { image: { provider: "openai", id: "gpt-image-1" } },
     });
+    expect(restored.get(project.id)?.modelSelections).toBeUndefined();
+    const reexported = await readArchive(await exportProjectArchive(restored.get(project.id)!));
+    expect(JSON.parse(reexported["ohmygame-project.json"]!.toString()).project).not.toHaveProperty("modelSelections");
     expect(await readdir(path.join(dataDirectory, "projects"))).toEqual([
       project.id,
     ]);
@@ -789,7 +854,7 @@ describe("project archive import", () => {
       ),
     });
 
-    expect(response.statusCode).toBe(201);
+    expect(response.statusCode, response.body).toBe(201);
     const project = response.json();
     expect(project).toMatchObject({
       name: "Night Train",
@@ -831,7 +896,7 @@ describe("project archive import", () => {
       });
     const invalid = await post(Buffer.from("not a zip"));
     expect(invalid.statusCode).toBe(400);
-    expect(invalid.json()).toEqual({
+    expect(invalid.json(), invalid.body).toEqual({
       error: "The file is not a valid ZIP archive.",
     });
     const settings = await post(

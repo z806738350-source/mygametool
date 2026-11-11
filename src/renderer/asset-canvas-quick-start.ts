@@ -1,6 +1,7 @@
 import type { ImageModel, ProjectState, VideoModel } from "../shared/contracts.js";
 import { createAssetCanvasStarterDocument, preferredImageOption, type AssetCanvasStarter } from "../shared/asset-canvas.js";
-import { createProject, deleteProject, listImageModels, listVideoModels, waitForRuntime } from "./api.js";
+import { videoReferenceAspectRatios } from "../shared/video-references.js";
+import { createProject, listImageModels, listVideoModels, waitForRuntime } from "./api.js";
 import { getCanvasWorkspace, getCanvasBoard, saveCanvasBoard } from "./canvas-api.js";
 import { t } from "./i18n.js";
 
@@ -68,12 +69,7 @@ export async function createAssetCanvasQuickStart(item: AssetCanvasQuickStart): 
     const current = await getCanvasBoard(project.id, workspace.boards[0]!.id);
     await saveCanvasBoard(project.id, { board: { ...document, id: current.board.id }, revision: current.revision });
   } catch (cause) {
-    try {
-      await deleteProject(project.id);
-    } catch {
-      throw new Error(`${errorMessage(cause)}. The empty canvas could not be removed.`);
-    }
-    throw cause;
+    throw new Error(`${errorMessage(cause)}. ${t("assetCanvas.starterProjectKept")}`);
   }
   return { project, nodeId };
 }
@@ -105,7 +101,7 @@ function starterOptions(item: AssetCanvasQuickStart, models: MediaModels): Param
   }
   if (item.type === "video") {
     const model = pickModel(item, models.video);
-    return model ? { videoModel: { provider: model.provider, id: model.id }, videoAspectRatio: model.aspectRatios[0], videoReferenceMode: model.imageReferenceMode } : {};
+    return model ? { videoModel: { provider: model.provider, id: model.id }, videoAspectRatio: videoReferenceAspectRatios(model, 0, model.imageReferenceMode)[0], videoReferenceMode: model.imageReferenceMode } : {};
   }
   return {};
 }

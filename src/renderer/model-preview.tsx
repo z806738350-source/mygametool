@@ -1,8 +1,8 @@
 import { LoaderCircle } from "./icons.js";
-import { createElement, useEffect, useRef, useState } from "react";
+import { createElement, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { t } from "./i18n.js";
 
-type ModelViewerElement = HTMLElement & { loaded?: boolean; availableAnimations?: string[] };
+type ModelViewerElement = HTMLElement & { loaded?: boolean; availableAnimations?: string[]; paused?: boolean; pause?: () => void; play?: () => void };
 
 type ModelViewerError = CustomEvent<{
   type?: "loadfailure" | "webglcontextlost";
@@ -13,7 +13,9 @@ type ModelViewerProgress = CustomEvent<{
   totalProgress?: number;
 }>;
 
-export function ModelPreview({ source, label, minHeight = 320, interactive = true, clipPicker = true }: { source: string; label: string; minHeight?: number; interactive?: boolean; clipPicker?: boolean }) {
+export function ModelPreview({ source, label, minHeight = 320, interactive = true, autoRotate = interactive, animate = interactive, rotationPerSecond, clipPicker = true, onError }: { source: string; label: string; minHeight?: number; interactive?: boolean; autoRotate?: boolean; animate?: boolean; rotationPerSecond?: string; clipPicker?: boolean; onError?: () => void }) {
+  const errorCallback = useRef(onError); errorCallback.current = onError;
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const viewerRef = useRef<ModelViewerElement | null>(null);
   const [componentReady, setComponentReady] = useState(Boolean(customElements.get("model-viewer")));
   const [componentError, setComponentError] = useState(false);
@@ -22,6 +24,44 @@ export function ModelPreview({ source, label, minHeight = 320, interactive = tru
   const [modelError, setModelError] = useState<string>();
   const [clips, setClips] = useState<string[]>([]);
   const [clip, setClip] = useState<string>();
+  const [inViewport, setInViewport] = useState(typeof IntersectionObserver === "undefined");
+  const [documentVisible, setDocumentVisible] = useState(typeof document === "undefined" || document.visibilityState !== "hidden");
+  const motionActive = inViewport && documentVisible;
+  const playing = animate && motionActive && clips.length > 0;
+
+  useEffect(() => {
+    const update = () => setDocumentVisible(document.visibilityState !== "hidden");
+    document.addEventListener("visibilitychange", update);
+    update();
+    return () => document.removeEventListener("visibilitychange", update);
+  }, []);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!componentReady || !container) return;
+    if (typeof IntersectionObserver === "undefined") { setInViewport(true); return; }
+    setInViewport(false);
+    const observer = new IntersectionObserver(([entry]) => { if (entry) setInViewport(entry.isIntersecting); });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [componentReady, source]);
+
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    if (!playing) {
+      if (viewer.paused === false) viewer.pause?.();
+    } else if (viewer.paused !== false) viewer.play?.();
+  }, [componentReady, source, playing]);
+
+  useLayoutEffect(() => {
+    const viewer = viewerRef.current;
+    return () => {
+      if (!viewer || viewer.getAttribute("src") !== source) return;
+      try { viewer.pause?.(); } catch { /* The viewer may already be detached. */ }
+      viewer.removeAttribute("src");
+    };
+  }, [componentReady, source]);
 
   useEffect(() => {
     if (componentReady) return;
@@ -30,6 +70,7 @@ export function ModelPreview({ source, label, minHeight = 320, interactive = tru
       if (active) setComponentReady(true);
     }).catch(() => {
       if (active) setComponentError(true);
+      if (active) errorCallback.current?.();
     });
     return () => { active = false; };
   }, [componentReady]);
@@ -63,6 +104,7 @@ export function ModelPreview({ source, label, minHeight = 320, interactive = tru
       setModelError(type === "webglcontextlost"
         ? t("modelPreview.contextLost")
         : t("modelPreview.displayFailed"));
+      errorCallback.current?.();
     };
 
     viewer.addEventListener("load", handleLoad);
@@ -85,7 +127,7 @@ export function ModelPreview({ source, label, minHeight = 320, interactive = tru
   }
 
   return (
-    <div className="model-preview" style={{ minHeight: `${minHeight}px` }}>
+    <div ref={containerRef} className="model-preview" style={{ minHeight: `${minHeight}px` }}>
       {createElement("model-viewer", {
         key: source,
         ref: (element: ModelViewerElement | null) => { viewerRef.current = element; },
@@ -93,9 +135,10 @@ export function ModelPreview({ source, label, minHeight = 320, interactive = tru
         alt: label,
         loading: "eager",
         "camera-controls": interactive || undefined,
-        "auto-rotate": true,
+        "auto-rotate": autoRotate && motionActive || undefined,
+        "rotation-per-second": rotationPerSecond,
         // Plays the first clip of animated models (e.g. rigged characters); static models are unaffected.
-        autoplay: true,
+        autoplay: playing || undefined,
         "animation-name": clip,
         "shadow-intensity": "1",
         tabIndex: interactive ? undefined : -1,

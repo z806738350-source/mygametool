@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -8,6 +9,7 @@ import {
 } from "react";
 import { Pause, Play } from "./icons.js";
 import { t } from "./i18n.js";
+import { releaseMedia } from "./release-media.js";
 import {
   clampVideoTrim,
   isWholeVideo,
@@ -45,7 +47,7 @@ export function VideoTrimEditor({
 }: {
   url: string;
   label: string;
-  loadSource: () => Promise<Blob>;
+  loadSource: (signal?: AbortSignal) => Promise<Blob>;
   trim?: VideoTrim;
   onTrimChange: (trim: VideoTrim | undefined) => void;
   disabled?: boolean;
@@ -69,18 +71,20 @@ export function VideoTrimEditor({
   const kept = trim ?? (duration ? { start: 0, end: duration } : undefined);
   const changed = Boolean(duration && kept && !isWholeVideo(kept, duration));
 
+  useLayoutEffect(() => { const element = video.current; return () => releaseMedia(element, url); }, [url]);
+
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
+    setFrames([]);
+    setError(undefined);
     void loadSourceRef
-      .current()
-      .then((blob) => videoFilmstrip(blob, FILMSTRIP_FRAMES, FILMSTRIP_HEIGHT))
+      .current(controller.signal)
+      .then((blob) => videoFilmstrip(blob, FILMSTRIP_FRAMES, FILMSTRIP_HEIGHT, controller.signal))
       .then((strip) => {
-        if (!cancelled) setFrames(strip);
+        if (!controller.signal.aborted) setFrames(strip);
       })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
+      .catch((cause) => { if (!controller.signal.aborted) setError(t("videoTrim.failed", { error: cause instanceof Error ? cause.message : String(cause) })); });
+    return () => controller.abort();
   }, [url]);
 
   // Numeric edits and Reset use the same preview as dragging the handles.

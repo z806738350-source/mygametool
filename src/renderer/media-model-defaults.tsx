@@ -1,7 +1,9 @@
+import { isMeshyModelReference } from "../shared/disabled-media-providers.js";
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { MediaModelCatalog, MediaModelDefaults, MediaModelUsage, ModelRef, ProjectState, ProviderCapability } from "../shared/contracts.js";
-import { listImageModelCatalog, listModel3DCatalog, listVideoModelCatalog, MODELS_CHANGED_EVENT, setDefaultMediaModel, updateProjectMediaModelDefaults } from "./api.js";
+import type { MediaModelCatalog, MediaModelUsage, ModelRef, ProjectState, ProviderCapability } from "../shared/contracts.js";
+import { listImageModelCatalog, listModel3DCatalog, listVideoModelCatalog, MODELS_CHANGED_EVENT, setDefaultMediaModel, updateProjectModelSelections } from "./api.js";
+import { KUNPO_MODEL_OPTIONS, KUNPO_MODEL_ROLES, kunpoModelOption, type KunpoModelRole, type KunpoModelSelections } from "../shared/kunpo-models.js";
 import { CanvasChipSelect, type CanvasChipOption } from "./canvas-chip-select.js";
 import { LoaderCircle, SlidersHorizontal } from "./icons.js";
 import { menuPlacement } from "./popover-placement.js";
@@ -48,22 +50,23 @@ function ModelDefaultField({ usage, catalog, selected, inherit = false, loading,
   menuContainer?: HTMLElement | null;
   onChange: (model?: ModelRef) => void;
 }) {
-  const selectedModel = selected && catalog?.models.find((model) => modelKey(model) === modelKey(selected));
-  const automatic = inherit ? catalog?.defaultModel ?? catalog?.models[0] : catalog?.models[0];
-  const effective = automatic && catalog?.models.find((model) => modelKey(model) === modelKey(automatic));
+  const models = catalog?.models.filter((model) => usage !== "3d" || !isMeshyModelReference(model));
+  const selectedModel = selected && models?.find((model) => modelKey(model) === modelKey(selected));
+  const automatic = inherit ? catalog?.defaultModel ?? models?.[0] : models?.[0];
+  const effective = automatic && models?.find((model) => modelKey(model) === modelKey(automatic));
   const effectiveLabel = !catalog ? loading ? t("mediaDefaults.loading") : t("mediaDefaults.unavailable") : effective?.name ?? (automatic ? t("mediaDefaults.modelUnavailable", { id: automatic.id }) : t("mediaDefaults.noModel"));
   const automaticLabel = catalog ? inherit ? t("mediaDefaults.useGlobal", { label: effectiveLabel }) : t("mediaDefaults.automatic", { label: effectiveLabel }) : effectiveLabel;
   const options: CanvasChipOption<string>[] = [
     { value: "", label: automaticLabel, shortLabel: effectiveLabel },
-    ...(selected && !selectedModel ? [{ value: modelKey(selected), label: t("mediaDefaults.modelUnavailable", { id: selected.id }), group: selected.provider }] : []),
-    ...(catalog?.models.map((model) => ({ value: modelKey(model), label: model.name, group: model.providerName })) ?? []),
+    ...(selected && !selectedModel ? [{ value: modelKey(selected), label: t("mediaDefaults.modelUnavailable", { id: selected.id }), group: selected.provider, disabled: usage === "3d" && isMeshyModelReference(selected) }] : []),
+    ...(models?.map((model) => ({ value: modelKey(model), label: model.name, group: model.providerName })) ?? []),
   ];
   return <div className="media-default-field">
     <span>{t(`capability.${usage}`)}</span>
     <CanvasChipSelect label={inherit ? t("mediaDefaults.projectModel", { usage: t(`capability.${usage}`) }) : t("mediaDefaults.globalModel", { usage: t(`capability.${usage}`) })}
       value={selected ? modelKey(selected) : ""} options={options} menuContainer={menuContainer}
       disabled={disabled || !catalog || (!catalog.models.length && !selected)}
-      onChange={(value) => onChange(catalog?.models.find((model) => modelKey(model) === value))} />
+      onChange={(value) => onChange(models?.find((model) => modelKey(model) === value))} />
   </div>;
 }
 
@@ -97,17 +100,16 @@ export function ProjectMediaModelSettings({ project, onSaved }: {
   const [popup, setPopup] = useState<HTMLDivElement | null>(null);
   const [open, setOpen] = useState(false);
   const [position, setPosition] = useState<{ top: number; left: number }>();
-  const { catalogs, loading, error: loadError } = useMediaModelCatalogs(open);
-  const [defaults, setDefaults] = useState<MediaModelDefaults>(() => ({ ...project.mediaModelDefaults }));
+  const [selections, setSelections] = useState<KunpoModelSelections>(() => ({ ...project.modelSelections }));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>();
-  useEffect(() => { setDefaults({ ...project.mediaModelDefaults }); }, [project.mediaModelDefaults]);
+  useEffect(() => { setSelections({ ...project.modelSelections }); }, [project.modelSelections]);
   useLayoutEffect(() => {
     if (!open) { setPosition(undefined); return; }
     const anchor = trigger.current?.getBoundingClientRect();
     const bounds = popup?.getBoundingClientRect();
     if (anchor && bounds) setPosition(menuPlacement(anchor, bounds, { width: window.innerWidth, height: window.innerHeight }));
-  }, [open, popup, loading, error, loadError]);
+  }, [open, popup, error]);
   useLayoutEffect(() => {
     if (open && position && document.activeElement === trigger.current) popup?.querySelector<HTMLButtonElement>(".canvas-chip")?.focus();
   }, [open, position, popup]);
@@ -134,15 +136,12 @@ export function ProjectMediaModelSettings({ project, onSaved }: {
     };
   }, [open, popup]);
 
-  async function choose(usage: MediaModelUsage, model?: ModelRef) {
+  async function choose(role: KunpoModelRole, model?: ModelRef) {
     if (saving) return;
     setSaving(true); setError(undefined);
-    const next = { ...defaults };
-    if (model) next[usage] = { provider: model.provider, id: model.id };
-    else delete next[usage];
     try {
-      const updated = await updateProjectMediaModelDefaults(project.id, next);
-      setDefaults({ ...updated.mediaModelDefaults });
+      const updated = await updateProjectModelSelections(project.id, { [role]: model ? { provider: model.provider, id: model.id } : null });
+      setSelections({ ...updated.modelSelections });
       onSaved(updated);
     } catch (cause) { setError(errorMessage(cause)); }
     finally { setSaving(false); }
@@ -152,10 +151,33 @@ export function ProjectMediaModelSettings({ project, onSaved }: {
     {open ? createPortal(<div ref={setPopup} className="canvas-chip-menu project-media-defaults" role="dialog" aria-labelledby={titleId}
       style={position ?? { top: 0, left: 0, visibility: "hidden" }}>
       <div className="canvas-chip-menu-heading" id={titleId}>{t("mediaDefaults.title")}{saving ? <LoaderCircle className="spin" size={12} aria-label={t("mediaDefaults.saving")} /> : null}</div>
-      {USAGES.map((usage) => <ModelDefaultField key={usage} usage={usage} catalog={catalogs[usage]} selected={defaults[usage]} inherit loading={loading} disabled={saving || loading} menuContainer={popup} onChange={(model) => void choose(usage, model)} />)}
-      {error || loadError ? <p className="settings-error" role="alert">{error ?? loadError}</p> : null}
+      <div className="project-model-selection-list">
+        {KUNPO_MODEL_ROLES.map((role) => <ProjectModelSelectionField key={role} role={role} selected={selections[role]} project={project} disabled={saving} menuContainer={popup} onChange={(model) => void choose(role, model)} />)}
+      </div>
+      {error ? <p className="settings-error" role="alert">{error}</p> : null}
     </div>, document.body) : null}
   </>;
+}
+
+function ProjectModelSelectionField({ role, selected, project, disabled, menuContainer, onChange }: {
+  role: KunpoModelRole; selected?: ModelRef; project: ProjectState; disabled: boolean;
+  menuContainer?: HTMLElement | null; onChange: (model?: ModelRef) => void;
+}) {
+  const options = KUNPO_MODEL_OPTIONS.filter((option) => option.role === role);
+  const legacy = role === "image" || role === "video" ? project.mediaModelDefaults?.[role] : role === "3d-generation" ? project.mediaModelDefaults?.["3d"] : undefined;
+  const current = kunpoModelOption(role, selected);
+  const fallback = legacy ? t("kunpoModels.inheritExisting", { label: legacy.id }) : role === "music" ? t("kunpoModels.noConfirmedDefault") : t("kunpoModels.inheritDefault");
+  const help = role === "speech" ? t("kunpoModels.speechHelp") : role === "music" ? t("kunpoModels.musicHelp") : current?.status === "pending" ? t("kunpoModels.pendingHelp") : role === "agent" && current?.imageInputStatus === "unverified" ? t("kunpoModels.textOnlyHelp") : t("kunpoModels.unverifiedHelp");
+  return <div className="media-default-field" title={help}>
+    <span>{t(`kunpoModels.roles.${role}`)}</span>
+    <CanvasChipSelect label={t(`kunpoModels.roles.${role}`)} value={selected ? modelKey(selected) : ""} menuContainer={menuContainer} disabled={disabled}
+      options={[
+        { value: "", label: fallback },
+        ...(selected && !current ? [{ value: modelKey(selected), label: t("mediaDefaults.modelUnavailable", { id: selected.id }), disabled: true }] : []),
+        ...options.map((option) => ({ value: modelKey(option), label: `${option.name} · ${t(`kunpoModels.status.${option.status}`)}`, shortLabel: option.name,
+          disabled: option.status === "pending", title: option.status === "pending" ? t("kunpoModels.pendingHelp") : help })),
+      ]} onChange={(key) => onChange(options.find((option) => modelKey(option) === key))} />
+  </div>;
 }
 
 function modelKey(model: ModelRef): string { return JSON.stringify([model.provider, model.id]); }

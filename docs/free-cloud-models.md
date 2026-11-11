@@ -45,7 +45,7 @@ cost is an estimate; Hyper3D determines actual billing and key access.
 Rodin accepts one to five PNG/JPEG references with no required direction order.
 Canvas labels them **Reference 1…5**, showing supplied images and the next slot.
 Tripo keeps its protocol's **Front / Left / Back / Right** order. Meshy uses
-neutral reference labels and the selected version's image limit.
+neutral reference labels and the selected version's image limit in the upstream UI; Meshy is disabled in this local edition.
 
 Hyper3D's `check_balance` reports upstream credits and does not document remaining
 daily free model requests. The desktop displays only the account's daily allocation;

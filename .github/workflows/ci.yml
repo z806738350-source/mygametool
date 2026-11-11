@@ -11,6 +11,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -22,9 +25,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - run: bun install --frozen-lockfile
+      - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run changelog:check
-      - run: bun run prepare:preinstalled-plugins
       - run: bun run typecheck
       - run: bun run test:ablation --dry-run
       - run: bun run test
@@ -45,8 +47,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - run: bun install --frozen-lockfile
-      - run: bun run prepare:preinstalled-plugins
+      - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run typecheck
       - run: bun run test
       - run: bun run test:node-runtime

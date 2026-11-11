@@ -19,6 +19,7 @@ import { readCodexImage } from "./codex-images.js";
 import { privateFolder } from "./discovery.js";
 import { record } from "./driver-context.js";
 import type { AgentRuntimeService } from "./service.js";
+import { assertLocalExecutionAllowed, LOCAL_EXECUTION_ENABLED } from "../local-execution-policy.js";
 
 export const CODEX_IMAGE_MODEL: ImageModel = {
   provider: "codex-cli",
@@ -76,6 +77,7 @@ export class CodexImageProvider {
   }
 
   #refreshStatus(recheck = false): Promise<CodexImageStatus> {
+    if (!LOCAL_EXECUTION_ENABLED) return Promise.resolve({ authStatus: "unknown", message: "Codex CLI image generation is temporarily unavailable pending isolated execution." });
     if (this.#closed) return Promise.resolve(this.#statusSnapshot);
     if (this.#refresh) {
       // An explicit recheck must observe login changes after an older check.
@@ -131,7 +133,7 @@ export class CodexImageProvider {
       configured: ready,
       imageConfigured: ready,
       authStatus: status.authStatus,
-      enabled,
+      enabled: LOCAL_EXECUTION_ENABLED && enabled,
       status: ready ? "connected" : "not_configured",
       capabilities: ["image"],
       ...(status.message ? { error: status.message } : {}),
@@ -160,6 +162,7 @@ export class CodexImageProvider {
     input: ImageGenerationInput,
     signal?: AbortSignal,
   ): Promise<GeneratedImage> {
+    assertLocalExecutionAllowed("Codex CLI image generation");
     signal?.throwIfAborted();
     const prompt: Array<Record<string, unknown>> = [
       { type: "text", text: input.prompt, text_elements: [] },

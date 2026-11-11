@@ -1,10 +1,85 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import { startDaemon } from "../src/desktop/daemon-process.js";
+import { playtestActionError, playtestOpenError } from "../src/shared/playtest.js";
+import { localDesktopLaunch } from "../src/desktop/local-launch.js";
+import { bindDesktopDaemonOwner } from "../src/daemon/desktop-owner.js";
+
+describe("source desktop launcher arguments and ownership", () => {
+  const envFile = path.resolve(tmpdir(), "fake.env"), profile = path.resolve(tmpdir(), "fake-profile");
+  const launchId = "46dbd610-c6de-4a40-8ec0-5a28b9374079";
+  const required = ["--local-profile", profile, "--local-launch-id", launchId];
+  it("passes explicit paths and a non-secret ownership ID without discovering or reading a credential file", () => {
+    expect(localDesktopLaunch(["electron", "main.js"])).toBeUndefined();
+    expect(localDesktopLaunch(["--local-env", envFile, ...required])).toEqual({ envFile, profileDirectory: profile, launchId, reuseLocalEnv: false });
+    expect(localDesktopLaunch([`--local-env=${envFile}`, `--local-profile=${profile}`, `--local-launch-id=${launchId}`]))
+      .toEqual({ envFile, profileDirectory: profile, launchId, reuseLocalEnv: false });
+    expect(localDesktopLaunch(["--reuse-local-env", ...required])).toEqual({ profileDirectory: profile, launchId, reuseLocalEnv: true });
+  });
+  it.each([
+    ["--local-env", envFile], ["--local-env", "relative.env", ...required],
+    ["--local-env", envFile, "--local-profile", "relative", "--local-launch-id", launchId],
+    ["--local-env", envFile, "--local-profile", profile, "--local-launch-id", "not-an-ownership-id"],
+    ["--local-env", envFile, `--local-env=${envFile}`, ...required],
+    ["--local-env=", ...required], ["--local-env", `${envFile}\n`, ...required],
+    ["--reuse-local-env", "--local-env", envFile, ...required],
+    ["--reuse-local-env=true", ...required], ["--reuse-local-env", "--reuse-local-env", ...required],
+  ])("rejects malformed or ambiguous local launcher arguments (%j)", (...argv) => {
+    expect(() => localDesktopLaunch(argv)).toThrow();
+  });
+  it("closes a desktop-owned daemon once when private parent IPC disconnects", async () => {
+    const owner = Object.assign(new EventEmitter(), { connected: true }), shutdown = vi.fn(async () => {});
+    bindDesktopDaemonOwner(owner, shutdown);
+    owner.connected = false;
+    owner.emit("disconnect"); owner.emit("disconnect");
+    expect(shutdown).toHaveBeenCalledOnce();
+  });
+  it("refuses ownership if the parent disconnected before authentication finished", () => {
+    const owner = Object.assign(new EventEmitter(), { connected: false }), shutdown = vi.fn(async () => {});
+    expect(() => bindDesktopDaemonOwner(owner, shutdown)).toThrow("private parent IPC");
+    expect(owner.listenerCount("disconnect")).toBe(0); expect(shutdown).not.toHaveBeenCalled();
+  });
+});
 
 describe("desktop daemon process", () => {
+  it("rejects conflicting or relative credential-file options before spawning a child", async () => {
+    const options = { daemonEntry: "/missing/fake-daemon.mjs", dataDirectory: tmpdir(), token: "test-token", allowedOrigins: [] };
+    await expect(startDaemon({ ...options, localEnvFile: "relative.env" })).rejects.toThrow("absolute local credential");
+    await expect(startDaemon({ ...options, localEnvFile: path.resolve(tmpdir(), "fake.env"), reuseLocalEnv: true })).rejects.toThrow("never both");
+  });
+  it.each([false, true])("passes only credential file or reuse arguments and strips ambient keys (reuse=%s)", async (reuseLocalEnv) => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-desktop-env-")), entry = path.join(directory, "daemon.mjs");
+    const envFile = path.join(directory, "intentionally-absent.env"), resultFile = path.join(directory, "result.json");
+    await writeFile(entry, `
+      import { writeFileSync } from 'node:fs';
+      import { createServer } from 'node:http';
+      const names = ['KUNPO_API_KEY','kunpo_api_key','OPENAI_API_KEY','AZURE_CLIENT_SECRET','AWS_SECRET_ACCESS_KEY','SSH_AUTH_SOCK','NODE_OPTIONS','DYLD_INSERT_LIBRARIES'];
+      let token = ''; for await (const chunk of process.stdin) token += chunk;
+      writeFileSync(${JSON.stringify(resultFile)}, JSON.stringify({ args: process.argv.slice(2), inheritedNames: names.filter(name => process.env[name] !== undefined), tokenInEnvironment: process.env.OHMYGAME_DAEMON_TOKEN !== undefined, tokenInArguments: process.argv.includes(token), launchId: process.env.OHMYGAME_LOCAL_LAUNCH_ID }));
+      const server = createServer((request, response) => { response.statusCode = request.headers.authorization === 'Bearer ' + token ? 200 : 401; response.end(); });
+      server.listen(Number(process.env.DAEMON_PORT), '127.0.0.1');
+      process.on('message', message => { if (message?.channel === 'ohmygame:shutdown') server.close(() => process.exit(0)); });
+      process.once('SIGTERM', () => server.close(() => process.exit(0)));
+    `);
+    const launchId = "46dbd610-c6de-4a40-8ec0-5a28b9374079";
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    const lines: string[] = [];
+    const daemon = await startDaemon({ daemonEntry: entry, dataDirectory: directory, token: "test-token", allowedOrigins: [], executable: process.execPath,
+      ...(reuseLocalEnv ? { reuseLocalEnv: true } : { localEnvFile: envFile }), localLaunchId: launchId, development: true,
+      log: { line: (line) => lines.push(line), stream: () => ({ write() {}, flush() {} }) },
+      environment: { HOME: directory, TMPDIR: directory, KUNPO_API_KEY: "FAKE_KUNPO_CANARY", kunpo_api_key: "FAKE_LOWER_CANARY", OPENAI_API_KEY: "FAKE_OPENAI_CANARY", AZURE_CLIENT_SECRET: "FAKE_AZURE_CANARY", AWS_SECRET_ACCESS_KEY: "FAKE_AWS_CANARY", SSH_AUTH_SOCK: "/fake/agent", NODE_OPTIONS: "--require=/missing/must-not-execute", DYLD_INSERT_LIBRARIES: "/missing/must-not-load" }, healthTimeoutMs: 2_000 });
+    try {
+      expect(JSON.parse(await readFile(resultFile, "utf8"))).toEqual({ args: ["--dev", ...(reuseLocalEnv ? ["--reuse-local-env"] : ["--local-env", envFile])], inheritedNames: [], tokenInEnvironment: false, tokenInArguments: false, launchId });
+    } finally {
+      await daemon.stop();
+      expect(lines.at(-1)).toBe("OhMyGame service exited (0)");
+      expect(timers.mock.calls.some(([, milliseconds]) => milliseconds === 150_000)).toBe(true);
+      timers.mockRestore(); await rm(directory, { recursive: true, force: true });
+    }
+  });
   it("resolves the system proxy over private child IPC", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-proxy-ipc-"));
     const entry = path.join(directory, "daemon.mjs");
@@ -310,10 +385,13 @@ describe("desktop daemon process", () => {
     await daemon.stop();
   });
 
-  it("routes playtest requests over the private child-process channel", async () => {
+  it.each(["success", "known-failure", "untrusted-fields", "open-failure", "untrusted-open-fields"])("routes playtest requests over the private child-process channel (%s)", async kind => {
     const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-playtest-ipc-"));
     const resultFile = path.join(directory, "playtest-result");
     const entry = path.join(directory, "daemon.mjs");
+    const request = kind.includes("open") ? { operation: "open", target: { runtime: "web", url: "http://127.0.0.1:1234/" }, viewport: { width: 800, height: 600 } }
+      : kind === "success" ? { operation: "close", sessionId: "session-1" }
+      : { operation: "act", sessionId: "session-1", actions: [{ type: "click", target: { text: "Start" } }] };
     await writeFile(entry, `
       import { writeFileSync } from "node:fs";
       import { createServer } from "node:http";
@@ -322,7 +400,7 @@ describe("desktop daemon process", () => {
         process.send({
           channel: "ohmygame:playtest-request",
           id: "request-1",
-          request: { operation: "close", sessionId: "session-1" },
+          request: ${JSON.stringify(request)},
         });
       });
       process.on("message", (message) => {
@@ -332,7 +410,15 @@ describe("desktop daemon process", () => {
       process.once("SIGTERM", () => server.close(() => process.exit(0)));
     `);
 
-    const handler = vi.fn(async () => ({ operation: "close" as const }));
+    const failure = { version: 1 as const, sessionId: "session-1", completedActions: 0, failedAction: 1, actionType: "click" as const, phase: "target_lookup" as const, inputDispatched: false as const };
+    const openFailure = { version: 1 as const, reason: "session_limit" as const, limit: 4, windowCreated: false as const };
+    const handler = vi.fn(async () => {
+      if (kind === "open-failure") throw playtestOpenError("Session limit", openFailure);
+      if (kind === "untrusted-open-fields") throw Object.assign(new Error("Session limit"), { openFailure });
+      if (kind === "known-failure") throw playtestActionError("Target missing", failure);
+      if (kind === "untrusted-fields") throw Object.assign(new Error("Target missing"), { actionFailure: failure });
+      return { operation: "close" as const };
+    });
     const daemon = await startDaemon({
       daemonEntry: entry,
       dataDirectory: directory,
@@ -348,11 +434,16 @@ describe("desktop daemon process", () => {
       expect(JSON.parse(await readFile(resultFile, "utf8"))).toMatchObject({
         channel: "ohmygame:playtest-response",
         id: "request-1",
-        result: { operation: "close" },
+        ...(kind === "success" ? { result: { operation: "close" } } : { error: kind.includes("open") ? "Session limit" : "Target missing" }),
       });
     });
+    const response = JSON.parse(await readFile(resultFile, "utf8"));
+    if (kind === "known-failure") expect(response.actionFailure).toEqual(failure);
+    else expect(response.actionFailure).toBeUndefined();
+    if (kind === "open-failure") expect(response.openFailure).toEqual(openFailure);
+    else expect(response.openFailure).toBeUndefined();
     expect(handler).toHaveBeenCalledWith(
-      { operation: "close", sessionId: "session-1" },
+      request,
       expect.any(AbortSignal),
     );
     await daemon.stop();

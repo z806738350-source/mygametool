@@ -3,9 +3,10 @@ import { describe, expect, it, vi } from "vitest";
 import { generateCreativeText, generateDesignDocumentMarkdown, generateDesignTable, generateProjectName } from "../src/daemon/text-generation.js";
 import { createCanvasTable } from "../src/shared/canvas-table.js";
 import type { RuntimeModel } from "../src/daemon/agent.js";
+import { registerSensitiveValue } from "../src/shared/sensitive-values.js";
 
 const model: RuntimeModel = {
-  provider: "custom-relay", id: "gpt-6.1-sol", name: "GPT-6.1 Sol", api: "openai-completions", baseUrl: "https://fixture.example/v1",
+  provider: "custom-relay", id: "gpt-6.1-sol", name: "GPT-6.1 Sol", api: "openai-completions", baseUrl: "https://llm.ziy.cc/v1",
   reasoning: true, thinkingLevelMap: { max: "ultra" }, input: ["text"], contextWindow: 128_000, maxTokens: 16_384,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 };
@@ -111,9 +112,13 @@ describe("text generation", () => {
     expect(streamSimple).not.toHaveBeenCalled();
     await expect(generateDesignDocumentMarkdown(runtime, model, { ...document, markdown: "Rules" }, "Revise")).resolves.toEqual({ status: "incomplete", markdown: "Partial document", error: expect.stringContaining("output limit") });
   });
-  it.each(["error", "aborted"] as const)("keeps partial text and the provider's %s reason", async (stopReason) => {
-    const { runtime } = fixture({ ...assistant("## Recovered draft"), stopReason, errorMessage: "Provider connection lost" });
-    await expect(generateDesignDocumentMarkdown(runtime, model, document, "Revise")).resolves.toEqual({ status: "incomplete", markdown: "## Recovered draft", error: "Provider connection lost" });
+  it.each(["error", "aborted"] as const)("keeps partial text and hides the provider's private %s reason", async (stopReason) => {
+    const key = "sk-text-generation-error-canary";
+    registerSensitiveValue(key);
+    const { runtime } = fixture({ ...assistant("## Recovered draft"), stopReason, errorMessage: `Provider connection lost ${key}` });
+    const result = await generateDesignDocumentMarkdown(runtime, model, document, "Revise");
+    expect(result).toEqual({ status: "incomplete", markdown: "## Recovered draft", error: "The configured model could not complete the request." });
+    expect(JSON.stringify(result)).not.toContain(key);
   });
   it.each<{ content: ResponseMessage["content"] }>([{ content: [] }, { content: [{ type: "thinking", thinking: "Private reasoning" }] }, { content: [{ type: "toolCall", id: "1", name: "write", arguments: { markdown: "Tool content" } }] }])("does not turn non-text output into a document", async ({ content }) => {
     const { runtime } = fixture({ ...assistant(""), content });
@@ -131,7 +136,10 @@ describe("text generation", () => {
       },
     }));
     const runtime = { streamSimple } as unknown as ModelRuntime;
-    await expect(generateDesignDocumentMarkdown(runtime, model, document, "Revise")).resolves.toMatchObject({ status: "incomplete", markdown: "## Draft\n\n正文", error: expect.stringMatching(/Connection reset|connection ended/) });
+    await expect(generateDesignDocumentMarkdown(runtime, model, document, "Revise")).resolves.toEqual({
+      status: "incomplete", markdown: "## Draft\n\n正文",
+      error: failure === "disconnect" ? "The model connection ended before the document was complete. Try again." : "The configured model could not complete the request.",
+    });
   });
   it("reports timeout instead of a generic empty response", async () => {
     const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(AbortSignal.abort(new DOMException("Timed out", "TimeoutError")));

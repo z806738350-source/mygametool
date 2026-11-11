@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { PlaytestSnapshot } from "../src/shared/playtest.js";
+import { getPlaytestActionFailure, getPlaytestOpenFailure, type PlaytestSnapshot } from "../src/shared/playtest.js";
+import { Window } from "happy-dom";
 
 const electron = vi.hoisted(() => {
   class FakeImage {
@@ -30,7 +31,7 @@ const electron = vi.hoisted(() => {
     setPermissionCheckHandler = vi.fn((handler) => { this.permissionCheckHandler = handler; });
     setPermissionRequestHandler = vi.fn((handler) => { this.permissionHandler = handler; });
     on = vi.fn((event: string, handler) => { if (event === "will-download") this.downloadHandler = handler; });
-    readonly webRequest = { onErrorOccurred: vi.fn((handler) => { this.requestErrorHandler = handler; }) };
+    readonly webRequest = { onBeforeRequest: vi.fn(), onErrorOccurred: vi.fn((handler) => { this.requestErrorHandler = handler; }) };
   }
 
   const windows: FakeWindow[] = [];
@@ -39,6 +40,9 @@ const electron = vi.hoisted(() => {
     readonly debugger = new FakeDebugger();
     readonly session = new FakeSession();
     destroyed = false;
+    visible = false;
+    minimized = false;
+    handlers = new Map<string, (() => void)[]>();
     loadedUrl = "";
     navigateHandler?: (event: { preventDefault(): void }, url: string) => void;
     redirectHandler?: (event: { preventDefault(): void }, url: string) => void;
@@ -47,8 +51,12 @@ const electron = vi.hoisted(() => {
     closedHandler?: () => void;
     readonly setContentSize = vi.fn();
     readonly getContentSize = vi.fn(() => [this.options.width, this.options.height]);
-    readonly showInactive = vi.fn();
-    readonly hide = vi.fn();
+    emit(event: string) { for (const handler of this.handlers.get(event) ?? []) handler(); }
+    readonly showInactive = vi.fn(() => { this.visible = true; this.emit("show"); });
+    readonly hide = vi.fn(() => { this.visible = false; this.emit("hide"); });
+    readonly restore = vi.fn(() => { this.minimized = false; this.emit("restore"); });
+    isVisible() { return this.visible; }
+    isMinimized() { return this.minimized; }
     readonly loadURL = vi.fn(async (url: string) => { this.loadedUrl = url; });
     /** Child frames of the page, such as a Playable Nodes sandbox. */
     readonly childFrames: { url: string; executeJavaScript: (script: string) => Promise<unknown> }[] = [];
@@ -63,6 +71,8 @@ const electron = vi.hoisted(() => {
       debugger: this.debugger,
       session: this.session,
       setWindowOpenHandler: vi.fn(),
+      setAudioMuted: vi.fn(),
+      setBackgroundThrottling: vi.fn(),
       on: vi.fn((event: string, handler: any) => {
         if (event === "will-navigate") this.navigateHandler = handler;
         if (event === "will-redirect") this.redirectHandler = handler;
@@ -95,7 +105,10 @@ const electron = vi.hoisted(() => {
       windows.push(this);
     }
 
-    on(event: string, handler: any) { if (event === "close") this.closeHandler = handler; }
+    on(event: string, handler: any) {
+      if (event === "close") this.closeHandler = handler;
+      else this.handlers.set(event, [...this.handlers.get(event) ?? [], handler]);
+    }
     once(event: string, handler: () => void) { if (event === "closed") this.closedHandler = handler; }
     isDestroyed() { return this.destroyed; }
     destroy() { this.destroyed = true; this.closedHandler?.(); }
@@ -106,6 +119,80 @@ const electron = vi.hoisted(() => {
 vi.mock("electron", () => ({ BrowserWindow: electron.FakeWindow }));
 
 import { analyzeBitmap, ElectronPlaytestDriver, validatedPlaytestUrl } from "../src/desktop/playtest-driver.js";
+
+async function domPlaytest(html: string, texts: string[] = []) {
+  const dom = new Window({ url: "http://127.0.0.1:43123/" });
+  dom.document.body.innerHTML = html;
+  for (const [index, element] of [...dom.document.querySelectorAll("button")].entries()) {
+    Object.defineProperty(element, "innerText", { value: texts[index] ?? element.textContent });
+    Object.defineProperty(element, "checkVisibility", { value: () => !element.hidden });
+    element.getBoundingClientRect = () => new dom.DOMRect(77, 493, 250, 66);
+  }
+  const driver = new ElectronPlaytestDriver();
+  const opening = driver.request({ operation: "open", target: { runtime: "web", url: "http://127.0.0.1:43123/" }, viewport: { width: 800, height: 600 } });
+  const window = electron.windows[0]!, original = window.webContents.executeJavaScript.getMockImplementation()!;
+  window.webContents.executeJavaScript.mockImplementation(async script => script.includes('deepQueryAll("iframe")') ? window.frameBoxes
+    : script.includes("const INTERACTIVE") ? dom.eval(script) : original(script));
+  const opened = await opening;
+  if (opened.operation !== "open") throw Error("Expected open");
+  return { driver, dom, window, snapshot: opened.snapshot as PlaytestSnapshot,
+    close: async () => { driver.close(); await dom.happyDOM.close(); } };
+}
+
+describe("playtest DOM target consistency", () => {
+  beforeEach(() => { electron.windows.length = 0; });
+  it.each(["text", "role"])("matches reported multiline %s after normalizing whitespace on both sides", async kind => {
+    const fixture = await domPlaytest('<button id="start"><span>踏入暮林</span><em>ENTER / 点击开始</em></button>', ["\t踏入暮林 \n ENTER\u00a0/\t 点击开始  "]);
+    try {
+      expect(fixture.snapshot.elements[0]?.text).toBe("踏入暮林 ENTER / 点击开始");
+      const name = " 踏入暮林\tENTER / 点击开始\n";
+      const target = kind === "text" ? { text: name } : { role: "button", name };
+      await fixture.driver.request({ operation: "act", sessionId: fixture.snapshot.sessionId, actions: [{ type: "click", target }] });
+      expect(fixture.window.debugger.commands.filter(command => command.method === "Input.dispatchMouseEvent")).toHaveLength(3);
+    } finally { await fixture.close(); }
+  });
+  it.each(["duplicate", "hidden", "disabled", "blank"])("does not dispatch input for a %s target", async kind => {
+    const html = kind === "duplicate" ? '<button>Start</button><button>Start</button>' : `<button ${kind === "hidden" ? "hidden" : kind === "disabled" ? "disabled" : ""}>Start</button>`;
+    const fixture = await domPlaytest(html);
+    try {
+      const cause = await fixture.driver.request({ operation: "act", sessionId: fixture.snapshot.sessionId, actions: [{ type: "click", target: { text: kind === "blank" ? " \n\t" : "Start" } }] }).catch(error => error);
+      expect(getPlaytestActionFailure(cause)).toMatchObject({ completedActions: 0, failedAction: 1, phase: "target_lookup", inputDispatched: false });
+      expect(fixture.window.debugger.commands.filter(command => command.method.startsWith("Input."))).toHaveLength(0);
+      if (kind === "duplicate") expect(cause.message).toContain("Multiple visible");
+    } finally { await fixture.close(); }
+  });
+  it("ignores a hidden duplicate and preserves completed input when a later target is missing", async () => {
+    const fixture = await domPlaytest('<button hidden>Start</button><button id="start">Start</button>');
+    try {
+      const cause = await fixture.driver.request({ operation: "act", sessionId: fixture.snapshot.sessionId, actions: [{ type: "click", target: { text: "Start" } }, { type: "click", target: { text: "Missing" } }] }).catch(error => error);
+      expect(getPlaytestActionFailure(cause)).toMatchObject({ completedActions: 1, failedAction: 2, phase: "target_lookup", inputDispatched: false });
+      expect(fixture.window.debugger.commands.filter(command => command.method === "Input.dispatchMouseEvent")).toHaveLength(3);
+    } finally { await fixture.close(); }
+  });
+  it("keeps delivery uncertain when a mouse dispatch fails", async () => {
+    const fixture = await domPlaytest('<button>Start</button>');
+    try {
+      const dispatch = fixture.window.debugger.sendCommand.getMockImplementation()!;
+      fixture.window.debugger.sendCommand.mockImplementation(async (method, parameters) => {
+        if (method === "Input.dispatchMouseEvent") throw new Error("Dispatch interrupted");
+        return dispatch(method, parameters);
+      });
+      const cause = await fixture.driver.request({ operation: "act", sessionId: fixture.snapshot.sessionId, actions: [{ type: "click", target: { text: "Start" } }] }).catch(error => error);
+      expect(getPlaytestActionFailure(cause)).toMatchObject({ completedActions: 0, phase: "action", inputDispatched: "unknown" });
+    } finally { await fixture.close(); }
+  });
+  it("refuses ambiguous matches across frames before any mouse input", async () => {
+    const fixture = await domPlaytest('<button>Start</button>');
+    try {
+      fixture.window.frameBoxes = [{ url: "about:srcdoc", x: 0, y: 0, scaleX: 1, scaleY: 1 }];
+      fixture.window.childFrames.push({ url: "about:srcdoc", executeJavaScript: async () => ({ x: 20, y: 30 }) });
+      const cause = await fixture.driver.request({ operation: "act", sessionId: fixture.snapshot.sessionId, actions: [{ type: "click", target: { text: "Start" } }] }).catch(error => error);
+      expect(cause.message).toContain("across frames");
+      expect(getPlaytestActionFailure(cause)).toMatchObject({ completedActions: 0, inputDispatched: false });
+      expect(fixture.window.debugger.commands.filter(command => command.method.startsWith("Input."))).toHaveLength(0);
+    } finally { await fixture.close(); }
+  });
+});
 
 beforeEach(() => { electron.windows.length = 0; });
 
@@ -134,6 +221,35 @@ describe("electron playtest driver", () => {
     expect(electron.windows[0]?.debugger.attach).toHaveBeenCalledWith("1.3");
     expect(electron.windows[0]?.options.resizable).toBe(true);
     driver.close();
+  });
+
+  it("shows a new Agent actual bridge capabilities and media progress without interpreting historical failures as decoder failure", async () => {
+    const dom = new Window({ url: "http://127.0.0.1:43123/" });
+    dom.document.body.innerHTML = '<video id="intro" src="/media/intro.mp4?private=query"></video>';
+    const video = dom.document.querySelector("video")!;
+    Object.defineProperties(video, {
+      readyState: { value: 4 }, currentTime: { value: 1.2 }, duration: { value: 5 }, paused: { value: false },
+      networkState: { value: 1 }, videoWidth: { value: 1280 }, videoHeight: { value: 720 },
+      buffered: { value: { length: 1, start: () => 0, end: () => 5 } },
+      getVideoPlaybackQuality: { value: () => ({ totalVideoFrames: 29, droppedVideoFrames: 2 }) },
+    });
+    Object.assign(dom, { __OHMYGAME_PLAYTEST__: { snapshot: () => ({ level: 1 }), reset: () => {}, setSeed: () => {}, step: () => {}, customProbe: () => {} } });
+    const driver = new ElectronPlaytestDriver();
+    const opening = driver.request({ operation: "open", target: { runtime: "web", url: "http://127.0.0.1:43123/" }, viewport: { width: 800, height: 600 } });
+    const window = electron.windows[0]!;
+    const original = window.webContents.executeJavaScript.getMockImplementation()!;
+    window.webContents.executeJavaScript.mockImplementation(async script => script.includes('const listMedia') ? dom.eval(script) : original(script));
+    try {
+      const opened = await opening;
+      if (opened.operation !== "open") throw Error("Expected open");
+      expect(opened.snapshot.capabilities.deterministic).toEqual(["snapshot", "reset", "seed", "step"]);
+      expect(opened.snapshot.bridgeCapabilities).not.toContain("customProbe");
+      const observed = opened.snapshot as PlaytestSnapshot;
+      expect(observed.media).toMatchObject([{ elementId: "intro", source: "/media/intro.mp4", currentTime: 1.2, errorCode: null,
+        networkState: 1, videoWidth: 1280, videoHeight: 720, totalVideoFrames: 29, droppedVideoFrames: 2, buffered: [{ start: 0, end: 5 }] }]);
+      expect(JSON.stringify(observed.media)).not.toContain("private=query");
+      expect(driver.capabilities.deterministic).toEqual([]); // Other sessions do not inherit this page's bridge.
+    } finally { driver.close(); await dom.happyDOM.close(); }
   });
 
   it("keeps watched sessions independent and resizable", async () => {
@@ -208,6 +324,35 @@ describe("electron playtest driver", () => {
     }
   });
 
+  it("preserves watched sessions across idle deadlines and reclaims them after hiding", async () => {
+    vi.useFakeTimers();
+    const driver = new ElectronPlaytestDriver(undefined, 1_000);
+    try {
+      await driver.request({ operation: "open", target: { runtime: "web", url: "http://127.0.0.1:43123/" }, viewport: { width: 800, height: 600 } });
+      const window = electron.windows[0]!;
+      driver.setVisible(true);
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(window.destroyed).toBe(false); expect(driver.watchState().activeSessions).toBe(1);
+      driver.setVisible(false);
+      await vi.advanceTimersByTimeAsync(999); expect(window.destroyed).toBe(false);
+      await vi.advanceTimersByTimeAsync(1); expect(window.destroyed).toBe(true);
+    } finally { driver.close(); vi.useRealTimers(); }
+  });
+
+  it("does not expire an active tool request, then reclaims the hidden session", async () => {
+    vi.useFakeTimers();
+    const driver = new ElectronPlaytestDriver(undefined, 1_000);
+    try {
+      const opened = await driver.request({ operation: "open", target: { runtime: "web", url: "http://127.0.0.1:43123/" }, viewport: { width: 800, height: 600 } });
+      if (opened.operation !== "open") throw Error("Expected open result");
+      const pending = driver.request({ operation: "act", sessionId: opened.snapshot.sessionId, actions: [{ type: "wait", milliseconds: 1_500 }] });
+      await vi.advanceTimersByTimeAsync(1_100); expect(electron.windows[0]!.destroyed).toBe(false);
+      await vi.advanceTimersByTimeAsync(400); await pending;
+      await vi.advanceTimersByTimeAsync(999); expect(electron.windows[0]!.destroyed).toBe(false);
+      await vi.advanceTimersByTimeAsync(1); expect(electron.windows[0]!.destroyed).toBe(true);
+    } finally { driver.close(); vi.useRealTimers(); }
+  });
+
   it("stops the idle timer when a session is closed", async () => {
     vi.useFakeTimers();
     try {
@@ -219,6 +364,96 @@ describe("electron playtest driver", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("freezes hidden sessions between requests, including errors and cancellation", async () => {
+    const driver = new ElectronPlaytestDriver();
+    const opened = await driver.request({ operation: "open", target: { runtime: "web", url: "http://127.0.0.1:43123/" }, viewport: { width: 800, height: 600 } });
+    if (opened.operation !== "open") throw new Error("Expected open result");
+    const window = electron.windows[0]!;
+    const lifecycle = () => window.debugger.commands.filter(({ method }) => method === "Page.setWebLifecycleState");
+    expect(lifecycle().at(-1)?.parameters).toEqual({ state: "frozen" });
+    expect(window.webContents.setAudioMuted).toHaveBeenLastCalledWith(true);
+    expect(window.webContents.setBackgroundThrottling).toHaveBeenLastCalledWith(true);
+
+    await driver.request({ operation: "inspect", sessionId: opened.snapshot.sessionId });
+    expect(lifecycle().slice(-2).map(({ parameters }) => parameters)).toEqual([{ state: "active" }, { state: "frozen" }]);
+    await expect(driver.request({ operation: "act", sessionId: opened.snapshot.sessionId, actions: [{ type: "wait", milliseconds: -1 }] })).rejects.toThrow("waits must");
+    expect(lifecycle().at(-1)?.parameters).toEqual({ state: "frozen" });
+
+    const controller = new AbortController();
+    const pending = driver.request({ operation: "act", sessionId: opened.snapshot.sessionId, actions: [{ type: "wait", milliseconds: 5_000 }] }, controller.signal);
+    controller.abort(new Error("Cancelled test"));
+    await expect(pending).rejects.toThrow("Cancelled test");
+    expect(lifecycle().at(-1)?.parameters).toEqual({ state: "frozen" });
+    expect(window.loadURL).toHaveBeenCalledOnce();
+    driver.close();
+  });
+
+  it("keeps overlapping requests running until the last request completes", async () => {
+    const driver = new ElectronPlaytestDriver();
+    const opened = await driver.request({ operation: "open", target: { runtime: "web", url: "http://127.0.0.1:43123/" }, viewport: { width: 800, height: 600 } });
+    if (opened.operation !== "open") throw new Error("Expected open result");
+    const window = electron.windows[0]!;
+    let finish!: (value: InstanceType<typeof electron.FakeImage>) => void;
+    window.webContents.capturePage.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const capture = driver.request({ operation: "capture", sessionId: opened.snapshot.sessionId });
+    await vi.waitFor(() => expect(window.webContents.capturePage).toHaveBeenCalledOnce());
+    await driver.request({ operation: "inspect", sessionId: opened.snapshot.sessionId });
+    expect(window.debugger.commands.filter(({ method }) => method === "Page.setWebLifecycleState").at(-1)?.parameters).toEqual({ state: "active" });
+    expect(window.debugger.commands.at(-1)).toEqual({ method: "Emulation.setFocusEmulationEnabled", parameters: { enabled: true } });
+    expect(window.webContents.setBackgroundThrottling).toHaveBeenLastCalledWith(false);
+    finish(new electron.FakeImage());
+    await capture;
+    expect(window.debugger.commands.at(-1)?.parameters).toEqual({ state: "frozen" });
+    driver.close();
+  });
+
+  it.each(["snapshot", "bridge", "capture"] as const)("suspends a cancelled pending %s without waiting for game code", async (kind) => {
+    const driver = new ElectronPlaytestDriver();
+    const opened = await driver.request({ operation: "open", target: { runtime: "web", url: "http://127.0.0.1:43123/" }, viewport: { width: 800, height: 600 } });
+    if (opened.operation !== "open") throw new Error("Expected open result");
+    const window = electron.windows[0]!;
+    const unresolved = new Promise<never>(() => {});
+    const called = vi.fn(() => unresolved);
+    if (kind === "capture") window.webContents.capturePage.mockImplementationOnce(called);
+    else window.webContents.executeJavaScript.mockImplementationOnce(called);
+    const controller = new AbortController();
+    const sessionId = opened.snapshot.sessionId;
+    const pending = driver.request(kind === "bridge"
+      ? { operation: "act", sessionId, actions: [{ type: "bridge", method: "reset" }] }
+      : { operation: kind === "snapshot" ? "inspect" : "capture", sessionId }, controller.signal);
+    await vi.waitFor(() => expect(called).toHaveBeenCalledOnce());
+    controller.abort(new Error("Cancel stalled request"));
+    await expect(pending).rejects.toThrow("Cancel stalled request");
+    expect(window.debugger.commands.filter(({ method }) => method === "Page.setWebLifecycleState").at(-1)?.parameters).toEqual({ state: "frozen" });
+    expect(window.webContents.setBackgroundThrottling).toHaveBeenLastCalledWith(true);
+    expect(window.webContents.setAudioMuted).toHaveBeenLastCalledWith(true);
+    await expect(driver.request({ operation: "inspect", sessionId })).resolves.toMatchObject({ operation: "inspect" });
+    driver.close();
+  });
+
+  it("resumes watched windows and suspends hidden or minimized windows without reloading", async () => {
+    const driver = new ElectronPlaytestDriver();
+    const opened = await driver.request({ operation: "open", target: { runtime: "web", url: "http://127.0.0.1:43123/" }, viewport: { width: 800, height: 600 } });
+    if (opened.operation !== "open") throw new Error("Expected open result");
+    const window = electron.windows[0]!;
+    driver.setVisible(true);
+    await vi.waitFor(() => expect(window.debugger.commands.filter(({ method }) => method === "Page.setWebLifecycleState").at(-1)?.parameters).toEqual({ state: "active" }));
+    expect(window.webContents.setAudioMuted).toHaveBeenLastCalledWith(false);
+    expect(window.webContents.setBackgroundThrottling).toHaveBeenLastCalledWith(true);
+    window.minimized = true;
+    window.emit("minimize");
+    await vi.waitFor(() => expect(window.debugger.commands.filter(({ method }) => method === "Page.setWebLifecycleState").at(-1)?.parameters).toEqual({ state: "frozen" }));
+    expect(window.webContents.setAudioMuted).toHaveBeenLastCalledWith(true);
+    driver.setVisible(true);
+    await vi.waitFor(() => expect(window.debugger.commands.filter(({ method }) => method === "Page.setWebLifecycleState").at(-1)?.parameters).toEqual({ state: "active" }));
+    expect(window.restore).toHaveBeenCalledOnce();
+    driver.setVisible(false);
+    await vi.waitFor(() => expect(window.debugger.commands.filter(({ method }) => method === "Page.setWebLifecycleState").at(-1)?.parameters).toEqual({ state: "frozen" }));
+    expect(window.webContents.setAudioMuted).toHaveBeenLastCalledWith(true);
+    expect(window.loadURL).toHaveBeenCalledOnce();
+    driver.close();
   });
 
   it("blocks navigation and redirects away from the preview origin", async () => {
@@ -299,16 +534,26 @@ describe("electron playtest driver", () => {
 
   it("bounds retained browser sessions", async () => {
     const driver = new ElectronPlaytestDriver();
+    const sessionIds: string[] = [];
     for (let index = 0; index < 4; index++) {
-      await driver.request({ operation: "open", target: { runtime: "web", url: `http://127.0.0.1:43123/${index}` }, viewport: { width: 800, height: 600 } });
+      const result = await driver.request({ operation: "open", target: { runtime: "web", url: `http://127.0.0.1:43123/${index}` }, viewport: { width: 800, height: 600 } });
+      if (result.operation !== "open") throw new Error("Expected open result");
+      sessionIds.push(result.snapshot.sessionId);
     }
 
-    await expect(driver.request({
+    const failure = await driver.request({
       operation: "open",
       target: { runtime: "web", url: "http://127.0.0.1:43123/overflow" },
       viewport: { width: 800, height: 600 },
-    })).rejects.toThrow("Close an existing game session");
+    }).catch(error => error);
+    expect(failure.message).toContain("Close an existing game session");
+    expect(getPlaytestOpenFailure(failure)).toEqual({ version: 1, reason: "session_limit", limit: 4, windowCreated: false });
     expect(electron.windows).toHaveLength(4);
+    expect(electron.windows.every(window => !window.destroyed)).toBe(true);
+    await driver.request({ operation: "close", sessionId: sessionIds[0]! });
+    await expect(driver.request({ operation: "open", target: { runtime: "web", url: "http://127.0.0.1:43123/recovered" }, viewport: { width: 800, height: 600 } })).resolves.toMatchObject({ operation: "open" });
+    expect(driver.watchState().activeSessions).toBe(4);
+    expect(electron.windows.slice(1).every(window => !window.destroyed)).toBe(true);
     driver.close();
   });
 
@@ -330,7 +575,7 @@ describe("electron playtest driver", () => {
     });
 
     expect(result.operation).toBe("act");
-    expect(electron.windows[0]?.debugger.commands.map(({ method }) => method)).toEqual([
+    expect(electron.windows[0]?.debugger.commands.filter(({ method }) => method.startsWith("Input.")).map(({ method }) => method)).toEqual([
       "Input.dispatchMouseEvent", "Input.dispatchMouseEvent", "Input.dispatchMouseEvent",
       "Input.insertText", "Input.dispatchKeyEvent", "Input.dispatchKeyEvent",
       "Input.dispatchTouchEvent", "Input.dispatchTouchEvent",
@@ -339,11 +584,56 @@ describe("electron playtest driver", () => {
     driver.close();
   });
 
+  it("changes only pixel density in the running game and rejects invalid ratios before applying them", async () => {
+    const driver = new ElectronPlaytestDriver();
+    const viewport = { width: 800, height: 600 };
+    const opened = await driver.request({
+      operation: "open", target: { runtime: "web", url: "http://localhost:43123/" }, viewport: { ...viewport, deviceScaleFactor: 1 },
+    });
+    if (opened.operation !== "open") throw new Error("Expected open result");
+    const resize = (deviceScaleFactor: number) => driver.request({
+      operation: "act", sessionId: opened.snapshot.sessionId, actions: [{ type: "resize", viewport: { ...viewport, deviceScaleFactor } }],
+    });
+    await resize(2);
+    await resize(1);
+    await expect(resize(NaN)).rejects.toThrow("deviceScaleFactor");
+    const window = electron.windows[0]!;
+    expect(window.debugger.commands.filter(({ method }) => method === "Emulation.setDeviceMetricsOverride")).toEqual([1, 2, 1].map(deviceScaleFactor => ({
+      method: "Emulation.setDeviceMetricsOverride", parameters: { width: 0, height: 0, mobile: false, deviceScaleFactor },
+    })));
+    expect(window.setContentSize).not.toHaveBeenCalled();
+    expect(window.loadURL.mock.calls.map(([url]) => url)).toEqual(["about:blank", "http://localhost:43123/?ohmygamePlaytest=1"]);
+    driver.close();
+  });
+
+  it("sends physical codes for letter and digit keys and releases a cancelled hold", async () => {
+    const driver = new ElectronPlaytestDriver();
+    const opened = await driver.request({ operation: "open", target: { runtime: "web", url: "http://127.0.0.1:43123/" }, viewport: { width: 800, height: 600 } });
+    if (opened.operation !== "open") throw new Error("Expected open result");
+    await driver.request({ operation: "act", sessionId: opened.snapshot.sessionId, actions: [{ type: "press", key: "w" }, { type: "press", key: "2" }] });
+    const window = electron.windows[0]!;
+    const keys = () => window.debugger.commands.filter(({ method }) => method === "Input.dispatchKeyEvent").map(({ parameters }) => parameters);
+    expect(keys()).toEqual([
+      { type: "keyDown", key: "w", code: "KeyW", text: "w" }, { type: "keyUp", key: "w", code: "KeyW", text: "w" },
+      { type: "keyDown", key: "2", code: "Digit2", text: "2" }, { type: "keyUp", key: "2", code: "Digit2", text: "2" },
+    ]);
+    const controller = new AbortController();
+    const held = driver.request({ operation: "act", sessionId: opened.snapshot.sessionId, actions: [{ type: "press", key: "d", duration: 5_000 }] }, controller.signal);
+    await vi.waitFor(() => expect(keys().at(-1)).toMatchObject({ type: "keyDown", code: "KeyD" }));
+    controller.abort();
+    await expect(held).rejects.toThrow("aborted");
+    expect(keys().at(-1)).toMatchObject({ type: "keyUp", code: "KeyD" });
+    expect(window.debugger.commands.at(-1)?.parameters).toEqual({ state: "frozen" });
+    driver.close();
+  });
+
   it("reads and clicks content inside scaled child frames", async () => {
     const driver = new ElectronPlaytestDriver();
     const opening = driver.request({ operation: "open", target: { runtime: "web", url: "http://127.0.0.1:43123/" }, viewport: { width: 800, height: 600 } });
     const window = electron.windows[0]!;
     window.frameBoxes = [{ url: "about:srcdoc", x: 100, y: 50, scaleX: 0.5, scaleY: 0.5 }];
+    const video = { tag: "video", source: "/media/opening.mp4", readyState: 4, currentTime: 1.2, duration: 4, paused: false, ended: false, errorCode: null, totalVideoFrames: 33 };
+    window.session.requestErrorHandler!({ webContentsId: window.webContents.id, url: "http://127.0.0.1:43123/media/opening.mp4", error: "net::ERR_FAILED", timestamp: Date.now() });
     window.childFrames.push({
       url: "about:srcdoc",
       executeJavaScript: async (script: string) => script.includes("box.x + box.width / 2")
@@ -351,6 +641,7 @@ describe("electron playtest driver", () => {
         : {
             elements: [{ index: 0, tag: "button", role: "button", name: "Take the train", text: "Take the train", enabled: true, box: { x: 10, y: 20, width: 40, height: 20 } }],
             text: "Platform 9 Take the train",
+            media: [video],
           },
     });
     const opened = await opening;
@@ -361,9 +652,11 @@ describe("electron playtest driver", () => {
       expect.objectContaining({ index: 0, name: "Take the train", box: { x: 105, y: 60, width: 20, height: 10 } }),
     ]);
     expect(snapshot.text).toBe("Platform 9 Take the train");
+    expect(snapshot.media).toEqual([video]);
+    expect(snapshot.failedRequests[0]?.error).toBe("net::ERR_FAILED");
 
     await driver.request({ operation: "act", sessionId: opened.snapshot.sessionId, actions: [{ type: "click", target: { text: "Take the train" } }] });
-    expect(window.debugger.commands[0]).toMatchObject({ method: "Input.dispatchMouseEvent", parameters: { type: "mouseMoved", x: 115, y: 65 } });
+    expect(window.debugger.commands.find(({ method }) => method === "Input.dispatchMouseEvent")).toMatchObject({ method: "Input.dispatchMouseEvent", parameters: { type: "mouseMoved", x: 115, y: 65 } });
     driver.close();
   });
 

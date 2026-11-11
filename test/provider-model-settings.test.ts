@@ -7,7 +7,11 @@ import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/daemon/app.js";
 import { normalizeCustomProviderModel, ProviderModelSettingsStore } from "../src/daemon/provider-model-settings.js";
-import { ModelCatalogRefresh } from "../src/daemon/model-catalog-refresh.js";
+import { MODEL_CATALOG_REFRESH_ERROR, ModelCatalogRefresh } from "../src/daemon/model-catalog-refresh.js";
+import { createLocalModelRuntime } from "../src/daemon/local-model-runtime.js";
+import { ProjectManager } from "../src/daemon/projects.js";
+import { ConversationManager } from "../src/daemon/conversations.js";
+import { defaultModel3DSettings } from "../src/shared/custom-models.js";
 
 const directories: string[] = [];
 const apps: Array<ReturnType<typeof createApp>> = [];
@@ -47,141 +51,102 @@ describe("Pi catalog refresh", () => {
     return { directory, runtime, request, createRuntime };
   }
 
-  it("returns the local list while refreshing, publishes the result and preserves it across restart", async () => {
+  it("serves local models and preserves local choices across restart without a background catalog request", async () => {
     const { directory, runtime, request, createRuntime } = await catalogFixture();
-    let release!: () => void;
-    request.mockImplementation(() => new Promise<void>((resolve) => { release = resolve; }));
     const app = createApp({ dataDirectory: directory, piAgentDirectory: directory, createModelRuntime: async () => runtime });
     apps.push(app);
     const first = await app.inject({ method: "GET", url: "/models" });
     expect(first.statusCode).toBe(200);
-    expect(first.json().loadingProviders).toContain("openai");
+    expect(first.json().loadingProviders).toBeUndefined();
     expect(first.json().models.some((model: { id: string }) => model.id === "catalog-new")).toBe(false);
-    await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
-    // Concurrent readers share the pending refresh instead of issuing more network requests.
-    await app.inject({ method: "GET", url: "/settings/models/providers/openai/models" });
-    expect(request).toHaveBeenCalledOnce();
-    release();
-    await vi.waitFor(async () => {
-      const models = (await app.inject({ method: "GET", url: "/models" })).json();
-      expect(models.loadingProviders).toBeUndefined();
-      expect(models.models).toContainEqual(expect.objectContaining({ id: "catalog-new" }));
-    });
-    const hidden = await app.inject({ method: "PUT", url: "/settings/models/providers/openai/models/visibility", payload: { ids: ["catalog-new"], visible: false } });
-    expect(hidden.statusCode).toBe(200);
-    await runtime.login("openai", "api_key", { signal: new AbortController().signal, notify: () => {}, prompt: async () => "fixture-key" });
-    request.mockResolvedValue();
-    const choice = first.json().models[0];
+    const choice = first.json().models.find((item: { provider: string }) => item.provider === "openai");
+    expect(choice).toBeDefined();
     expect((await app.inject({ method: "PUT", url: "/models/default", payload: { model: { provider: "openai", id: choice.id }, reasoningLevel: choice.reasoningLevels[0] } })).statusCode).toBe(204);
     expect((await app.inject({ method: "POST", url: "/settings/models/providers/openai/models/custom", payload: { ...model, id: "user-model" } })).statusCode).toBe(201);
+    const hidden = await app.inject({ method: "PUT", url: "/settings/models/providers/openai/models/visibility", payload: { ids: ["user-model"], visible: false } });
+    expect(hidden.statusCode).toBe(200);
     const forced = await app.inject({ method: "POST", url: "/settings/models/providers/openai/models/refresh" });
-    expect(forced.statusCode, forced.body).toBe(200);
-    expect(forced.json().models).toContainEqual(expect.objectContaining({ id: "catalog-new", visible: false }));
-    expect(request).toHaveBeenCalledTimes(2);
+    expect(forced.statusCode, forced.body).toBe(400);
     expect(runtime.getModel("openai", "user-model")).toMatchObject({ id: "user-model", contextWindow: model.contextWindow });
     expect((await app.inject({ method: "GET", url: "/models" })).json().defaultModel).toEqual({ provider: "openai", id: choice.id });
-    vi.stubEnv("PI_OFFLINE", "1");
-    expect((await app.inject({ method: "POST", url: "/settings/models/providers/openai/models/refresh" })).statusCode).toBe(400);
     const restored = await createRuntime();
-    expect(restored.getModel("openai", "catalog-new")).toBeDefined();
-    expect(request).toHaveBeenCalledTimes(2);
+    expect(restored.getModel("openai", "user-model")).toMatchObject({ id: "user-model", contextWindow: model.contextWindow });
+    expect(restored.getModel("openai", "catalog-new")).toBeUndefined();
+    const restarted = createApp({ dataDirectory: directory, piAgentDirectory: directory, createModelRuntime: async () => restored });
+    apps.push(restarted);
+    const providerModels = await restarted.inject({ method: "GET", url: "/settings/models/providers/openai/models" });
+    expect(providerModels.statusCode).toBe(200);
+    expect(providerModels.json().models).toContainEqual(expect.objectContaining({ id: "user-model", visible: false }));
+    expect((await restarted.inject({ method: "GET", url: "/models" })).json().defaultModel).toEqual({ provider: "openai", id: choice.id });
+    expect(request).not.toHaveBeenCalled();
   });
 
-  it("keeps cached models on failure, backs off automatic retries and allows an explicit retry", async () => {
+  it("refuses explicit SDK refresh without invoking or exposing the provider callback", async () => {
     const { directory, runtime, request } = await catalogFixture();
     request.mockRejectedValue(new Error("private-provider-token"));
     const app = createApp({ dataDirectory: directory, piAgentDirectory: directory, createModelRuntime: async () => runtime });
     apps.push(app);
     const initial = (await app.inject({ method: "GET", url: "/models" })).json();
-    await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
     const failed = await app.inject({ method: "POST", url: "/settings/models/providers/openai/models/refresh" });
-    expect(failed.statusCode).toBe(503);
+    expect(failed.statusCode).toBe(400);
     expect(failed.body).not.toContain("private-provider-token");
-    const calls = request.mock.calls.length;
     const cached = (await app.inject({ method: "GET", url: "/models" })).json();
     expect(cached.models).toEqual(initial.models);
-    expect(request).toHaveBeenCalledTimes(calls);
-    request.mockResolvedValue();
-    expect((await app.inject({ method: "POST", url: "/settings/models/providers/openai/models/refresh" })).statusCode).toBe(200);
-    expect(runtime.getModel("openai", "catalog-new")).toBeDefined();
+    expect(runtime.getModel("openai", "catalog-new")).toBeUndefined();
+    expect(request).not.toHaveBeenCalled();
   });
 
-  it("rechecks Pi's persisted cache when it expires, without adding another four-hour delay after restart", async () => {
-    const { directory } = await fixture();
-    await writeFile(path.join(directory, "auth.json"), JSON.stringify({ openai: { type: "api_key", key: "fixture-key" } }));
-    const createRuntime = () => ModelRuntime.create({
-      authPath: path.join(directory, "auth.json"), modelsPath: path.join(directory, "models.json"),
-      catalogBaseUrl: "https://catalog.example", allowModelNetwork: false,
-    });
-    const runtime = await createRuntime();
-    const model = { ...runtime.getModels("openai")[0]!, id: "remote-cached-model" };
-    const request = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => Response.json({ models: [model] }, {
-      headers: { "last-modified": "Thu, 01 Jan 2099 00:00:00 GMT", etag: '"catalog-v1"' },
-    }));
+  it("does not let elapsed cache time, saved credentials or an unset offline variable restore catalog networking", async () => {
+    const { runtime, createRuntime } = await catalogFixture();
+    const request = vi.fn<typeof fetch>();
     vi.stubGlobal("fetch", request);
     vi.stubEnv("PI_OFFLINE", undefined);
     const now = Date.now();
     const clock = vi.spyOn(Date, "now").mockReturnValue(now);
     await new ModelCatalogRefresh(() => true).refresh(runtime, "openai");
-    expect(request).toHaveBeenCalledOnce();
-    expect(runtime.getModel("openai", model.id)).toBeDefined();
-
-    clock.mockReturnValue(now + 3 * 60 * 60_000);
+    clock.mockReturnValue(now + 24 * 60 * 60_000);
     const restarted = await createRuntime();
     const refresh = new ModelCatalogRefresh(() => true);
     await refresh.refresh(restarted, "openai");
-    expect(request).toHaveBeenCalledOnce();
-    expect(restarted.getModel("openai", model.id)).toBeDefined();
-
-    clock.mockReturnValue(now + 4 * 60 * 60_000 + 1);
-    await refresh.refresh(restarted, "openai");
-    expect(request).toHaveBeenCalledTimes(2);
-    expect(request.mock.calls[1]?.[1]).toMatchObject({ headers: { "if-none-match": '"catalog-v1"' } });
+    expect(refresh.canRefresh(restarted, "openai")).toBe(false);
+    expect(refresh.schedule(restarted)).toEqual([]);
+    expect(request).not.toHaveBeenCalled();
   });
 
-  it("runs a forced manual refresh after an automatic check and shares simultaneous manual requests", async () => {
+  it("rejects simultaneous forced refreshes without starting an automatic or manual SDK refresh", async () => {
     const { runtime, request } = await catalogFixture();
-    let release!: () => void;
-    request.mockImplementationOnce(() => new Promise<void>((resolve) => { release = resolve; }));
     const calls = vi.spyOn(runtime, "refresh");
     const refresh = new ModelCatalogRefresh(() => true);
-    const automatic = refresh.refresh(runtime, "openai");
-    await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
-    const manual = refresh.refresh(runtime, "openai", true);
-    const secondManual = refresh.refresh(runtime, "openai", true);
-    release();
-    await Promise.all([automatic, manual, secondManual]);
-    expect(request).toHaveBeenCalledTimes(2);
-    expect(calls.mock.calls.map(([options]) => options?.force)).toEqual([false, true]);
+    await expect(refresh.refresh(runtime, "openai")).resolves.toBeUndefined();
+    const results = await Promise.allSettled([refresh.refresh(runtime, "openai", true), refresh.refresh(runtime, "openai", true)]);
+    expect(results).toEqual([
+      { status: "rejected", reason: new Error(MODEL_CATALOG_REFRESH_ERROR) },
+      { status: "rejected", reason: new Error(MODEL_CATALOG_REFRESH_ERROR) },
+    ]);
+    expect(refresh.refreshing("openai")).toBe(false);
+    expect(calls).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
   });
 
-  it("throttles automatic refreshes, invalidates account changes and aborts on shutdown", async () => {
+  it("keeps account invalidation, offline toggles and shutdown from enabling remote catalogs", async () => {
     const { runtime, request } = await catalogFixture("openrouter");
     let enabled = true;
     const refresh = new ModelCatalogRefresh(() => enabled);
-    const now = Date.now();
-    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
     await refresh.refresh(runtime, "openrouter");
-    await refresh.refresh(runtime, "openrouter");
-    expect(request).toHaveBeenCalledOnce();
-    clock.mockReturnValue(now + 4 * 60 * 60_000);
-    await refresh.refresh(runtime, "openrouter");
-    expect(request).toHaveBeenCalledTimes(2);
     refresh.invalidate("openrouter");
     await refresh.refresh(runtime, "openrouter");
-    expect(request).toHaveBeenCalledTimes(3);
     enabled = false;
     expect(refresh.canRefresh(runtime, "openrouter")).toBe(false);
     enabled = true;
     vi.stubEnv("PI_OFFLINE", "1");
     expect(refresh.schedule(runtime)).toEqual([]);
     vi.stubEnv("PI_OFFLINE", undefined);
-    request.mockImplementation(() => new Promise(() => {}));
-    const pending = refresh.refresh(runtime, "openrouter", true);
-    await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(4));
+    expect(refresh.canRefresh(runtime, "openrouter")).toBe(false);
+    await expect(refresh.refresh(runtime, "openrouter", true)).rejects.toThrow(MODEL_CATALOG_REFRESH_ERROR);
     refresh.close();
-    await expect(pending).rejects.toThrow("Model catalog refresh failed");
     expect(refresh.schedule(runtime)).toEqual([]);
+    expect(refresh.refreshing("openrouter")).toBe(false);
+    expect(request).not.toHaveBeenCalled();
   });
 });
 
@@ -194,6 +159,97 @@ async function fixture() {
 const model = { id: "custom/test", name: "Custom test", api: "openai-completions", contextWindow: 32_000, maxTokens: 4_000, reasoning: true, supportsImages: true };
 
 describe("provider model settings", () => {
+  it("preserves legacy Meshy settings while refusing new activation and runtime models", async () => {
+    const { directory, store } = await fixture();
+    const preferences = JSON.stringify({ version: 1, hidden: {}, customProviders: { old: { authentication: "none", preset: "meshy" } }, defaultModel3D: { provider: "meshy", id: "meshy-t2" } });
+    const models = JSON.stringify({ providers: { old: { name: "Old", api: "openai-completions", baseUrl: "https://llm.ziy.cc/v1", models: [] }, kunpo: { api: "openai-completions", baseUrl: "https://llm.ziy.cc/v1", models: [{ id: "meshy-7.1", name: "Old", contextWindow: 32000, maxTokens: 4000, reasoning: false, input: ["text"] }, { id: "good", name: "Good", contextWindow: 32000, maxTokens: 4000, reasoning: false, input: ["text"] }] } } });
+    await writeFile(path.join(directory, "model-visibility.json"), preferences);
+    await writeFile(path.join(directory, "models.json"), models);
+    await store.load();
+    expect(store.isEnabled("old")).toBe(false);
+    expect((await store.customProvider("old"))?.preset).toBe("meshy");
+    await expect(store.setEnabled("old", true)).rejects.toThrow("Meshy is disabled");
+    await expect(store.setEnabled("meshy", true)).rejects.toThrow("Meshy is disabled");
+    await expect(store.setDefaultMediaModel("3d", { provider: "meshy", id: "meshy-t2" })).rejects.toThrow("Meshy is disabled");
+    await expect(store.addCustomModel("kunpo", { ...model, id: "meshy-7.1" })).rejects.toThrow("Meshy is disabled");
+    const configured = await store.localRuntimeProviders();
+    expect(configured.some(item => item.id === "old")).toBe(false);
+    expect(configured.find(item => item.id === "kunpo")?.config.models?.map(item => item.id)).toEqual(["good"]);
+    expect(await readFile(path.join(directory, "models.json"), "utf8")).toBe(models);
+    expect(await readFile(path.join(directory, "model-visibility.json"), "utf8")).toBe(preferences);
+  });
+
+  it("preserves a mixed provider's old Meshy 3D usage without blocking its language model", async () => {
+    const { directory, store } = await fixture();
+    const settings = { name: "Mixed", api: "openai-completions", baseUrl: "https://llm.ziy.cc/v1", authentication: "none" as const, modelConfigurationVersion: 2 as const,
+      models: [{ ...model, id: "ordinary", usages: { language: true, "3d": { ...defaultModel3DSettings("standard", "meshy"), baseUrl: "https://api.meshy.ai/openapi/v1" } } }] };
+    const preferences = JSON.stringify({ version: 1, hidden: {}, customProviders: { mixed: { authentication: "none", modelConfigurationVersion: 2, models: settings.models } } });
+    await writeFile(path.join(directory, "model-visibility.json"), preferences);
+    await writeFile(path.join(directory, "models.json"), JSON.stringify({ providers: { mixed: { ...settings, models: [{ ...model, id: "ordinary", input: ["text"] }] } } }));
+    await store.load();
+    expect(store.isEnabled("mixed")).toBe(true);
+    expect((await store.customProvider("mixed"))?.models[0]?.usages?.["3d"]?.baseUrl).toBe("https://api.meshy.ai/openapi/v1");
+    expect((await store.localRuntimeProviders()).find(item => item.id === "mixed")?.config.models?.map(item => item.id)).toEqual(["ordinary"]);
+    await expect(store.setDefaultMediaModel("3d", { provider: "mixed", id: "ordinary" })).rejects.toThrow("Meshy is disabled");
+    await expect(store.setDefaultMediaModel("image", { provider: "mixed", id: "ordinary" })).resolves.toBeUndefined();
+    await expect(store.saveCustomProvider("mixed", settings, async () => {})).resolves.toBeUndefined();
+    await expect(store.saveCustomProvider("mixed", { ...settings, models: [{ ...settings.models[0]!, usages: { language: true, "3d": { ...settings.models[0]!.usages["3d"], maxReferenceImages: 2 } } }] }, async () => {})).rejects.toThrow("Meshy is disabled");
+  });
+  it("exposes the reviewed Kunpo catalog without a key or rewriting configuration", async () => {
+    const { directory, store } = await fixture();
+    await store.load();
+    expect(store.isBuiltIn("kunpo")).toBe(true);
+    expect((await store.customProviderCatalog()).find((provider) => provider.id === "kunpo")?.models.map((model) => model.id)).toContain("gpt-5.6-sol");
+    const providers = await store.localRuntimeProviders();
+    expect(providers.find((provider) => provider.id === "kunpo")?.config.models?.map((model) => model.id)).toEqual(["gpt-5.6-sol", "claude-opus-5-5", "gpt-6.1-sol"]);
+    await expect(readFile(path.join(directory, "models.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(store.removeProviderSettings("kunpo", async () => {})).rejects.toThrow("built in");
+  });
+
+  it("does not replace pre-existing explicit Kunpo runtime model metadata", async () => {
+    const { directory, store } = await fixture();
+    const text = JSON.stringify({ providers: { kunpo: { api: "openai-completions", baseUrl: "https://llm.ziy.cc/v1", models: [{
+      id: "explicit-existing", name: "Existing", contextWindow: 64_000, maxTokens: 4_000, reasoning: false, input: ["text"],
+    }] } } });
+    await writeFile(path.join(directory, "models.json"), text);
+    const configured = (await store.localRuntimeProviders()).filter((provider) => provider.id === "kunpo");
+    expect(configured).toHaveLength(1);
+    expect(configured[0]!.config.models?.map((model) => model.id)).toEqual(["explicit-existing"]);
+    expect(await readFile(path.join(directory, "models.json"), "utf8")).toBe(text);
+  });
+
+  it("refuses pending Kunpo Agents from legacy models.json and persisted conversations", async () => {
+    const { directory, store } = await fixture();
+    const pending = { provider: "kunpo", id: "gemini-3.8-flash" };
+    await writeFile(path.join(directory, "models.json"), JSON.stringify({ providers: { kunpo: {
+      api: "openai-completions", baseUrl: "https://llm.ziy.cc/v1", models: [{ id: pending.id, name: pending.id, contextWindow: 128_000, maxTokens: 4_000, reasoning: false, input: ["text", "image"] }],
+    } } }));
+    const runtime = await createLocalModelRuntime(path.join(directory, "local-api-keys.json"), () => store.localRuntimeProviders());
+    await runtime.login("kunpo", "api_key", { prompt: async () => "CANARY_PENDING_GATE_TEST_ONLY", notify: () => {} });
+    expect((await runtime.getAvailable("kunpo")).map((model) => model.id)).toContain(pending.id);
+    const projects = new ProjectManager(directory);
+    const project = await projects.create("Legacy pending Agent", "asset-canvas");
+    const conversations = new ConversationManager();
+    const conversation = await conversations.create(project, pending);
+    conversations.open(project, conversation).appendMessage({ role: "user", content: "Earlier fixture message", timestamp: 1 });
+    const request = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", request);
+    const app = createApp({ dataDirectory: directory, piAgentDirectory: directory, createModelRuntime: async () => runtime, generateProjectName: async () => undefined });
+    apps.push(app);
+    const explicit = await app.inject({ method: "POST", url: `/projects/${project.id}/conversations`, payload: { model: pending } });
+    expect(explicit.statusCode, explicit.body).toBe(201);
+    for (const id of [conversation.summary.id, explicit.json().id]) {
+      const turn = await app.inject({ method: "POST", url: `/projects/${project.id}/conversations/${id}/turns`, payload: { prompt: "Continue this fixture" } });
+      expect(turn.statusCode, turn.body).toBe(202);
+      await vi.waitFor(async () => {
+        const detail = (await app.inject({ method: "GET", url: `/projects/${project.id}/conversations/${id}` })).json();
+        expect(detail.agent).toMatchObject({ status: "error", error: expect.stringContaining("not integrated") });
+        expect(detail.settings.model).toEqual(pending);
+      });
+    }
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it("isolates inherited provider credentials while allowing explicit test credentials", async () => {
     const { directory } = await fixture();
     // A fresh process exercises the setup with inherited credentials before Pi

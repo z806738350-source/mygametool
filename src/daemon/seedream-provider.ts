@@ -1,3 +1,4 @@
+import { providerControlUrl, assertProviderBytes, providerCredentialValues, fetchProviderArtifact, providerRequest } from "./provider-network.js";
 import type { ImageModel } from "../shared/contracts.js";
 import { ImageGenerationError, openAIImageSize, type GeneratedImage, type ImageGenerationInput } from "./openai-image.js";
 import { SEEDREAM_BASE_URL, seedreamRequestOptions } from "./seedream-models.js";
@@ -14,6 +15,7 @@ export class SeedreamProvider {
   ) {}
 
   async generate(model: ImageModel, input: ImageGenerationInput, signal?: AbortSignal): Promise<GeneratedImage> {
+    providerControlUrl(this.baseUrl, true);
     const key = this.apiKey();
     if (!key) throw new ImageGenerationError("Volcengine Ark API key is not configured", 503);
     if (!input.resolution || !input.aspectRatio) {
@@ -30,7 +32,7 @@ export class SeedreamProvider {
     const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
     let response: Response;
     try {
-      response = await this.request(`${this.baseUrl.replace(/\/$/, "")}/images/generations`, {
+      response = await providerRequest(this.request, `${this.baseUrl.replace(/\/$/, "")}/images/generations`, {
         method: "POST",
         headers: { ...this.headers, ...(this.authentication === "none" ? {} : { authorization: `Bearer ${key}` }), "content-type": "application/json" },
         body: JSON.stringify({
@@ -53,18 +55,18 @@ export class SeedreamProvider {
     }
 
     const body = await response.json().catch(() => ({})) as SeedreamResponse;
-    if (!response.ok || body.error) throw seedreamError(response.status, body.error);
+    if (!response.ok || body.error) throw seedreamError(response.status);
     const result = body.data?.[0];
-    if (result?.error) throw seedreamError(400, result.error);
+    if (result?.error) throw seedreamError(400);
     if (typeof result?.b64_json === "string" && result.b64_json) {
       return {
-        bytes: Buffer.from(stripDataUrl(result.b64_json), "base64"),
+        bytes: assertProviderBytes(Buffer.from(stripDataUrl(result.b64_json), "base64"), providerCredentialValues(key, this.headers)),
         mediaType: imageMediaType(result.output_format),
         requestId: response.headers.get("x-request-id") ?? undefined,
       };
     }
     if (typeof result?.url === "string" && /^https?:\/\//.test(result.url)) {
-      const downloaded = await this.request(result.url, { signal });
+      const downloaded = await fetchProviderArtifact(this.request, result.url, this.baseUrl, { signal, protectedSecrets: providerCredentialValues(key, this.headers) });
       if (!downloaded.ok) throw new ImageGenerationError(`Seedream image download failed (${downloaded.status})`, 502);
       return {
         bytes: Buffer.from(await downloaded.arrayBuffer()),
@@ -86,11 +88,10 @@ interface SeedreamResponse {
   error?: { code?: unknown; message?: unknown };
 }
 
-function seedreamError(status: number, error?: { code?: unknown; message?: unknown }): ImageGenerationError {
+function seedreamError(status: number): ImageGenerationError {
   if (status === 401 || status === 403) return new ImageGenerationError("Volcengine Ark credentials were rejected", 503);
   if (status === 429) return new ImageGenerationError("Volcengine Ark image generation is temporarily rate limited", 429);
-  const detail = typeof error?.message === "string" && error.message.trim() ? error.message.trim() : undefined;
-  return new ImageGenerationError(detail ?? "Volcengine Ark image generation failed", status >= 500 ? 502 : 400);
+  return new ImageGenerationError("Volcengine Ark image generation failed", status >= 500 ? 502 : 400);
 }
 
 function stripDataUrl(value: string): string {

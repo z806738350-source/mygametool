@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { createAssetCanvasDocument, isAssetCanvasDocument, validateAssetCanvasDocument, withoutContentNodeSizes } from "../src/shared/asset-canvas.js";
-import { canvasHistoryKey, model3DViewLabels, toAssetCanvasNode } from "../src/renderer/asset-canvas-workspace.js";
+import { createAssetCanvasDocument, createAssetGenerationNode, isAssetCanvasDocument, validateAssetCanvasDocument, withoutContentNodeSizes } from "../src/shared/asset-canvas.js";
+import { canvasHistoryKey, model3DViewLabels, toAssetCanvasNode, toFlowNode } from "../src/renderer/asset-canvas-workspace.js";
+import { imageModelsForProvider } from "../src/daemon/image-models.js";
 import type { Model3DModel } from "../src/shared/contracts.js";
 import { model3DModel } from "../src/shared/custom-models.js";
 import { MODEL_3D_PRESETS } from "../src/shared/model3d-presets.js";
@@ -8,6 +9,40 @@ import { buildModel3DToolRequest } from "../src/shared/generation-config.js";
 import { MODEL3D_CONNECTION_ID } from "../src/shared/model3d-operations.js";
 
 describe("Asset Canvas node serialization", () => {
+  it.each([["1K", "3:2"], ["1K", "2:3"], ["4K", "16:9"]] as const)("keeps saved %s %s settings when inheriting the default image model", (resolution, aspectRatio) => {
+    const source = createAssetGenerationNode("image", { x: 20, y: 30 }, { imageResolution: resolution, imageAspectRatio: aspectRatio });
+    const models = imageModelsForProvider("openai", "Fixture", ["gpt-image-2.5-sunburst"]);
+    const loaded = toAssetCanvasNode(toFlowNode(source, models, []));
+    expect(loaded).toEqual({ ...source, data: { ...source.data, model: { provider: models[0]!.provider, id: models[0]!.id } } });
+    expect(source.data).not.toHaveProperty("model");
+  });
+  it("keeps requested image settings even before a model catalog is available or when its defaults differ", () => {
+    const source = createAssetGenerationNode("image", { x: 0, y: 0 }, { imageResolution: "4K", imageAspectRatio: "16:9" });
+    expect(toAssetCanvasNode(toFlowNode(source, [], []))).toEqual(source);
+    const limited = imageModelsForProvider("openai", "Fixture", ["gpt-image-1"]);
+    expect(toAssetCanvasNode(toFlowNode(source, limited, [])).data).toMatchObject({ resolution: "4K", aspectRatio: "16:9" });
+  });
+  it("persists selected voice versions independently of the current generated candidate", () => {
+    const digest = "a".repeat(64), model = { provider: "volcengine-tts", id: "seed-audio-1.0" };
+    const voice = toAssetCanvasNode({ id: "voice", type: "voice", position: { x: 0, y: 0 }, data: { voiceDescription: "Warm", sampleText: "Hello", audioModel: model, assetId: "new-candidate", selectedAssetId: "old-candidate", selectedSha256: digest } });
+    const speech = toAssetCanvasNode({ id: "speech", type: "speech", position: { x: 600, y: 0 }, data: { text: "Hello", referenceAssetId: "old-candidate", referenceSha256: digest, voiceSourceNodeId: "voice" } });
+    const canvas = createAssetCanvasDocument(); canvas.nodes = [voice, speech]; canvas.editorLayout.nodes = { voice: voice.position, speech: speech.position };
+    expect(isAssetCanvasDocument(canvas)).toBe(true);
+    expect(voice.data).toMatchObject({ assetId: "new-candidate", selectedAssetId: "old-candidate", selectedSha256: digest });
+    expect(speech.data).toMatchObject({ referenceAssetId: "old-candidate", referenceSha256: digest, voiceSourceNodeId: "voice" });
+    if (voice.type !== "voice" || speech.type !== "speech") throw new Error();
+    delete voice.data.selectedSha256; expect(isAssetCanvasDocument(canvas)).toBe(false);
+    voice.data.selectedSha256 = digest; speech.data.voiceSourceNodeId = "missing"; expect(isAssetCanvasDocument(canvas)).toBe(false);
+  });
+  it("stores image generation parameters and a mask reference without embedding image bytes", () => {
+    const node = toAssetCanvasNode({ id: "image", type: "image", position: { x: 0, y: 0 }, data: { prompt: "A hero", model: { provider: "openai", id: "gpt-image-2.5-sunburst" }, resolution: "1K", aspectRatio: "1:1", images: [{ type: "library", assetId: "reference" }], quality: "max", outputFormat: "png", background: "transparent", mask: { type: "library", assetId: "mask" } } });
+    const canvas = createAssetCanvasDocument(); canvas.nodes = [node]; canvas.editorLayout.nodes.image = { x: 0, y: 0 };
+    expect(isAssetCanvasDocument(canvas)).toBe(true);
+    expect(node.data).toMatchObject({ quality: "max", outputFormat: "png", background: "transparent", mask: { type: "library", assetId: "mask" } });
+    if (node.type !== "image") throw new Error("Expected image node");
+    node.data.outputCompression = 101;
+    expect(isAssetCanvasDocument(canvas)).toBe(false);
+  });
   it("keeps resize history and serialization while rejecting invalid node dimensions", () => {
     const canvas = createAssetCanvasDocument();
     const node = toAssetCanvasNode({ id: "notes", type: "text", position: { x: 0, y: 0 }, width: 600, height: 400, data: { text: "Notes" } });
@@ -86,10 +121,10 @@ describe("Asset Canvas node serialization", () => {
   it("round-trips a speech node without runtime fields and accepts it as a saved board", () => {
     const node = toAssetCanvasNode({ id: "narration", type: "speech", position: { x: 0, y: 0 }, data: {
       text: "欢迎来到雾港。", promptSource: { type: "node", nodeId: "script" }, audioModel: { provider: "volcengine-tts", id: "seed-tts-2.0" },
-      voiceId: "zh_male_m191_uranus_bigtts", speed: 25, assetId: "audio-1", audioRuntime: { models: [], providers: [] },
+      voiceId: "zh_male_m191_uranus_bigtts", referenceAssetId: "local-voice-reference", speed: 25, assetId: "audio-1", audioRuntime: { models: [], providers: [] },
     } as unknown as Parameters<typeof toAssetCanvasNode>[0]["data"] });
     expect(node.type).toBe("speech");
-    expect(node.data).toEqual({ text: "欢迎来到雾港。", promptSource: { type: "node", nodeId: "script" }, model: { provider: "volcengine-tts", id: "seed-tts-2.0" }, voiceId: "zh_male_m191_uranus_bigtts", speed: 25, assetId: "audio-1" });
+    expect(node.data).toEqual({ text: "欢迎来到雾港。", promptSource: { type: "node", nodeId: "script" }, model: { provider: "volcengine-tts", id: "seed-tts-2.0" }, voiceId: "zh_male_m191_uranus_bigtts", referenceAssetId: "local-voice-reference", speed: 25, assetId: "audio-1" });
     const canvas = createAssetCanvasDocument();
     canvas.nodes = [
       node,
@@ -176,4 +211,12 @@ describe("3D processing node serialization", () => {
     const result = removeNodesAndReferences([{ id: "texture", type: "model-3d", position: { x: 0, y: 0 }, data: { model3DSource: { type: "node", nodeId: "source" }, model3DOperation: "retexture" } }], new Set(["source"]));
     expect(result[0]!.data.model3DSource).toBeUndefined();
   });
+});
+
+it.each(["speech", "voice", "sound-effect", "music"] as const)("preserves extra %s generation settings when the editor saves", (type) => {
+  const node = toAssetCanvasNode({ id: type, type, position: { x: 0, y: 0 }, data: { text: "Hello", voiceDescription: "Warm", sampleText: "Hello", prompt: "Soft rain", instrumental: true, ...(type === "voice" || type === "speech" ? { language: "en", style: "Warm", speed: 10 } : {}), output: { format: "wav", sampleRate: 24000 } } });
+  const canvas = createAssetCanvasDocument(); canvas.nodes = [node]; canvas.editorLayout.nodes[type] = node.position;
+  expect(isAssetCanvasDocument(canvas)).toBe(true);
+  expect(node.data).toMatchObject({ output: { format: "wav", sampleRate: 24000 } });
+  if (type === "voice" || type === "speech") expect(node.data).toMatchObject({ language: "en", style: "Warm", speed: 10 });
 });

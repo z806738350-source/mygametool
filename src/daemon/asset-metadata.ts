@@ -14,11 +14,14 @@ interface AssetMetadata {
   purposes: Record<string, LibraryAssetPurpose>;
 }
 
-export async function readAssetMetadata(workspacePath: string): Promise<AssetMetadata> {
+export async function readAssetMetadata(workspacePath: string, options: { strict?: boolean } = {}): Promise<AssetMetadata> {
   try {
     const parsed: unknown = JSON.parse(await readFile(path.join(workspacePath, ASSET_METADATA_FILE), "utf8"));
-    return parseAssetMetadata(parsed) ?? emptyMetadata();
-  } catch {
+    const metadata = parseAssetMetadata(parsed);
+    if (!metadata && options.strict) throw new Error("Invalid project asset metadata");
+    return metadata ?? emptyMetadata();
+  } catch (cause) {
+    if (options.strict && (cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
     return emptyMetadata();
   }
 }
@@ -101,13 +104,13 @@ function parseAssetMetadata(value: unknown): AssetMetadata | undefined {
   const origins = (value as { origins?: unknown }).origins ?? {};
   const purposes = (value as { purposes?: unknown }).purposes ?? {};
   if (!validEntries(origins, ["generated", "uploaded", "workspace", "builtin", "unknown"]) || !validEntries(purposes, ["asset", "reference"])) return undefined;
-  if (prompts === null || typeof prompts !== "object" || !Object.entries(prompts).every(([assetPath, prompt]) => (
+  if (prompts === null || typeof prompts !== "object" || Array.isArray(prompts) || !Object.entries(prompts).every(([assetPath, prompt]) => (
     Boolean(assetPath) && typeof prompt === "string" && Boolean(prompt.trim())
   ))) return undefined;
-  if (previews !== undefined && (previews === null || typeof previews !== "object" || !Object.entries(previews).every(([assetPath, previewPath]) => (
-      Boolean(assetPath) && typeof previewPath === "string" && /^\.data\/asset-previews\/[a-zA-Z0-9][a-zA-Z0-9._-]*\.(png|jpg)$/.test(previewPath)
+  if (previews !== undefined && (previews === null || typeof previews !== "object" || Array.isArray(previews) || !Object.entries(previews).every(([assetPath, previewPath]) => (
+      Boolean(assetPath) && typeof previewPath === "string" && (/^\.data\/asset-previews\/[a-zA-Z0-9][a-zA-Z0-9._-]*\.(png|jpg)$/.test(previewPath) || /^assets\/imported\/[^/\\]+\.glb$/.test(previewPath) || /^\.data\/model-assets\/[a-f0-9]{64}\/[a-f0-9]{64}\.glb$/.test(previewPath))
   )))) return undefined;
-  if (libraryAssets === null || typeof libraryAssets !== "object" || !Object.entries(libraryAssets).every(([assetPath, assetId]) => (
+  if (libraryAssets === null || typeof libraryAssets !== "object" || Array.isArray(libraryAssets) || !Object.entries(libraryAssets).every(([assetPath, assetId]) => (
     Boolean(assetPath) && typeof assetId === "string" && Boolean(assetId)
   ))) return undefined;
   return {

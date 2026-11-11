@@ -9,6 +9,19 @@ import { ConversationManager, defaultConversationTitle } from "../src/daemon/con
 import type { ProjectState } from "../src/shared/contracts.js";
 
 describe("ConversationManager", () => {
+  it.each(["user", "toolResult"] as const)("detects %s images in the active conversation context without changing the session", async (role) => {
+    const project = await createProject(), conversations = new ConversationManager();
+    const stored = await conversations.create(project);
+    expect(await conversations.hasImageHistory(project, stored)).toBe(false);
+    const manager = conversations.open(project, stored);
+    manager.appendMessage({ role, timestamp: 1, ...(role === "toolResult" ? { toolCallId: "call-image", toolName: "read", isError: false } : {}), content: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }] } as never);
+    const before = JSON.stringify(manager.getEntries());
+    expect(await conversations.hasImageHistory(project, stored)).toBe(true);
+    expect(JSON.stringify(manager.getEntries())).toBe(before);
+    manager.appendCompaction("Previous image history summarized.", null, 100);
+    expect(await conversations.hasImageHistory(project, stored)).toBe(false);
+    expect(manager.getEntries().length).toBeGreaterThan(1); // The original history remains on disk/in the tree.
+  });
   it("creates and reopens a pending Pi session", async () => {
     const project = await createProject();
     const conversations = new ConversationManager();

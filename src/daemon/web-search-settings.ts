@@ -1,7 +1,8 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { registerSensitiveValue } from "../shared/sensitive-values.js";
+import { randomUUID } from "node:crypto";
+import { readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type {
-  UpdateWebSearchSettings,
   WebSearchProvider,
   WebSearchSettings,
 } from "../shared/web-search.js";
@@ -23,9 +24,9 @@ export interface StoredWebSearchSettings {
 
 const DEFAULT_SETTINGS: StoredWebSearchSettings = {
   version: 1,
-  enabled: true,
+  enabled: false,
   provider: "auto",
-  fallback: true,
+  fallback: false,
 };
 
 export class WebSearchSettingsStore {
@@ -43,7 +44,10 @@ export class WebSearchSettingsStore {
       ) as unknown;
       if (!isStoredSettings(value))
         throw new Error(`Invalid web search settings: ${this.#filePath}`);
-      this.#settings = cloneStored(value);
+      this.#settings = value;
+      registerSensitiveValue(this.#settings.exaApiKey);
+      registerSensitiveValue(this.#settings.parallelApiKey);
+      registerSensitiveValue(this.#settings.custom?.apiKey);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
@@ -52,17 +56,14 @@ export class WebSearchSettingsStore {
   get(): WebSearchSettings {
     const value = this.#settings;
     return {
-      enabled: value.enabled,
+      enabled: false,
       provider: value.provider,
-      fallback: value.fallback,
+      fallback: false,
       exaApiKeyConfigured: Boolean(value.exaApiKey),
       parallelApiKeyConfigured: Boolean(value.parallelApiKey),
       ...(value.custom
         ? {
             custom: {
-              name: value.custom.name,
-              endpoint: value.custom.endpoint,
-              toolName: value.custom.toolName,
               apiKeyConfigured: Boolean(value.custom.apiKey),
             },
           }
@@ -70,103 +71,24 @@ export class WebSearchSettingsStore {
     };
   }
 
-  runtime(): StoredWebSearchSettings {
-    return cloneStored(this.#settings);
-  }
-
-  async update(input: UpdateWebSearchSettings): Promise<WebSearchSettings> {
-    const custom = input.custom
-      ? {
-          name: required(input.custom.name, "Custom provider name"),
-          endpoint: normalizedEndpoint(input.custom.endpoint),
-          toolName: required(input.custom.toolName, "Custom MCP tool name"),
-          ...secretUpdate(input.custom.apiKey, this.#settings.custom?.apiKey),
-        }
-      : this.#settings.custom
-        ? { ...this.#settings.custom }
-        : undefined;
-    if (input.provider === "custom" && !custom)
-      throw new Error("Custom provider configuration is required");
-    const next: StoredWebSearchSettings = {
-      version: 1,
-      enabled: input.enabled,
-      provider: input.provider,
-      fallback: input.fallback,
-      ...secretField("exaApiKey", input.exaApiKey, this.#settings.exaApiKey),
-      ...secretField(
-        "parallelApiKey",
-        input.parallelApiKey,
-        this.#settings.parallelApiKey,
-      ),
-      ...(custom ? { custom } : {}),
-    };
-    await mkdir(path.dirname(this.#filePath), { recursive: true });
-    const temporary = `${this.#filePath}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    await rename(temporary, this.#filePath);
-    this.#settings = cloneStored(next);
+  async clearCredentials(): Promise<WebSearchSettings> {
+    const current = this.#settings;
+    if (!current.exaApiKey && !current.parallelApiKey && !current.custom?.apiKey) return this.get();
+    const { exaApiKey: _exa, parallelApiKey: _parallel, ...next } = current;
+    if (next.custom) {
+      const { apiKey: _customKey, ...custom } = next.custom;
+      next.custom = custom;
+    }
+    const temporary = `${this.#filePath}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+      await rename(temporary, this.#filePath);
+    } finally {
+      await rm(temporary, { force: true });
+    }
+    this.#settings = next;
     return this.get();
   }
-}
-
-function secretField<K extends "exaApiKey" | "parallelApiKey">(
-  key: K,
-  update: string | null | undefined,
-  current: string | undefined,
-): Partial<Pick<StoredWebSearchSettings, K>> {
-  const value = updatedSecret(update, current);
-  return value ? ({ [key]: value } as Pick<StoredWebSearchSettings, K>) : {};
-}
-
-function secretUpdate(
-  update: string | null | undefined,
-  current: string | undefined,
-): { apiKey?: string } {
-  const value = updatedSecret(update, current);
-  return value ? { apiKey: value } : {};
-}
-
-function updatedSecret(
-  update: string | null | undefined,
-  current: string | undefined,
-): string | undefined {
-  if (update === undefined) return current;
-  if (update === null) return undefined;
-  return update.trim() || undefined;
-}
-
-function normalizedEndpoint(value: string): string {
-  let endpoint: URL;
-  try {
-    endpoint = new URL(value.trim());
-  } catch {
-    throw new Error("Custom MCP endpoint is not valid");
-  }
-  if (
-    !/^https?:$/.test(endpoint.protocol) ||
-    endpoint.username ||
-    endpoint.password ||
-    endpoint.hash
-  ) {
-    throw new Error("Custom MCP endpoint is not valid");
-  }
-  return endpoint.toString();
-}
-
-function required(value: string, label: string): string {
-  const normalized = value.trim();
-  if (!normalized) throw new Error(`${label} is required`);
-  return normalized;
-}
-
-function cloneStored(value: StoredWebSearchSettings): StoredWebSearchSettings {
-  return {
-    ...value,
-    ...(value.custom ? { custom: { ...value.custom } } : {}),
-  };
 }
 
 function isStoredSettings(value: unknown): value is StoredWebSearchSettings {

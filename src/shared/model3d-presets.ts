@@ -8,7 +8,7 @@ export function isNative3DProvider(id: string): id is Native3DProviderId { retur
 
 export const MODEL_3D_CATALOG_DOCS: Record<Native3DProviderId, string> = {
   meshy: "https://docs.meshy.ai/en/api/image-to-3d",
-  tripo: "https://developers.tripo3d.ai/en/docs/models-and-versions",
+  tripo: "https://docs.ziy.cc/api-reference/tripo-3d/",
   hyper3d: "https://docs.hyper3d.ai/en/api-specification/rodin-gen2-5",
 };
 export const MODEL_3D_CATALOG_REVIEWED = "2026-10-23";
@@ -16,18 +16,18 @@ export const MODEL_3D_CATALOG_REVIEWED = "2026-10-23";
 /** Documented image-generation versions. Saved defaults override these definitions. */
 export const MODEL_3D_PRESETS: Record<Native3DProviderId, readonly Model3DDefinition[]> = {
   meshy: [
-    { id: "meshy-t2", name: "Meshy T2", settings: defaultModel3DSettings("smart-topology") },
-    { id: "meshy-t2.5", name: "Meshy T2.5", settings: { ...defaultModel3DSettings("smart-topology"),
+    { id: "meshy-t2", name: "Meshy T2", settings: defaultModel3DSettings("smart-topology", "meshy") },
+    { id: "meshy-t2.5", name: "Meshy T2.5", settings: { ...defaultModel3DSettings("smart-topology", "meshy"),
       polycount: { min: 100, max: 30_000, default: 15_000, presets: [1_000, 4_000, 10_000, 15_000, 30_000] } } },
-    { id: "meshy-7.1", name: "Meshy 7.1", settings: { ...defaultModel3DSettings(), operation: "multi-image-to-3d", maxReferenceImages: 4 } },
+    { id: "meshy-7.1", name: "Meshy 7.1", settings: { ...defaultModel3DSettings("standard", "meshy"), operation: "multi-image-to-3d", maxReferenceImages: 4 } },
     ...["meshy-7", "meshy-6", "meshy-6-lite", "latest"].map((id) => ({ id,
       name: id === "latest" ? "Meshy Latest" : id === "meshy-7" ? "Meshy 7 (deprecated)" : id.replace("meshy-", "Meshy ").replace("-lite", " Lite"),
-      settings: { ...defaultModel3DSettings(), operation: "multi-image-to-3d" as const, maxReferenceImages: 4 } })),
+      settings: { ...defaultModel3DSettings("standard", "meshy"), operation: "multi-image-to-3d" as const, maxReferenceImages: 4 } })),
   ],
   tripo: [
-    { id: "P1-20260311", name: "Tripo P1", settings: defaultModel3DSettings("standard", "tripo") },
     { id: "v3.1-20260211", name: "Tripo V3.1", settings: { ...defaultModel3DSettings("standard", "tripo"),
       polycount: { min: 100, max: 1_500_000, default: 30_000, presets: [10_000, 30_000, 100_000, 300_000] } } },
+    { id: "P1-20260311", name: "Tripo P1", settings: defaultModel3DSettings("standard", "tripo") },
     { id: "P2-20260801", name: "Tripo P2 (preview)", settings: { ...defaultModel3DSettings("standard", "tripo"),
       polycount: { min: 48, max: 50_000, default: 4_000, presets: [1_000, 4_000, 10_000, 20_000, 50_000] } } },
     ...[{ id: "v3.0-20250812", name: "Tripo V3.0", max: 1_000_000 }, { id: "v2.5-20250123", name: "Tripo V2.5", max: 500_000 }].map(({ id, name, max }) => ({ id, name,
@@ -44,7 +44,11 @@ export function model3DPreset(provider: string, id: string): Model3DDefinition |
 /** Official endpoints have no compatible /models discovery in our supported protocols. */
 export function usesModel3DPresets(baseUrl: string, preset?: CustomProviderPreset): boolean {
   if (!preset || !isNative3DProvider(preset)) return false;
-  try { return new URL(baseUrl).origin === { meshy: "https://api.meshy.ai", tripo: "https://openapi.tripo3d.ai", hyper3d: "https://api.hyper3d.com" }[preset]; }
+  try {
+    const target = new URL(baseUrl);
+    if (preset === "tripo" && target.origin === "https://llm.ziy.cc" && target.pathname.replace(/\/+$/, "") === "/tripo/v3") return true;
+    return target.origin === { meshy: "https://api.meshy.ai", tripo: "https://openapi.tripo3d.ai", hyper3d: "https://api.hyper3d.com" }[preset];
+  }
   catch { return false; }
 }
 

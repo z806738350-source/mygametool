@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/daemon/app.js";
 import { conversationItems } from "../src/daemon/agent.js";
+import { createLocalAgentFileTools } from "../src/daemon/agent-local-files.js";
 import { gameDesignReference } from "../src/daemon/game-design-context.js";
 import { writeCanvasDocument } from "../src/daemon/canvas-workspace.js";
 import { createCanvasDocument, canvasDocumentPath } from "../src/shared/canvas-document.js";
@@ -44,6 +45,32 @@ async function runtime(hold = false, type: ProjectType = "web-game") {
 }
 
 describe("game design prompt context", () => {
+  it("exposes agent board writes before the active turn finishes", async () => {
+    const { app, project, prompt, finish, url, idle } = await runtime(true);
+    const workspaceUrl = `/projects/${project.id}/canvas/workspace`;
+    const workspace = (await app.inject({ method: "GET", url: workspaceUrl })).json();
+    const boardId = workspace.boards[0].id;
+    const boardUrl = `/projects/${project.id}/canvas/boards/${boardId}`;
+    const write = createLocalAgentFileTools(project.workspacePath).find((tool) => tool.name === "write")!;
+    try {
+      await app.inject({ method: "POST", url, payload: { prompt: "Create the design" } });
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
+      const document = await writeCanvasDocument(project.workspacePath, { ...createCanvasDocument("Live design"), markdown: "Work in progress" });
+      // Registering a document does not add its node to the board.
+      expect((await app.inject({ method: "GET", url: workspaceUrl })).json().documents).toHaveLength(1);
+      expect((await app.inject({ method: "GET", url: boardUrl })).json().board.nodes).toEqual([]);
+      const node = { id: "live-design", type: "document", title: "Live design", data: { documentId: document.document.id } };
+      await write.execute("write-board", { path: `canvas/boards/${boardId}.json`, content: JSON.stringify({ version: 1, id: boardId, viewport: { width: 1280, height: 720 }, nodes: [node], edges: [] }) }, undefined, undefined, {} as never);
+      const response = await app.inject({ method: "GET", url: boardUrl });
+      expect(response.statusCode, response.body).toBe(200);
+      expect(response.json().board.nodes).toMatchObject([node]);
+      expect((await app.inject({ method: "GET", url: "/projects/activity" })).json().activity).not.toEqual([]);
+    } finally {
+      finish();
+      await idle();
+    }
+  });
+
   it("captures an explicitly referenced Asset Canvas document without a main game design", async () => {
     const { app, project, prompt, url, idle } = await runtime(false, "asset-canvas");
     const detail = await writeCanvasDocument(project.workspacePath, { ...createCanvasDocument("Art brief"), markdown: "A bright garden" }, false);

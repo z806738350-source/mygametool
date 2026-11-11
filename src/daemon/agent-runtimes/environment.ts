@@ -61,6 +61,7 @@ const RUNTIME_KEEP: Record<AgentRuntimeId, readonly string[]> = {
   "claude-code-cli": ["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"],
   "codex-cli": ["CODEX_HOME"],
   "opencode-cli": ["OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG"],
+  "qoder-cli": [],
 };
 
 export function agentEnvironment(
@@ -70,6 +71,7 @@ export function agentEnvironment(
   source: NodeJS.ProcessEnv = process.env,
   shellPath?: string,
 ): Record<string, string> {
+  if (runtime === "qoder-cli") throw new Error("Qoder requires its separate controlled environment");
   const keep = new Set([...SHARED, ...RUNTIME_KEEP[runtime]]);
   const result: Record<string, string> = {};
   for (const [name, value] of Object.entries(source)) {

@@ -11,7 +11,6 @@ import {
   FileText,
   Gamepad2,
   Image,
-  LoaderCircle,
   Pencil,
   Undo2,
   Plug,
@@ -477,7 +476,7 @@ function ToolActivityGroup({ tools, thinking }: { tools: ToolItem[]; thinking: b
 type ToolIcon = IconComponent | typeof GodotIcon;
 
 function toolGroupIcon(tools: ToolItem[]): ToolIcon {
-  if (tools.some((tool) => tool.type === "dynamicToolCall" && tool.tool === "generate_image")) return WandSparkles;
+  if (tools.some((tool) => tool.type === "dynamicToolCall" && (tool.tool === "generate_image" || tool.tool === "generate_reference_image"))) return WandSparkles;
   if (tools.some((tool) => tool.type === "dynamicToolCall" && (tool.tool === "edit" || tool.tool === "write"))) return FilePenLine;
   if (tools.some((tool) => tool.type === "dynamicToolCall" && (tool.tool === "read" || tool.tool === "ls"))) return FileText;
   if (tools.some((tool) => tool.type === "dynamicToolCall" && (tool.tool === "grep" || tool.tool === "find"))) return Search;
@@ -555,6 +554,7 @@ function TimelineItem({ item, images, hideError = false }: { item: ThreadItem; i
     );
   }
   if (item.type === "imageRead") {
+    // This legacy event counts attachments, not an acknowledgement from the agent.
     const label = item.count === 1 ? t("timeline.viewedImage") : t("timeline.viewedImages", { count: item.count });
     if (images?.length) {
       return (
@@ -896,6 +896,13 @@ function toolPresentation(item: Extract<ThreadItem, { type: "dynamicToolCall" | 
     case "ls": return { icon: FileText, label: withTarget("listing", values) };
     case "web_search": return { icon: Search, label: searchLabel("searchingWeb", values) };
     case "game_use": return { icon: Gamepad2, label: playtestLabel(values, false) };
+    case "prepare_three_runtime": return { icon: Wrench, label: t("timeline.preparingThree") };
+    case "list_media_capabilities": return { icon: Search, label: t("timeline.checkingMediaModels") };
+    case "list_animation_actions": return { icon: Search, label: t("timeline.checkingAnimationActions") };
+    case "recover_media":
+    case "recover_canvas_media": return { icon: Wrench, label: t("timeline.recoveringMedia") };
+    case "replace_canvas_media": return { icon: Wrench, label: t("timeline.requestingReplacement") };
+    case "generate_reference_image":
     case "generate_image": return { icon: WandSparkles, label: t("timeline.generatingImage") };
     default: return { icon: Wrench, label: toolName };
   }
@@ -918,6 +925,13 @@ function completedToolPresentation(item: Extract<ThreadItem, { type: "dynamicToo
     case "ls": return { icon: FileText, label: withTarget("listed", values) };
     case "web_search": return { icon: Search, label: searchLabel("searchedWeb", values) };
     case "game_use": return { icon: Gamepad2, label: playtestLabel(values, true) };
+    case "prepare_three_runtime": return { icon: Wrench, label: t("timeline.preparedThree") };
+    case "list_media_capabilities": return { icon: Search, label: t("timeline.checkedMediaModels") };
+    case "list_animation_actions": return { icon: Search, label: t("timeline.checkedAnimationActions") };
+    case "recover_media":
+    case "recover_canvas_media": return { icon: Wrench, label: t("timeline.recoveredMedia") };
+    case "replace_canvas_media": return { icon: Wrench, label: t("timeline.requestedReplacement") };
+    case "generate_reference_image":
     case "generate_image": return { icon: WandSparkles, label: t("timeline.generatedImage") };
     default: return { icon: Wrench, label: t("timeline.used", { tool: toolName }) };
   }

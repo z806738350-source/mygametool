@@ -4,8 +4,12 @@ import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { filterModels, groupModelsByProvider, ModelSelector, useAgentModels } from "../src/renderer/model-selector.js";
-import type { AgentModel, AgentReasoningLevel } from "../src/shared/contracts.js";
+import type { AgentModel, AgentReasoningLevel, ProjectState } from "../src/shared/contracts.js";
 import { PROVIDER_ICONS } from "../src/renderer/provider-icons.js";
+import { CanvasChipSelect } from "../src/renderer/canvas-chip-select.js";
+import { ProjectMediaModelSettings } from "../src/renderer/media-model-defaults.js";
+import { SpeechNode } from "../src/renderer/asset-canvas-workspace.js";
+import { ReactFlowProvider } from "@xyflow/react";
 
 const model: AgentModel = {
   provider: "openai",
@@ -76,6 +80,109 @@ describe("ModelSelector interaction", () => {
   });
   afterEach(async () => { await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
+  it("opens the speech reference picker and requires an explicit choice for a legacy Speaker ID", async () => {
+    const audio = { provider: "volcengine-tts", id: "seed-audio-1.0", name: "Seed Audio", providerName: "KunpoAPI", protocol: "kunpo-seed-audio-binary", capabilities: { operations: ["speech" as const], executionModes: ["synchronous" as const], formats: ["mp3" as const], supportsReferenceAudio: true } };
+    const onChange = vi.fn(), onGenerate = vi.fn();
+    const voiceReference = { busy: false, uploading: false, references: [], maxReferences: 1, accept: ".mp3,.wav,audio/mpeg,audio/wav", addLabel: "Reference audio", onRemoveReference: vi.fn(), onUploadReferences: vi.fn() };
+    const data = { panelOpen: true, text: "Welcome", audioModel: audio, audioRuntime: { models: [audio], providers: [], generating: false, busy: false, voiceReference, onChange, onGenerate } };
+    await act(async () => root.render(<ReactFlowProvider><SpeechNode selected={false} data={{ ...data, voiceId: "old-speaker" }} /></ReactFlowProvider>));
+    expect(container.querySelector('input[aria-label="Voice ID"]')).toBeNull();
+    const generate = container.querySelector<HTMLButtonElement>('button[aria-label="Generate speech"]')!;
+    expect(generate.disabled).toBe(true);
+    const select = container.querySelector<HTMLInputElement>('input[type="file"]')!;
+    const open = vi.spyOn(select, "click");
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Reference audio"]')!.click());
+    expect(open).toHaveBeenCalledOnce();
+    const clear = [...container.querySelectorAll("button")].find(button => button.textContent === "Use no reference")!;
+    await act(async () => clear.click());
+    expect(onChange.mock.calls[0]?.[0].voiceId).toBeUndefined();
+    expect(onGenerate).not.toHaveBeenCalled();
+    await act(async () => root.render(<ReactFlowProvider><SpeechNode selected={false} data={data} /></ReactFlowProvider>));
+    expect(generate.disabled).toBe(false);
+  });
+
+  it("shows pending Kunpo candidates without selecting or silently replacing them", async () => {
+    const onChange = vi.fn();
+    const ready = { ...model, provider: "kunpo", providerName: "KunpoAPI", id: "gpt-5.6-sol", name: "gpt-5.6-sol" };
+    await act(async () => root.render(<ModelSelector models={[ready]} value={{ provider: "kunpo", id: "gemini-3.8-flash" }} onChange={onChange} onReasoningChange={() => {}} />));
+    const trigger = container.querySelector<HTMLButtonElement>(".model-selector-trigger")!;
+    expect(trigger.textContent).toContain("gemini-3.8-flash");
+    await act(async () => trigger.click());
+    const pending = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')].find((button) => button.textContent?.includes("gemini-3.8-flash"))!;
+    expect(pending.disabled).toBe(true);
+    await act(async () => pending.click());
+    expect(onChange).not.toHaveBeenCalled();
+    expect(trigger.textContent).not.toContain("gpt-5.6-sol");
+  });
+
+  it("distinguishes GPT-6.1 vision from the unverified Kunpo connection", async () => {
+    const textOnly = { ...model, provider: "kunpo", providerName: "KunpoAPI", id: "gpt-6.1-sol", name: "gpt-6.1-sol" };
+    await act(async () => root.render(<ModelSelector models={[textOnly]} value={textOnly} onChange={() => {}} onReasoningChange={() => {}} />));
+    const trigger = container.querySelector<HTMLButtonElement>(".model-selector-trigger")!;
+    expect(trigger.title).toContain("GPT-6.1 Sol supports image input");
+    await act(async () => trigger.click());
+    const option = document.querySelector<HTMLButtonElement>('[role="menuitemradio"]')!;
+    expect(option.title).toContain("Kunpo Responses connection is not verified");
+    expect(option.disabled).toBe(false);
+  });
+
+  it("warns about image history before delegating the model change to the server preflight", async () => {
+    const onChange = vi.fn();
+    const blocked = { ...model, supportsImages: false }, vision = { ...model, id: "vision", name: "Vision", supportsImages: true };
+    await act(async () => root.render(<ModelSelector models={[blocked, vision]} value={vision} hasImageHistory onChange={onChange} onReasoningChange={() => {}} />));
+    await act(async () => container.querySelector<HTMLButtonElement>(".model-selector-trigger")!.click());
+    expect(document.querySelector('[role="status"]')?.textContent).toContain("conversation contains images");
+    const options = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')];
+    expect(options[0]!.title).toContain("conversation contains images");
+    expect(options[0]!.disabled).toBe(false); // Displayed images may have left the active context after compaction.
+    expect(options[1]!.disabled).toBe(false);
+    await act(async () => options[0]!.click());
+    expect(onChange).toHaveBeenCalledExactlyOnceWith(blocked, "medium");
+    expect(container.querySelector('.model-selector-trigger')?.textContent).toContain("Vision");
+    expect(container.querySelector('.model-selector-trigger')?.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("honors explicitly image-enabled runtime metadata over the built-in gateway restriction", async () => {
+    const enabled = { ...model, provider: "kunpo", id: "gpt-6.1-sol", supportsImages: true };
+    await act(async () => root.render(<ModelSelector models={[enabled]} hasImageHistory onChange={() => {}} onReasoningChange={() => {}} />));
+    await act(async () => container.querySelector<HTMLButtonElement>(".model-selector-trigger")!.click());
+    expect(document.querySelector<HTMLButtonElement>('[role="menuitemradio"]')!.disabled).toBe(false);
+    expect(document.querySelector('[role="status"]')).toBeNull();
+  });
+
+  it("keeps unavailable chip options visible while keyboard navigation skips them", async () => {
+    const onChange = vi.fn();
+    await act(async () => root.render(<CanvasChipSelect label="Model" value="pending" options={[{ value: "pending", label: "Pending", disabled: true }, { value: "ready", label: "Ready" }]} onChange={onChange} />));
+    await act(async () => container.querySelector<HTMLButtonElement>("button")!.click());
+    const options = [...document.querySelectorAll<HTMLButtonElement>('[role="option"]')];
+    expect(options[0]?.disabled).toBe(true);
+    await act(async () => document.querySelector(".canvas-chip-menu")!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })));
+    expect(document.activeElement).toBe(options[1]);
+    await act(async () => options[0]!.click());
+    expect(onChange).not.toHaveBeenCalled();
+    await act(async () => options[1]!.click());
+    expect(onChange).toHaveBeenCalledExactlyOnceWith("ready");
+  });
+
+  it("disables pending project choices while retaining a previously saved pending selection", async () => {
+    const project = { id: "project", modelSelections: { agent: { provider: "kunpo", id: "gemini-3.8-flash" } } } as ProjectState;
+    const saved = vi.fn();
+    await act(async () => root.render(<ProjectMediaModelSettings project={project} onSaved={saved} />));
+    const trigger = container.querySelector<HTMLButtonElement>('[aria-haspopup="dialog"]')!;
+    await act(async () => trigger.click());
+    const agent = [...document.querySelectorAll<HTMLButtonElement>('.project-media-defaults .canvas-chip')].find((button) => button.getAttribute("aria-label")?.startsWith("Agent:"))!;
+    expect(agent.textContent).toContain("gemini-3.8-flash");
+    await act(async () => agent.click());
+    const pending = [...document.querySelectorAll<HTMLButtonElement>('[role="option"]')].find((button) => button.textContent?.includes("gemini-3.8-flash"))!;
+    expect(pending.disabled).toBe(true);
+    await act(async () => pending.click());
+    expect(saved).not.toHaveBeenCalled();
+    expect(agent.textContent).toContain("gemini-3.8-flash");
+    await act(async () => trigger.click());
+    await act(async () => trigger.click());
+    expect(document.querySelector('.project-media-defaults')?.textContent).toContain("gemini-3.8-flash");
+  });
+
   it("quietly reloads a pending Pi catalog while keeping existing models available", async () => {
     vi.useFakeTimers();
     const next = { ...model, id: "new-model", name: "New model" };
@@ -101,6 +208,7 @@ describe("ModelSelector interaction", () => {
       { ...model, provider: "codex-cli", providerName: "Codex" },
       { ...model, provider: "claude-code-cli", providerName: "Claude Code" },
       { ...model, provider: "opencode-cli", providerName: "OpenCode" },
+      { ...model, provider: "qoder-cli", providerName: "Qoder" },
     ];
     function Selector() {
       const [selected, setSelected] = useState(model);

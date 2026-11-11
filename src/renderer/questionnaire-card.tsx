@@ -1,6 +1,6 @@
 import { ArrowLeft, ArrowRight, Check, X } from "./icons.js";
 import { useEffect, useState } from "react";
-import type { ThreadItem } from "../shared/contracts.js";
+import type { ThreadItem, ToolId } from "../shared/contracts.js";
 import { InlineAnswer } from "./inline-answer.js";
 import { t } from "./i18n.js";
 
@@ -9,6 +9,11 @@ interface QuestionnaireCardProps {
   onSubmit: (answers: Array<{ questionId: string; value: string }>) => Promise<boolean>;
   onSkip: () => Promise<boolean>;
 }
+
+const mediaLabels = {
+  "generate-image": "image", "generate-video": "video", "image-to-3d": "model3d", "animate-3d": "animate3d",
+  "generate-speech": "speech", "generate-sound-effect": "soundEffect", "generate-music": "music",
+} as const satisfies Record<ToolId, string>;
 
 export function QuestionnaireCard({ request, onSubmit, onSkip }: QuestionnaireCardProps) {
   const [index, setIndex] = useState(0);
@@ -65,9 +70,9 @@ export function QuestionnaireCard({ request, onSubmit, onSkip }: QuestionnaireCa
   }
 
   return (
-    <section className="questionnaire-card" aria-label={t("questionnaire.label")}>
+    <section className="questionnaire-card" aria-label={t(request.paidMediaTool ? "questionnaire.paidLabel" : "questionnaire.label")}>
       <header>
-        <strong>{question.prompt}</strong>
+        <strong>{request.paidMediaTool ? t("questionnaire.paidPrompt", { media: t(`assetCanvas.node.${mediaLabels[request.paidMediaTool]}`), count: request.previousPaidCount ?? 1 }) : question.prompt}</strong>
         <div className="questionnaire-navigation">
           <button type="button" onClick={() => move(index - 1)} disabled={submitting || index === 0} aria-label={t("questionnaire.previous")}><ArrowLeft size={14} /></button>
           <span>{t("questionnaire.position", { current: index + 1, total: request.questions.length })}</span>
@@ -87,7 +92,7 @@ export function QuestionnaireCard({ request, onSubmit, onSkip }: QuestionnaireCa
           >
             <span className="questionnaire-option-number">{answer === option.value ? <Check size={13} /> : optionIndex + 1}</span>
             <span className="questionnaire-option-copy">
-              <strong>{option.label}{option.recommended ? <small>{t("providers.recommended")}</small> : null}</strong>
+              <strong>{request.paidMediaTool ? t(option.value === "new" ? "questionnaire.paidNew" : "questionnaire.paidKeep") : option.label}{option.recommended ? <small>{t("providers.recommended")}</small> : null}</strong>
               {option.description ? <span>{option.description}</span> : null}
             </span>
           </button>

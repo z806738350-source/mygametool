@@ -67,6 +67,27 @@ async function commit() {
 }
 
 describe("read-only workspace Git changes", () => {
+  it("does not pass provider keys or proxy credentials to read-only Git", async () => {
+    const secret = "fake-key-canary-local-only";
+    vi.stubEnv("OPENAI_API_KEY", secret);
+    vi.stubEnv("HTTPS_PROXY", `http://user:${secret}@proxy.invalid`);
+    const firstCall = vi.mocked(execFile).mock.calls.length;
+    try {
+      await listWorkspaceGitChanges(workspace);
+      const calls = vi.mocked(execFile).mock.calls.slice(firstCall);
+      expect(calls.length).toBeGreaterThan(0);
+      for (const [, args, options] of calls) {
+        const environment = (options as { env: NodeJS.ProcessEnv }).env;
+        expect(JSON.stringify(environment)).not.toContain(secret);
+        expect(environment.GIT_CONFIG_NOSYSTEM).toBe("1");
+        expect(environment.GIT_NO_LAZY_FETCH).toBe("1");
+        expect(environment.GIT_TERMINAL_PROMPT).toBe("0");
+        expect(args).toContain("protocol.allow=never");
+        expect(args).toContain("--no-pager");
+      }
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it("does not treat a normal project or its parent's repository as a Git project", async () => {
     await write("game.ts", "game\n");
     expect(await listWorkspaceGitChanges(workspace)).toEqual({

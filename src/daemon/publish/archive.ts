@@ -1,9 +1,12 @@
+import { assertLocalExecutionAllowed } from "../local-execution-policy.js";
+import type { IsolatedProjectExecution } from "../isolated-project-execution.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, cp, mkdir, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { Readable } from "node:stream";
+import { Readable } from "node:stream";
 import { ZipFile } from "yazl";
 import type { ProjectState } from "../../shared/contracts.js";
 import { isWebRuntimeProjectType } from "../../shared/project-runtime.js";
@@ -23,6 +26,11 @@ import { getWorkspaceMedia } from "../workspace.js";
 import { isWebStory, publishableWebStoryFiles } from "../story-web-project.js";
 import { compressArchiveFile } from "../archive-compression.js";
 import { PublishMediaOptimizer } from "./media.js";
+import { assertNoKnownSecretBytes } from "../safe-project-file.js";
+
+const MAX_ARCHIVE_ENTRY_BYTES = 128 * 1024 * 1024;
+const MAX_ARCHIVE_SOURCE_BYTES = 512 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES = 10_000;
 
 interface PackageJson {
   scripts?: { build?: unknown };
@@ -39,7 +47,19 @@ export class PublishError extends Error {
 export class ArtifactBuilder {
   readonly #running = new Map<string, ChildProcess>();
 
-  constructor(private readonly library?: AssetLibrary, private readonly playerDirectory?: string) {}
+  constructor(private readonly library?: AssetLibrary, private readonly playerDirectory?: string, private readonly execution?: IsolatedProjectExecution) {}
+
+  /** Local output only; this route never contacts a publishing service. */
+  async buildLocal(project: ProjectState, signal?: AbortSignal): Promise<string> {
+    if (!this.execution) assertLocalExecutionAllowed("Project builds");
+    if (!isWebRuntimeProjectType(project.type)) throw new PublishError("This isolated build supports web npm projects only");
+    signal?.throwIfAborted();
+    try {
+      const startup = await publishStartupDirectory(project);
+      const source = await prepareSource(startup.absolutePath, (child) => this.#running.set(project.id, child), project, this.execution, signal);
+      return path.join(startup.relativePath, path.relative(startup.absolutePath, source)).split(path.sep).join("/");
+    } finally { this.#running.delete(project.id); }
+  }
 
   async create(project: ProjectState, cover?: Buffer): Promise<Buffer> {
     return this.#create(project, cover, PUBLISH_ARTIFACT_MAX_BYTES);
@@ -67,10 +87,10 @@ export class ArtifactBuilder {
         // Legacy manifests hash the optimized bytes during preparation.
         optimizeZip = undefined;
       } else {
-        const workspacePath = isWebRuntimeProjectType(project.type)
-          ? await publishStartupDirectory(project)
+        const workspacePath = isWebRuntimeProjectType(project.type) || project.type === "general"
+          ? (await publishStartupDirectory(project)).absolutePath
           : project.workspacePath;
-        source = await prepareSource(workspacePath, (child) => this.#running.set(project.id, child), project);
+        source = await prepareSource(workspacePath, (child) => this.#running.set(project.id, child), project, this.execution);
       }
       return await createZip(source, false, cover, maxBytes, false, optimizeZip);
     } finally {
@@ -113,14 +133,14 @@ export class ArtifactBuilder {
   }
 
   async close(): Promise<void> {
-    await Promise.all([...this.#running.values()].map(terminate));
+    await Promise.all([...this.#running.values()].map((child) => this.execution?.owns(child) ? this.execution.stop(child) : terminate(child)));
     this.#running.clear();
   }
 }
 
-async function publishStartupDirectory(project: ProjectState): Promise<string> {
+async function publishStartupDirectory(project: ProjectState) {
   try {
-    return (await resolveStartupDirectory(project.workspacePath, project.startupDirectory ?? ".")).absolutePath;
+    return await resolveStartupDirectory(project.workspacePath, project.startupDirectory ?? ".");
   } catch (cause) {
     throw new PublishError(cause instanceof Error ? cause.message : String(cause));
   }
@@ -339,7 +359,7 @@ export async function createPluginArchive(source: string, maxBytes = 25 * 1024 *
   return createZip(source, true, undefined, maxBytes, preserveExecutable);
 }
 
-async function prepareSource(workspacePath: string, track: (child: ChildProcess) => void, project?: ProjectState): Promise<string> {
+async function prepareSource(workspacePath: string, track: (child: ChildProcess) => void, project?: ProjectState, execution?: IsolatedProjectExecution, signal?: AbortSignal): Promise<string> {
   const packageJson = await readPackageJson(workspacePath);
   if (packageJson) {
     const build = packageJson.scripts?.build;
@@ -347,11 +367,14 @@ async function prepareSource(workspacePath: string, track: (child: ChildProcess)
       throw new PublishError("Projects with package.json need a non-empty scripts.build command before publishing");
     }
     const { manager: packageManager } = await resolvePackageManager(workspacePath, project?.packageManager);
-    if (hasDependencies(packageJson)) {
+    if (execution && packageManager !== "npm") throw new PublishError("This isolated runtime currently supports npm projects only");
+    // Static projects can vendor their browser dependencies; their build still runs inside the same isolated VM.
+    if (hasDependencies(packageJson) && project?.previewMode !== "static") {
       await ensureProjectDependencies(workspacePath, packageManager,
-        (command, args) => run(command, args, workspacePath, track));
+        (command, args) => run(command, args, workspacePath, track, execution, project, "install", signal), false, () => signal?.throwIfAborted(), execution);
     }
-    await run(packageManagerCommand(packageManager), packageManagerRunArguments("build"), workspacePath, track);
+    await run(packageManagerCommand(packageManager), packageManagerRunArguments("build"), workspacePath, track, execution, project, "build", signal);
+    if (execution && project) await execution.artifacts(project, workspacePath, { playable: true, signal });
     const output = await findBuildOutput(workspacePath);
     if (!output) throw new PublishError("Build completed but did not produce a static index.html in dist, build, or out");
     return output;
@@ -363,6 +386,7 @@ async function prepareSource(workspacePath: string, track: (child: ChildProcess)
 async function createZip(source: string, plugin = false, cover?: Buffer, maxBytes?: number, preserveExecutable = false, media?: PublishMediaOptimizer): Promise<Buffer> {
   const zip = new ZipFile();
   const files = await filesIn(source, "", plugin);
+  if (files.length > MAX_ARCHIVE_ENTRIES) throw new PublishError("Archive source exceeds the secure entry budget", 413);
   const zipOptions = {
     mtime: new Date(1980, 0, 2),
     forceDosTimestamp: true,
@@ -373,33 +397,66 @@ async function createZip(source: string, plugin = false, cover?: Buffer, maxByte
   if (cover !== undefined && files.includes(PUBLISH_GAME_COVER_PATH)) {
     throw new PublishError(`Publish output uses reserved path: ${PUBLISH_GAME_COVER_PATH}`);
   }
-  for (const file of files) {
-    const original = path.join(source, ...file.split("/"));
-    const filename = media ? await media.optimize(original) : original;
-    const executable = preserveExecutable && ((await stat(filename)).mode & 0o111) !== 0;
-    const options = { ...zipOptions, compress: !plugin && compressArchiveFile(file) };
-    zip.addFile(filename, file, executable ? { ...options, mode: 0o100755 } : options);
-  }
-  if (cover !== undefined) zip.addBuffer(cover, PUBLISH_GAME_COVER_PATH, { ...zipOptions, compress: false });
+  if (cover !== undefined) { cover = Buffer.from(cover); assertNoKnownSecretBytes(cover); }
+  const budget = { bytes: cover?.byteLength ?? 0 };
+  const active = new Set<Readable>();
   const chunks: Buffer[] = [];
   const output = zip.outputStream as Readable;
   const completed = new Promise<Buffer>((resolve, reject) => {
     let bytes = 0;
+    const fail = (cause: Error) => { for (const stream of active) stream.destroy(); output.destroy(); reject(cause); };
     output.on("data", (chunk: Buffer) => {
       bytes += chunk.length;
-      if (maxBytes !== undefined && bytes > maxBytes) {
-        output.destroy(new PublishError(`Publish artifact exceeds ${maxBytes / (1024 * 1024)} MB`, 413));
-        return;
-      }
+      if (maxBytes !== undefined && bytes > maxBytes) { fail(new PublishError(`Publish artifact exceeds ${maxBytes / (1024 * 1024)} MB`, 413)); return; }
       chunks.push(chunk);
     });
-    output.once("error", reject);
-    // yazl reports a file it cannot stat or read on the ZipFile, possibly once per file, and then never ends the output.
-    zip.on("error", reject);
+    output.once("error", fail);
+    zip.on("error", fail);
     output.once("end", () => resolve(Buffer.concat(chunks)));
   });
-  zip.end();
-  return completed;
+  // A preparation error can precede the awaited output promise.
+  void completed.catch(() => {});
+  try {
+    for (const file of files) {
+      assertNoKnownSecretBytes(Buffer.from(file));
+      const original = path.join(source, ...file.split("/"));
+      const filename = media ? await media.optimize(original) : original;
+      const info = await stat(filename);
+      const executable = preserveExecutable && (info.mode & 0o111) !== 0;
+      const options = { mode: info.mode, ...zipOptions, size: info.size, compress: !plugin && compressArchiveFile(file) };
+      zip.addReadStreamLazy(file, executable ? { ...options, mode: 0o100755 } : options, (callback) => {
+        void archiveSnapshot(filename, budget).then((bytes) => {
+          if (output.destroyed) { callback(new PublishError("Archive creation was stopped"), undefined as unknown as Readable); return; }
+          const stream = Readable.from(bytes); active.add(stream); stream.once("close", () => active.delete(stream));
+          callback(null, stream);
+        }, (cause) => callback(cause, undefined as unknown as Readable));
+      });
+    }
+    if (cover !== undefined) zip.addBuffer(cover, PUBLISH_GAME_COVER_PATH, { ...zipOptions, compress: false });
+    zip.end();
+    return await completed;
+  } catch (cause) { for (const stream of active) stream.destroy(); output.destroy(); throw cause; }
+}
+
+/** Inspect the exact immutable bytes the ZIP will consume, without reopening the pathname. */
+async function archiveSnapshot(filename: string, budget: { bytes: number }): Promise<Buffer> {
+  const handle = await open(filename, constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const initial = await handle.stat({ bigint: true });
+    if (!initial.isFile() || initial.nlink !== 1n) throw new PublishError("Linked or non-ordinary archive entries are unavailable");
+    if (initial.size > BigInt(MAX_ARCHIVE_ENTRY_BYTES) || budget.bytes + Number(initial.size) > MAX_ARCHIVE_SOURCE_BYTES) throw new PublishError("Archive source exceeds the secure inspection budget", 413);
+    budget.bytes += Number(initial.size);
+    const bytes = Buffer.alloc(Number(initial.size) + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const result = await handle.read(bytes, offset, Math.min(64 * 1024, bytes.length - offset), offset);
+      if (!result.bytesRead) break;
+      offset += result.bytesRead;
+    }
+    const final = await handle.stat({ bigint: true });
+    if (offset !== Number(initial.size) || final.size !== initial.size || final.mtimeNs !== initial.mtimeNs || final.ctimeNs !== initial.ctimeNs || final.nlink !== 1n) throw new PublishError("Archive source changed during secure inspection; retry the export");
+    const snapshot = bytes.subarray(0, offset); assertNoKnownSecretBytes(snapshot); return snapshot;
+  } finally { await handle.close(); }
 }
 
 async function filesIn(root: string, relative = "", plugin = false): Promise<string[]> {
@@ -435,8 +492,11 @@ async function findBuildOutput(workspacePath: string): Promise<string | undefine
   return undefined;
 }
 
-async function run(command: string, args: string[], cwd: string, track: (child: ChildProcess) => void): Promise<void> {
-  const child = spawn(command, args, {
+async function run(command: string, args: string[], cwd: string, track: (child: ChildProcess) => void, execution?: IsolatedProjectExecution, project?: ProjectState, mode: "install" | "build" = "build", signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  if (!execution) assertLocalExecutionAllowed("Project publish build execution");
+  if (execution && !project) throw new PublishError("The isolated project is unavailable");
+  const child = execution ? await execution.start(project!, mode, cwd, [], undefined, { signal }) : spawn(command, args, {
     cwd,
     env: { ...projectProcessEnvironment(), BROWSER: "none" },
     stdio: ["ignore", "ignore", "pipe"],
@@ -447,12 +507,24 @@ async function run(command: string, args: string[], cwd: string, track: (child: 
   track(child);
   let stderr = "";
   child.stderr?.on("data", (chunk) => { stderr = `${stderr}${String(chunk)}`.slice(-4_000); });
-  await new Promise<void>((resolve, reject) => {
+  let stopping: Promise<void> | undefined;
+  const cancel = () => {
+    stopping = execution?.stop(child);
+    void stopping?.catch(() => {});
+  };
+  signal?.addEventListener("abort", cancel, { once: true });
+  let completed = false;
+  try { await new Promise<void>((resolve, reject) => {
     child.once("error", reject);
-    child.once("exit", (code) => code === 0
+    child.once("close", (code) => code === 0
       ? resolve()
       : reject(new PublishError(stderr.trim() || `${command} exited with ${code}`)));
-  });
+    if (signal?.aborted) cancel();
+  }); completed = true; } finally {
+    signal?.removeEventListener("abort", cancel);
+    try { await stopping; } finally { await execution?.settled(child, completed); }
+  }
+  signal?.throwIfAborted();
 }
 
 function ignored(name: string, relative: string, plugin: boolean): boolean {

@@ -3,6 +3,7 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Box, Check, Copy, FileCode2, FileText, Film, Image, Music2, type IconComponent } from "./icons.js";
 import { t } from "./i18n.js";
+import { isLocalImageSource } from "./local-resources.js";
 
 export type WorkspaceFileIconKind = "code" | "text" | "image" | "video" | "audio" | "model" | "file";
 
@@ -35,7 +36,9 @@ export const MarkdownContent = memo(function MarkdownContent({ text, className =
 }) {
   // Stable component types keep loaded images mounted when only Markdown text changes.
   const components = useMemo<Components>(() => ({
-    ...(renderImage ? { img: ({ src, alt }: { src?: string; alt?: string }) => renderImage(src, alt) } : {}),
+    img: ({ src, alt }: { src?: string; alt?: string }) => isLocalImageSource(src)
+      ? renderImage ? renderImage(src, alt) : <img src={src} alt={alt ?? ""} loading="lazy" />
+      : <span className="design-image-placeholder" title={t("localEdition.remoteResourceBlocked")}>{t("localEdition.remoteResourceBlocked")}{alt ? ` (${alt})` : ""}</span>,
     a: ({ href, children }) => {
       const filePath = onOpenWorkspaceFile ? workspaceLinkPath(href, workspacePath, baseDir) : undefined;
       if (filePath) {

@@ -135,7 +135,8 @@ it("resolves workspace symlinks, including missing descendants, before protectin
   }
 });
 it("protects custom CLI credential roots", () => {
-  for (const name of ["CODEX_HOME", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG"]) {
+  expect(neverTouchPaths("/tmp/app", "/tmp/pi-agent", [], "/tmp/home")).toContain("/tmp/home/.qoder");
+  for (const name of ["CODEX_HOME", "QODER_CONFIG_DIR", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG"]) {
     const before = process.env[name];
     process.env[name] = "/tmp/custom-cli-auth";
     try {
@@ -203,14 +204,20 @@ it("keeps runtimes opt-in and persists native defaults independently of Pi", asy
 });
 it("reclaims a verified orphan, preserving a live daemon and unrelated PID identities", async () => {
   const root = await folder();
-  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  expect(processIdentity(process.pid), "This ownership test requires permission to inspect its own PID identity before spawning a child").toBeTruthy();
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => process.exit(0), 15000); setInterval(() => {}, 1000)"], {
     detached: process.platform !== "win32",
     stdio: "ignore",
   });
   trackAgentProcess(root, child);
-  cleanup.push(() => terminateProjectProcess(child));
+  let identity: string | undefined;
+  cleanup.push(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    if (!child.pid || !identity || processIdentity(child.pid) !== identity) throw new Error("The test child identity could not be verified; no unrelated PID was signalled");
+    await terminateProjectProcess(child);
+  });
   await once(child, "spawn");
-  const identity = processIdentity(child.pid!)!;
+  identity = processIdentity(child.pid!);
   expect(identity).toBeTruthy();
   expect(await readdir(root)).toHaveLength(1);
   await recoverAgentProcesses(root);

@@ -20,7 +20,10 @@ describe("agent-owned Playtest", () => {
     const second = new OwnedPlaytestDriver(shared);
     await first.request(open);
     await second.request(open);
+    expect(first.ownedSessionIds()).toEqual(["session-1"]);
+    expect(second.ownedSessionIds()).toEqual(["session-2"]);
     await first.cleanup();
+    expect(first.ownedSessionIds()).toEqual([]);
     expect(shared.request.mock.calls.at(-1)).toEqual([{ operation: "close", sessionId: "session-1" }]);
     await expect(first.request({ operation: "close", sessionId: "session-2" })).rejects.toThrow("belong");
     expect(shared.close).not.toHaveBeenCalled();

@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { createLogRedactor } from "../src/shared/log-redaction.js";
+import { registerSensitiveValue } from "../src/shared/sensitive-values.js";
 import { afterEach, describe, expect, it } from "vitest";
 import yauzl from "yauzl";
 import { createApp } from "../src/daemon/app.js";
@@ -69,6 +70,18 @@ afterEach(async () => {
 });
 
 describe("diagnostics export", () => {
+  it("re-scrubs old log bytes with newly registered credentials without discarding the file", async () => {
+    const logs = await directory("ohmygame-diagnostics-known-values-");
+    const secret = 'diagnostics-canary+/quote"slash\\value';
+    const forms = [secret, JSON.stringify(secret).slice(1, -1), encodeURIComponent(secret)];
+    await writeFile(path.join(logs, "daemon.1.log"), `${"ordinary old line\n".repeat(6_000)}${forms.join("\n")}\n`);
+    registerSensitiveValue(secret);
+    const files = await unzip(await diagnosticsArchive({ logDirectory: logs, summary: async () => summary }));
+    expect(files["logs/daemon.1.log"]).toContain("ordinary old line");
+    expect(files["logs/daemon.1.log"]).toContain("[redacted]");
+    for (const form of forms) expect(files["logs/daemon.1.log"]).not.toContain(form);
+    expect(files["logs/daemon.1.log"]!.split("ordinary old line")).toHaveLength(6_001);
+  });
   it("includes the desktop logs and system information, and nothing else from the folder", async () => {
     const logs = await directory("ohmygame-diagnostics-logs-");
     await writeFile(path.join(logs, "main.log"), "main line\n");
@@ -160,17 +173,19 @@ describe("diagnostics export", () => {
     });
   });
 
-  it("exports configured providers by name only", async () => {
+  it("does not activate legacy native provider settings or export their credentials in diagnostic summaries", async () => {
     const dataDirectory = await directory("ohmygame-diagnostics-data-");
     const logs = await directory("ohmygame-diagnostics-route-logs-");
     await writeFile(path.join(logs, "daemon.log"), "service starting\n");
+    await writeFile(path.join(dataDirectory, "meshy.json"), JSON.stringify({ version: 1, apiKey: "historical-meshy-secret" }));
     const app = createApp({ dataDirectory, logDirectory: logs });
     apps.push(app);
-    await app.inject({
+    const retired = await app.inject({
       method: "PUT",
       url: "/settings/models/providers/meshy",
       payload: { apiKey: "msy_secret_value" },
     });
+    expect(retired.statusCode).toBe(410);
 
     const response = await app.inject({
       method: "POST",
@@ -185,14 +200,9 @@ describe("diagnostics export", () => {
     const files = await unzip(response.rawPayload);
     expect(files["logs/daemon.log"]).toBe("service starting\n");
     const system = JSON.parse(files["system.json"]!);
-    // Keys in the test environment can configure other providers too.
-    expect(system.providers).toContainEqual({
-      id: "meshy",
-      enabled: true,
-      custom: false,
-      capabilities: ["3d"],
-    });
+    expect(system.providers).not.toEqual(expect.arrayContaining([expect.objectContaining({ id: "meshy" })]));
     expect(files["system.json"]).not.toContain("msy_secret_value");
+    expect(files["system.json"]).not.toContain("historical-meshy-secret");
     expect(files["system.json"]).not.toContain(dataDirectory);
   });
 

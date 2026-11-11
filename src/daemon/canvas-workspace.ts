@@ -1,24 +1,32 @@
 import { CANVAS_TABLE_SCHEMA, createCanvasTable, isCanvasTable, canvasTablePath, type CanvasTable, type CanvasTableDetail } from "../shared/canvas-table.js";
 import { createHash, randomUUID } from "node:crypto";
+import { validVideoReferencePreparation } from "../shared/video-reference-preparation.js";
 import { applyCanvasNodeLayout, canvasNodeContent, canvasNodeLayout, contentNodeSizeIssue, isResizableCanvasNodeType } from "../shared/canvas-node-layout.js";
 import { resolveVideoMentions } from "../shared/video-references.js";
-import { lstat, readFile, rm } from "node:fs/promises";
+import { chmod, lstat, readFile, rm } from "node:fs/promises";
 import path from "node:path";
-import { convertToPng } from "@earendil-works/pi-coding-agent";
-import type { AssetCanvasNode, PromptImage, RunToolRequest, ToolJob, ToolId } from "../shared/contracts.js";
+import { readWebpModelReference } from "./image-working-assets.js";
+import type { AssetCanvasNode, AssetCanvasReference, Model3DOptions, PromptImage, RunToolRequest, ToolJob, ToolId } from "../shared/contracts.js";
 import { createCanvasBoard, fitCanvasLayout, isCanvasBoard, isCanvasIndex, CANVAS_INDEX_SCHEMA, CANVAS_BOARD_SCHEMA, CANVAS_LAYOUT_SCHEMA, type CanvasBoard, type CanvasBoardDetail, type CanvasWorkspaceDetail, type CanvasWorkspaceIndex } from "../shared/canvas-workspace.js";
 import { CANVAS_ASSETS_SCHEMA, canvasNodeAssetIds } from "../shared/canvas-assets.js";
 import { combineAssetCanvasPrompt, createAssetCanvasDocument, resolveAssetCanvasAssetId, validateAssetCanvasDocument } from "../shared/asset-canvas.js";
-import { buildModel3DToolRequest } from "../shared/generation-config.js";
+import { buildModel3DToolRequest, mediaGenerationNeedsConfirmation, resolveModel3D } from "../shared/generation-config.js";
+import { requiresModelTurnaround } from "../shared/model3d-operations.js";
 import { getWorkspaceMedia } from "./workspace.js";
 import { createCanvasDocument, canvasDocumentPath, type CanvasDocumentDetail, type CanvasMarkdownDocument } from "../shared/canvas-document.js";
 import { isCanvasDocument } from "../shared/canvas-document-schema.js";
 import type { AssetLibrary } from "./asset-library.js";
 import type { ProjectManager } from "./projects.js";
-import type { ToolRunner } from "./tools.js";
+import { ToolRunError, type ToolRunner } from "./tools.js";
+import { inheritToolPreflightFailure, toolPreflightError } from "./agent-tool-errors.js";
 import { CanvasError, canvasPath, parseCanvasJson, readCanvasFile, writeCanvasFile as writeAtomic, writeCanvasJson as writeJson } from "./canvas-files.js";
 import { canvasAssetCatalog, canvasLibraryAsset, ensureCanvasAssets, inspectCanvasAssets, readCanvasAssets } from "./canvas-assets.js";
 export { CanvasError } from "./canvas-files.js";
+
+function recoveryUnavailable(message: string): CanvasError {
+  // This recovery stopped before start(). It says nothing about the original provider submission.
+  return inheritToolPreflightFailure(new CanvasError(message, 409), toolPreflightError(message, "media_recovery_unavailable"));
+}
 
 const locks = new Map<string, Promise<unknown>>();
 export function withCanvasLock<T>(workspace: string, operation: () => Promise<T>): Promise<T> {
@@ -29,6 +37,8 @@ export function withCanvasLock<T>(workspace: string, operation: () => Promise<T>
 }
 const validId = (id: string) => { if (!/^[a-zA-Z0-9_-]{1,100}$/.test(id)) throw new CanvasError("Invalid canvas ID"); return id; };
 const revision = (value: unknown) => createHash("sha256").update(typeof value === "string" ? value : JSON.stringify(value)).digest("hex");
+const CANVAS_MEDIA_WORKFLOW = "Before submitting new project media, save its generation node on the board, then call generate_canvas_media. It records history, assets and results on that node. Only register a result manually when it already exists outside the board.";
+const LEGACY_CANVAS_MEDIA_WORKFLOW = "After each media result is saved, register its path in assets.json and add or update its board node before the next long-running step. Do not defer board writes until the final response.";
 const CANVAS_INSTRUCTIONS = `# Canvas workspace
 
 Canvas files are the source of truth in both Design and Asset Canvas. Use normal read, edit, and write tools to create and change boards, nodes, documents, and references.
@@ -36,16 +46,22 @@ Canvas files are the source of truth in both Design and Asset Canvas. Use normal
 - Read README.md and schemas/ before changing a contract. Run canvas_check after editing.
 - index.json lists boards, documents, optional tables, and the main document. Keep IDs stable; names and titles may change.
 - boards/<id>.json contains nodes and their content. Every node may have a title and a description of its purpose. Document bodies live in documents/<id>.md, referenced by documentId. Table data lives in tables/<id>.json, referenced by tableId; register tables in index.json. Keep row/column IDs stable and match cells to their column types.
+- Publish progress incrementally: add a document node as soon as its document is created; an index entry alone does not display a node. ${CANVAS_MEDIA_WORKFLOW} Reuse existing node and asset IDs and preserve user edits.
 - Give nodes meaningful titles. Descriptions explain their intended role; do not describe unseen image pixels as verified facts.
 - For game work, identify reference mockups and production assets in node titles/descriptions. Record production assets' intended gameplay use in the design document; reference mockups do not fulfill those requirements.
 - editor/<board-id>.json stores positions, zoom, and width/height for text, document, and table nodes only; media and generation nodes size to their content. fitView requests a one-time fit when a remixed board is first opened; the editor clears it after saving the new viewport. New nodes are placed automatically; layout edits are only needed when the user asks to arrange the canvas.
 - assets.json maps asset IDs to names, workspace-relative paths, optional descriptions and generation prompts. Use the same ID for the same asset across boards. References with type "library" resolve through this manifest. libraryAssetId records provenance; local files remain usable without the Library.
+- For 3D game code, use get_model_asset to obtain validated runtimePath and local resource files. modelPreviewPath is a triangulated editor preview; FBX originals preserve topology. Keep glTF buffer files together in builds. Local rebuildPreview repairs existing resources without generation or billing. Private editor sources under .data/model-assets/ are retained for recovery/export, not isolated runtime URLs.
 - Read actual image files with read when judging their appearance. A name, description, or generation prompt is not proof of what the image shows.
 - promptSource references a text or document node. Text and document nodes accept references to text, document, image, or image asset nodes as AI source material. images, references, and source declare dependencies; their canvas lines are derived. Do not duplicate these relationships in edges.
-- Speech, sound-effect, and music nodes use the shared audio model contract. Keep provider-specific credentials out of canvas files; select models by provider/id and only use options advertised by that model's capabilities.
-- To add local media, register its workspace-relative path in assets.json and reference its ID from an asset node or an existing generation node.
+- Voice nodes generate candidate audio from a description and sample script. Explicitly select or connect a generated sample to speech; connecting can adopt the current sample when none is selected, without generating. Existing bindings stay pinned until explicitly updated. Connections and audition never generate audio.
+- Speech supports an optional local reference; missing or changed selected references must not fall back to unconditioned speech. Speech, voice, sound-effect, and music nodes use the shared audio model contract. Keep provider-specific credentials out of canvas files; select models by provider/id and only use options advertised by that model's capabilities.
+- To add local media, register its workspace-relative path in assets.json and reference its ID from an asset node or an existing generation node. Asset nodes require both data.assetId and data.mediaType (image, video, audio, or model), matching the actual media. Do not omit mediaType or assume unknown media is an image. Board write/edit rejects invalid schemas before saving; correct the reported fields and retry.
 - A file node points at any other project file by its project-relative path (data.path), such as a source file, font, archive or editor project; with directory: true it points at a folder whose structure matters, such as an asset pack. Files and folders imported on the canvas live under assets/files/. Read or use the files themselves; update the path if you move them.
+- Game Canvas media marked canvasOnly are portable editor copies. When the game needs one, use use_canvas_asset with its assetId and a destination such as public/media/night-raid.mp4. Load the returned game file; leave unused candidates on the board.
 - Do not trigger generation merely by editing a prompt or adding a reference. A game-creation request includes its needed media unless the user narrows the scope. Use generate_canvas_media with the saved boardId and nodeId for generation; it uses the node settings and shared generation history.
+- A failed or cancelled node without output does not block unrelated work. Preserve its job history and valid assets, and continue with available results. An empty preview does not prove that the provider never accepted or billed the original request. Unavailable recovery cannot authorize a replacement. Leave application-managed jobs.json and private recovery inputs unchanged.
+- If legacy jobs.json is too large to read or transfer, call canvas_initialize to compact its metadata while preserving original retry inputs. Do not truncate the history or raise source limits.
 - Removing a node or board keeps its documents, tables, and assets. Remove references to a deleted node from the same board.
 - An editor-context block identifies the current board and selected nodes. Read the referenced files before editing, and preserve other user changes.
 `;
@@ -62,7 +78,7 @@ The canvas edits ordinary project files. Documents are Markdown and media files 
 | assets.json | Asset IDs, names, project-relative file paths, descriptions and generation prompts |
 | editor/<id>.json | Positions, text/document/table node dimensions and canvas viewport; missing node positions are filled automatically |
 | schemas/ | Exact persisted file contracts |
-| jobs.json | Generation history managed by the application |
+| jobs.json | Compact generation history managed by the application; original retry inputs are private |
 
 Read AGENTS.md for editing conventions. Asset paths are relative to the project root; Markdown image links are relative to the document file. Node IDs need only be unique within their board; asset, document and table IDs are shared across the canvas workspace.
 `;
@@ -71,7 +87,11 @@ export async function ensureCanvasContract(workspace: string, replaceReadme = fa
     const file = `schemas/${name}.schema.json`, text = `${JSON.stringify(value, null, 2)}\n`;
     if (await readCanvasFile(workspace, file) !== text) await writeAtomic(workspace, file, text);
   }
-  for (const [name, text] of [["AGENTS.md", CANVAS_INSTRUCTIONS], ["README.md", CANVAS_README]] as const) if ((replaceReadme && name === "README.md") || await readCanvasFile(workspace, name) === undefined) await writeAtomic(workspace, name, text);
+  const previous = await readCanvasFile(workspace, "AGENTS.md");
+  if (previous === undefined || previous === CANVAS_INSTRUCTIONS.replace(CANVAS_MEDIA_WORKFLOW, LEGACY_CANVAS_MEDIA_WORKFLOW))
+    await writeAtomic(workspace, "AGENTS.md", CANVAS_INSTRUCTIONS);
+  if (replaceReadme || await readCanvasFile(workspace, "README.md") === undefined)
+    await writeAtomic(workspace, "README.md", CANVAS_README);
 }
 export async function readCanvasIndex(workspace: string): Promise<CanvasWorkspaceIndex | undefined> {
   const text = await readCanvasFile(workspace, "index.json", 512_000);
@@ -191,13 +211,34 @@ async function writeCanvasBoard(workspace: string, board: CanvasBoard): Promise<
   await writeJson(workspace, `editor/${board.id}.json`, editorLayout);
   return (await readCanvasBoard(workspace, board.id))!;
 }
-export async function canvasReferencesAsset(workspace: string, id: string): Promise<boolean> {
+export async function canvasReferencesAsset(workspace: string, id: string, localPaths: readonly string[] = []): Promise<boolean> {
   const index = await readCanvasIndex(workspace);
   const manifest = await readCanvasAssets(workspace);
   const ids = new Set([id, ...Object.entries(manifest.assets).filter(([, asset]) => asset.libraryAssetId === id).map(([key]) => key)]);
+  const paths = [...new Set([...localPaths, ...Object.entries(manifest.assets).filter(([key]) => ids.has(key)).map(([, asset]) => asset.path)])];
+  if (!index) {
+    try { await lstat(path.join(workspace, "canvas")); }
+    catch (cause) { if ((cause as NodeJS.ErrnoException).code === "ENOENT") return false; throw cause; }
+    throw new CanvasError("Canvas index data is missing", 409);
+  }
+  // Count literal or URL-encoded local paths conservatively, including Markdown links and file-node content.
+  const mentionsPath = (content: string) => {
+    const decoded = content.replace(/(?:%[a-f\d]{2})+/gi, (value) => { try { return decodeURIComponent(value); } catch { return value; } });
+    if (paths.some((file) => decoded.includes(file) || decoded.replace(/\/\.\//g, "/").includes(file))) return true;
+    return content.split(/[\s"'<>()[\]`\\]+/).some((token) => {
+      try { token = decodeURIComponent(token); } catch { /* Keep undecodable text literal. */ }
+      return paths.some((file) => path.posix.normalize(token).includes(file));
+    });
+  };
   for (const entry of index?.boards ?? []) {
     const detail = await readCanvasBoard(workspace, entry.id);
-    if (detail && canvasNodeAssetIds(detail.board.nodes).some((assetId) => ids.has(assetId))) return true;
+    if (!detail) throw new CanvasError("Canvas board data is missing", 409);
+    if (canvasNodeAssetIds(detail.board.nodes).some((assetId) => ids.has(assetId))) return true;
+    if (mentionsPath(JSON.stringify(detail.board.nodes)) || detail.board.nodes.some((node) => node.type === "file" && node.data.directory && paths.some((file) => file.startsWith(`${node.data.path}/`)))) return true;
+  }
+  if (index && paths.length) {
+    for (const detail of await readCanvasDocuments(workspace, index)) if (mentionsPath(detail.document.markdown)) return true;
+    for (const entry of index.tables ?? []) if (mentionsPath(JSON.stringify((await readTableFile(workspace, entry.id)).table))) return true;
   }
   return false;
 }
@@ -245,7 +286,7 @@ export async function renameCanvasAssetPaths(workspace: string, from: string, to
   });
 }
 
-export async function removeCanvasAssetReferences(workspace: string, assetIds: string | readonly string[], options: { localOnly?: boolean } = {}): Promise<void> {
+export async function removeCanvasAssetReferences(workspace: string, assetIds: string | readonly string[], options: { localOnly?: boolean; checkOnly?: boolean } = {}): Promise<void> {
   const requested = new Set(typeof assetIds === "string" ? [assetIds] : assetIds);
   if (!requested.size) return;
   await withCanvasLock(workspace, async () => {
@@ -255,8 +296,22 @@ export async function removeCanvasAssetReferences(workspace: string, assetIds: s
     const boards = await Promise.all((index?.boards ?? []).map(async (entry) => {
       const detail = await readCanvasBoard(workspace, entry.id);
       if (!detail) throw new CanvasError("Canvas board data is missing", 409);
-      return detail;
+      const removed = new Set(detail.board.nodes.filter((node) => node.type === "asset" && ids.has(node.data.assetId)).map((node) => node.id));
+      const removesReference = (reference: AssetCanvasReference) => reference.type === "library" ? ids.has(reference.assetId) : removed.has(reference.nodeId);
+      for (const node of detail.board.nodes) {
+        if (node.type !== "model-3d" || !node.data.images.length) continue;
+        // For unrecognized custom connections the stored T/A pose may require directional inputs.
+        const protocol = node.data.model && resolveModel3D(node.data.model)?.protocol;
+        if (!requiresModelTurnaround(node.data.options, protocol ?? "tripo", node.data.operation ?? "image")) continue;
+        const first = node.data.images.findIndex(removesReference);
+        if (first >= 0 && node.data.images.slice(first + 1).some((image) => !removesReference(image))) {
+          const view = ["Front", "Left", "Back", "Right"][first];
+          throw new CanvasError(`Replace the ${view} image in "${node.title || node.id}" on board "${entry.name}" before deleting its asset. Removing it would shift the other views.`, 409);
+        }
+      }
+      return { detail, removed, removesReference };
     }));
+    if (options.checkOnly) return;
     const removedLinks = new Set([...ids].flatMap((assetId) => manifest.assets[assetId] ? [`../../${manifest.assets[assetId]!.path.split("/").map(encodeURIComponent).join("/")}`] : []));
     if (index && removedLinks.size) {
       const removedImages = new RegExp(`!\\[[^\\]\\n]*\\]\\((?:${[...removedLinks].map((link) => link.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\)`, "g");
@@ -265,14 +320,26 @@ export async function removeCanvasAssetReferences(workspace: string, assetIds: s
         if (markdown !== detail.document.markdown) await writeAtomic(workspace, `documents/${detail.document.id}.md`, markdown);
       }
     }
-    for (const detail of boards) {
+    for (const { detail, removed, removesReference } of boards) {
       if (!canvasNodeAssetIds(detail.board.nodes).some((assetId) => ids.has(assetId))) continue;
-      const removed = new Set(detail.board.nodes.filter((node) => node.type === "asset" && ids.has(node.data.assetId)).map((node) => node.id));
       detail.board.nodes = detail.board.nodes.filter((node) => !removed.has(node.id)).map((node) => {
         const data = { ...node.data };
         if ("assetId" in data && data.assetId && ids.has(data.assetId)) delete data.assetId;
-        if ("images" in data) data.images = data.images.filter((reference) => reference.type === "library" ? !ids.has(reference.assetId) : !removed.has(reference.nodeId));
+        if ("referenceAssetId" in data && data.referenceAssetId && ids.has(data.referenceAssetId)) {
+          delete data.referenceAssetId;
+          delete data.referenceSha256;
+          delete data.voiceSourceNodeId;
+        } else if ("voiceSourceNodeId" in data && data.voiceSourceNodeId && removed.has(data.voiceSourceNodeId)) {
+          // Disconnect a removed source node without dropping a different pinned recording.
+          delete data.voiceSourceNodeId;
+        }
+        if ("selectedAssetId" in data && data.selectedAssetId && ids.has(data.selectedAssetId)) {
+          delete data.selectedAssetId;
+          delete data.selectedSha256;
+        }
+        if ("images" in data) data.images = data.images.filter((reference) => !removesReference(reference));
         if ("references" in data && data.references) data.references = data.references.filter((reference) => reference.type === "library" ? !ids.has(reference.assetId) : !removed.has(reference.nodeId));
+        if ("mask" in data && data.mask && (data.mask.type === "library" ? ids.has(data.mask.assetId) : removed.has(data.mask.nodeId))) delete data.mask;
         if ("source" in data && data.source && (data.source.type === "library" ? ids.has(data.source.assetId) : removed.has(data.source.nodeId))) delete data.source;
         return { ...node, data } as AssetCanvasNode;
       });
@@ -295,7 +362,8 @@ export class CanvasStore {
     while (this.#executions.get(id)?.size) await Promise.allSettled([...this.#executions.get(id)!]);
   }
   readonly #jobs = new Map<string, StoredJob[]>();
-  readonly #controllers = new Map<string, AbortController>();
+  readonly #savedInputs = new Map<string, string>();
+  readonly #controllers = new Map<StoredJob, AbortController>();
   #closed = false;
   constructor(private readonly projects: ProjectManager, private readonly library: AssetLibrary, private readonly tools: ToolRunner) {}
   #project(id: string) {
@@ -306,6 +374,20 @@ export class CanvasStore {
   }
   async read(id: string, documentId?: string) { return readCanvasDocument(this.#project(id).workspacePath, documentId); }
   async exportAsset(id: string, assetId: string) { return { assetId: await canvasLibraryAsset(this.#project(id), this.library, assetId) }; }
+  async modelPreview(id: string, assetId: string, rebuild = false) {
+    const project = this.#project(id), libraryId = await canvasLibraryAsset(project, this.library, assetId);
+    if (rebuild) {
+      const asset = await this.library.rebuildModelPreview(libraryId);
+      await withCanvasLock(project.workspacePath, async () => {
+        const manifest = await readCanvasAssets(project.workspacePath), previous = manifest.assets[assetId];
+        if (!previous) throw new CanvasError("Canvas asset not found", 404);
+        const file = await this.projects.materializeLibraryAsset(id, libraryId, true, previous.canvasOnly === true);
+        manifest.assets[assetId] = { ...previous, libraryAssetId: libraryId, model3d: asset.model3d, modelPreviewPath: file.modelPreviewPath, modelRuntimePath: file.modelRuntimePath };
+        await writeJson(project.workspacePath, "assets.json", manifest);
+      });
+    }
+    return this.library.openContent(libraryId, undefined, true);
+  }
   async workspace(id: string): Promise<CanvasWorkspaceDetail> {
     const project = this.#project(id), workspace = project.workspacePath;
     return withCanvasLock(workspace, async () => {
@@ -393,6 +475,60 @@ export class CanvasStore {
       return detail;
     });
   }
+  /** Publish an agent request and its sources atomically before any provider call. */
+  async createAgentMediaNode(id: string, nodeId: string, create: (reference: (source: { path: string } | { assetId: string; audioReference?: true } | { attachmentReference: string; image: PromptImage; signal?: AbortSignal }) => Promise<AssetCanvasReference>) => Promise<AssetCanvasNode>, boardId?: string): Promise<{ boardId: string; nodeId: string }> {
+    const project = this.#project(id), workspace = project.workspacePath;
+    return withCanvasLock(workspace, async () => {
+      const index = await ensureCanvasIndex(workspace);
+      await ensureCanvasContract(workspace);
+      const selected = boardId ?? index.boards[0]!.id;
+      const { board } = await this.board(id, selected);
+      if (board.nodes.some(node => node.id === nodeId)) return { boardId: selected, nodeId };
+      const manifest = await readCanvasAssets(workspace);
+      const node = await create(async source => {
+        let assetId: string;
+        if ("path" in source) {
+          const file = await getWorkspaceMedia(workspace, source.path);
+          assetId = Object.entries(manifest.assets).find(([, asset]) => asset.path === file.relativePath)?.[0]
+            ?? await this.projects.ensureLibraryAsset(id, file.relativePath);
+        } else if ("attachmentReference" in source) {
+          source.signal?.throwIfAborted();
+          const bytes = Buffer.from(source.image.data, "base64"), digest = createHash("sha256").update(bytes).digest("hex");
+          if (!["image/png", "image/jpeg"].includes(source.image.mediaType)) throw new CanvasError("Attachment references require PNG or JPEG");
+          const extension = source.image.mediaType === "image/png" ? "png" : "jpg";
+          assetId = (await this.library.add(`attachment-${digest}.${extension}`, bytes, {
+            origin: "uploaded", purpose: "reference", signal: source.signal,
+            sourceKey: `attachment:${createHash("sha256").update(JSON.stringify([id, source.attachmentReference, digest])).digest("hex")}`,
+          })).id;
+        } else assetId = source.assetId;
+        await ensureCanvasAssets(project, this.projects, this.library, [assetId]);
+        const existing = board.nodes.find(node => "assetId" in node.data && node.data.assetId === assetId
+          && (!("audioReference" in source && source.audioReference) || node.type === "voice" || node.type === "asset" && node.data.mediaType === "audio"));
+        if (existing) return { type: "node", nodeId: existing.id };
+        const asset = (await canvasAssetCatalog(workspace, await readCanvasAssets(workspace), [assetId]))[0]!;
+        const sourceId = randomUUID();
+        board.nodes.push({ id: sourceId, type: "asset", position: { x: 0, y: 0 }, title: asset.name, description: "path" in source ? `Project source: ${source.path}` : "attachmentReference" in source ? `Chat attachment: ${source.attachmentReference}` : `Library source: ${source.assetId}`, data: { assetId, mediaType: asset.mediaType } });
+        return { type: "node", nodeId: sourceId };
+      });
+      node.id = nodeId;
+      board.nodes.push(node);
+      board.editorLayout = fitCanvasLayout(board.nodes, board.editorLayout);
+      for (const entry of board.nodes) entry.position = board.editorLayout.nodes[entry.id]!;
+      await writeCanvasBoard(workspace, board);
+      await this.projects.touch(id);
+      return { boardId: selected, nodeId };
+    });
+  }
+  async recordAgentMediaFailure(id: string, boardId: string, nodeId: string, toolId: ToolId, error: string): Promise<void> {
+    await withCanvasLock(this.#project(id).workspacePath, async () => {
+      const jobs = await this.#loadJobs(id);
+      if (jobs.some(job => job.context?.boardId === boardId && job.context.nodeId === nodeId)) return;
+      const { board } = await this.board(id, boardId);
+      const node = board.nodes.find(node => node.id === nodeId);
+      if (node) await this.#rememberJob(id, { id: randomUUID(), toolId, title: node.title ?? node.type, createdAt: new Date().toISOString(), status: "failed", error,
+        context: { projectId: id, boardId, nodeId } }, jobs);
+    });
+  }
   async changeBoards(id: string, action: { type: "create"; name: string } | { type: "rename" | "delete" | "move"; boardId: string; name?: string; direction?: number }) {
     if (this.#project(id).type === "asset-canvas") throw new CanvasError("Asset Canvas uses one default board", 409);
     const workspace = this.#project(id).workspacePath;
@@ -438,34 +574,137 @@ export class CanvasStore {
     try {
       const value: unknown = JSON.parse(await readFile(await canvasPath(this.#project(id).workspacePath, "jobs.json"), "utf8"));
       if (!Array.isArray(value) || value.length > 1000 || value.some((job) => !job || typeof job.id !== "string" || job.context?.projectId !== id || typeof job.context?.boardId !== "string" || typeof job.context?.nodeId !== "string" || !["running", "succeeded", "failed", "cancelled"].includes(job.status))) throw new CanvasError("Invalid generation history");
-      jobs = value.map((job) => job.status === "running" ? { ...job, status: "cancelled", error: "Generation was interrupted. Retry to resume a submitted 3D task." } : job);
+      jobs = await Promise.all(value.map(async (job) => ({ ...job,
+        ...(job.input?.retainedInput !== undefined ? { input: await this.#readJobInput(id, job) } : {}),
+        sources: Array.isArray(job.sources) && job.sources.length <= 64 && job.sources.every((source: unknown) => source && typeof source === "object" && "assetId" in source && typeof source.assetId === "string" && "name" in source && typeof source.name === "string") ? job.sources : undefined,
+        videoSubmission: ["not-submitted", "attempted"].includes(job.videoSubmission) ? job.videoSubmission : undefined,
+        videoReferencePreparation: validVideoReferencePreparation(job.videoReferencePreparation) ? job.videoReferencePreparation : undefined,
+        ...(job.status === "running" ? { status: "cancelled", error: "Generation was interrupted. Recover a saved result; unknown submissions are never resubmitted.",
+          ...(!job.run && ["generate-speech", "generate-sound-effect", "generate-music"].includes(job.toolId) ? { submissionOutcome: "unknown" as const } : {}) } : {}) })));
     } catch (cause) { if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause; }
-    this.#jobs.set(id, jobs); await this.#saveJobs(id); return jobs;
+    this.#jobs.set(id, jobs);
+    try { await this.#saveJobs(id); }
+    catch (cause) { this.#jobs.delete(id); throw cause; }
+    return jobs;
   }
-  #saveJobs(id: string) { return writeJson(this.#project(id).workspacePath, "jobs.json", this.#jobs.get(id) ?? []); }
-  async jobs(id: string): Promise<ToolJob[]> { return withCanvasLock(this.#project(id).workspacePath, async () => (await this.#loadJobs(id)).map(({ input: _input, recoveryId: _recoveryId, ...job }) => structuredClone(job))); }
-  async start(id: string, boardId: string, nodeId: string, toolId: ToolId, input: RunToolRequest, expectedRevision?: string, recoveryId?: string): Promise<ToolJob> {
+  async #readJobInput(id: string, job: StoredJob & { input: { retainedInput: string } }): Promise<RunToolRequest> {
+    const key = revision(job.id);
+    if (job.input.retainedInput !== key) throw new CanvasError("Invalid retained generation input binding", 409);
+    const file = await canvasPath(this.#project(id).workspacePath, `.job-inputs/${key}.json`);
+    let saved;
+    try { saved = JSON.parse(await readFile(file, "utf8")); }
+    catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") throw new CanvasError("Original generation input is unavailable; history retained and no replacement was submitted", 409);
+      throw cause;
+    }
+    if (saved.version !== 1 || saved.jobId !== job.id || saved.boardId !== job.context?.boardId || saved.nodeId !== job.context?.nodeId || saved.toolId !== job.toolId || !saved.input || typeof saved.input !== "object" || Array.isArray(saved.input))
+      throw new CanvasError("The original generation input does not match this job; no replacement was submitted", 409);
+    return saved.input as RunToolRequest;
+  }
+  async #saveJobs(id: string) {
+    const workspace = this.#project(id).workspacePath;
+    const history = await Promise.all((this.#jobs.get(id) ?? []).map(async (job) => {
+      if (!job.input) return job;
+      const key = revision(job.id), name = `.job-inputs/${key}.json`;
+      const saved = { version: 1, jobId: job.id, boardId: job.context?.boardId, nodeId: job.context?.nodeId, toolId: job.toolId, input: job.input };
+      const text = JSON.stringify(saved), digest = revision(text), cacheKey = `${id}:${key}`;
+      if (this.#savedInputs.get(cacheKey) !== digest) {
+        const file = await canvasPath(workspace, name, true);
+        await chmod(path.dirname(file), 0o700);
+        await writeAtomic(workspace, name, text);
+        await chmod(file, 0o600);
+        this.#savedInputs.set(cacheKey, digest);
+      }
+      return { ...job, input: { retainedInput: key } };
+    }));
+    // Save complete inputs first. A failed metadata write must not discard recovery data.
+    return writeJson(workspace, "jobs.json", history);
+  }
+  async #rememberJob(id: string, job: StoredJob, history: StoredJob[]): Promise<void> {
+    const seenNodes = new Set([JSON.stringify([job.context?.boardId, job.context?.nodeId])]);
+    const pending = new Set(history.filter((entry) => {
+      const node = JSON.stringify([entry.context?.boardId, entry.context?.nodeId]);
+      const latest = !seenNodes.has(node);
+      seenNodes.add(node);
+      return entry.status === "running" || latest && (entry.status === "failed" || entry.status === "cancelled");
+    }));
+    if (history.filter((entry) => entry.status === "running").length >= 20) throw new CanvasError("Too many active generation jobs", 409);
+    if (pending.size >= 1000) throw new CanvasError("Canvas job history is full. Resolve pending results before starting another generation.", 409);
+    let recent = Math.min(80, 999 - pending.size);
+    const kept = history.filter((entry) => pending.has(entry) || recent-- > 0);
+    this.#jobs.set(id, [job, ...kept]);
+    try { await this.#saveJobs(id); }
+    catch (cause) { this.#jobs.set(id, history); throw cause; }
+  }
+  async #publicJob({ input, recoveryId, ...job }: StoredJob): Promise<ToolJob> {
+    const id = recoveryId ?? job.id, outputs = (input as { outputs?: number } | undefined)?.outputs ?? 1;
+    const terminal = job.status === "cancelled" || job.status === "failed";
+    return {
+      ...structuredClone(job),
+      ...(job.toolId === "generate-image" ? { canRecoverImage: await this.tools.hasSavedImageResult(id, outputs) } : {}),
+      ...(job.toolId === "generate-video" ? { canRecoverVideo: await this.tools.hasSavedVideoTask(id) } : {}),
+      ...(terminal && (job.toolId === "image-to-3d" || job.toolId === "animate-3d") ? { canRecoverModel3D: !!job.run || !!input && await this.#canRecover3D(job.toolId, input, id) } : {}),
+      ...(terminal && !job.run && await this.tools.mediaWasAttempted(job.toolId, id, outputs) ? { submissionOutcome: "unknown" as const } : {}),
+    };
+  }
+  async #canRecover3D(toolId: string, input: RunToolRequest, recoveryId: string): Promise<boolean> {
+    try {
+      await this.tools.assertMediaAvailable(toolId, input, true);
+      return await this.tools.hasSavedModel3DTask(recoveryId);
+    } catch { return false; }
+  }
+  async jobs(id: string): Promise<ToolJob[]> {
+    return withCanvasLock(this.#project(id).workspacePath, async () => Promise.all((await this.#loadJobs(id)).map((job) => this.#publicJob(job))));
+  }
+  async start(id: string, boardId: string, nodeId: string, toolId: ToolId, input: RunToolRequest, expectedRevision?: string, recoveryId?: string, imageRecoveryOnly = false, videoRecoveryOnly = false, model3DRecoveryOnly = false, confirmedAudioJobId?: string, retryJobId?: string, agentCanInspectImages?: boolean): Promise<ToolJob> {
     const workspace = this.#project(id).workspacePath;
     const { job, prepared } = await withCanvasLock(workspace, async () => {
       if (this.#closed) throw new CanvasError("Generation is shutting down", 503);
       const detail = await this.board(id, boardId);
       if (expectedRevision && detail.revision !== expectedRevision) throw new CanvasError("The node settings changed before generation. Read the current board and try again.", 409);
       const node = detail.board.nodes.find((node) => node.id === nodeId);
-      const expectedNodeType = ({ "generate-image": "image", "generate-video": "video", "image-to-3d": "model-3d", "animate-3d": "animate-3d", "generate-speech": "speech", "generate-sound-effect": "sound-effect", "generate-music": "music" } as Partial<Record<ToolId, string>>)[toolId];
+      const expectedNodeType = toolId === "generate-speech" && "voiceDesign" in input && input.voiceDesign ? "voice" : ({ "generate-image": "image", "generate-video": "video", "image-to-3d": "model-3d", "animate-3d": "animate-3d", "generate-speech": "speech", "generate-sound-effect": "sound-effect", "generate-music": "music" } as Partial<Record<ToolId, string>>)[toolId];
       if (!node || !expectedNodeType || expectedNodeType !== node.type) throw new CanvasError("Generation node not found", 404);
       const jobs = await this.#loadJobs(id);
       if (jobs.some((job) => job.context?.boardId === boardId && job.context.nodeId === nodeId && job.status === "running")) throw new CanvasError("This node is already generating", 409);
-      const resolved = await this.tools.prepare(toolId, input, id);
+      const previous = jobs.find((job) => job.context?.boardId === boardId && job.context.nodeId === nodeId);
+      if (retryJobId && previous?.id !== retryJobId) throw new CanvasError("This recovery was superseded. Refresh the node before continuing.", 409);
+      if (previous?.status === "cancelled" && this.#controllers.has(previous)) throw new CanvasError("Wait for the cancelled generation to finish recording its result.", 409);
+      if (previous?.run && previous.toolId === toolId && previous.status !== "succeeded" && (!recoveryId || recoveryId === (previous.recoveryId ?? previous.id))) {
+        if (!previous.input) throw new CanvasError("The saved output is in the Library. Restore it locally before generating again.", 409);
+        const job = { ...previous, id: randomUUID(), createdAt: new Date().toISOString(), status: "running" as const, error: undefined, submissionOutcome: undefined };
+        await this.#rememberJob(id, job, jobs);
+        return { job, prepared: previous.input };
+      }
+      if (retryJobId && previous?.run) throw new CanvasError("This saved output cannot be restored. Recovery will not submit a new request.", 409);
+      await this.tools.assertMediaAvailable(toolId, input, model3DRecoveryOnly);
+      const canSubmit = !imageRecoveryOnly && !videoRecoveryOnly && !model3DRecoveryOnly;
+      if (canSubmit && previous && mediaGenerationNeedsConfirmation(await this.#publicJob(previous)) && confirmedAudioJobId !== previous.id) {
+        throw new CanvasError("The previous request may have been billed. Explicitly confirm a new request or recover the previous result.", 409);
+      }
+      if (confirmedAudioJobId && confirmedAudioJobId !== previous?.id) throw new CanvasError("This confirmation is out of date. Refresh the node before continuing.", 409);
+      const resolved = await this.tools.prepare(toolId, input, id, canSubmit ? agentCanInspectImages : undefined);
+      if (canSubmit) await this.tools.assertMediaInputOptions(toolId, resolved);
       const prepared = structuredClone(resolved);
       const model = "imageModel" in resolved ? resolved.imageModel : "model" in resolved ? resolved.model : undefined;
       if (toolId === "generate-video" && "references" in prepared) for (const reference of prepared.references ?? []) reference.assetId = await canvasLibraryAsset(this.#project(id), this.library, reference.assetId);
+      if (toolId === "generate-speech" && "referenceAssetId" in prepared && prepared.referenceAssetId) prepared.referenceAssetId = await canvasLibraryAsset(this.#project(id), this.library, prepared.referenceAssetId);
       if (toolId === "animate-3d" && "assetId" in prepared) prepared.assetId = await canvasLibraryAsset(this.#project(id), this.library, prepared.assetId);
       if (toolId === "image-to-3d" && "sourceAssetId" in prepared && prepared.sourceAssetId) prepared.sourceAssetId = await canvasLibraryAsset(this.#project(id), this.library, prepared.sourceAssetId);
-      const job: StoredJob = { recoveryId: recoveryId ?? randomUUID(), id: randomUUID(), toolId, createdAt: new Date().toISOString(), status: "running", title: "prompt" in input ? (input.prompt ?? "Model 3D").slice(0, 200) : "text" in input ? (input.text.trim().slice(0, 200) || "Speech") : "Model 3D", context: { projectId: id, boardId, nodeId }, ...(model ? { model } : {}), input: structuredClone(resolved) };
-      if (jobs.filter((job) => job.status === "running").length >= 20) throw new CanvasError("Too many active generation jobs", 409);
-      this.#jobs.set(id, [job, ...jobs.filter((job) => job.status === "running"), ...jobs.filter((job) => job.status !== "running").slice(0, 80)]); await this.#saveJobs(id); return { job, prepared };
+      const sourceIds = [
+        ...("images" in prepared ? prepared.images?.map(image => image.libraryAssetId) ?? [] : []),
+        ...("references" in prepared ? prepared.references?.map(reference => reference.assetId) ?? [] : []),
+        "mask" in prepared ? prepared.mask?.libraryAssetId : undefined,
+        "assetId" in prepared ? prepared.assetId : undefined,
+        "sourceAssetId" in prepared ? prepared.sourceAssetId : undefined,
+        "referenceAssetId" in prepared ? prepared.referenceAssetId : undefined,
+      ].filter((assetId): assetId is string => typeof assetId === "string");
+      const sources = [...new Set(sourceIds)].map(assetId => ({ assetId, name: this.library.get(assetId)?.name ?? assetId }));
+      const job: StoredJob = { sources, imageRecoveryOnly, videoRecoveryOnly, model3DRecoveryOnly, recoveryId: recoveryId ?? randomUUID(), id: randomUUID(), toolId, ...(toolId === "generate-video" ? { videoSubmission: videoRecoveryOnly ? "attempted" as const : "not-submitted" as const } : {}), createdAt: new Date().toISOString(), status: "running", title: "prompt" in input ? (input.prompt ?? "Model 3D").slice(0, 200) : "text" in input ? (input.text.trim().slice(0, 200) || "Speech") : "Model 3D", context: { projectId: id, boardId, nodeId }, ...(model ? { model } : {}), input: structuredClone(resolved) };
+      await this.#rememberJob(id, job, jobs);
+      return { job, prepared };
     });
-    const controller = new AbortController(); this.#controllers.set(job.id, controller);
+    const controller = new AbortController(); this.#controllers.set(job, controller);
     const execution = this.#execute(id, job, prepared, controller);
     let executions = this.#executions.get(id);
     if (!executions) { executions = new Set(); this.#executions.set(id, executions); }
@@ -476,10 +715,13 @@ export class CanvasStore {
     });
     const { input: _input, recoveryId: _recoveryId, ...publicJob } = job; return structuredClone(publicJob);
   }
-  async generateNode(id: string, boardId: string, nodeId: string): Promise<ToolJob> {
+  async generateNode(id: string, boardId: string, nodeId: string, confirmedAudioJobId?: string, defaultReferenceMode?: Model3DOptions["referenceMode"], agentCanInspectImages?: boolean): Promise<ToolJob> {
     const project = this.#project(id), { board, revision } = await this.board(id, boardId);
     const node = board.nodes.find((node) => node.id === nodeId);
-    if (!node || !["image", "video", "model-3d", "animate-3d", "speech", "sound-effect", "music"].includes(node.type)) throw new CanvasError("Choose a media generation node");
+    const start = (toolId: ToolId, input: RunToolRequest) => this.start(id, boardId, nodeId, toolId, input, revision, undefined, false, false, false, confirmedAudioJobId, undefined, agentCanInspectImages);
+    if (!node || !["image", "video", "model-3d", "animate-3d", "speech", "voice", "sound-effect", "music"].includes(node.type)) throw new CanvasError("Choose a media generation node");
+    const latest = await withCanvasLock(project.workspacePath, async () => (await this.#loadJobs(id)).find((job) => job.context?.boardId === boardId && job.context.nodeId === nodeId));
+    if (latest?.run && (latest.status === "failed" || latest.status === "cancelled")) return this.retry(id, latest.id);
     const manifest = await readCanvasAssets(project.workspacePath);
     const assetId = (reference: Parameters<typeof resolveAssetCanvasAssetId>[1]): string => {
       const id = resolveAssetCanvasAssetId(board.nodes, reference);
@@ -488,65 +730,83 @@ export class CanvasStore {
     };
     const image = async (reference: Parameters<typeof assetId>[0]): Promise<PromptImage> => {
       const source = await getWorkspaceMedia(project.workspacePath, manifest.assets[assetId(reference)]!.path);
+      if (node.type === "model-3d" && source.contentType === "image/webp") {
+        try { return await readWebpModelReference(project.workspacePath, source); }
+        catch (cause) { throw new CanvasError(cause instanceof Error ? cause.message : String(cause)); }
+      }
+      if (node.type === "model-3d" && source.contentType !== "image/png" && source.contentType !== "image/jpeg") throw new CanvasError("3D generation requires PNG, JPEG or WebP reference images");
       if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(source.contentType)) throw new CanvasError("Reference images must be PNG, JPEG, WebP or GIF");
-      return { mediaType: source.contentType as PromptImage["mediaType"], data: (await readFile(source.absolutePath)).toString("base64") };
+      return { mediaType: source.contentType as PromptImage["mediaType"], data: (await readFile(source.absolutePath)).toString("base64"),
+        libraryAssetId: await canvasLibraryAsset(project, this.library, assetId(reference)) };
     };
     if (node.type === "animate-3d") {
       if (!node.data.source || !node.data.actionIds.length) throw new CanvasError("Choose a source model and animation actions first");
-      return this.start(id, boardId, nodeId, "animate-3d", { model: node.data.model, options: node.data.options, assetId: assetId(node.data.source), actionIds: node.data.actionIds, heightMeters: node.data.heightMeters }, revision);
+      return start("animate-3d", { model: node.data.model, options: node.data.options, assetId: assetId(node.data.source), actionIds: node.data.actionIds, heightMeters: node.data.heightMeters });
     }
     if (node.type === "model-3d") {
       const operation = node.data.operation ?? "image";
       if (operation === "image" && !node.data.images.length) throw new CanvasError("Add a reference image before generating");
-      const linked = board.nodes.find((candidate) => candidate.id === node.data.promptSource?.nodeId);
-      const text = linked?.type === "text" ? linked.data.text : linked?.type === "document" ? (await this.read(id, linked.data.documentId))?.document.markdown : undefined;
-      const prompt = combineAssetCanvasPrompt(text, node.data.prompt ?? "");
-      const images = await Promise.all(node.data.images.map(async (reference) => {
-        const source = await image(reference);
-        if (source.mediaType === "image/webp") {
-          const png = await convertToPng(source.data, source.mediaType);
-          if (!png) throw new CanvasError("Could not convert the WebP reference image to PNG");
-          return { mediaType: "image/png" as const, data: png.data };
-        }
-        if (source.mediaType !== "image/png" && source.mediaType !== "image/jpeg") throw new CanvasError("3D generation requires PNG, JPEG or WebP reference images");
-        return source;
-      }));
-      return this.start(id, boardId, nodeId, "image-to-3d", { ...buildModel3DToolRequest(node.data, images, operation), operation, ...(prompt ? { prompt } : {}), ...(node.data.source ? { sourceAssetId: assetId(node.data.source) } : {}), ...(node.data.options ? { options: node.data.options } : {}) }, revision);
+      let prompt: string | undefined;
+      if (operation === "text" || operation === "retexture") {
+        const linked = board.nodes.find((candidate) => candidate.id === node.data.promptSource?.nodeId);
+        const text = linked?.type === "text" ? linked.data.text : linked?.type === "document" ? (await this.read(id, linked.data.documentId))?.document.markdown : undefined;
+        prompt = combineAssetCanvasPrompt(text, node.data.prompt ?? "");
+      }
+      const images: PromptImage[] = [];
+      for (const reference of node.data.images) images.push(await image(reference));
+      const options = operation === "image" && defaultReferenceMode ? { referenceMode: defaultReferenceMode, ...node.data.options } : node.data.options;
+      return start("image-to-3d", { ...buildModel3DToolRequest(node.data, images, operation), operation, ...(prompt ? { prompt } : {}), ...(node.data.source ? { sourceAssetId: assetId(node.data.source) } : {}), ...(options ? { options } : {}) });
+    }
+    if (node.type === "voice") {
+      if (!node.data.description.trim() || !node.data.sampleText.trim()) throw new CanvasError("Describe the voice and add sample text before generating", 400);
+      return start("generate-speech", { voiceDesign: true, voiceDescription: node.data.description, text: node.data.sampleText, output: node.data.output ?? { format: "wav", sampleRate: 48000 }, language: node.data.language, style: node.data.style, speed: node.data.speed, ...(node.data.model ? { model: node.data.model } : {}) });
     }
     if (node.type === "speech") {
       const linked = board.nodes.find((candidate) => candidate.id === node.data.promptSource?.nodeId);
       const linkedText = linked?.type === "text" ? linked.data.text : linked?.type === "document" ? (await this.read(id, linked.data.documentId))?.document.markdown : undefined;
       const text = combineAssetCanvasPrompt(linkedText, node.data.text);
       if (!text) throw new CanvasError("Add text to synthesize before generating");
-      return this.start(id, boardId, nodeId, "generate-speech", { text, ...(node.data.model ? { model: node.data.model } : {}), ...(node.data.voiceId ? { voiceId: node.data.voiceId } : {}), ...(node.data.speed !== undefined ? { speed: node.data.speed } : {}) }, revision);
+      if (node.data.voiceId && !node.data.referenceAssetId) throw new CanvasError("The legacy voice is unavailable; explicitly select reference audio or no reference", 400);
+      return start("generate-speech", { text, language: node.data.language, style: node.data.style, output: node.data.output, ...(node.data.referenceAssetId ? { referenceAssetId: node.data.referenceAssetId } : {}), ...(node.data.referenceSha256 ? { referenceSha256: node.data.referenceSha256 } : {}), ...(node.data.model ? { model: node.data.model } : {}), ...(node.data.speed !== undefined ? { speed: node.data.speed } : {}) });
     }
     if (node.type === "sound-effect" || node.type === "music") {
       const linked = board.nodes.find((candidate) => candidate.id === node.data.promptSource?.nodeId);
       const linkedText = linked?.type === "text" ? linked.data.text : linked?.type === "document" ? (await this.read(id, linked.data.documentId))?.document.markdown : undefined;
       const prompt = combineAssetCanvasPrompt(linkedText, node.data.prompt);
       if (!prompt) throw new CanvasError(`Add a prompt before generating ${node.type === "music" ? "music" : "a sound effect"}`);
-      if (node.type === "sound-effect") return this.start(id, boardId, nodeId, "generate-sound-effect", {
+      if (node.type === "sound-effect") return start("generate-sound-effect", {
         prompt,
+        ...(node.data.output ? { output: node.data.output } : {}),
         ...(node.data.model ? { model: node.data.model } : {}),
         ...(node.data.durationSeconds !== undefined ? { durationSeconds: node.data.durationSeconds } : {}),
         ...(node.data.loop !== undefined ? { loop: node.data.loop } : {}),
         ...(node.data.negativePrompt ? { negativePrompt: node.data.negativePrompt } : {}),
-      }, revision);
-      return this.start(id, boardId, nodeId, "generate-music", {
+      });
+      return start("generate-music", {
         prompt,
+        ...(node.data.output ? { output: node.data.output } : {}),
         ...(node.data.model ? { model: node.data.model } : {}),
         instrumental: node.data.instrumental,
         ...(node.data.lyrics ? { lyrics: node.data.lyrics } : {}),
         ...(node.data.durationSeconds !== undefined ? { durationSeconds: node.data.durationSeconds } : {}),
         ...(node.data.loop !== undefined ? { loop: node.data.loop } : {}),
-      }, revision);
+      });
     }
     if (node.type !== "image" && node.type !== "video") throw new CanvasError("Unsupported generation node");
     const linked = board.nodes.find((candidate) => candidate.id === node.data.promptSource?.nodeId);
     const text = linked?.type === "text" ? linked.data.text : linked?.type === "document" ? (await this.read(id, linked.data.documentId))?.document.markdown : undefined;
     const prompt = combineAssetCanvasPrompt(text, node.data.prompt);
     if (!prompt) throw new CanvasError("Add a prompt before generating");
-    if (node.type === "image") return this.start(id, boardId, nodeId, "generate-image", { prompt, resolution: node.data.resolution, aspectRatio: node.data.aspectRatio, ...(node.data.model ? { imageModel: node.data.model } : {}), images: await Promise.all(node.data.images.map(image)) }, revision);
+    if (node.type === "image") return start("generate-image", {
+      prompt, resolution: node.data.resolution, aspectRatio: node.data.aspectRatio,
+      ...(node.data.model ? { imageModel: node.data.model } : {}),
+      ...(node.data.quality !== undefined ? { quality: node.data.quality } : {}),
+      ...(node.data.outputFormat !== undefined ? { outputFormat: node.data.outputFormat } : {}),
+      ...(node.data.outputCompression !== undefined ? { outputCompression: node.data.outputCompression } : {}),
+      ...(node.data.background !== undefined ? { background: node.data.background } : {}),
+      ...(node.data.mask ? { mask: await image(node.data.mask) } : {}),
+      images: await Promise.all(node.data.images.map(image)),
+    });
     const referenceIds = node.data.references.map(assetId);
     const catalog = await canvasAssetCatalog(project.workspacePath, manifest, referenceIds);
     const references = referenceIds.map((id) => {
@@ -557,11 +817,32 @@ export class CanvasStore {
     let resolvedPrompt: string;
     try { resolvedPrompt = resolveVideoMentions(prompt, node.data.references, node.data.referenceMentions); }
     catch (cause) { throw new CanvasError(cause instanceof Error ? cause.message : String(cause)); }
-    return this.start(id, boardId, nodeId, "generate-video", { prompt: resolvedPrompt, model: node.data.model, resolution: node.data.resolution, aspectRatio: node.data.aspectRatio, duration: node.data.duration, references, ...(node.data.referenceMode ? { referenceMode: node.data.referenceMode } : {}) }, revision);
+    return start("generate-video", { prompt: resolvedPrompt, model: node.data.model, resolution: node.data.resolution, aspectRatio: node.data.aspectRatio, duration: node.data.duration, references, ...(node.data.referenceMode ? { referenceMode: node.data.referenceMode } : {}) });
   }
   async #execute(id: string, job: StoredJob, prepared: RunToolRequest, controller: AbortController) {
     try {
-      const run = await this.tools.runPrepared(job.toolId, prepared, controller.signal, { recoveryId: job.recoveryId ?? job.id, projectId: id }); controller.signal.throwIfAborted();
+      const retained = job.run;
+      const run = retained ? await this.tools.recoverCanvasRun(retained.id, job.toolId, job.context!) : await this.tools.runPrepared(job.toolId, prepared, controller.signal, { recoveryId: job.recoveryId ?? job.id, projectId: id, canvasContext: job.context,
+        ...(job.imageRecoveryOnly ? { imageRecoveryOnly: true } : {}), ...(job.videoRecoveryOnly ? { videoRecoveryOnly: true } : {}), ...(job.model3DRecoveryOnly ? { model3DRecoveryOnly: true } : {}) }, async (summary) => {
+        if (!validVideoReferencePreparation(summary)) throw new CanvasError("Invalid video reference preparation summary", 400);
+        await withCanvasLock(this.#project(id).workspacePath, async () => {
+          controller.signal.throwIfAborted();
+          job.videoReferencePreparation = structuredClone(summary);
+          await this.#saveJobs(id);
+        });
+      }, async () => {
+        await withCanvasLock(this.#project(id).workspacePath, async () => {
+          controller.signal.throwIfAborted();
+          job.videoSubmission = "attempted";
+          await this.#saveJobs(id);
+        });
+      });
+      job.run = run;
+      if (!retained) {
+        delete job.submissionOutcome;
+        await withCanvasLock(this.#project(id).workspacePath, () => this.#saveJobs(id));
+      }
+      controller.signal.throwIfAborted();
       const output = run.files[0];
       if (!output?.assetId) throw new CanvasError("Generation returned no Library asset", 502);
       await withCanvasLock(this.#project(id).workspacePath, async () => {
@@ -570,29 +851,42 @@ export class CanvasStore {
         await ensureCanvasAssets(this.#project(id), this.projects, this.library, [output.assetId!]);
         if ((await readCanvasIndex(workspace))?.boards.some((board) => board.id === boardId)) {
           const detail = await readCanvasBoard(workspace, boardId), node = detail?.board.nodes.find((node) => node.id === job.context!.nodeId);
-          const expectedType = ({ "generate-image": "image", "generate-video": "video", "image-to-3d": "model-3d", "animate-3d": "animate-3d", "generate-speech": "speech", "generate-sound-effect": "sound-effect", "generate-music": "music" } as Partial<Record<ToolId, string>>)[job.toolId];
+          const expectedType = job.toolId === "generate-speech" && "voiceDesign" in prepared && prepared.voiceDesign ? "voice" : ({ "generate-image": "image", "generate-video": "video", "image-to-3d": "model-3d", "animate-3d": "animate-3d", "generate-speech": "speech", "generate-sound-effect": "sound-effect", "generate-music": "music" } as Partial<Record<ToolId, string>>)[job.toolId];
           if (detail && node && expectedType && node.type === expectedType) { Object.assign(node.data, { assetId: output.assetId }); await writeCanvasBoard(workspace, detail.board); }
         }
-        job.run = run; job.status = "succeeded"; delete job.input; await this.#saveJobs(id);
+        job.status = "succeeded"; delete job.input; await this.#saveJobs(id);
       });
-      await this.tools.removeRun(run.id).catch(() => {});
+      if (job.status === "succeeded") await this.tools.removeRun(run.id).catch(() => {});
     } catch (cause) {
       job.status = controller.signal.aborted ? "cancelled" : "failed"; job.error = cause instanceof Error ? cause.message : String(cause);
+      if (job.run) {
+        job.input ??= prepared;
+        job.error += ". A generation result was received. Retry to attach the existing output without another generation.";
+      }
+      if (job.toolId === "generate-video" && cause instanceof ToolRunError && cause.notSubmitted) job.videoSubmission = "not-submitted";
+      if (cause instanceof ToolRunError && cause.videoDiagnostic) job.videoDiagnostic = cause.videoDiagnostic;
+      if (cause instanceof ToolRunError && cause.audioDiagnostic) job.audioDiagnostic = cause.audioDiagnostic;
+      if (cause instanceof ToolRunError && cause.submissionOutcome === "unknown" || controller.signal.aborted && !job.run && ["generate-speech", "generate-sound-effect", "generate-music"].includes(job.toolId)) job.submissionOutcome = "unknown";
       try { await withCanvasLock(this.#project(id).workspacePath, () => this.#saveJobs(id)); } catch { /* Removed projects have no history to update. */ }
-    } finally { this.#controllers.delete(job.id); }
+    } finally { this.#controllers.delete(job); }
   }
   async cancel(id: string, jobId: string): Promise<ToolJob> {
     return withCanvasLock(this.#project(id).workspacePath, async () => {
       const job = (await this.#loadJobs(id)).find((job) => job.id === jobId);
       if (!job) throw new CanvasError("Generation job not found", 404);
-      if (job.status === "running") { job.status = "cancelled"; job.error = job.toolId === "image-to-3d" || job.toolId === "animate-3d" ? "Stopped waiting locally. Retry to resume; the provider task may still be running." : "Generation cancelled"; this.#controllers.get(job.id)?.abort(); await this.#saveJobs(id); }
+      if (job.status === "running") { job.status = "cancelled"; job.error = job.toolId === "image-to-3d" || job.toolId === "animate-3d" ? "Stopped waiting locally. Retry to resume; the provider task may still be running." : "Generation cancelled"; if (!job.run && ["generate-speech", "generate-sound-effect", "generate-music"].includes(job.toolId)) job.submissionOutcome = "unknown"; this.#controllers.get(job)?.abort(); await this.#saveJobs(id); }
       const { input: _input, recoveryId: _recoveryId, ...result } = job; return structuredClone(result);
     });
   }
-  async retry(id: string, jobId: string): Promise<ToolJob> {
+  async retry(id: string, jobId: string, recoveryOnly = false): Promise<ToolJob> {
     const job = await withCanvasLock(this.#project(id).workspacePath, async () => (await this.#loadJobs(id)).find((job) => job.id === jobId));
     if (!job || !job.input || !["failed", "cancelled"].includes(job.status)) throw new CanvasError("This job cannot be retried", 409);
-    return this.start(id, job.context!.boardId!, job.context!.nodeId, job.toolId, job.input, undefined, job.recoveryId ?? job.id);
+    if (job.run) return this.start(id, job.context!.boardId!, job.context!.nodeId, job.toolId, job.input, undefined, job.recoveryId ?? job.id, false, false, false, undefined, job.id);
+    if (["generate-speech", "generate-sound-effect", "generate-music"].includes(job.toolId) && (recoveryOnly || job.submissionOutcome === "unknown" || /unknown|interrupted|cancelled/i.test(job.error ?? ""))) throw recoveryUnavailable("The previous audio request may have been billed. Its result is unknown; recovery cannot submit another paid request. Preserve this job and continue work that does not require a replacement.");
+    if (job.toolId === "generate-image" && !await this.tools.hasSavedImageResult(job.recoveryId ?? job.id, (job.input as { outputs?: number }).outputs ?? 1)) throw recoveryUnavailable("No saved image result is available. Recovery never submits a new generation; check the provider record. The original submission may be unknown. Preserve this job and continue work that does not require a replacement.");
+    if (job.toolId === "generate-video" && !await this.tools.hasSavedVideoTask(job.recoveryId ?? job.id)) throw recoveryUnavailable("No saved video task is available. Recovery never submits a new generation. Preserve this job and continue work that does not require a replacement.");
+    const recoveryId = ["generate-speech", "generate-sound-effect", "generate-music"].includes(job.toolId) ? randomUUID() : job.recoveryId ?? job.id;
+    return this.start(id, job.context!.boardId!, job.context!.nodeId, job.toolId, job.input, undefined, recoveryId, job.toolId === "generate-image", job.toolId === "generate-video", ["image-to-3d", "animate-3d"].includes(job.toolId), undefined, job.id);
   }
   async cancelProject(id: string) { for (const job of this.#jobs.get(id) ?? []) if (job.status === "running") await this.cancel(id, job.id); this.#jobs.delete(id); }
   async close() { this.#closed = true; for (const controller of this.#controllers.values()) controller.abort(); await Promise.allSettled([...this.#executions.values()].flatMap((executions) => [...executions])); }

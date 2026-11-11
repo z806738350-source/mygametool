@@ -2,10 +2,19 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OpenAISessionFiles } from "../src/daemon/openai-session-files.js";
 import { OpenAISessionTransport, type ResponseSocket } from "../src/daemon/openai-session-transport.js";
 import { SessionImages } from "../src/daemon/session-images.js";
+import { legacyImageFilesRequest } from "./legacy-image-files-fixture.js";
+
+const legacyProtocol = vi.hoisted(() => ({ enabled: true }));
+vi.mock("../src/daemon/provider-network.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/daemon/provider-network.js")>();
+  const { legacyImageFilesFetch } = await import("./legacy-image-files-fixture.js");
+  return { ...actual, guardedProviderFetch: (delegate: typeof fetch) => legacyProtocol.enabled ? legacyImageFilesFetch(delegate) : actual.guardedProviderFetch(delegate) };
+});
+beforeEach(() => { legacyProtocol.enabled = true; });
 
 const dirs: string[] = [];
 afterEach(async () => { vi.useRealTimers(); await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))); });
@@ -24,7 +33,7 @@ class API {
   model: (body: any) => Response = () => json({ ok: true });
   uploadWait?: (signal: AbortSignal) => Promise<void>;
   fetch: typeof globalThis.fetch = vi.fn(async (input, init) => {
-    const request = new Request(input, init); const url = new URL(request.url);
+    const request = legacyImageFilesRequest(input, init); const url = new URL(request.url);
     this.auth.push(request.headers.get("authorization") ?? "");
     if (url.pathname === "/v1/files" && request.method === "POST") {
       this.uploads++; const id = `file-${this.uploads}`;
@@ -44,6 +53,14 @@ const headers = (key = "sk-key-a", project?: string) => new Headers({ authorizat
 const replace = (files: OpenAISessionFiles, api: API, key?: string, project?: string, signal = new AbortController().signal) => files.replace(payload(), headers(key, project), api.fetch, signal);
 
 describe("OpenAI session image files", () => {
+  it("denies real original-provider uploads and undocumented Kunpo Files requests before transport", async () => {
+    legacyProtocol.enabled = false;
+    const delegate = vi.fn<typeof fetch>(), files = new OpenAISessionFiles(await directory());
+    await expect(files.replace(payload(), headers(), delegate, new AbortController().signal)).rejects.toThrow();
+    const actual = await vi.importActual<typeof import("../src/daemon/provider-network.js")>("../src/daemon/provider-network.ts");
+    await expect(actual.guardedProviderFetch(delegate)("https://llm.ziy.cc/v1/files", { method: "POST", headers: { authorization: "Bearer fake-only-key" } })).rejects.toThrow("Invalid provider API path");
+    expect(delegate).not.toHaveBeenCalled();
+  });
   it("uploads once, persists mappings, and scopes them by credentials and project", async () => {
     const dir = await directory(); const api = new API(); const files = new OpenAISessionFiles(dir);
     const request = payload(); await files.replace(request, headers(), api.fetch, new AbortController().signal);

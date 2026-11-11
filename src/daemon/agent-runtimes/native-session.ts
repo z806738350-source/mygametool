@@ -18,6 +18,10 @@ import type { CodingSession, SkillCatalogItem } from "../agent.js";
 import { handoffSummary } from "./handoff.js";
 import { NATIVE_API } from "./replay.js";
 import { inside } from "./policy.js";
+import { sessionImageReferenceContext, sessionImageReferences } from "../session-images.js";
+import { isRecoverableInterruption, type AgentInterruption, type AutoContinueTools } from "../agent-auto-continue.js";
+import { getToolPreflightFailure } from "../agent-tool-errors.js";
+import { getIsolatedOperationReceipts, getIsolatedRepairResolutions, getIsolatedRepairPending } from "../isolated-tool-receipts.js";
 
 /** The custom entry that records which native session a conversation's branch continues. */
 export const NATIVE_SESSION_ENTRY = "ohmygame-native-session";
@@ -27,6 +31,7 @@ export interface StoredNativeSession {
   runtime: AgentRuntimeId;
   state: "active" | "ready" | "invalid";
   sessionId?: string;
+  contextVersion?: string;
 }
 
 /** A native context was removed; the shared session must rebuild it from the current branch. */
@@ -43,6 +48,8 @@ export interface NativeTurnInput {
   images: PromptImage[];
   /** Planning turns may read but not change the workspace. */
   readOnly: boolean;
+  /** The current branch retains visual references even when its text handoff sends no old pixels. */
+  requiresImageInput?: boolean;
 }
 
 /** A tool result in the shape OhMyGame's own tools return, so artifacts and images show the same way. */
@@ -54,10 +61,19 @@ export interface NativeToolResult {
   details?: unknown;
 }
 
+type NativeResultSubtype = "success" | "error_during_execution" | "error_max_turns" | "error_max_budget_usd";
+export interface NativeResultMetadata {
+  /** SDK-reported count for this segment; provider counters are not a task budget. */
+  modelTurns?: number;
+  resultSubtype?: NativeResultSubtype;
+  terminalReason?: "max_turns" | "abort" | "aborted_streaming" | "aborted_tools" | "hook_stopped" | "repeated_tool_call_denied" | "completed" | "unknown";
+  stopReason?: "end_turn" | "stop_sequence" | "tool_use" | "max_tokens" | "pause_turn" | "refusal" | "unknown";
+  cancelOrigin?: "user" | "host" | "runtime";
+}
 export type NativeTurnOutcome =
-  | { status: "completed" }
+  | ({ status: "completed" } & NativeResultMetadata)
   | { status: "aborted" }
-  | { status: "failed"; error: string };
+  | ({ status: "failed"; error: string; interruption?: AgentInterruption } & NativeResultMetadata);
 
 export interface NativeUsage {
   input: number;
@@ -81,6 +97,8 @@ export interface NativeTurnSink {
   toolStarted(callId: string): void;
   toolUpdate(callId: string, result: NativeToolResult): void;
   toolResult(callId: string, result: NativeToolResult, isError: boolean): void;
+  /** A completed effect arriving after a terminal signal still needs a durable receipt. */
+  toolSettled?(callId: string, result: NativeToolResult, isError: boolean): void;
   usage(
     usage: NativeUsage,
     contextWindow?: number,
@@ -125,6 +143,10 @@ export interface NativeSessionOptions {
   /** The model as the conversation names it: the runtime's own model ID. */
   model: string;
   nativeReasoningLevel?: string;
+  /** Rebuild native context when the host tool/security contract changes. */
+  contextVersion?: string;
+  /** Verified catalog capability; a text-only connection must not silently ignore retained images. */
+  supportsImages?: boolean;
   sessionManager: SessionManager;
   /** Creates the adapter for the native session the branch continues, if any. */
   createDriver(
@@ -152,9 +174,20 @@ export interface NativeSessionOptions {
   cancellationTimeoutMs?: number;
   /** How long a CLI may sit idle before it is stopped; the next message resumes its native session. */
   idleTimeoutMs?: number;
+  continuationTools?: AutoContinueTools;
+  assertContinuation?(): void | Promise<void>;
+  beginTask?(userEntryId: string): void | Promise<void>;
 }
 
 const IDLE_PROCESS_MS = 10 * 60_000;
+interface NativeContinuation {
+  text: string;
+  images: PromptImage[];
+  userEntryId: string;
+  model: string;
+  reasoningLevel?: string;
+  readOnly: boolean;
+}
 
 /**
  * A conversation run by a coding agent CLI. It keeps the conversation in the
@@ -185,6 +218,37 @@ export class NativeCodingSession implements CodingSession {
   #idleTimer?: ReturnType<typeof setTimeout>;
   /** An idle CLI still stopping; the next run waits so two processes never share a native session. */
   #idleStop?: Promise<void>;
+  #interruption?: AgentInterruption;
+  #continuation?: NativeContinuation;
+  #continuationPrepared = false;
+  #segment = 0;
+  #cancelOrigin?: "user" | "host";
+  #forcedInterruption?: AgentInterruption;
+  #stoppingUnconfirmed?: Promise<void>;
+
+  get interruption(): AgentInterruption | undefined {
+    return this.#interruption && isRecoverableInterruption(this.#interruption) && this.options.continuationTools?.repairable
+      ? { ...this.#interruption, repairOnly: true } : this.#interruption;
+  }
+
+  #toolStopMessage(): string {
+    try { this.options.continuationTools?.assertSafe(); }
+    catch (cause) { return cause instanceof Error ? cause.message : String(cause); }
+    return "An operation has an unconfirmed outcome. Recover or review the original operation before continuing.";
+  }
+
+  /** A daemon-owned effect guard can stop the native loop without impersonating a user Stop. */
+  stopForUnconfirmedEffect(): Promise<void> {
+    if (!this.#running) return Promise.resolve();
+    if (this.#stoppingUnconfirmed) return this.#stoppingUnconfirmed;
+    this.#forcedInterruption = { kind: "blocked", source: this.runtime === "qoder-cli" ? "qoder" : "codex", code: "unconfirmed_tool_effect", phase: "tools", cancelOrigin: "host" };
+    const running = this.#running;
+    const driver = this.#driver;
+    return this.#stoppingUnconfirmed = (async () => {
+      await bounded(driver.interrupt().catch(() => {}), this.options.cancellationTimeoutMs ?? 1_500);
+      if (!await bounded(running.done, this.options.cancellationTimeoutMs ?? 1_500)) await driver.dispose();
+    })().finally(() => { this.#stoppingUnconfirmed = undefined; });
+  }
 
   constructor(private readonly options: NativeSessionOptions) {
     this.runtime = options.runtime;
@@ -197,6 +261,7 @@ export class NativeCodingSession implements CodingSession {
     const stored = latestNativeSession(
       this.sessionManager.getBranch(),
       options.runtime,
+      options.contextVersion,
     );
     this.#nativeSessionId = stored?.sessionId;
     // A branch with messages and no native session of this agent was held by another agent, or by this one before
@@ -275,7 +340,11 @@ export class NativeCodingSession implements CodingSession {
     return { steering, followUp };
   }
 
-  async abort(): Promise<void> {
+  async abort(origin: "user" | "host" = "user"): Promise<void> {
+    this.#cancelOrigin ??= origin;
+    this.#interruption = undefined;
+    this.#continuation = undefined;
+    this.#continuationPrepared = false;
     this.#followUps = [];
     this.#steering = [];
     const running = this.#running;
@@ -290,6 +359,69 @@ export class NativeCodingSession implements CodingSession {
       await this.#driver.dispose();
       await running.done;
     }
+  }
+
+  #assertContinuation(): NativeContinuation {
+    const task = this.#continuation;
+    const lastUser = this.sessionManager.getBranch().findLast(entry => entry.type === "message" && entry.message.role === "user");
+    if (this.#disposed || this.#running || !task || lastUser?.id !== task.userEntryId || !isRecoverableInterruption(this.interruption) ||
+      task.model !== this.options.model || task.reasoningLevel !== this.options.nativeReasoningLevel || task.readOnly !== this.#readOnly)
+      throw new Error("This interrupted task is no longer eligible for automatic continuation");
+    return task;
+  }
+
+  async prepareContinuation(signal: AbortSignal): Promise<void> {
+    this.#assertContinuation();
+    signal.throwIfAborted();
+    await this.options.assertContinuation?.();
+    this.#assertContinuation();
+    const guard = this.options.continuationTools;
+    if (!guard) throw new Error("Automatic continuation has no controlled tool-result guard");
+    await guard.prepare(signal, async (result, tool, callId) => {
+      this.#assertContinuation();
+      signal.throwIfAborted();
+      this.sessionManager.appendCustomMessageEntry("ohmygame-native-recovered-tool", [
+        { type: "text", text: `Recovered the existing result of ${tool}, original call ${callId}. No replacement operation was submitted.` },
+        ...result.content,
+      ] as never, false, { tool, originalCallId: callId });
+    });
+    signal.throwIfAborted();
+    await this.options.assertContinuation?.();
+    this.#assertContinuation();
+    this.#continuationPrepared = true;
+  }
+
+  async resumeAfterInterruption(): Promise<void> {
+    this.#assertContinuation();
+    if (!this.#continuationPrepared) throw new Error("Confirm retained tool outcomes before continuing");
+    await this.options.assertContinuation?.();
+    this.#assertContinuation();
+    this.#continuationPrepared = false;
+    this.#cancelOrigin = undefined;
+    this.#forcedInterruption = undefined;
+    this.#checkpointFailure = undefined;
+    const controller = new AbortController();
+    let settle!: () => void;
+    const done = new Promise<void>(resolve => { settle = resolve; });
+    this.#running = { controller, done };
+    try {
+      const stopping = this.#takeIdleStop();
+      if (stopping) await stopping;
+      let failed = await this.#runMessage("Continue the same unfinished user task from the retained conversation and current files. Reuse completed tool results. Never replay completed effects; recover uncertain operations by their original call or job ID. A normal final answer ends this task.", [], controller.signal, true);
+      while (!failed && !controller.signal.aborted) {
+        const next = this.#steering.shift() ?? this.#followUps.shift();
+        if (!next) break;
+        failed = await this.#runMessage(next.text, next.images, controller.signal);
+      }
+      if (failed || controller.signal.aborted) { this.#followUps = []; this.#steering = []; }
+    } finally {
+      this.#running = undefined;
+      settle();
+      this.#scheduleIdleStop();
+      this.#emit({ type: "agent_settled", aborted: controller.signal.aborted });
+    }
+    const failure = this.#checkpointFailure as { cause: unknown } | undefined;
+    if (failure) throw failure.cause;
   }
 
   async compact(customInstructions?: string): Promise<void> {
@@ -330,8 +462,8 @@ export class NativeCodingSession implements CodingSession {
     }
   }
 
-  abortCompaction(): void {
-    void this.abort();
+  abortCompaction(origin: "user" | "host" = "user"): void {
+    void this.abort(origin);
   }
 
   getContextUsage(): AgentContextUsage | undefined {
@@ -409,6 +541,7 @@ export class NativeCodingSession implements CodingSession {
   dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;
+    this.#cancelOrigin ??= "host";
     clearTimeout(this.#idleTimer);
     this.#running?.controller.abort();
     // Keep generated config/Skills until the process has actually stopped.
@@ -447,6 +580,7 @@ export class NativeCodingSession implements CodingSession {
       runtime: this.runtime,
       state: "active",
       sessionId,
+      ...(this.options.contextVersion ? { contextVersion: this.options.contextVersion } : {}),
     } satisfies StoredNativeSession);
   }
 
@@ -507,10 +641,26 @@ export class NativeCodingSession implements CodingSession {
     text: string,
     images: PromptImage[],
     signal: AbortSignal,
+    continuation = false,
   ): Promise<boolean> {
     const history = this.sessionManager.getBranch();
-    if (!(await this.#storeUserMessage(text, images))) return true;
+    if (!continuation) {
+      this.#cancelOrigin = undefined;
+      this.#forcedInterruption = undefined;
+      this.#interruption = undefined;
+      this.#continuationPrepared = false;
+      if (!(await this.#storeUserMessage(text, images))) return true;
+      const user = this.sessionManager.getBranch().findLast(entry => entry.type === "message" && entry.message.role === "user");
+      if (!user) throw new Error("The current user message was not retained");
+      this.#continuation = { text, images, userEntryId: user.id, model: this.options.model, reasoningLevel: this.options.nativeReasoningLevel, readOnly: this.#readOnly };
+      this.#segment = 0;
+      this.options.continuationTools?.reset(user.id);
+      await this.options.beginTask?.(user.id);
+    }
     if (signal.aborted) return true;
+    const branch = this.sessionManager.getBranch();
+    const requiresImageInput = images.length > 0 || sessionImageReferences(branch).length > 0;
+    const imageContext = this.options.toolNames.includes("recall_image") ? sessionImageReferenceContext(branch) : undefined;
     const notice = await this.options.turnNotice?.().catch(() => undefined);
     let wire = notice
       ? `${text}\n\nWorkspace restore notice (inspect current files before continuing):\n${notice}`
@@ -521,16 +671,30 @@ export class NativeCodingSession implements CodingSession {
       if (summary) wire = `${summary}\n\n${wire}`;
       this.#handoff = false;
     }
+    if (imageContext) wire = `${imageContext}\n\n${wire}`;
+    if (continuation && this.options.continuationTools?.recoverySummary)
+      wire = `${this.options.continuationTools.recoverySummary}\n\n${wire}`;
     // A crash or interrupted write must never leave an earlier ready marker
     // claiming that this native context still matches the branch.
     this.#storeNativeState("active");
     const turn = new TurnRecorder(this, this.options.model);
+    const sink = turn.sink();
+    const recordToolResult = sink.toolResult;
+    sink.toolResult = (...result) => {
+      // Persist the actual rejection/effect receipt before interrupting the adapter.
+      // Stopping inside Tool.execute races the adapter's result callback and loses it.
+      recordToolResult(...result);
+      if (this.options.continuationTools?.stopRequested && !this.options.continuationTools.repairable)
+        void this.stopForUnconfirmedEffect().catch(() => {});
+    };
     let outcome: NativeTurnOutcome;
     try {
       try {
+        if (requiresImageInput && this.options.supportsImages === false)
+          throw new Error("This conversation contains retained images, but the selected connection does not have image input enabled. Choose an image-enabled connection before continuing; original images are retained and no model task was sent.");
         outcome = await this.#driver.runTurn(
-          { text: wire, images, readOnly: this.#readOnly },
-          turn.sink(),
+          { text: wire, images, readOnly: this.#readOnly, ...(requiresImageInput ? { requiresImageInput: true } : {}) },
+          sink,
           signal,
         );
       } catch (cause) {
@@ -540,11 +704,12 @@ export class NativeCodingSession implements CodingSession {
         const summary = handoffSummary(history);
         outcome = await this.#driver.runTurn(
           {
-            text: summary ? `${summary}\n\n${currentPrompt}` : currentPrompt,
+            text: `${imageContext ? `${imageContext}\n\n` : ""}${summary ? `${summary}\n\n${currentPrompt}` : currentPrompt}`,
             images,
             readOnly: this.#readOnly,
+            ...(requiresImageInput ? { requiresImageInput: true } : {}),
           },
-          turn.sink(),
+          sink,
           signal,
         );
         this.#handoff = false;
@@ -559,6 +724,21 @@ export class NativeCodingSession implements CodingSession {
     }
     if (signal.aborted && outcome.status !== "failed")
       outcome = { status: "aborted" };
+    if (this.#forcedInterruption && !signal.aborted)
+      outcome = { status: "failed", error: this.#toolStopMessage(), interruption: this.#forcedInterruption };
+    if (outcome.status === "completed" && this.options.continuationTools?.stopRequested)
+      outcome = { status: "failed", error: this.#toolStopMessage(), interruption: { kind: "blocked", source: this.runtime === "qoder-cli" ? "qoder" : "codex", code: "unconfirmed_tool_effect", phase: "tools" } };
+    this.#interruption = outcome.status === "failed" && !signal.aborted ? outcome.interruption : undefined;
+    this.sessionManager.appendCustomEntry("ohmygame-native-outcome", { version: 1, taskId: this.#continuation?.userEntryId, status: outcome.status,
+      segment: ++this.#segment,
+      ...(outcome.status !== "aborted" && outcome.modelTurns !== undefined ? { sdkNumTurns: outcome.modelTurns } : {}),
+      ...(outcome.status !== "aborted" && outcome.resultSubtype ? { resultSubtype: outcome.resultSubtype } : {}),
+      ...(outcome.status !== "aborted" && outcome.terminalReason ? { terminalReason: outcome.terminalReason } : {}),
+      ...(outcome.status !== "aborted" && outcome.stopReason ? { stopReason: outcome.stopReason } : {}),
+      ...(outcome.status !== "aborted" && (outcome.cancelOrigin ?? this.#interruption?.cancelOrigin) ? { cancelOrigin: outcome.cancelOrigin ?? this.#interruption?.cancelOrigin } : {}),
+      ...(this.#interruption ? { interruption: this.#interruption } : {}),
+      ...(signal.aborted ? { cancelOrigin: this.#cancelOrigin ?? "host" } : {}),
+    });
     turn.finish(outcome);
     if (outcome.status === "completed") this.#storeNativeState("ready");
     else await this.#resetContext();
@@ -603,6 +783,7 @@ export class NativeCodingSession implements CodingSession {
       version: 2,
       runtime: this.runtime,
       state,
+      ...(this.options.contextVersion ? { contextVersion: this.options.contextVersion } : {}),
       ...(state !== "invalid" && this.#nativeSessionId
         ? { sessionId: this.#nativeSessionId }
         : {}),
@@ -679,6 +860,7 @@ interface ToolState {
  * turn ends; each tool result is its own message, as in a Pi session.
  */
 class TurnRecorder {
+  readonly #userEntryId?: string;
   #assistant?: { message: AssistantRecord; blocks: Map<string, number> };
   #tools = new Map<string, ToolState>();
   /** Cumulative text survives flushing an assistant before a tool starts. */
@@ -688,7 +870,9 @@ class TurnRecorder {
   constructor(
     private readonly session: NativeCodingSession,
     private readonly model: string,
-  ) {}
+  ) {
+    this.#userEntryId = session.sessionManager.getBranch().findLast(entry => entry.type === "message" && entry.message.role === "user")?.id;
+  }
 
   sink(): NativeTurnSink {
     return {
@@ -713,6 +897,18 @@ class TurnRecorder {
       },
       toolResult: (callId, result, isError) =>
         this.#toolResult(callId, result, isError),
+      toolSettled: (callId, result, isError) => {
+        const tool = this.#tools.get(callId);
+        const user = this.session.sessionManager.getBranch().findLast(entry => entry.type === "message" && entry.message.role === "user");
+        if (!tool || user?.id !== this.#userEntryId) return;
+        const preflightFailure = isError ? getToolPreflightFailure(result) : undefined;
+        const isolatedOperations = getIsolatedOperationReceipts(result);
+        const isolatedRepairResolutions = getIsolatedRepairResolutions(result);
+        const isolatedRepairPending = getIsolatedRepairPending(result);
+        this.session.sessionManager.appendCustomEntry("ohmygame-native-tool-settlement", { version: 1, taskId: this.#userEntryId, originalCallId: callId, tool: tool.name,
+          state: preflightFailure ? preflightFailure.disposition === "correctable" ? "not_executed" : "blocked" : isError ? "returned-error" : "completed", result,
+          ...(preflightFailure ? { preflightFailure } : {}), ...(isolatedOperations ? { isolatedOperations } : {}), ...(isolatedRepairResolutions ? { isolatedRepairResolutions } : {}), ...(isolatedRepairPending ? { isolatedRepairPending } : {}) });
+      },
       usage: (usage, contextWindow, contextTokens) => {
         this.#usage = usage;
         this.session.reportUsage(
@@ -802,6 +998,7 @@ class TurnRecorder {
         this.#toolResult(
           callId,
           {
+            details: { nativeToolState: "unconfirmed", executionStarted: tool.started },
             content: [
               {
                 type: "text",
@@ -977,6 +1174,10 @@ class TurnRecorder {
   ): void {
     const tool = this.#tools.get(callId);
     if (!tool || tool.finished) return;
+    const preflightFailure = isError ? getToolPreflightFailure(result) : undefined;
+    const isolatedOperations = getIsolatedOperationReceipts(result);
+    const isolatedRepairResolutions = getIsolatedRepairResolutions(result);
+    const isolatedRepairPending = getIsolatedRepairPending(result);
     this.#toolStarted(callId);
     tool.finished = true;
     this.session.emit({
@@ -992,6 +1193,10 @@ class TurnRecorder {
       toolName: tool.name,
       content: result.content,
       ...(result.details !== undefined ? { details: result.details } : {}),
+      ...(preflightFailure ? { preflightFailure } : {}),
+      ...(isolatedOperations ? { isolatedOperations } : {}),
+      ...(isolatedRepairResolutions ? { isolatedRepairResolutions } : {}),
+      ...(isolatedRepairPending ? { isolatedRepairPending } : {}),
       isError,
       timestamp: Date.now(),
     });
@@ -1050,6 +1255,7 @@ function usageRecord(usage: NativeUsage) {
 export function latestNativeSession(
   entries: readonly SessionEntry[],
   runtime: AgentRuntimeId,
+  contextVersion?: string,
 ): StoredNativeSession | undefined {
   for (let index = entries.length - 1; index >= 0; index--) {
     const entry = entries[index];
@@ -1068,12 +1274,13 @@ export function latestNativeSession(
     if (
       data?.version !== 2 ||
       data.state !== "ready" ||
+      (contextVersion !== undefined && data.contextVersion !== contextVersion) ||
       typeof data.sessionId !== "string" ||
       !data.sessionId
     )
       return undefined;
     return data.runtime === runtime
-      ? { version: 2, runtime, state: "ready", sessionId: data.sessionId }
+      ? { version: 2, runtime, state: "ready", sessionId: data.sessionId, ...(typeof data.contextVersion === "string" ? { contextVersion: data.contextVersion } : {}) }
       : undefined;
   }
   return undefined;

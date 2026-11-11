@@ -10,6 +10,8 @@ import { listModels, MODELS_CHANGED_EVENT, waitForRuntime } from "./api.js";
 import { menuPlacement } from "./popover-placement.js";
 import { settingsHash } from "./routes.js";
 import { PROVIDER_ICONS } from "./provider-icons.js";
+import { KUNPO_MODEL_OPTIONS, kunpoModelOption } from "../shared/kunpo-models.js";
+import { agentModelImageInput } from "../shared/agent-models.js";
 
 interface ModelSelectorProps {
   models: AgentModel[];
@@ -18,6 +20,7 @@ interface ModelSelectorProps {
   reasoningLevel?: AgentReasoningLevel;
   nativeReasoningLevel?: string;
   disabled?: boolean;
+  hasImageHistory?: boolean;
   variant?: "chat" | "canvas";
   placement?: "above" | "below";
   onChange: (model: AgentModel, reasoningLevel: AgentReasoningLevel) => void;
@@ -27,7 +30,7 @@ interface ModelSelectorProps {
 
 type ModelPanel = "models" | "reasoning";
 
-export function ModelSelector({ models, status = "ready", value, reasoningLevel, nativeReasoningLevel, disabled, variant = "chat", placement = "above", onChange, onReasoningChange, onNativeReasoningChange }: ModelSelectorProps) {
+export function ModelSelector({ models, status = "ready", value, reasoningLevel, nativeReasoningLevel, disabled, hasImageHistory = false, variant = "chat", placement = "above", onChange, onReasoningChange, onNativeReasoningChange }: ModelSelectorProps) {
   const [panel, setPanel] = useState<ModelPanel>();
   const [position, setPosition] = useState<{ top: number; left: number }>();
   const [query, setQuery] = useState("");
@@ -40,8 +43,14 @@ export function ModelSelector({ models, status = "ready", value, reasoningLevel,
   const menuId = useId();
   const currentKey = value ? modelKey(value) : "";
   const current = models.find((model) => modelKey(model) === currentKey) ?? (value && "name" in value ? value : undefined);
+  const currentName = current?.name ?? value?.id;
+  const textOnly = agentModelImageInput(current ?? value) === false;
+  const incompatible = (model: AgentModel) => hasImageHistory && agentModelImageInput(model) === false;
+  const imageHelp = (model: AgentModelRef) => kunpoModelOption("agent", model)?.imageInputStatus === "unverified" ? t("kunpoModels.textOnlyHelp") : t("modelSelector.imageInputDisabled");
   const visibleModels = status === "ready" ? filterModels(models, query) : [];
   const providerGroups = groupModelsByProvider(visibleModels);
+  const pendingModels = status === "ready" && models.some((model) => model.provider === "kunpo") ? KUNPO_MODEL_OPTIONS.filter((model) => model.role === "agent" && model.status === "pending"
+    && !models.some((entry) => modelKey(entry) === modelKey(model)) && `${model.name} ${model.id}`.toLowerCase().includes(query.trim().toLowerCase())) : [];
   const effectiveReasoning = clampReasoningLevel(reasoningLevel ?? "medium", current?.reasoningLevels ?? []);
   const native = isAgentRuntimeId(current?.provider) && variant !== "canvas";
   const levels = native ? current?.nativeReasoningLevels ?? [] : current?.reasoningLevels ?? [];
@@ -74,6 +83,7 @@ export function ModelSelector({ models, status = "ready", value, reasoningLevel,
   }
 
   function select(model: AgentModel): void {
+    // Visible history can include images removed by compaction; the server checks the active context before saving.
     if (modelKey(model) !== currentKey) onChange(model, clampReasoningLevel(reasoningLevel ?? "medium", model.reasoningLevels));
     close(true);
   }
@@ -135,17 +145,17 @@ export function ModelSelector({ models, status = "ready", value, reasoningLevel,
         ref={trigger}
         className={canvas ? "canvas-chip" : "model-selector-trigger"}
         type="button"
-        aria-label={canvas ? t("modelSelector.textModel", { name: current?.name ?? unavailableLabel }) : t("modelSelector.model")}
+        aria-label={canvas ? t("modelSelector.textModel", { name: currentName ?? unavailableLabel }) : t("modelSelector.model")}
         aria-description={supportsReasoning ? t("modelSelector.reasoning", { level: reasoningText }) : undefined}
         aria-controls={menuId}
         aria-expanded={open}
         aria-haspopup="menu"
         disabled={disabled || (!canvas && !canSelect)}
         onClick={toggle}
-        title={current ? `${t("modelSelector.textModelTitle", { provider: current.providerName, name: current.name })}${supportsReasoning ? ` · ${reasoningText}` : ""}` : unavailableLabel}
+        title={`${current ? `${t("modelSelector.textModelTitle", { provider: current.providerName, name: current.name })}${supportsReasoning ? ` · ${reasoningText}` : ""}` : unavailableLabel}${textOnly && value ? ` · ${imageHelp(value)}` : ""}`}
       >
         {native ? <AgentIcon provider={current?.provider} /> : null}
-        <span className="model-selector-name">{current?.name ?? unavailableLabel}</span>
+        <span className="model-selector-name">{currentName ?? unavailableLabel}</span>
         {supportsReasoning ? <span className="model-selector-reasoning-value">{reasoningText}</span> : null}
         <ChevronDown aria-hidden="true" size={12} />
       </button>
@@ -179,6 +189,7 @@ export function ModelSelector({ models, status = "ready", value, reasoningLevel,
                   window.location.hash = settingsHash(native ? "agents" : "providers");
                 }}><Settings aria-hidden="true" size={13} /></button>
               </div>
+              {hasImageHistory && models.some(incompatible) ? <p className="model-selector-empty" role="status">{t("modelSelector.imageHistoryIncompatible")}</p> : null}
               <div className="model-selector-model-list">
                 {providerGroups.map((group) => (
                   <div className="model-selector-provider-group" role="group" aria-label={group.providerName} key={group.provider}>
@@ -193,7 +204,7 @@ export function ModelSelector({ models, status = "ready", value, reasoningLevel,
                           aria-checked={selected}
                           key={modelKey(model)}
                           onClick={() => select(model)}
-                          title={`${model.provider}/${model.id}`}
+                          title={incompatible(model) ? t("modelSelector.imageHistoryIncompatible") : agentModelImageInput(model) === false ? imageHelp(model) : kunpoModelOption("agent", model) ? t("kunpoModels.unverifiedHelp") : `${model.provider}/${model.id}`}
                         >
                           <span className="model-selector-name">{model.name}</span>
                           {selected ? <Check aria-hidden="true" size={12} /> : null}
@@ -202,7 +213,11 @@ export function ModelSelector({ models, status = "ready", value, reasoningLevel,
                     })}
                   </div>
                 ))}
-                {visibleModels.length === 0 ? <p className="model-selector-empty" role="status">{status !== "ready" || !query.trim() ? unavailableLabel : t("modelSelector.noMatch")}</p> : null}
+                {pendingModels.length ? <div className="model-selector-provider-group" role="group" aria-label={t("kunpoModels.pendingGroup")}>
+                  <div className="model-selector-provider-name">{t("kunpoModels.pendingGroup")}</div>
+                  {pendingModels.map((model) => <button type="button" role="menuitemradio" aria-checked={false} disabled key={modelKey(model)} title={t("kunpoModels.pendingHelp")}><span className="model-selector-name">{model.name}</span></button>)}
+                </div> : null}
+                {visibleModels.length === 0 && pendingModels.length === 0 ? <p className="model-selector-empty" role="status">{status !== "ready" || !query.trim() ? unavailableLabel : t("modelSelector.noMatch")}</p> : null}
               </div>
               {supportsReasoning && canSelect ? <button
                 ref={reasoningEntry}
@@ -315,7 +330,7 @@ function moveModelFocus(event: React.KeyboardEvent, menu: HTMLDivElement | null,
   if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
   event.preventDefault();
   event.stopPropagation();
-  const items = [...(menu?.querySelectorAll<HTMLButtonElement>('button[role^="menuitem"]') ?? [])];
+  const items = [...(menu?.querySelectorAll<HTMLButtonElement>('button[role^="menuitem"]:not(:disabled)') ?? [])];
   const index = items.indexOf(document.activeElement as HTMLButtonElement);
   if (event.key === "ArrowUp" && index === 0 && search) {
     search.focus();

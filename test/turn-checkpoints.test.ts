@@ -7,17 +7,21 @@ import {
   ModelRuntime,
   SessionManager,
   type AgentSession,
+  type AgentSessionEvent,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
   createAssistantMessageEventStream,
   type AssistantMessage,
   type AssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { Type } from "typebox";
 import {
   AgentManager,
   conversationItems,
   createPiSession,
+  type CodingSession,
 } from "../src/daemon/agent.js";
 import { CheckpointStore } from "../src/daemon/checkpoints.js";
 import { CheckpointFileTooLargeError } from "../src/daemon/checkpoint-objects.js";
@@ -29,6 +33,137 @@ import {
 import { ProjectWrites } from "../src/daemon/project-writes.js";
 import { RuntimeEventBus } from "../src/shared/events.js";
 import type { ProjectState } from "../src/shared/contracts.js";
+import * as continuation from "../src/daemon/agent-auto-continue.js";
+import { annotateIsolatedRepairPublication, createIsolatedRepairProof, getRepairTargets, inheritIsolatedRepairProof, reportIsolatedOperation, settleIsolatedRepair } from "../src/daemon/isolated-tool-receipts.js";
+import { handoffSummary } from "../src/daemon/agent-runtimes/handoff.js";
+
+it("runs an actual Pi repair-only tool chain under the same task and continuation budget", async () => {
+  const binding = { scope: "project_command" as const, namespace: "test" as const, projectId: "11111111-1111-4111-8111-111111111111", operationId: "a".repeat(32), mode: "shell" as const };
+  const trace: string[] = [];
+  const shell = vi.fn<ToolDefinition["execute"]>(async () => {
+    for (const phase of ["input_preflight", "prepare_submitting", "prepared", "run_submitting", "running", "captured", "retained", "released"] as const)
+      await reportIsolatedOperation({ ...binding, phase, ...(["input_preflight", "prepare_submitting"].includes(phase) ? {} : { generation: 1 }), ...(["captured", "retained", "released"].includes(phase) ? { snapshotId: "b".repeat(64) } : {}) });
+    throw new Error("Original command return failed; retained snapshot is confirmed");
+  });
+  let state!: Awaited<ReturnType<typeof fixture>>;
+  const repair = vi.fn<ToolDefinition["execute"]>(async (_id, input) => {
+    const action = String((input as { action: string }).action); trace.push(action);
+    expect(getRepairTargets()).toHaveLength(1);
+    if (action === "adopt") {
+      await writeFile(path.join(state.project.workspacePath, "game.txt"), "restored");
+      state.manager.invalidateProjectSessions(state.project.id);
+      const output = inheritIsolatedRepairProof({ content: [{ type: "text" as const, text: "Original effects returned; read current files" }], details: {} }, createIsolatedRepairProof({
+        namespace: "test", projectId: binding.projectId, generation: 1, rawSnapshotId: "b".repeat(64), preparedBatchId: "c".repeat(64), reviewId: "d".repeat(64), preparedSnapshotId: "e".repeat(64), hostTargetFingerprint: "f".repeat(64),
+        publicationId: "22222222-2222-4222-8222-222222222222", recoveryOperationId: "c".repeat(32), originOperations: [{ operationId: binding.operationId, mode: "shell", snapshotId: "b".repeat(64) }], allOriginalsDurable: true, acknowledged: true, released: true,
+      }));
+      annotateIsolatedRepairPublication(output, "host-publication-1"); expect(await settleIsolatedRepair(output)).toBe(1); return output;
+    }
+    return { content: [{ type: "text", text: `Fresh ${action} completed` }], details: {} };
+  });
+  const tools: ToolDefinition[] = [
+    { name: "isolated_shell", label: "Offline original", description: "Offline only", parameters: Type.Object({ command: Type.String() }), execute: shell },
+    { name: "recover_isolated_changes", label: "Offline recovery", description: "Offline controlled action fixture", parameters: Type.Object({ action: Type.Union([Type.Literal("inspect"), Type.Literal("review"), Type.Literal("optimize"), Type.Literal("adopt")]) }), execute: repair },
+  ];
+  state = await fixture(undefined, undefined, tools, ["write"]);
+  state.project.id = binding.projectId; state.conversation.summary.projectId = binding.projectId;
+  await writeFile(path.join(state.project.workspacePath, "game.txt"), "before");
+  const wait = vi.spyOn(continuation, "waitForContinuation").mockResolvedValue(true); cleanups.push(() => wait.mockRestore());
+  const call = (id: string, name: string, arguments_: Record<string, string>) => assistant([{ type: "toolCall", id, name, arguments: arguments_ }], "toolUse");
+  const error = assistant([], "error"); error.errorMessage = "The native segment ended";
+  const responses = [call("original-command", "isolated_shell", { command: "original" }), error,
+    call("blocked-write", "write", { path: "game.txt", content: "must not run" }),
+    call("inspect-1", "recover_isolated_changes", { action: "inspect" }), call("inspect-2", "recover_isolated_changes", { action: "inspect" }),
+    call("review-1", "recover_isolated_changes", { action: "review" }), call("optimize-1", "recover_isolated_changes", { action: "optimize" }), call("review-2", "recover_isolated_changes", { action: "review" }), call("adopt-1", "recover_isolated_changes", { action: "adopt" }),
+    call("blocked-before-read", "write", { path: "game.txt", content: "must read first" }), call("original-command", "isolated_shell", { command: "original" }), call("same-command-new-id", "isolated_shell", { command: "original" }),
+    call("read-current", "read", { path: "game.txt" }), call("corrected-write", "write", { path: "game.txt", content: "corrected" }), assistant([{ type: "text", text: "Finished the corrected task" }])];
+  const request = vi.fn(() => { const message = responses.shift(); if (!message) throw new Error("Unexpected extra model loop"); return stream(message); }); state.runtime.streamSimple = request;
+  await expect(state.manager.prompt(state.project, state.conversation, "Complete the original task with controlled recovery").result).resolves.toBe("completed");
+  expect(wait).toHaveBeenCalledOnce(); expect(request).toHaveBeenCalledTimes(15); expect(shell).toHaveBeenCalledOnce();
+  expect(trace).toEqual(["inspect", "inspect", "review", "optimize", "review", "adopt"]);
+  expect(await readFile(path.join(state.project.workspacePath, "game.txt"), "utf8")).toBe("corrected");
+  const branch = state.sessionManager.getBranch();
+  expect(branch.filter(entry => entry.type === "message" && entry.message.role === "toolResult" && ["blocked-write", "blocked-before-read"].includes(entry.message.toolCallId))).toEqual([
+    expect.objectContaining({ message: expect.objectContaining({ isError: true }) }), expect.objectContaining({ message: expect.objectContaining({ isError: true }) }),
+  ]);
+  expect(branch.filter(entry => entry.type === "message" && entry.message.role === "user")).toHaveLength(1);
+  expect(branch.filter(entry => entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY)).toHaveLength(1);
+  expect(branch.findLast(entry => entry.type === "custom" && entry.customType === continuation.AUTO_CONTINUE_TOOL_ENTRY && (entry.data as { callId: string }).callId === "original-command")).toMatchObject({ data: { state: "effects_recovered" } });
+  expect(handoffSummary(branch)).toContain('"state":"effects_recovered"');
+});
+
+it("shares the existing three-continuation limit with actual Pi repair-only work", async () => {
+  const binding = { scope: "project_command" as const, namespace: "test" as const, projectId: "11111111-1111-4111-8111-111111111111", operationId: "a".repeat(32), mode: "shell" as const };
+  const shell = vi.fn<ToolDefinition["execute"]>(async () => {
+    for (const phase of ["input_preflight", "prepare_submitting", "prepared", "run_submitting", "running", "captured", "retained", "released"] as const)
+      await reportIsolatedOperation({ ...binding, phase, ...(["input_preflight", "prepare_submitting"].includes(phase) ? {} : { generation: 1 }), ...(["captured", "retained", "released"].includes(phase) ? { snapshotId: "b".repeat(64) } : {}) });
+    throw new Error("Retained source output needs repair");
+  });
+  const inspect = vi.fn<ToolDefinition["execute"]>(async () => { expect(getRepairTargets()).toHaveLength(1); return { content: [{ type: "text", text: "Original retained changes" }], details: {} }; });
+  const tools: ToolDefinition[] = [{ name: "isolated_shell", label: "Offline", description: "Offline", parameters: Type.Object({ command: Type.String() }), execute: shell },
+    { name: "recover_isolated_changes", label: "Offline", description: "Offline", parameters: Type.Object({ action: Type.Literal("inspect") }), execute: inspect }];
+  const state = await fixture(undefined, undefined, tools); state.project.id = binding.projectId; state.conversation.summary.projectId = binding.projectId;
+  const wait = vi.spyOn(continuation, "waitForContinuation").mockResolvedValue(true); cleanups.push(() => wait.mockRestore());
+  const error = () => { const message = assistant([], "error"); message.errorMessage = "Segment interrupted while retained changes need repair"; return message; };
+  const responses = [assistant([{ type: "toolCall", id: "original", name: "isolated_shell", arguments: { command: "original" } }], "toolUse"), error(), ...[1, 2, 3].flatMap(attempt => [assistant([{ type: "toolCall", id: `inspect-${attempt}`, name: "recover_isolated_changes", arguments: { action: "inspect" } }], "toolUse"), error()])];
+  const request = vi.fn(() => { const message = responses.shift(); if (!message) throw new Error("Repair exceeded the existing continuation limit"); return stream(message); }); state.runtime.streamSimple = request;
+  await expect(state.manager.prompt(state.project, state.conversation, "Repair only within the existing continuation policy").result).rejects.toThrow("Segment interrupted");
+  expect(wait.mock.calls.map(([delay]) => delay)).toEqual([5_000, 15_000, 45_000]); expect(request).toHaveBeenCalledTimes(8); expect(shell).toHaveBeenCalledOnce(); expect(inspect).toHaveBeenCalledTimes(3);
+  const branch = state.sessionManager.getBranch(); expect(branch.filter(entry => entry.type === "message" && entry.message.role === "user")).toHaveLength(1); expect(branch.filter(entry => entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY)).toHaveLength(1);
+});
+
+it.each([500, 503])("continues an actual Pi session after HTTP %s while reusing completed side effects and the original checkpoint", async status => {
+  const effect = vi.fn(async () => ({ content: [{ type: "text" as const, text: "Effect already completed" }], details: {} }));
+  const tool: ToolDefinition = { name: "optimize_image_asset", label: "Offline effect", description: "Offline test effect", parameters: Type.Object({ path: Type.String() }), execute: effect };
+  const state = await fixture(undefined, undefined, [tool]);
+  const wait = vi.spyOn(continuation, "waitForContinuation").mockResolvedValue(true);
+  cleanups.push(() => wait.mockRestore());
+  const call = (id: string) => assistant([{ type: "toolCall", id, name: tool.name, arguments: { path: "fixture.png" } }], "toolUse");
+  const error = assistant([], "error");
+  error.errorMessage = "Provider request failed";
+  error.diagnostics = [{ type: "provider_failure", timestamp: Date.now(), details: { status } }];
+  const responses = [call("effect-original"), error, call("effect-repeated"), assistant([{ type: "text", text: "Finished" }])];
+  const request = vi.fn(() => stream(responses.shift()!));
+  state.runtime.streamSimple = request;
+  await expect(state.manager.prompt(state.project, state.conversation, "Complete this task").result).resolves.toBe("completed");
+  expect(request).toHaveBeenCalledTimes(4); expect(effect).toHaveBeenCalledOnce();
+  expect(state.session.messages.filter(message => message.role === "user")).toHaveLength(1);
+  expect(state.sessionManager.getBranch().filter(entry => entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY)).toHaveLength(1);
+  const reloaded = SessionManager.open(state.sessionManager.getSessionFile()!);
+  expect(conversationItems(reloaded.getBranch())).toEqual(expect.arrayContaining([expect.objectContaining({ type: "retry", status: "completed", attempt: 1 })]));
+});
+
+it("retrieves an existing media result before actual Pi continuation without resubmitting its generator", async () => {
+  const generate = vi.fn(async () => { throw new Error("Result not delivered yet"); });
+  const recover = vi.fn<ToolDefinition["execute"]>(async () => ({ content: [{ type: "text" as const, text: "Recovered saved asset existing-image.png" }], details: { assetId: "existing-asset" } }));
+  const tools: ToolDefinition[] = [
+    { name: "generate_image", label: "Offline generation", description: "Offline only", parameters: Type.Object({ prompt: Type.String() }), execute: generate },
+    { name: "recover_media", label: "Recover", description: "Retrieve existing result", parameters: Type.Object({ tool: Type.String(), recoverCallId: Type.String(), originalArguments: Type.Unknown() }), execute: recover },
+  ];
+  const state = await fixture(undefined, undefined, tools);
+  const wait = vi.spyOn(continuation, "waitForContinuation").mockResolvedValue(true); cleanups.push(() => wait.mockRestore());
+  const call = (id: string) => assistant([{ type: "toolCall", id, name: "generate_image", arguments: { prompt: "Offline moth" } }], "toolUse");
+  const error = assistant([], "error"); error.errorMessage = "Provider request failed";
+  error.diagnostics = [{ type: "provider_failure", timestamp: Date.now(), details: { status: 500 } }];
+  const responses = [call("original-media"), error, call("repeated-media"), assistant([{ type: "text", text: "Finished" }])];
+  state.runtime.streamSimple = vi.fn(() => stream(responses.shift()!));
+  await expect(state.manager.prompt(state.project, state.conversation, "Complete this task").result).resolves.toBe("completed");
+  expect(generate).toHaveBeenCalledOnce(); expect(recover).toHaveBeenCalledOnce();
+  expect(recover.mock.calls[0]?.[1]).toMatchObject({ recoverCallId: "original-media", tool: "generate_image" });
+  expect(state.session.messages.some(message => message.role === "custom" && message.customType === "ohmygame-recovered-media")).toBe(true);
+});
+
+it("ends actual Pi continuation before another model request when a new effect becomes uncertain", async () => {
+  const effect = vi.fn(async () => { throw new Error("Unknown operation outcome"); });
+  const tool: ToolDefinition = { name: "optimize_image_asset", label: "Offline effect", description: "Offline only", parameters: Type.Object({}), execute: effect };
+  const state = await fixture(undefined, undefined, [tool]);
+  const wait = vi.spyOn(continuation, "waitForContinuation").mockResolvedValue(true); cleanups.push(() => wait.mockRestore());
+  const error = assistant([], "error"); error.errorMessage = "Provider request failed";
+  error.diagnostics = [{ type: "provider_failure", timestamp: Date.now(), details: { status: 500 } }];
+  const replies = [error, assistant([{ type: "toolCall", id: "new-effect", name: tool.name, arguments: {} }], "toolUse")];
+  const request = vi.fn(() => stream(replies.shift()!)); state.runtime.streamSimple = request;
+  await expect(state.manager.prompt(state.project, state.conversation, "Continue this task").result).rejects.toThrow(/unconfirmed/);
+  expect(effect).toHaveBeenCalledOnce(); expect(request).toHaveBeenCalledTimes(2);
+});
 
 const cleanups: Array<() => unknown | Promise<unknown>> = [];
 afterEach(async () => {
@@ -85,6 +220,8 @@ function stream(message: AssistantMessage): AssistantMessageEventStream {
 async function fixture(
   snapshotOverride?: (project: ProjectState) => Promise<string>,
   loading?: Promise<void>,
+  tools: ToolDefinition[] = [],
+  extraActive: string[] = [],
 ) {
   const directory = await mkdtemp(
     path.join(tmpdir(), "ohmygame-turn-checkpoints-"),
@@ -114,9 +251,11 @@ async function fixture(
     authPath: path.join(agentDir, "auth.json"),
     modelsPath: null,
     refreshOnCreate: false,
+    allowModelNetwork: false,
   });
-  await runtime.setRuntimeApiKey("anthropic", "test");
+  await runtime.setRuntimeApiKey("anthropic", "turn-checkpoints-fake-credential-20261028");
   const model = runtime.getModels("anthropic")[0]!;
+  model.baseUrl = "http://127.0.0.1:43199";
   const sessionManager = SessionManager.create(
     project.workspacePath,
     path.join(directory, "sessions"),
@@ -128,17 +267,17 @@ async function fixture(
   const session = (await createPiSession(
     project,
     sessionManager,
-    [],
+    tools,
     runtime,
     model,
     agentDir,
-    undefined,
     undefined,
     undefined,
     () => snapshot(project),
   )) as AgentSession;
   const events = new RuntimeEventBus();
   const manager = new AgentManager(events, {
+    ...(tools.length || extraActive.length ? { activeToolNames: () => ["read", ...tools.map(tool => tool.name), ...extraActive] } : {}),
     createSession: async () => {
       await loading;
       return session;
@@ -174,6 +313,317 @@ async function fixture(
     runtime,
   };
 }
+
+describe("Manager interruption continuation", () => {
+  async function setup(runtime: "qoder" | "codex" = "qoder", withCheckpoints = false) {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-manager-interruption-"));
+    cleanups.push(() => rm(directory, { recursive: true, force: true }));
+    const project: ProjectState = { id: "interruption-project", name: "Offline continuation", type: "web-game", workspacePath: path.join(directory, "workspace"), storagePath: directory,
+      updatedAt: new Date().toISOString(), preview: { status: "waiting" } };
+    await mkdir(project.workspacePath);
+    const sessionManager = SessionManager.inMemory(project.workspacePath), events = new RuntimeEventBus();
+    const store = new CheckpointStore(), snapshot = vi.fn((state: ProjectState) => store.snapshot(state));
+    const messages: Array<AssistantMessage | { role: "user"; content: string; timestamp: number }> = [];
+    const listeners = new Set<(event: AgentSessionEvent) => void>();
+    const emit = (event: AgentSessionEvent) => { for (const listener of listeners) listener(event); };
+    let interruption: continuation.AgentInterruption | undefined;
+    const reason: continuation.AgentInterruption = { kind: "turn_limit", source: runtime, code: `${runtime}_max_turns`, phase: "result", terminalReason: "max_turns" };
+    const reply = (message: AssistantMessage) => {
+      messages.push(message); sessionManager.appendMessage(message); emit({ type: "message_end", message });
+    };
+    const fail = (value: continuation.AgentInterruption | undefined) => {
+      interruption = value;
+      const message = assistant([], "error"); message.errorMessage = "Offline runtime request interrupted"; reply(message);
+    };
+    const complete = () => { interruption = undefined; reply(assistant([{ type: "text", text: "Finished" }])); };
+    const respond = vi.fn(async () => fail(reason));
+    const prepare = vi.fn(async (_signal: AbortSignal) => {}), resume = vi.fn(async () => complete());
+    const consumeUser = async (text: string) => {
+      const message = { role: "user" as const, content: text, timestamp: Date.now() };
+      emit({ type: "message_start", message });
+      sessionManager.appendCustomEntry(CHECKPOINT_ENTRY, { version: 1, commit: withCheckpoints ? await snapshot(project) : "a".repeat(40) });
+      emit({ type: "message_end", message }); messages.push(message); sessionManager.appendMessage(message);
+    };
+    const session: CodingSession = {
+      runtime: runtime === "qoder" ? "qoder-cli" : "codex-cli", emitsInitialUserMessage: true, messages, sessionManager,
+      get interruption() { return interruption; },
+      prompt: vi.fn<CodingSession["prompt"]>(async text => {
+        await consumeUser(text); await respond();
+      }),
+      prepareContinuation: prepare, resumeAfterInterruption: resume,
+      followUp: vi.fn(async () => {}),
+      abort: vi.fn(async () => {}), dispose: vi.fn(), clearQueue: vi.fn(() => ({ steering: [], followUp: [] })),
+      subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    };
+    const manager = new AgentManager(events, { createSession: async () => session, ...(withCheckpoints ? { checkpoints: {
+      snapshot, changed: (state: ProjectState, before: string, after: string) => store.summarize(state, before, after),
+    } } : {}) });
+    cleanups.push(() => manager.close());
+    const conversation = { sessionPath: path.join(directory, "offline-session.jsonl"), summary: { id: sessionManager.getSessionId(), projectId: project.id,
+      title: "Offline", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), messageCount: 0 } };
+    const wait = vi.spyOn(continuation, "waitForContinuation").mockResolvedValue(true);
+    cleanups.push(() => wait.mockRestore());
+    return { project, conversation, manager, session, sessionManager, events, respond, prepare, resume, fail, complete, consumeUser, reason, wait, snapshot };
+  }
+
+  it.each(["qoder", "codex"] as const)("continues a safe %s turn limit without a second user message or checkpoint", async runtime => {
+    const state = await setup(runtime), turn = state.manager.prompt(state.project, state.conversation, "Finish the saved task");
+    await expect(turn.result).resolves.toBe("completed");
+    expect(state.session.prompt).toHaveBeenCalledExactlyOnceWith("Finish the saved task");
+    expect(state.prepare).toHaveBeenCalledOnce(); expect(state.resume).toHaveBeenCalledOnce();
+    expect(state.wait).toHaveBeenCalledWith(5_000, expect.any(AbortSignal));
+    expect(state.session.messages.filter(message => (message as { role?: string }).role === "user")).toHaveLength(1);
+    expect(state.sessionManager.getBranch().filter(entry => entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY)).toHaveLength(1);
+    const retries = conversationItems(state.sessionManager.getBranch()).filter(item => item.type === "retry");
+    expect(retries).toMatchObject([{ turnId: expect.any(String), status: "completed", attempt: 1 }]);
+    expect(state.events.since(state.project.id).filter(event => (event.type === "item.started" || event.type === "item.updated" || event.type === "item.completed")
+      && event.data.item.type === "retry").every(event => event.turnId === turn.turnId)).toBe(true);
+    expect(state.events.since(state.project.id).filter(event => event.type === "agent.completed")).toHaveLength(1);
+    expect(state.events.since(state.project.id).some(event => event.type === "agent.error")).toBe(false);
+  });
+
+  it.each(["transient", "runtime_interrupted"] as const)("continues a typed %s native interruption", async kind => {
+    const state = await setup();
+    state.respond.mockImplementation(async () => state.fail({ kind, source: "qoder", phase: "response-stream", terminalReason: "transport_lost" }));
+    await expect(state.manager.prompt(state.project, state.conversation, "Finish").result).resolves.toBe("completed");
+    expect(state.resume).toHaveBeenCalledOnce(); expect(state.session.prompt).toHaveBeenCalledOnce();
+  });
+
+  it("does not continue a normal completion", async () => {
+    const state = await setup(); state.respond.mockImplementation(async () => state.complete());
+    await expect(state.manager.prompt(state.project, state.conversation, "Finish").result).resolves.toBe("completed");
+    expect(state.wait).not.toHaveBeenCalled(); expect(state.prepare).not.toHaveBeenCalled(); expect(state.resume).not.toHaveBeenCalled();
+  });
+
+  it.each(["unknown", "blocked", "unclassified"] as const)("does not continue an %s native failure", async kind => {
+    const state = await setup();
+    state.respond.mockImplementation(async () => state.fail(kind === "unclassified" ? undefined : { kind, source: "qoder", terminalReason: "unknown" }));
+    await expect(state.manager.prompt(state.project, state.conversation, "Finish").result).rejects.toThrow("interrupted");
+    expect(state.wait).not.toHaveBeenCalled(); expect(state.prepare).not.toHaveBeenCalled(); expect(state.resume).not.toHaveBeenCalled();
+  });
+
+  it.each(["user", "host"] as const)("does not continue a native interruption cancelled by %s", async cancelOrigin => {
+    const state = await setup();
+    state.respond.mockImplementation(async () => state.fail({ kind: "runtime_interrupted", source: "qoder", terminalReason: "abort", cancelOrigin }));
+    await expect(state.manager.prompt(state.project, state.conversation, "Finish").result).rejects.toThrow("interrupted");
+    expect(state.wait).not.toHaveBeenCalled(); expect(state.prepare).not.toHaveBeenCalled(); expect(state.resume).not.toHaveBeenCalled();
+  });
+
+  it("stops after three continuations and preserves the original turn", async () => {
+    const state = await setup(); state.resume.mockImplementation(async () => state.fail(state.reason));
+    await expect(state.manager.prompt(state.project, state.conversation, "Finish once").result).rejects.toThrow("interrupted");
+    expect(state.wait.mock.calls.map(([delay]) => delay)).toEqual([5_000, 15_000, 45_000]);
+    expect(state.prepare).toHaveBeenCalledTimes(3); expect(state.resume).toHaveBeenCalledTimes(3); expect(state.session.prompt).toHaveBeenCalledOnce();
+    expect(conversationItems(state.sessionManager.getBranch()).filter(item => item.type === "retry")).toMatchObject([{ attempt: 3, status: "failed" }]);
+    expect(state.sessionManager.getBranch().filter(entry => entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY)).toHaveLength(1);
+  });
+
+  it("never sends continuation when preparing recovery fails", async () => {
+    const state = await setup(); state.prepare.mockRejectedValue(new Error("Original tool outcome is unconfirmed"));
+    await expect(state.manager.prompt(state.project, state.conversation, "Finish").result).rejects.toThrow("unconfirmed");
+    expect(state.prepare).toHaveBeenCalledOnce(); expect(state.resume).not.toHaveBeenCalled();
+    expect(conversationItems(state.sessionManager.getBranch()).filter(item => item.type === "retry")).toMatchObject([{ status: "failed" }]);
+  });
+
+  it("gives manual cancellation priority when the interrupted request settles", async () => {
+    const state = await setup(), pending = deferred();
+    cleanups.push(() => pending.resolve());
+    state.respond.mockImplementation(() => pending.promise);
+    vi.mocked(state.session.abort).mockImplementation(async () => { state.fail(state.reason); pending.resolve(); });
+    const turn = state.manager.prompt(state.project, state.conversation, "Finish");
+    await vi.waitFor(() => expect(state.respond).toHaveBeenCalledOnce());
+    await state.manager.cancel(state.project.id, state.conversation.summary.id, turn.turnId);
+    await expect(turn.result).resolves.toBe("cancelled");
+    expect(state.wait).not.toHaveBeenCalled(); expect(state.resume).not.toHaveBeenCalled();
+    expect(state.events.since(state.project.id).some(event => event.type === "agent.error")).toBe(false);
+  });
+
+  it("cancels during backoff after recovery preparation without requesting continuation", async () => {
+    const state = await setup(), waiting = deferred();
+    let signal: AbortSignal | undefined;
+    state.wait.mockImplementation((_delay, current) => new Promise(resolve => {
+      signal = current; current.addEventListener("abort", () => resolve(false), { once: true }); waiting.resolve();
+    }));
+    const turn = state.manager.prompt(state.project, state.conversation, "Finish"); await waiting.promise;
+    await state.manager.cancel(state.project.id, state.conversation.summary.id, turn.turnId);
+    await expect(turn.result).resolves.toBe("cancelled");
+    expect(signal?.aborted).toBe(true); expect(state.prepare).toHaveBeenCalledOnce(); expect(state.resume).not.toHaveBeenCalled();
+    expect(conversationItems(state.sessionManager.getBranch()).filter(item => item.type === "retry")).toMatchObject([{ status: "completed" }]);
+  });
+
+  it("cancels recovery preparation before requesting continuation", async () => {
+    const state = await setup(), preparing = deferred();
+    state.prepare.mockImplementation(signal => new Promise((_, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true }); preparing.resolve();
+    }));
+    const turn = state.manager.prompt(state.project, state.conversation, "Finish"); await preparing.promise;
+    await state.manager.cancel(state.project.id, state.conversation.summary.id, turn.turnId);
+    await expect(turn.result).resolves.toBe("cancelled"); expect(state.wait).not.toHaveBeenCalled(); expect(state.resume).not.toHaveBeenCalled();
+  });
+
+  it("does not resume after workspace files change during backoff and retains those edits", async () => {
+    const state = await setup("qoder", true), file = path.join(state.project.workspacePath, "manual.txt");
+    await writeFile(file, "Before backoff");
+    state.wait.mockImplementation(async () => { await writeFile(file, "Edited during backoff"); return true; });
+    await expect(state.manager.prompt(state.project, state.conversation, "Finish").result).rejects.toThrow();
+    expect(state.prepare).toHaveBeenCalledOnce(); expect(state.wait).toHaveBeenCalledOnce(); expect(state.resume).not.toHaveBeenCalled();
+    expect(state.snapshot.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(await readFile(file, "utf8")).toBe("Edited during backoff");
+    expect(state.session.prompt).toHaveBeenCalledOnce();
+    expect(state.sessionManager.getBranch().filter(entry => entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY)).toHaveLength(1);
+  });
+
+  it("does not resume when the durable continuation marker leaves the current branch", async () => {
+    const state = await setup(); let markerId: string | undefined;
+    state.wait.mockImplementation(async () => {
+      markerId = state.sessionManager.getBranch().findLast(entry => entry.type === "custom" && entry.customType === continuation.AUTO_CONTINUE_ENTRY)?.id;
+      expect(markerId).toBeDefined();
+      const user = state.sessionManager.getBranch().find(entry => entry.type === "message" && entry.message.role === "user")!;
+      state.sessionManager.branch(user.id); return true;
+    });
+    await expect(state.manager.prompt(state.project, state.conversation, "Finish").result).rejects.toThrow();
+    expect(state.prepare).toHaveBeenCalledOnce(); expect(state.resume).not.toHaveBeenCalled();
+    expect(state.sessionManager.getBranch().some(entry => entry.id === markerId)).toBe(false);
+    expect(state.sessionManager.getEntries().some(entry => entry.id === markerId)).toBe(true);
+    expect(state.session.prompt).toHaveBeenCalledOnce();
+  });
+
+  it.each(["backoff", "preparation"] as const)("gives a new user instruction its own turn during %s", async phase => {
+    const state = await setup(), entered = deferred();
+    state.respond.mockImplementationOnce(async () => state.fail(state.reason)).mockImplementation(async () => state.complete());
+    if (phase === "backoff") state.wait.mockImplementation((_delay, signal) => new Promise(resolve => {
+      signal.addEventListener("abort", () => resolve(false), { once: true }); entered.resolve();
+    }));
+    else state.prepare.mockImplementation(signal => new Promise((_, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true }); entered.resolve();
+    }));
+    const original = state.manager.prompt(state.project, state.conversation, "Original interrupted task");
+    const stopped = expect(original.result).rejects.toThrow("interrupted");
+    await entered.promise;
+    const replacement = state.manager.prompt(state.project, state.conversation, "New user instruction");
+    expect(replacement.queued).toBe(true);
+    await stopped; await expect(replacement.result).resolves.toBeUndefined();
+    await vi.waitFor(() => expect(state.events.since(state.project.id).some(event => event.type === "agent.completed" && event.turnId === replacement.turnId)).toBe(true));
+    expect(state.resume).not.toHaveBeenCalled(); expect(state.session.followUp).not.toHaveBeenCalled();
+    expect(vi.mocked(state.session.prompt).mock.calls.map(([text]) => text)).toEqual(["Original interrupted task", "New user instruction"]);
+    expect(state.session.messages.filter(message => (message as { role?: string }).role === "user")).toHaveLength(2);
+    expect(state.sessionManager.getBranch().filter(entry => entry.type === "custom" && entry.customType === CHECKPOINT_ENTRY)).toHaveLength(2);
+    const events = state.events.since(state.project.id);
+    expect(events.filter(event => event.type === "agent.error").map(event => event.turnId)).toEqual([original.turnId]);
+    expect(events.filter(event => event.type === "agent.completed").map(event => event.turnId)).toEqual([replacement.turnId]);
+  });
+
+  it.each(["completed", "failed"] as const)("acknowledges a replacement before its deferred task is %s", async outcome => {
+    const state = await setup(), waiting = deferred(), pending = deferred();
+    cleanups.push(() => pending.resolve());
+    state.respond.mockImplementationOnce(async () => state.fail(state.reason)).mockImplementation(async () => {
+      await pending.promise;
+      if (outcome === "completed") state.complete();
+      else state.fail({ kind: "blocked", source: "qoder", terminalReason: "unknown" });
+    });
+    state.wait.mockImplementation((_delay, signal) => new Promise(resolve => {
+      signal.addEventListener("abort", () => resolve(false), { once: true }); waiting.resolve();
+    }));
+    const original = state.manager.prompt(state.project, state.conversation, "Original interrupted task");
+    const stopped = expect(original.result).rejects.toThrow("interrupted");
+    await waiting.promise;
+    const replacement = state.manager.prompt(state.project, state.conversation, "New deferred task");
+    expect(replacement.queued).toBe(true);
+    await stopped; await expect(replacement.result).resolves.toBeUndefined();
+    await vi.waitFor(() => expect(state.respond).toHaveBeenCalledTimes(2));
+    expect(state.manager.activeTurnId(state.project.id, state.conversation.summary.id)).toBe(replacement.turnId);
+    expect(state.manager.agentState(state.conversation).status).toBe("running");
+    const live = state.events.since(state.project.id).filter(event => event.turnId === replacement.turnId);
+    expect(live.filter(event => event.type === "agent.started")).toHaveLength(1);
+    expect(live.some(event => event.type === "agent.completed" || event.type === "agent.error")).toBe(false);
+
+    pending.resolve();
+    const terminal = outcome === "completed" ? "agent.completed" : "agent.error";
+    await vi.waitFor(() => expect(state.events.since(state.project.id).some(event => event.type === terminal && event.turnId === replacement.turnId)).toBe(true));
+    expect(state.manager.agentState(state.conversation).status).toBe(outcome === "completed" ? "idle" : "error");
+    await expect(replacement.result).resolves.toBeUndefined();
+    expect(vi.mocked(state.session.prompt).mock.calls.map(([text]) => text)).toEqual(["Original interrupted task", "New deferred task"]);
+    expect(state.resume).not.toHaveBeenCalled(); expect(state.session.followUp).not.toHaveBeenCalled();
+  });
+
+  it.each(["completed", "failed"] as const)("keeps the original retry scope when dispatched continuation consumes a %s follow-up", async outcome => {
+    const state = await setup(), dispatched = deferred(), release = deferred();
+    cleanups.push(() => release.resolve());
+    let queuedText: string | undefined;
+    vi.mocked(state.session.followUp!).mockImplementation(async text => { queuedText = text; });
+    state.resume.mockImplementation(async () => {
+      dispatched.resolve(); await release.promise;
+      state.complete();
+      await state.consumeUser(queuedText!);
+      if (outcome === "completed") state.complete();
+      else state.fail({ kind: "blocked", source: "qoder", terminalReason: "unknown" });
+    });
+    const original = state.manager.prompt(state.project, state.conversation, "Original interrupted task");
+    const finished = outcome === "completed" ? expect(original.result).resolves.toBe("completed") : expect(original.result).rejects.toThrow("interrupted");
+    await dispatched.promise;
+    const followUp = state.manager.prompt(state.project, state.conversation, "Ordinary queued follow-up");
+    expect(followUp.queued).toBe(true); await expect(followUp.result).resolves.toBeUndefined();
+    expect(state.session.followUp).toHaveBeenCalledExactlyOnceWith("Ordinary queued follow-up", undefined);
+    expect(state.resume).toHaveBeenCalledOnce();
+    release.resolve(); await finished;
+
+    const events = state.events.since(state.project.id);
+    const completedRetries = events.filter(event => event.type === "item.completed" && event.data.item.type === "retry");
+    expect(completedRetries).toHaveLength(1);
+    expect(completedRetries[0]).toMatchObject({ turnId: original.turnId, data: { item: { type: "retry", turnId: original.turnId, status: "completed" } } });
+    const retryRecords = state.sessionManager.getBranch().flatMap(entry => entry.type === "custom" && entry.customType === continuation.AUTO_CONTINUE_ENTRY
+      ? [entry.data as { item: { turnId: string; status: string } }] : []);
+    expect(retryRecords.at(-1)?.item).toMatchObject({ turnId: original.turnId, status: "completed" });
+    expect(retryRecords.some(record => record.item.status === "failed")).toBe(false);
+    expect(events.filter(event => event.type === (outcome === "completed" ? "agent.completed" : "agent.error")).map(event => event.turnId)).toEqual([followUp.turnId]);
+    expect(state.session.prompt).toHaveBeenCalledExactlyOnceWith("Original interrupted task");
+    expect(state.session.messages.filter(message => (message as { role?: string }).role === "user")).toHaveLength(2);
+  });
+});
+
+it("stops identical rejected media calls before a third model request and allows a corrected continuation", async () => {
+  const validation = "generate_image: Omit maskPath. No generation was submitted.";
+  const execute = vi.fn(async (_id: string, args: { prompt: string }) => {
+    if (args.prompt === "Executed") throw new Error(validation);
+    return { content: [{ type: "text" as const, text: "Fixture result" }], details: {} };
+  });
+  const tool: ToolDefinition = {
+    name: "generate_image", label: "Image", description: "Fixture image",
+    parameters: Type.Object({ prompt: Type.String(), maskPath: Type.Optional(Type.String()) }),
+    prepareArguments(args) {
+      if (typeof args === "object" && args && "maskPath" in args && args.maskPath === "null")
+        throw new Error(validation);
+      return args;
+    },
+    execute,
+  };
+  const { runtime, project, manager, conversation, sessionManager, events } = await fixture(undefined, undefined, [tool]);
+  const call = (id: string, args: Record<string,string>) => ({ type: "toolCall" as const, id, name: tool.name, arguments: args });
+  const bad = { prompt: "Front", maskPath: "null" };
+  const replies = [
+    assistant([call("1", bad)], "toolUse"), assistant([call("2", { maskPath: "null", prompt: "Front" })], "toolUse"),
+  ];
+  const infer = vi.fn(() => stream(replies.shift() ?? assistant([{ type: "text", text: "Done" }])));
+  runtime.streamSimple = infer;
+  await expect(manager.prompt(project, conversation, "Draw").result).rejects.toThrow("failed local validation twice");
+  expect(infer).toHaveBeenCalledTimes(2);
+  expect(execute).not.toHaveBeenCalled();
+  expect(events.since(project.id).find(event => event.type === "agent.error")?.data).toMatchObject({ code: "repeated_media_arguments" });
+  expect(conversationItems(sessionManager.getBranch())).toContainEqual(expect.objectContaining({
+    type: "agentMessage", status: "failed", error: expect.objectContaining({ code: "repeated_media_arguments" }),
+  }));
+  replies.push(
+    assistant([call("3", bad)], "toolUse"),
+    assistant([call("4", bad), call("5", { prompt: "Side" })], "toolUse"),
+    assistant([call("6", bad)], "toolUse"),
+    assistant([call("7", { ...bad, prompt: "Back" })], "toolUse"),
+    assistant([call("8", { prompt: "Executed" })], "toolUse"),
+    assistant([call("9", { prompt: "Executed" })], "toolUse"),
+    assistant([call("10", { prompt: "Front" })], "toolUse"),
+  );
+  await expect(manager.prompt(project, conversation, "Continue").result).resolves.toBe("completed");
+  expect(execute).toHaveBeenCalledTimes(4);
+});
 
 function checkpointId(
   events: RuntimeEventBus,
@@ -221,16 +671,8 @@ it("projects real edit/write diffs before the turn ends and restores them from d
               name: "edit",
               arguments: {
                 path: "src/render.ts",
-                edits: [
-                  {
-                    oldText: "const color = 'red';",
-                    newText: "const color = 'green';",
-                  },
-                  {
-                    oldText: "const width = 1;",
-                    newText: "const width = 2;\nconst height = 3;",
-                  },
-                ],
+                oldText: "const color = 'red';\nconst width = 1;",
+                newText: "const color = 'green';\nconst width = 2;\nconst height = 3;",
               },
             },
             {
@@ -280,7 +722,7 @@ it("projects real edit/write diffs before the turn ends and restores them from d
   expect(edit).toMatchObject({
     tool: "edit",
     status: "completed",
-    output: "Successfully replaced 2 block(s) in src/render.ts.",
+    output: "Project file edited.",
     lineChanges: { added: 3, removed: 2 },
   });
   expect(edit?.fileDiff?.hunks.flat().map((line) => line.text)).toContain(
@@ -678,9 +1120,9 @@ it("adds the durable workspace notice to later model requests", async () => {
   expect(inference).toHaveBeenCalledOnce();
 });
 
-it("drains real writes, refuses new stale writes and lets other projects proceed", async () => {
+it.each([false, "metadata"] as const)("drains %s writes, refuses new stale writes and lets other projects proceed", async (access) => {
   const writes = new ProjectWrites(),
-    held = await writes.enter("one", false),
+    held = await writes.enter("one", access),
     restored = deferred();
   const operation = writes.exclusive("one", async () => {
     writes.changed("one");
@@ -688,12 +1130,17 @@ it("drains real writes, refuses new stale writes and lets other projects proceed
   });
   await Promise.resolve();
   await expect(writes.enter("one", false)).rejects.toThrow("being checkpointed");
+  await expect(writes.enter("one", "metadata")).rejects.toThrow("being checkpointed");
   const other = await writes.enter("two", false);
   other();
   held();
   await operation;
   await restored.promise;
   await expect(writes.enter("one", false, "0")).rejects.toThrow("was restored");
+  const version = writes.version("one");
+  const metadata = await writes.enter("one", "metadata", "0");
+  metadata();
+  expect(writes.version("one")).toBe(version);
   const current = await writes.enter("one", false, writes.version("one"));
   current();
   await expect(
@@ -717,12 +1164,20 @@ it("lets reads through a snapshot and holds writes until it ends", async () => {
     wrote = true;
     release();
   });
+  let renamed = false;
+  const metadata = writes.enter("one", "metadata").then((release) => {
+    renamed = true;
+    release();
+  });
   await new Promise<void>((resolve) => setImmediate(resolve));
   expect(wrote).toBe(false);
+  expect(renamed).toBe(false);
   reading.resolve();
   await snapshot;
   await write;
+  await metadata;
   expect(wrote).toBe(true);
+  expect(renamed).toBe(true);
 });
 
 it("holds reads until a restore finishes, so they read the restored workspace", async () => {
@@ -800,14 +1255,14 @@ it("waits for an HTTP write handler even after its client disconnects", async ()
   expect(order).toEqual(["write", "restore"]);
 });
 
-it("waits for a write handler that continues after sending its response", async () => {
+it.each([false, "metadata"] as const)("waits for a %s write handler that continues after sending its response", async (access) => {
   const app = Fastify();
   const writes = new ProjectWrites();
   const release = deferred();
   const order: string[] = [];
   writes.install(app);
   app.addHook("preHandler", async (request) => {
-    writes.track(request, await writes.enter("one", false));
+    writes.track(request, await writes.enter("one", access));
   });
   app.post("/write", async (_request, reply) => {
     reply.send({ accepted: true });

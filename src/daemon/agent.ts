@@ -1,49 +1,51 @@
 import {
   createAgentSession,
-  createBashToolDefinition,
   DefaultResourceLoader,
-  loadSkills,
   ModelRuntime,
   parseSkillBlock,
   SessionManager,
   SettingsManager,
+  type AgentSession,
   type AgentSessionEvent,
   type SessionEntry,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { promptContextLabels, splitPromptContext, withProjectDesignContext } from "./prompt-context.js";
 import { gameDesignMetadata } from "./game-design-context.js";
 import { createHash, randomUUID } from "node:crypto";
+import { withProviderRequestScope } from "./provider-request-monitor.js";
 import { existsSync } from "node:fs";
-import { createTrackedWriteTool, fileChangeMetadata } from "./file-line-changes.js";
+import { fileChangeMetadata } from "./file-line-changes.js";
+import { createAgentAttachmentReadTool, createLocalAgentFileTools } from "./agent-local-files.js";
+import { getAttachmentReferences, type AttachmentReference } from "./agent-attachments.js";
 import { readWorkspaceNotice } from "./workspace-notice.js";
-import type { AgentContextUsage, AgentMessagePhase, AgentReasoningLevel, AgentStatus, ConversationAgentState, ConversationAttachment, PendingPrompt, PlanMode, PlanSessionState, PlanState, PluginMention, ProjectAgentActivity, ProjectState, PromptImage, PromptReference, QuestionnaireAnswer, QuestionnaireQuestion, QuestionnaireResult, ResponsesTransportMode, ThreadItem, ThreadItemError, ToolArtifact, TurnChanges } from "../shared/contracts.js";
+import type { AgentContextUsage, AgentMessagePhase, AgentReasoningLevel, AgentStatus, ConversationAgentState, ConversationAttachment, PendingPrompt, PlanMode, PlanSessionState, PlanState, PluginMention, ProjectAgentActivity, ProjectState, PromptImage, PromptReference, QuestionnaireAnswer, QuestionnaireQuestion, QuestionnaireResult, ResponsesTransportMode, ThreadItem, ThreadItemError, ToolArtifact, ToolId, TurnChanges } from "../shared/contracts.js";
 import { hasPluginMentionToken, parsePluginMentions, serializePluginMentions } from "../shared/plugins.js";
 import type { RuntimeEventBus } from "../shared/events.js";
 import type { AgentRuntimeId, ApprovalDecision, ApprovalRequestDetails } from "../shared/agent-runtimes.js";
+import { isVolumeMigrationReview, validVolumeMigrationConfirmation, type VolumeMigrationConfirmation } from "../shared/volume-migration.js";
+import { validSourceConfirmation, type IsolatedSourceConfirmation } from "../shared/execution-storage.js";
 import type { StoredConversation } from "./conversations.js";
 import { replayNativeMessages } from "./agent-runtimes/replay.js";
-import {
-  ensureOhMyGamePiEnvironment,
-  withoutOhMyGameManagedPiPackages,
-} from "./pi-agent.js";
 import { mcpToolInput, parseMcpToolIdentity } from "../shared/mcp.js";
 import type { PluginSkillRegistration } from "./plugin-runtime.js";
 import { appendSystemPromptForProject, type AgentPromptProject } from "./agent-prompts.js";
-import { openRouterAttributionExtension } from "./openrouter-attribution.js";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import type { PluginMcpHost } from "./plugin-mcp-host.js";
-import { projectProcessEnvironment } from "./project-process.js";
-import { createProviderImageReadTool, installDeepSeekImageFiles } from "./deepseek-image-files.js";
-import { SessionImages } from "./session-images.js";
+import { installDeepSeekImageFiles } from "./deepseek-image-files.js";
+import { recordSessionImageOrigins, sessionImageOrigins, SessionImages } from "./session-images.js";
 import { installSessionImageRequests } from "./session-image-requests.js";
-import { AGENT_ERROR_ENTRY, assistantMessageError, normalizeAgentError, thrownAgentError } from "./agent-errors.js";
+import { AGENT_ERROR_ENTRY, assistantMessageError, normalizeAgentError, RepeatedMediaArgumentsError, thrownAgentError } from "./agent-errors.js";
 import {
   CHECKPOINT_ENTRY, CHECKPOINT_RESTORED_ENTRY, CHECKPOINT_UNDONE_ENTRY, TURN_END_ENTRY, checkpointExtension, parseStoredCheckpoint, parseStoredCheckpointUndone, parseStoredTurnEnd, turnRange,
   type StoredCheckpointUndone, type StoredTurnEnd, type TurnRange,
 } from "./checkpoint-extension.js";
 import { normalizeAssistantMessage, normalizeAssistantText, AssistantTextStreamNormalizer } from "./assistant-thinking.js";
+import { AUTO_CONTINUE_DELAYS, AUTO_CONTINUE_ENTRY, AUTO_CONTINUE_PROMPT, AutoContinueTools, isRecoverableInterruption, waitForContinuation, type AgentInterruption } from "./agent-auto-continue.js";
+
+const CONTINUATION_SUPERSEDED = Symbol("newer user message");
 
 export interface CodingSession {
   readonly messages: readonly unknown[];
@@ -54,14 +56,21 @@ export interface CodingSession {
   readonly emitsInitialUserMessage?: boolean;
   readonly sessionManager?: Pick<SessionManager, "appendCustomEntry" | "getBranch"> & Partial<Pick<SessionManager, "branch">>;
   prompt(prompt: string, options?: { images?: PiPromptImage[] }): Promise<void>;
+  /** Application-owned continuation; never repeats the original prompt or SDK retry loop. */
+  readonly interruption?: AgentInterruption;
+  prepareContinuation?(signal: AbortSignal): Promise<void>;
+  resumeAfterInterruption?(): Promise<void>;
+  /** Compatibility for sessions predating the shared interruption protocol. */
+  prepareHttp500Continuation?(signal: AbortSignal): Promise<void>;
+  resumeAfterHttp500?(): Promise<void>;
   followUp?(prompt: string, images?: PiPromptImage[]): Promise<unknown>;
   steer?(prompt: string, images?: PiPromptImage[]): Promise<unknown>;
   compact?(customInstructions?: string): Promise<unknown>;
-  abortCompaction?(): void;
+  abortCompaction?(origin?: "user" | "host"): void;
   getContextUsage?(): AgentContextUsage | undefined;
   clearQueue?(): { steering: string[]; followUp: string[] };
   navigateTree?(targetId: string, options?: { summarize?: boolean }): Promise<{ editorText?: string; cancelled: boolean }>;
-  abort(): Promise<void>;
+  abort(origin?: "user" | "host"): Promise<void>;
   dispose(): void;
   subscribe(listener: (event: AgentSessionEvent) => void): () => void;
   setModel?(model: RuntimeModel): Promise<void>;
@@ -128,6 +137,28 @@ export function conversationItems(entries: readonly SessionEntry[], markInterrup
   let checkpointId: string | undefined;
 
   for (const entry of entries) {
+    if (entry.type === "custom" && entry.customType === AUTO_CONTINUE_ENTRY) {
+      const data = record(entry.data), saved = record(data?.item), failure = record(saved?.error);
+      if (data?.version !== 1 || saved?.type !== "retry" || typeof saved.id !== "string" || saved.id.length > 200
+        || !Number.isInteger(saved.attempt) || Number(saved.attempt) < 1 || Number(saved.attempt) > AUTO_CONTINUE_DELAYS.length
+        || !["inProgress", "completed", "failed"].includes(String(saved.status)) || typeof failure?.message !== "string") continue;
+      const interrupted = markInterrupted && saved.status === "inProgress";
+      const item: Extract<ThreadItem, { type: "retry" }> = { id: saved.id, turnId: turnId ?? entry.id, type: "retry",
+        attempt: Number(saved.attempt), maxAttempts: AUTO_CONTINUE_DELAYS.length,
+        delayMs: typeof saved.delayMs === "number" && saved.delayMs >= 0 && saved.delayMs <= 45_000 ? saved.delayMs : 0,
+        status: interrupted ? "failed" : saved.status as "inProgress" | "completed" | "failed",
+        error: interrupted ? normalizeAgentError("The application restarted during automatic continuation. It was stopped; review the saved task before continuing.") : normalizeAgentError(failure.message, failure.diagnostics),
+        timestamp: Date.parse(entry.timestamp) };
+      const previous = items.findIndex(candidate => candidate.id === item.id);
+      if (previous < 0) items.push(item); else items[previous] = item;
+      if (data.outcome === "cancelled") {
+        const latest = items.findLast(candidate => candidate.turnId === item.turnId && candidate.type === "agentMessage");
+        if (latest?.type !== "agentMessage" || latest.status !== "cancelled") items.push({ id: `${item.id}:cancelled`, turnId: item.turnId,
+          type: "agentMessage", text: "", status: "cancelled", timestamp: item.timestamp });
+        turnFinished = true;
+      }
+      continue;
+    }
     if (entry.type === "compaction") {
       const compactedAt = Date.parse(entry.timestamp);
       items.push({
@@ -196,7 +227,9 @@ export function conversationItems(entries: readonly SessionEntry[], markInterrup
         storedPrompt = undefined;
         checkpointId = undefined;
       } else turnId ??= entry.id;
-      const error = normalizeAgentError(storedError.message, storedError.diagnostics);
+      const error: ThreadItemError = storedError.code === "repeated_media_arguments"
+        ? { code: storedError.code, message: storedError.message }
+        : normalizeAgentError(storedError.message, storedError.diagnostics);
       const previous = items.findLastIndex((item) => item.turnId === turnId && item.type === "agentMessage");
       const item = items[previous];
       if (item?.type === "agentMessage" && item.status === "failed") items[previous] = { ...item, error };
@@ -456,6 +489,10 @@ interface ActiveTurn {
   userMessageStarted?: boolean;
   lastError?: ThreadItemError;
   retryAttempts?: number;
+  continuationAbort?: AbortController;
+  cancelOrigin?: "user" | "host";
+  run?: Promise<AgentRunResult>;
+  autoContinuationItem?: Extract<ThreadItem, { type: "retry" }>;
   items: Map<string, ThreadItem>;
   startedEventId?: number;
   startedAt?: number;
@@ -500,11 +537,14 @@ export class AgentManager {
   readonly #invalidatedProjects = new Set<string>();
   readonly #runtimeRevisions = new Map<AgentRuntimeId, number>();
   #closing = false;
+  #projectAdmission?: (projectId: string) => void;
 
   constructor(
     private readonly events: RuntimeEventBus,
     private readonly options: AgentManagerOptions = {},
   ) {}
+
+  setProjectAdmission(check: (projectId: string) => void): void { this.#projectAdmission = check; }
 
   agentState(conversation: StoredConversation): ConversationAgentState {
     return this.#agentStates.get(conversationKey(conversation.summary.projectId, conversation.summary.id)) ?? { status: "idle" };
@@ -551,10 +591,12 @@ export class AgentManager {
   }
 
   async approvePlan(project: ProjectState, conversation: StoredConversation): Promise<{ turnId: string; result: Promise<AgentRunResult> }> {
+    this.#projectAdmission?.(project.id);
     const key = conversationKey(project.id, conversation.summary.id);
     if (this.#activeTurns.get(key)?.ended) await this.#turnClosed(key);
     if (this.#activeTurns.has(key)) throw new Error("Wait for the agent to finish before approving the plan");
     await this.#getSession(project, conversation);
+    this.#projectAdmission?.(project.id);
     if (this.#activeTurns.has(key)) throw new Error("Wait for the agent to finish before approving the plan");
     if (this.#puttingBack.has(project.id)) throw new Error(PUTTING_BACK);
     if (this.options.checkpoints && this.isProjectBusy(project.id)) throw new Error("Wait for the project agent to finish");
@@ -583,7 +625,11 @@ export class AgentManager {
       return;
     }
     if (!managed.session.setModel) throw new Error("The current agent session cannot change models");
+    const previousInput = managed.session.model?.input;
     await managed.session.setModel(compatibleRuntimeModel(model));
+    // Tool registration and the visual context warning are chosen when the session is created.
+    // Reopen the saved branch when changing this capability in either direction.
+    if (previousInput && previousInput.includes("image") !== model.input.includes("image")) this.#forgetConversation(key);
   }
 
   /**
@@ -647,12 +693,14 @@ export class AgentManager {
     conversation: StoredConversation,
     customInstructions?: string,
   ): Promise<{ turnId: string; result: Promise<AgentRunResult> }> {
+    this.#projectAdmission?.(project.id);
     const key = conversationKey(project.id, conversation.summary.id);
     if (this.#activeTurns.get(key)?.ended) await this.#turnClosed(key);
     if (this.#activeTurns.has(key) || this.#revisions.has(key)) {
       throw new Error("Wait for the agent to finish before compacting the session");
     }
     const managed = await this.#getSession(project, conversation);
+    this.#projectAdmission?.(project.id);
     if (this.#activeTurns.has(key) || this.#revisions.has(key)) {
       throw new Error("Wait for the agent to finish before compacting the session");
     }
@@ -687,7 +735,8 @@ export class AgentManager {
     this.#setState(project.id, conversation.summary.id, { status: "running" });
 
     let run: Promise<AgentRunResult>;
-    const execution = managed.session.compact(customInstructions).then(() => "completed" as const);
+    const execution = withProviderRequestScope({ projectId: project.id, conversationId: conversation.summary.id, turnId },
+      () => managed.session.compact!(customInstructions)).then(() => "completed" as const);
     run = execution.then(
       (result) => {
         this.#finishCompact(project, active, run, { status: result });
@@ -732,10 +781,24 @@ export class AgentManager {
     attachmentContext = "",
     attachments: ConversationAttachment[] = [],
   ): { turnId: string; queued: boolean; result?: Promise<AgentRunResult | void> } {
+    this.#projectAdmission?.(project.id);
     if (!prompt.trim() && images.length === 0 && !attachmentContext.trim()) throw new Error("Prompt must not be empty");
     if (this.#closing) throw new Error("Agent manager is closing");
     const key = conversationKey(project.id, conversation.summary.id);
     const active = this.#activeTurns.get(key);
+    if (active?.continuationAbort && active.run && !isCancelling(active)) {
+      // The failed SDK is idle. Do not queue new user work inside it or let a
+      // scheduled continuation consume the newer instruction.
+      active.continuationAbort.abort(CONTINUATION_SUPERSEDED);
+      const result = active.run.catch(() => {}).then(() => {
+        if (this.#activeTurns.get(key) === active) throw new Error("The interrupted turn has not safely settled");
+        const next = this.prompt(project, conversation, prompt, references, images, mode, mentions, turnId, attachmentContext, attachments);
+        // This promise acknowledges admission. A newly running model reports
+        // completion through events; keeping the POST open invites resubmission.
+        return next.queued ? next.result : undefined;
+      });
+      return { turnId, queued: true, result };
+    }
     if (active?.ended) {
       // The conversation reads as idle, so this is a message for a new run and not one to queue in the run
       // that is over. It waits in the conversation's queue, behind the mutation that closes the turn, and is
@@ -764,7 +827,7 @@ export class AgentManager {
         const metadata = await gameDesignMetadata(project, Boolean(managedDesign?.designContext));
         if (managedDesign) managedDesign.designContext = metadata;
         const privateContext = withProjectDesignContext(attachmentContext, metadata);
-        const wirePrompt = `${promptWithReferences(skillInvocationPrompt(serializePluginMentions(prompt, mentions)), references)}${privateContext}`;
+        const wirePrompt = `${promptWithReferences(serializePluginMentions(prompt, mentions), references)}${privateContext}`;
         const event = this.events.publish(
           project.id,
           "prompt.queued",
@@ -814,6 +877,7 @@ export class AgentManager {
     prompt: string,
     validateReference: (reference: PromptReference) => Promise<PromptReference>,
   ): Promise<{ turnId: string; result: Promise<AgentRunResult> }> {
+    this.#projectAdmission?.(project.id);
     if (!prompt.trim()) throw new Error("Prompt must not be empty");
     const key = conversationKey(project.id, conversation.summary.id);
     if (this.#activeTurns.get(key)?.ended) await this.#turnClosed(key);
@@ -1053,7 +1117,7 @@ export class AgentManager {
     attachments: ConversationAttachment[] = [],
     left?: readonly SessionEntry[],
   ): Promise<AgentRunResult> {
-
+    this.#projectAdmission?.(project.id);
     const active: ActiveTurn = {
       project,
       projectId: project.id,
@@ -1092,15 +1156,16 @@ export class AgentManager {
     );
     active.startedEventId = started.id;
     active.startedAt = Date.parse(started.timestamp);
-    const mentionedPrompt = serializePluginMentions(prompt, mentions);
-    const invocation = mode === "normal" ? skillInvocationPrompt(mentionedPrompt) : mentionedPrompt;
+    const invocation = serializePluginMentions(prompt, mentions);
     const basePrompt = mode === "planning"
       ? planningPrompt(promptWithReferences(invocation, references))
       : mode === "executing"
         ? executionPrompt(promptWithReferences(invocation, references), active.plan)
         : promptWithReferences(invocation, references);
     const wirePrompt = `${basePrompt}${attachmentContext}`;
-    const execution = this.#runPrompt(project, conversation, wirePrompt, images, active);
+    const execution = withProviderRequestScope(() => ({ projectId: project.id, conversationId: conversation.summary.id,
+      turnId: this.#activeTurns.get(conversationKey(project.id, conversation.summary.id))?.turnId }),
+    () => this.#runPrompt(project, conversation, wirePrompt, images, active));
     let run: Promise<AgentRunResult>;
     run = execution.then(
       async (result) => {
@@ -1112,6 +1177,7 @@ export class AgentManager {
         throw cause;
       },
     );
+    active.run = run;
     this.#runs.add(run);
     void run.catch(() => {});
     return run;
@@ -1146,11 +1212,8 @@ export class AgentManager {
       managed.session.setActiveToolsByName?.(managed.session.getAllTools?.().some((tool) => tool.name === "recall_image")
         ? [...new Set([...activeTools, "recall_image"])] : activeTools);
       appendPromptDetails(managed.session.sessionManager, active, prompt);
-      if (images.length) {
-        await managed.session.prompt(prompt, { images: images.map(toPiImage) });
-      } else {
-        await managed.session.prompt(prompt);
-      }
+      await this.#promptWithContinuation(project, active, managed.session, () => images.length
+        ? managed.session.prompt(prompt, { images: images.map(toPiImage) }) : managed.session.prompt(prompt));
       if (isCancelling(active)) {
         this.#markCancelled(project.id, active);
         return "cancelled";
@@ -1165,15 +1228,107 @@ export class AgentManager {
       throw cause;
     }
 
-    const error = lastAssistantError(managed.session.messages);
-    if (error) {
-      this.#markError(project.id, active, error);
-      throw new Error(error.message);
-    }
     this.#completeOpenItems(project.id, active, "completed");
     this.#setState(project.id, active.conversationId, { status: "idle" });
     this.events.publish(project.id, "agent.completed", {}, eventScope(active));
     return "completed";
+  }
+
+  async #promptWithContinuation(project: ProjectState, active: ActiveTurn, session: CodingSession, first: () => Promise<void>): Promise<void> {
+    let invoke = first;
+    let taskId = active.turnId;
+    for (let attempt = 0; ; attempt++) {
+      const before = session.messages.findLast(isAssistantMessage);
+      let cause: unknown;
+      try { await invoke(); } catch (failure) { cause = failure; }
+      if (isCancelling(active) || this.#closing) return;
+      // A queued user message is a new logical task, not another retry of its predecessor.
+      if (taskId !== active.turnId) { taskId = active.turnId; attempt = 0; }
+      const error = cause === undefined ? lastAssistantError(session.messages) : thrownAgentError(cause);
+      if (!error) { this.#finishContinuation(project.id, active, "completed"); return; }
+      const failure = active.lastError?.message === error.message ? active.lastError : error;
+      active.lastError = failure;
+      const response = session.messages.findLast(isAssistantMessage);
+      const interruption = recoverableSessionInterruption(session, lastAssistantError(session.messages));
+      const prepare = session.prepareContinuation ?? (!session.runtime ? session.prepareHttp500Continuation : undefined);
+      const resume = session.resumeAfterInterruption ?? (!session.runtime ? session.resumeAfterHttp500 : undefined);
+      if (!response || response === before || response.stopReason !== "error" || !interruption || !prepare || !resume
+        || !session.sessionManager || attempt >= AUTO_CONTINUE_DELAYS.length) {
+        this.#finishContinuation(project.id, active, "failed", failure);
+        throw cause ?? new Error(failure.message);
+      }
+      const controller = new AbortController();
+      active.continuationAbort = controller;
+      active.retryAttempts = attempt + 1;
+      const owner = active.turnId;
+      const model = session.model ? `${session.model.provider}/${session.model.id}` : undefined;
+      const reasoning = session.thinkingLevel;
+      const key = conversationKey(project.id, active.conversationId);
+      const item: Extract<ThreadItem, { type: "retry" }> = { id: `${owner}:continuation`, turnId: owner, type: "retry",
+        status: "inProgress", attempt: attempt + 1, maxAttempts: AUTO_CONTINUE_DELAYS.length, delayMs: AUTO_CONTINUE_DELAYS[attempt]!, error: this.#turnError(active, failure) };
+      active.autoContinuationItem = item;
+      let marker: string;
+      const assertOwner = () => {
+        controller.signal.throwIfAborted();
+        if (this.#closing || isCancelling(active) || this.#activeTurns.get(key) !== active || active.turnId !== owner
+          || this.#sessions.get(key)?.session !== session || this.#puttingBack.has(project.id) || this.#revisions.has(key)
+          || model !== (session.model ? `${session.model.provider}/${session.model.id}` : undefined)
+          || reasoning !== session.thinkingLevel
+          || !session.sessionManager!.getBranch().some(entry => entry.id === marker))
+          throw new Error("Automatic continuation stopped because the task or conversation changed. Saved results are retained.");
+        this.#projectAdmission?.(project.id);
+      };
+      try {
+        marker = session.sessionManager.appendCustomEntry(AUTO_CONTINUE_ENTRY, { version: 1, item, interruption });
+        if (typeof marker !== "string" || !marker) throw new Error("Could not record automatic continuation ownership");
+        this.#updateItem(project.id, active, item);
+        console.info(JSON.stringify({ msg: "Agent automatic continuation", event: "scheduled", projectId: project.id, conversationId: active.conversationId,
+          turnId: owner, attempt: item.attempt, delayMs: item.delayMs, reason: interruption.kind, source: interruption.source }));
+        assertOwner();
+        await prepare.call(session, controller.signal);
+        assertOwner();
+        // Use the existing checkpoint store to detect user edits during backoff;
+        // cached tool receipts describe earlier effects, not current file content.
+        const baseline = await this.options.checkpoints?.snapshot(project);
+        assertOwner();
+        const ready = await waitForContinuation(item.delayMs, controller.signal);
+        assertOwner();
+        if (!ready) throw new Error("Automatic continuation was interrupted before resuming");
+        if (baseline !== undefined && baseline !== await this.options.checkpoints!.snapshot(project))
+          throw new Error("Automatic continuation stopped because the workspace changed. Inspect current files before continuing.");
+        assertOwner();
+        // Durable attempt ownership precedes the next model request. A process restart never replays it.
+        session.sessionManager.appendCustomEntry(AUTO_CONTINUE_ENTRY, { version: 1, item: { ...item, delayMs: 0 }, interruption });
+      } catch (stoppingCause) {
+        if (active.continuationAbort === controller) active.continuationAbort = undefined;
+        if (isCancelling(active) || this.#closing) return;
+        const superseded = controller.signal.reason === CONTINUATION_SUPERSEDED;
+        const stopped = superseded ? failure : thrownAgentError(stoppingCause);
+        active.lastError = stopped;
+        this.#finishContinuation(project.id, active, "failed", stopped);
+        throw superseded ? cause ?? new Error(failure.message) : stoppingCause;
+      }
+      invoke = () => {
+        assertOwner();
+        if (active.continuationAbort === controller) active.continuationAbort = undefined;
+        console.info(JSON.stringify({ msg: "Agent automatic continuation", event: "resuming", projectId: project.id,
+          conversationId: active.conversationId, turnId: owner, attempt: item.attempt }));
+        return resume.call(session);
+      };
+    }
+  }
+
+  #finishContinuation(projectId: string, active: ActiveTurn, status: "completed" | "failed" | "cancelled", error?: ThreadItemError): void {
+    const current = active.autoContinuationItem;
+    if (!current || current.status !== "inProgress") return;
+    const item = { ...current, status: status === "cancelled" ? "completed" as const : status, ...(error ? { error } : {}) };
+    active.autoContinuationItem = item;
+    this.#completeItem(projectId, active, item);
+    try { this.#sessions.get(conversationKey(projectId, active.conversationId))?.session.sessionManager?.appendCustomEntry(AUTO_CONTINUE_ENTRY, {
+      version: 1, item, outcome: status, ...(status === "cancelled" ? { cancelOrigin: active.cancelOrigin ?? "host" } : {}),
+    }); }
+    catch { console.warn("Could not save automatic continuation outcome"); }
+    console.info(JSON.stringify({ msg: "Agent automatic continuation", event: status, projectId, conversationId: active.conversationId, turnId: active.turnId, attempt: current.attempt }));
   }
 
   async cancel(projectId: string, conversationId: string, turnId: string): Promise<void> {
@@ -1181,7 +1336,9 @@ export class AgentManager {
     const active = this.#activeTurns.get(key);
     // A run that is over has nothing left to stop.
     if (!active || active.turnId !== turnId || active.status !== "running" || active.ended) return;
+    active.cancelOrigin = "user";
     active.status = "cancelling";
+    active.continuationAbort?.abort();
     this.#setState(projectId, conversationId, { status: "cancelling" });
     this.#denyApprovals(projectId, active);
     const managed = this.#sessions.get(key);
@@ -1190,8 +1347,8 @@ export class AgentManager {
         managed.session.clearQueue?.();
         this.#clearPending(projectId, conversationId);
       });
-      managed.session.abortCompaction?.();
-      await managed.session.abort();
+      managed.session.abortCompaction?.("user");
+      await managed.session.abort("user");
     } else {
       this.#clearPending(projectId, conversationId);
     }
@@ -1328,6 +1485,7 @@ export class AgentManager {
     conversationId: string,
     toolCallId: string,
     input: {
+      previousPaidCount?: number;
       questions: Array<{
         id: string;
         prompt: string;
@@ -1336,10 +1494,12 @@ export class AgentManager {
       }>;
     },
     signal?: AbortSignal,
+    paidMediaTool?: ToolId,
   ): Promise<QuestionnaireResult> {
+    signal?.throwIfAborted();
     const key = conversationKey(projectId, conversationId);
     const active = this.#activeTurns.get(key);
-    if (!active || active.mode !== "planning") throw new Error("Questions can only be asked during an active plan");
+    if (!active || (active.mode !== "planning" && !paidMediaTool)) throw new Error("Questions can only be asked during an active plan");
     if (this.#questionnaires.has(key)) throw new Error("A questionnaire is already waiting for an answer");
     validateQuestionnaire(input.questions);
     const item: Extract<ThreadItem, { type: "userInputRequest" }> = {
@@ -1347,6 +1507,7 @@ export class AgentManager {
       turnId: active.turnId,
       type: "userInputRequest",
       requestId: toolCallId,
+      ...(paidMediaTool ? { paidMediaTool, previousPaidCount: input.previousPaidCount ?? 1 } : {}),
       status: "inProgress",
       questions: input.questions.map((question) => ({
         id: question.id,
@@ -1414,6 +1575,11 @@ export class AgentManager {
     request: ApprovalRequestDetails,
     signal?: AbortSignal,
   ): Promise<ApprovalDecision> {
+    if (request.kind === "volumeMigration" || request.volumeMigration !== undefined) {
+      if (request.kind !== "volumeMigration" || request.canAllowSession || request.isolatedSourceReview || !isVolumeMigrationReview(request.volumeMigration) || request.volumeMigration.projectId !== projectId)
+        return Promise.resolve("deny");
+      request = structuredClone(request);
+    }
     const key = conversationKey(projectId, conversationId);
     const active = this.#activeTurns.get(key);
     if (!active || active.status !== "running" || active.ended) return Promise.resolve("deny");
@@ -1449,11 +1615,17 @@ export class AgentManager {
     });
   }
 
-  answerApproval(projectId: string, conversationId: string, requestId: string, decision: ApprovalDecision): void {
+  answerApproval(projectId: string, conversationId: string, requestId: string, decision: ApprovalDecision, sourceConfirmation?: IsolatedSourceConfirmation, volumeMigrationConfirmation?: VolumeMigrationConfirmation): void {
     const key = conversationKey(projectId, conversationId);
     const pending = this.#approvals.get(key)?.get(requestId);
     if (!pending) throw new Error("Approval request is no longer active");
+    if (pending.item.request.kind === "volumeMigration") {
+      if (decision !== "deny" && (decision !== "allow" || sourceConfirmation !== undefined || !validVolumeMigrationConfirmation(pending.item.request.volumeMigration, volumeMigrationConfirmation)))
+        throw new Error("Confirm the exact migration plan, capacity and retained old volume before allowing this one migration");
+    } else if (volumeMigrationConfirmation !== undefined) throw new Error("A migration confirmation cannot authorize another approval kind");
     if (decision === "allow-session" && !pending.item.request.canAllowSession) throw new Error("This request can only be allowed once");
+    if (decision !== "deny" && pending.item.request.isolatedSourceReview && (decision !== "allow" || !validSourceConfirmation(pending.item.request.isolatedSourceReview, sourceConfirmation)))
+      throw new Error("Confirm the exact retained file list and the separate code risk before allowing this recovery");
     this.#approvals.get(key)?.delete(requestId);
     pending.removeAbortListener?.();
     const active = this.#activeTurns.get(key);
@@ -1523,7 +1695,9 @@ export class AgentManager {
   async close(): Promise<void> {
     this.#closing = true;
     for (const active of this.#activeTurns.values()) {
+      active.cancelOrigin ??= "host";
       active.status = "cancelling";
+      active.continuationAbort?.abort();
       this.#setState(active.projectId, active.conversationId, { status: "cancelling" });
     }
     for (const pending of this.#questionnaires.values()) {
@@ -1539,8 +1713,8 @@ export class AgentManager {
     }
     this.#approvals.clear();
     const sessions = [...this.#sessions.values()];
-    for (const { session } of sessions) session.abortCompaction?.();
-    await Promise.allSettled(sessions.map(({ session }) => session.abort()));
+    for (const { session } of sessions) session.abortCompaction?.("host");
+    await Promise.allSettled(sessions.map(({ session }) => session.abort("host")));
     await Promise.allSettled([...this.#runs]);
     await Promise.allSettled([...this.#queueMutations.values()]);
     for (const managed of sessions) {
@@ -1581,9 +1755,9 @@ export class AgentManager {
         this.#completeItem(projectId, active, {
           ...questionnaire.item,
           status: "failed",
-          error: normalizeAgentError("Planning ended before the questionnaire was answered"),
+          error: normalizeAgentError("The turn ended before the question was answered"),
         });
-        questionnaire.reject(new Error("Planning ended before the questionnaire was answered"));
+        questionnaire.reject(new Error("The turn ended before the question was answered"));
         this.#questionnaires.delete(key);
       }
       if (active.images.length && active.startedEventId !== undefined) this.events.expireThrough(projectId, active.startedEventId);
@@ -1715,6 +1889,7 @@ export class AgentManager {
     const key = conversationKey(project.id, conversation.summary.id);
     const existing = this.#sessions.get(key);
     if (existing) return existing;
+    this.#projectAdmission?.(project.id);
     const loading = this.#sessionLoads.get(key);
     if (loading) {
       await loading;
@@ -1730,6 +1905,7 @@ export class AgentManager {
       this.#flushInvalidatedProject(project.id);
     }
     // Settings may change while discovery or session creation is still pending.
+    this.#projectAdmission?.(project.id);
     if (this.#sessions.get(key) === managed && this.#runtimeChanged(managed)) this.#forgetConversation(key);
     return this.#sessions.get(key) === managed ? managed : this.#getSession(project, conversation);
   }
@@ -1762,6 +1938,7 @@ export class AgentManager {
   #forwardEvent(projectId: string, conversationId: string, event: AgentSessionEvent): void {
     const active = this.#activeTurns.get(conversationKey(projectId, conversationId));
     if (!active) return;
+    if (event.type === "message_end" && isUserMessage(event.message)) recordSessionImageOrigins(this.#sessions.get(conversationKey(projectId, conversationId))?.session.sessionManager, event.message, active.images);
     if (event.type === "message_start" && isUserMessage(event.message)) {
       const initialMessage = !active.userMessageStarted;
       active.userMessageStarted = true;
@@ -1779,6 +1956,8 @@ export class AgentManager {
       appendPromptDetails(this.#sessions.get(key)?.session.sessionManager, started, started.wirePrompt);
       if (steering.length > 0) this.#steeringPrompts.set(key, steering.slice(1));
       else this.#pendingPrompts.set(key, pending.slice(1));
+      this.#finishContinuation(projectId, active, active.lastError ? "failed" : "completed", active.lastError);
+      active.autoContinuationItem = undefined;
       if (active.images.length && active.startedEventId !== undefined) this.events.expireThrough(projectId, active.startedEventId);
       if (started.images.length) this.events.expireThrough(projectId, started.queuedEventId);
       active.turnId = started.turnId;
@@ -2174,6 +2353,12 @@ export class AgentManager {
   }
 
   #markCancelled(projectId: string, active: ActiveTurn): void {
+    try {
+      this.#sessions.get(conversationKey(projectId, active.conversationId))?.session.sessionManager?.appendCustomEntry("ohmygame-agent-stop", {
+        version: 1, turnId: active.turnId, origin: active.cancelOrigin ?? "host",
+      });
+    } catch { console.warn("Could not save the agent stop origin"); }
+    this.#finishContinuation(projectId, active, "cancelled");
     this.#completeOpenItems(projectId, active, "cancelled");
     this.#ensureTerminalAgentItem(projectId, active, "cancelled");
     this.#setState(projectId, active.conversationId, { status: "idle" });
@@ -2186,6 +2371,7 @@ export class AgentManager {
   }
 
   #turnError(active: ActiveTurn, error: ThreadItemError): ThreadItemError {
+    if (error.code === "repeated_media_arguments") return error;
     const model = this.#sessions.get(conversationKey(active.projectId, active.conversationId))?.session.model;
     return normalizeAgentError(error.message, {
       ...(model ? { provider: model.provider, model: model.id, endpoint: model.baseUrl } : {}),
@@ -2216,7 +2402,7 @@ export class AgentManager {
 
   isProjectBusy(projectId: string): boolean {
     const prefix = `${projectId}:`;
-    return this.#puttingBack.has(projectId) || [...this.#activeTurns.keys(), ...this.#revisions].some((key) => key.startsWith(prefix));
+    return this.#puttingBack.has(projectId) || [...this.#activeTurns.keys(), ...this.#revisions, ...this.#sessionLoads.keys()].some((key) => key.startsWith(prefix));
   }
 
   invalidateProjectSessions(projectId: string): void {
@@ -2349,11 +2535,6 @@ function promptWithReferences(prompt: string, references: PromptReference[]): st
   return `${prompt}\n\n${REFERENCE_MARKER}\n${JSON.stringify(references.map(({ path }) => path))}\n</workspace-file-references>`;
 }
 
-export function skillInvocationPrompt(prompt: string): string {
-  const match = prompt.match(/^\$([a-zA-Z0-9][a-zA-Z0-9._-]*)(?=\s|$)/);
-  return match ? `/skill:${match[1]}${prompt.slice(match[0].length)}` : prompt;
-}
-
 function parseUserPrompt(value: string): { text: string; mentions: PluginMention[]; references: PromptReference[]; attachments: ConversationAttachment[]; attachmentContext: string } {
   const editorContext = splitPromptContext(value);
   const localAttachments = parseLocalAttachments(editorContext.rest);
@@ -2471,6 +2652,7 @@ function lastUserPrompt(project: ProjectState, sessionPath: string): {
   attachmentContext: string;
 } | undefined {
   const entries = SessionManager.open(sessionPath, sessionDirectory(project), project.workspacePath).getBranch();
+  const origins = sessionImageOrigins(entries);
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index];
     if (entry.type !== "message" || entry.message.role !== "user") continue;
@@ -2480,9 +2662,13 @@ function lastUserPrompt(project: ProjectState, sessionPath: string): {
       id: entry.id,
       mentions: details?.mentions ?? parsed.mentions,
       references: details?.references ?? parsed.references,
-      images: imageContent(entry.message.content),
+      images: imageContent(entry.message.content).map((image, imageIndex) => {
+        const libraryAssetId = origins.get(entry.id)?.[imageIndex];
+        return libraryAssetId ? { ...image, libraryAssetId } : image;
+      }),
       attachments: details?.attachments ?? parsed.attachments,
-      attachmentContext: details?.attachmentContext ?? parsed.attachmentContext,
+      // Legacy/user-authored attachment markup is display metadata, never an authorization grant on revision.
+      attachmentContext: details?.attachmentContext ?? splitPromptContext(parsed.attachmentContext).block,
     };
   }
   return undefined;
@@ -2497,6 +2683,28 @@ function storedPromptBefore(entries: readonly SessionEntry[], userIndex: number,
     return details?.wirePromptHash === promptHash(wirePrompt) ? details : undefined;
   }
   return undefined;
+}
+
+/** Receipts are granted by host-written prompt details bound to an actual user message, never by user-authored markup. */
+export function authorizeConversationAttachment(manager: Pick<SessionManager, "getBranch">, reference: AttachmentReference): boolean {
+  const entries = manager.getBranch();
+  return entries.some((entry, index) => {
+    if (entry.type !== "message" || entry.message.role !== "user") return false;
+    const details = storedPromptBefore(entries, index, textContent(entry.message.content));
+    if (!details?.attachments.length) return false;
+    const { rest } = splitPromptContext(details.attachmentContext);
+    const manifest = /^\s*<local-attachments>\s*([\s\S]*?)\s*<\/local-attachments>\s*$/.exec(rest);
+    if (!manifest) return false;
+    try {
+      const files: unknown = JSON.parse(manifest[1]!).files;
+      if (!Array.isArray(files) || files.length !== details.attachments.length || !files.every((file, fileIndex) => {
+        if (!file || typeof file !== "object" || !isConversationAttachment(file)) return false;
+        const { path: _path, ...metadata } = file as Record<string, unknown>;
+        return isDeepStrictEqual(metadata, details.attachments[fileIndex]);
+      })) return false;
+    } catch { return false; }
+    return getAttachmentReferences(rest).some((candidate) => candidate.batchId === reference.batchId.toLowerCase() && candidate.id === reference.id.toLowerCase());
+  });
 }
 
 function sessionDirectory(project: ProjectState): string {
@@ -2912,7 +3120,13 @@ function appendPlanState(sessionManager: CodingSession["sessionManager"], state:
   sessionManager.appendCustomEntry("ohmygame-plan", state);
 }
 
-const BASE_TOOL_NAMES = ["read", "write", "edit", "bash"];
+const BASE_TOOL_NAMES = ["read", "write", "edit", "ls", "find", "grep", "read_attachment", "recall_image"];
+const LOCAL_AGENT_TOOL_NAMES = new Set([
+  ...BASE_TOOL_NAMES, "read_workflow_guide", "questionnaire", "update_plan", "canvas_check", "canvas_initialize", "prepare_three_runtime", "list_media_capabilities",
+  "isolated_shell", "recover_isolated_changes", "build_game", "playable_add_node", "playable_check", "game_use", "generate_canvas_media", "get_model_asset", "optimize_image_asset", "use_canvas_asset",
+  "generate_image", "generate_reference_image", "generate_video", "generate_3d_asset", "generate_3d_from_views", "animate_3d_asset",
+  "generate_speech", "generate_sound_effect", "generate_music", "recover_media", "recover_canvas_media", "replace_canvas_media",
+]);
 
 const assistantThinkingSanitizerExtension: ExtensionFactory = (pi) => {
   pi.on("message_end", (event) => {
@@ -2922,6 +3136,27 @@ const assistantThinkingSanitizerExtension: ExtensionFactory = (pi) => {
   });
 };
 
+/** Only consecutive, single-call rounds in this Pi run qualify. The SDK omits
+ * durationMs when execute never ran; a tool which failed after submission has a duration. */
+function repeatedMediaRejection(messages: AgentSession["messages"], mediaTools: ReadonlySet<string>): string | undefined {
+  function rejectedCall(offset: number) {
+    const assistant = messages.at(offset);
+    const result = messages.at(offset + 1);
+    if (assistant?.role !== "assistant" || assistant.stopReason !== "toolUse" || result?.role !== "toolResult"
+      || !result.isError || result.durationMs !== undefined || !mediaTools.has(result.toolName)) return;
+    const calls = assistant.content.filter(block => block.type === "toolCall");
+    if (calls.length !== 1 || calls[0].id !== result.toolCallId || calls[0].name !== result.toolName) return;
+    const validation = result.content.some(block => block.type === "text" &&
+      (block.text.startsWith(`Validation failed for tool "${result.toolName}":`) ||
+       block.text.startsWith(`${result.toolName}: `) && block.text.endsWith("No generation was submitted.")));
+    if (validation) return calls[0];
+  }
+  const current = rejectedCall(-2);
+  if (!current) return;
+  const previous = rejectedCall(-4);
+  if (previous?.name === current.name && isDeepStrictEqual(previous.arguments, current.arguments)) return current.name;
+}
+
 export async function createPiSession(
   project: Pick<ProjectState, "workspacePath"> & Partial<Pick<ProjectState, "storagePath">> & AgentPromptProject,
   sessionManager: SessionManager,
@@ -2929,10 +3164,10 @@ export async function createPiSession(
   modelRuntime?: ModelRuntime,
   model?: RuntimeModel,
   agentDir = process.env.PI_CODING_AGENT_DIR ?? path.resolve(process.cwd(), ".data", "pi-agent"),
-  resolvePluginSkills?: () => Promise<PluginSkillRegistration[]>,
   mcp?: { factory: ExtensionFactory; host: PluginMcpHost },
   responsesTransport?: (provider: string) => ResponsesTransportMode,
   snapshotBeforeMessage?: () => Promise<string>,
+  mutateWorkspace?: <T>(operation: () => Promise<T>) => Promise<T>,
 ): Promise<CodingSession> {
   let checkpointFailure: { cause: unknown } | undefined;
   let stopForCheckpointFailure: () => void = () => {};
@@ -2958,21 +3193,26 @@ export async function createPiSession(
     }, failCheckpoint)(pi);
   };
   // Trusted-local phase: cwd guides Pi but is not an OS security boundary.
-  const { resourceLoader, sessionSettings, pluginSkills } = await createPiResourceLoader(project.workspacePath, agentDir, {
-    resolvePluginSkills,
-    appendSystemPrompt: appendSystemPromptForProject(project),
-    mcpFactory: mcp?.factory,
+  const textOnly = model !== undefined && !model.input.includes("image");
+  const { resourceLoader, sessionSettings } = await createPiResourceLoader(project.workspacePath, agentDir, {
+    appendSystemPrompt: [...appendSystemPromptForProject(project), ...(textOnly
+      ? ["This connection does not have image input enabled. Image attachments and image history are rejected. game_use and recall_image are unavailable for this connection; choose an image-enabled connection for screenshot-based playtesting or visual verification."] : [])],
     checkpointFactory: guardedCheckpoints,
   });
   const images = new SessionImages(sessionManager, path.join(agentDir, "request-image-previews"));
+  const authorizeAttachment = (reference: AttachmentReference) => authorizeConversationAttachment(sessionManager, reference);
+  const localTools = [...createLocalAgentFileTools(project.workspacePath, mutateWorkspace, model?.input.includes("image") === true, authorizeAttachment),
+    createAgentAttachmentReadTool(project.workspacePath, model?.input.includes("image") === true, authorizeAttachment), ...(textOnly ? [] : [images.recallTool as ToolDefinition]),
+    ...customTools.filter((tool) => LOCAL_AGENT_TOOL_NAMES.has(tool.name) && !BASE_TOOL_NAMES.includes(tool.name) && (!textOnly || tool.name !== "game_use"))];
+  const continuationTools = new AutoContinueTools(localTools, { sessionManager, assertCurrent: assertCheckpoint });
   const { session } = await createAgentSession({
     cwd: project.workspacePath,
     agentDir,
-    customTools: [createTrackedWriteTool(project.workspacePath) as ToolDefinition, createProviderImageReadTool(project.workspacePath, sessionSettings) as ToolDefinition, createBashToolDefinition(project.workspacePath, {
-      shellPath: sessionSettings.getShellPath(),
-      commandPrefix: sessionSettings.getShellCommandPrefix(),
-      spawnHook: (context) => ({ ...context, env: projectProcessEnvironment(context.env) }),
-    }) as ToolDefinition, images.recallTool as ToolDefinition, ...customTools],
+    noTools: "builtin",
+    // The SDK can retain inactive builtins and restored tool loadouts. Keep unsafe tools out of its registry as well.
+    tools: localTools.map((tool) => tool.name),
+    excludeTools: ["bash", "powershell", "mcp", "mcp__*"],
+    customTools: continuationTools.wrap(),
     model: model ? compatibleRuntimeModel(model) : undefined,
     modelRuntime,
     resourceLoader,
@@ -2980,6 +3220,16 @@ export async function createPiSession(
     settingsManager: sessionSettings,
   });
   stopForCheckpointFailure = () => { void session.abort().catch(() => {}); };
+  const mediaTools = new Set(localTools.filter(tool => tool.prepareArguments).map(tool => tool.name));
+  const finishTurn = session.agent.finishTurn;
+  let repeatedTool: string | undefined;
+  session.agent.finishTurn = async (turn, signal) => {
+    const decision = (await finishTurn?.(turn, signal)) ?? undefined;
+    if (continuationTools.stopRequested && !continuationTools.repairable) return { action: "end" };
+    if (decision?.action === "end" || signal?.aborted || session.pendingMessageCount) return decision;
+    repeatedTool = repeatedMediaRejection(turn.newMessages, mediaTools);
+    return repeatedTool ? { action: "end" } : decision;
+  };
   const streamFunction = session.agent.streamFunction;
   session.agent.streamFunction = (...args) => {
     // Pi swallows extension exceptions and may call a provider with an aborted signal.
@@ -2997,76 +3247,92 @@ export async function createPiSession(
   mcp?.host.manage(session);
   try { await session.bindExtensions({ mode: "rpc" }); } catch (cause) { session.dispose(); throw cause; }
   const prompt = session.prompt.bind(session);
+  session.subscribe(event => {
+    if (event.type === "message_start" && isUserMessage(event.message)) continuationTools.reset();
+  });
+  const prepareContinuation = async (signal: AbortSignal) => {
+      assertCheckpoint();
+      await continuationTools.prepare(signal, async (result, tool, callId) => {
+        await session.sendCustomMessage({ customType: "ohmygame-recovered-media", display: false,
+          content: [{ type: "text", text: `Recovered the existing result of ${tool}, original call ${callId}. No replacement generation was submitted.` }, ...result.content],
+          details: { tool, originalCallId: callId } }, { triggerTurn: false });
+      });
+  };
+  const resumeAfterInterruption = async () => {
+      assertCheckpoint();
+      await session.sendCustomMessage({ customType: AUTO_CONTINUE_ENTRY, display: false,
+        content: continuationTools.repairOnly ? `${AUTO_CONTINUE_PROMPT}\n\nOnly controlled reads and recover_isolated_changes inspect/review/optimize/adopt/recover are allowed. Settle the exact original snapshots; never replay the failed command or submit a replacement. After settlement read current project files before further changes.\n${continuationTools.recoverySummary ?? ""}` : AUTO_CONTINUE_PROMPT }, { triggerTurn: true });
+      assertCheckpoint();
+      continuationTools.assertSafe();
+      if (repeatedTool) throw new RepeatedMediaArgumentsError(repeatedTool);
+  };
+  Object.defineProperty(session, "interruption", { configurable: true, get: (): AgentInterruption | undefined => continuationTools.repairable
+    ? { kind: "runtime_interrupted", source: "pi", code: "isolated_effects_retained", phase: "tools", repairOnly: true } : undefined });
   return Object.assign(session, {
     emitsInitialUserMessage: true,
+    prepareContinuation,
+    resumeAfterInterruption,
+    prepareHttp500Continuation: prepareContinuation,
+    resumeAfterHttp500: resumeAfterInterruption,
     prompt: async (...args: Parameters<typeof prompt>) => {
+      if (textOnly && args[1]?.images?.length) throw new Error("The selected connection does not have image input enabled. Choose an image-enabled connection before sending images or screenshots.");
       checkpointFailure = undefined;
+      repeatedTool = undefined;
+      continuationTools.reset();
       await prompt(...args);
       assertCheckpoint();
+      if (repeatedTool) throw new RepeatedMediaArgumentsError(repeatedTool);
     },
-    getSkills: () => skillCatalog(resourceLoader.getSkills().skills, pluginSkills),
+    getSkills: () => [],
   });
 }
 
-export async function loadPiSkills(
-  workspacePath: string,
-  agentDir = process.env.PI_CODING_AGENT_DIR ?? path.resolve(process.cwd(), ".data", "pi-agent"),
-  resolvePluginSkills?: () => Promise<PluginSkillRegistration[]>,
-): Promise<SkillCatalogItem[]> {
-  const { resourceLoader, pluginSkills } = await createPiResourceLoader(workspacePath, agentDir, { resolvePluginSkills });
-  return skillCatalog(resourceLoader.getSkills().skills, pluginSkills);
-}
-
+/** Ambient Pi skills are disabled; bundled text workflows are served by read_workflow_guide. */
 export async function loadPiSkillCatalog(
-  workspacePath: string,
-  agentDir = process.env.PI_CODING_AGENT_DIR ?? path.resolve(process.cwd(), ".data", "pi-agent"),
-  resolvePluginSkills?: () => Promise<PluginSkillRegistration[]>,
+  _workspacePath?: string,
+  _agentDir?: string,
+  _resolvePluginSkills?: () => Promise<PluginSkillRegistration[]>,
 ): Promise<SkillCatalogItem[]> {
-  await ensureOhMyGamePiEnvironment(agentDir);
-  const pluginSkills = await resolvePluginSkills?.() ?? [];
-  return skillCatalog(loadSkills({
-    cwd: workspacePath,
-    agentDir,
-    skillPaths: pluginSkills.map((skill) => skill.path),
-    includeDefaults: true,
-  }).skills, pluginSkills);
+  return [];
 }
 
 async function createPiResourceLoader(
   workspacePath: string,
   agentDir: string,
   options: {
-    resolvePluginSkills?: () => Promise<PluginSkillRegistration[]>;
     appendSystemPrompt?: readonly string[];
-    mcpFactory?: ExtensionFactory;
     checkpointFactory?: ExtensionFactory;
   } = {},
-): Promise<{ resourceLoader: DefaultResourceLoader; sessionSettings: SettingsManager; pluginSkills: PluginSkillRegistration[] }> {
-  await ensureOhMyGamePiEnvironment(agentDir);
+): Promise<{ resourceLoader: DefaultResourceLoader; sessionSettings: SettingsManager }> {
   const persistedSettings = SettingsManager.create(workspacePath, agentDir);
-  const sessionSettings = SettingsManager.inMemory(persistedSettings.getGlobalSettings());
-  sessionSettings.applyOverrides(persistedSettings.getProjectSettings());
-  sessionSettings.setPackages(withoutOhMyGameManagedPiPackages(sessionSettings.getPackages()).filter(entry => {
-    const source = typeof entry === "string" ? entry : entry.source;
-    return !source.replace(/\\/g, "/").endsWith("/pi-mcp-adapter");
-  }));
-  const pluginSkills = await options.resolvePluginSkills?.() ?? [];
+  const sessionSettings = SettingsManager.inMemory({
+    ...persistedSettings.getGlobalSettings(),
+    // A failed or interrupted paid request may already have completed upstream.
+    // Saved preferences cannot restore automatic resubmission or background warming.
+    retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } },
+    cacheWarming: "off",
+  });
+  // Saved project/global packages must not restore executable extensions in this edition.
+  sessionSettings.setPackages([]);
   const resourceLoader = new DefaultResourceLoader({
     cwd: workspacePath,
     agentDir,
     settingsManager: sessionSettings,
-    extensionFactories: [{ name: "openrouter-attribution", factory: openRouterAttributionExtension, hidden: true },
-      { name: "assistant-thinking-sanitizer", factory: assistantThinkingSanitizerExtension, hidden: true },
-      ...(options.checkpointFactory ? [{ name: "checkpoints", factory: options.checkpointFactory, hidden: true }] : []),
-      ...(options.mcpFactory ? [{ name: "plugin-mcp", factory: options.mcpFactory, hidden: true }] : [])],
-    additionalSkillPaths: pluginSkills.map((skill) => skill.path),
-    appendSystemPrompt: options.appendSystemPrompt
-      ? [...options.appendSystemPrompt]
-      : [],
+    noExtensions: true,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+    extensionFactories: [{ name: "assistant-thinking-sanitizer", factory: assistantThinkingSanitizerExtension, hidden: true },
+      ...(options.checkpointFactory ? [{ name: "checkpoints", factory: options.checkpointFactory, hidden: true }] : [])],
+    appendSystemPrompt: [
+      ...(options.appendSystemPrompt ?? []),
+      "Current local secure edition execution contract (overrides generic workflow guidance above): Host Shell, native CLI, MCP/plugin execution, custom host commands and Cloud/Community publication remain unavailable. When isolated_shell is explicitly registered, it runs only in a bounded Linux VM copy with no host HOME, credentials or external network; source additions/edits require an unchanged host baseline and acknowledged return. Deletions, private files, links, oversized returns and conflicts are refused. Cancellation or failure retains unreturned changes for explicit recovery and blocks replacement; report retained changes rather than claiming they were saved. Dependency preparation, builds and dynamic Web previews use the registered VM backend; public npm requires exact v3 locks and excludes Git/URL dependencies, private credentials and install lifecycle scripts. game_use may prepare a dynamic preview through that backend; inspect returned status and report unsupported cases rather than claiming success. Do not use an absent tool or assume a host shell. File tools support relative non-private UTF-8 files. With an image-capable model, read can also open project PNG/JPEG/WebP images for visual inspection. Hidden files, links and parent paths are unavailable. Preserve the project's stack. Without a VM backend, prefer self-contained static files for a new browser game.",
+    ],
     agentsFilesOverride: ({ agentsFiles }) => ({ agentsFiles: projectContextFiles(agentsFiles, workspacePath, agentDir) }),
   });
   await resourceLoader.reload();
-  return { resourceLoader, sessionSettings, pluginSkills };
+  return { resourceLoader, sessionSettings };
 }
 
 /**
@@ -3083,25 +3349,38 @@ export function projectContextFiles<File extends { path: string }>(files: readon
   });
 }
 
-function skillCatalog(
-  skills: Array<{ name: string; description: string; filePath: string }>,
-  pluginSkills: readonly PluginSkillRegistration[],
-): SkillCatalogItem[] {
-  const sources = new Map(pluginSkills.map((skill) => [path.resolve(skill.path), skill]));
-  return skills.map(({ name, description, filePath }) => {
-    const source = sources.get(path.resolve(filePath));
-    return {
-      name,
-      description,
-      ...(source ? {
-        pluginDisplayName: source.pluginDisplayName,
-        marketplaceDisplayName: source.marketplaceDisplayName,
-      } : {}),
-    };
-  });
-}
-
 export function lastAssistantError(messages: readonly unknown[]): ThreadItemError | undefined {
   const message = messages.findLast(isAssistantMessage);
+  const rawStopReason = record(message)?.rawStopReason;
+  if (message?.stopReason === "length" && typeof rawStopReason === "string" && rawStopReason.startsWith("incomplete.")) {
+    return { message: "The model response is incomplete. Review the partial output before explicitly continuing.", code: "stream_error" };
+  }
   return message?.stopReason === "error" ? assistantMessageError(message) : undefined;
+}
+
+/** Only fresh, classified model failures can own a continuation. Local errors
+ * and native protocol/security failures do not inherit an older HTTP status. */
+function recoverableSessionInterruption(session: CodingSession, failure: ThreadItemError | undefined): AgentInterruption | undefined {
+  if (!failure) return;
+  if (session.runtime) {
+    const source = session.runtime === "qoder-cli" ? "qoder" : session.runtime === "codex-cli" ? "codex" : undefined;
+    const interruption = session.interruption;
+    return source && interruption?.source === source && isRecoverableInterruption(interruption) ? interruption : undefined;
+  }
+  if (failure.code && ["authentication_failed", "access_denied", "quota_exceeded", "invalid_request", "model_unavailable",
+    "sse_validation_failed", "runtime_incompatible", "runtime_probe_failed"].includes(failure.code)) return;
+  const diagnostics = failure.diagnostics;
+  if (/auth|credential|permission|policy|quota|credit|billing|payment|budget/i.test(diagnostics?.errorCode ?? "")) return;
+  const repair = session.interruption;
+  if (repair?.source === "pi" && repair.code === "isolated_effects_retained" && repair.repairOnly === true && isRecoverableInterruption(repair)) return repair;
+  const status = diagnostics?.statusCode;
+  if (status !== undefined && [408, 429, 500, 502, 503, 504].includes(status))
+    return { kind: "transient", source: "pi", code: `http_${status}`, phase: "stream" };
+  const codes = [diagnostics?.errorCode, ...(diagnostics?.causes?.map(cause => cause.code) ?? [])];
+  const transient = new Set(["SSE_IDLE_TIMEOUT", "SSE_CONNECTION_INTERRUPTED", "ECONNRESET", "EPIPE", "UND_ERR_SOCKET", "ETIMEDOUT", "EAI_AGAIN"]);
+  const code = codes.find((code): code is string => typeof code === "string" && transient.has(code));
+  if (code) return { kind: "transient", source: "pi", code, phase: "stream" };
+  if ((diagnostics?.transport === "sse" || diagnostics?.transport === "websocket") &&
+    failure.code && ["sse_connection_interrupted", "sse_idle_timeout", "connection_reset", "timeout"].includes(failure.code))
+    return { kind: "transient", source: "pi", code: failure.code, phase: "stream" };
 }

@@ -55,6 +55,13 @@ describe("image model families", () => {
     expect(preferredImageModelId(["gpt-4o", "gpt-image-1"])).toBe("gpt-image-1");
     expect(preferredImageModelId(["gpt-4o"])).toBeUndefined();
   });
+
+  it("prefers the selected Sunburst default and keeps GI2.1 on Images JSON", () => {
+    const models = imageModelsForProvider("kunpo", "KunpoAPI", ["Image-GI2.1", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"]);
+    expect(models.map((model) => model.id)).toEqual(["gpt-image-2.5-sunburst", "gpt-image-2.5-flare", "Image-GI2.1"]);
+    expect(models[2]).toMatchObject({ protocol: "openai-images", maxReferenceImages: 14, maxOutputs: 1 });
+    expect(preferredImageModelId(models.map((model) => model.id))).toBe("gpt-image-2.5-sunburst");
+  });
 });
 
 function catalogModel(id: string, name: string, aspectRatios: ImageModel["generationOptions"][number]["aspectRatio"][], maxReferenceImages: number): ImageModel {

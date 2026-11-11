@@ -1,12 +1,16 @@
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import type { LibraryAssetOrigin, LibraryAssetProject, LibraryAssetPurpose, WorkspaceFile } from "../shared/contracts.js";
-import { Box, Code2, ExternalLink, Film, Image as ImageIcon, Layers3, LoaderCircle, MoreHorizontal, Music2, Play, Search, X } from "./icons.js";
+import { Box, Code2, Download, ExternalLink, Film, Image as ImageIcon, Layers3, LoaderCircle, MoreHorizontal, Music2, Play, Search, X } from "./icons.js";
 import { useWorkspaceAssetUrl } from "./use-workspace-asset-url.js";
 import { AssetCardShell, AssetDialogShell, AssetMedia, useNearViewport } from "./asset-gallery.js";
 import { ModelPreview } from "./model-preview.js";
 import { VideoTrimmer } from "./video-trimmer.js";
 import type { VideoTrim } from "./video-trim.js";
 import { t } from "./i18n.js";
+import { FbxAssetActions } from "./fbx-asset-actions.js";
+import { getLibraryAsset, getWorkspaceAsset } from "./api.js";
+import { downloadAssetBlob } from "./library-assets.js";
+import { releaseImage, releaseMedia } from "./release-media.js";
 
 export type MediaFilter = "all" | NonNullable<WorkspaceFile["mediaType"]>;
 
@@ -40,11 +44,12 @@ const MEDIA_FILTERS: readonly { id: MediaFilter; label: string; icon: typeof Lay
   { id: "model", label: t("assets.filter.model"), icon: Box },
 ];
 
-export function AssetToolbar({ mediaFilter, query, onMediaFilterChange, onQueryChange, children }: {
-  mediaFilter: MediaFilter;
+export function AssetToolbar({ mediaFilter, query, onMediaFilterChange, onQueryChange, extraFilters, children }: {
+  mediaFilter: MediaFilter | undefined;
   query: string;
   onMediaFilterChange: (filter: MediaFilter) => void;
   onQueryChange: (query: string) => void;
+  extraFilters?: ReactNode;
   children?: ReactNode;
 }) {
   const searchId = `asset-search-${useId()}`;
@@ -64,13 +69,14 @@ export function AssetToolbar({ mediaFilter, query, onMediaFilterChange, onQueryC
     return () => filters.removeEventListener("wheel", scroll);
   }, []);
   return (
-    <div className="library-toolbar">
+    <div className={`library-toolbar${extraFilters ? " has-extra-filters" : ""}`}>
       <nav ref={filtersRef} className="library-filters" aria-label={t("assets.mediaTypes")} onFocusCapture={(event) => event.target.scrollIntoView({ block: "nearest", inline: "nearest" })}>
         {MEDIA_FILTERS.map(({ id, label, icon: Icon }) => (
           <button className={mediaFilter === id ? "is-active" : undefined} type="button" key={id} aria-pressed={mediaFilter === id} onClick={() => onMediaFilterChange(id)}>
             <Icon size={15} /><span>{label}</span>
           </button>
         ))}
+        {extraFilters}
       </nav>
       <div className="library-toolbar-end"><label className="library-search" htmlFor={searchId}>
         <Search size={14} aria-hidden="true" />
@@ -80,16 +86,17 @@ export function AssetToolbar({ mediaFilter, query, onMediaFilterChange, onQueryC
   );
 }
 
-export function WorkspaceAssetCard({ asset, title, onOpen, onRename, onDelete, onSaveToLibrary }: {
+export function WorkspaceAssetCard({ asset, title, onOpen, onRename, onDelete, onSaveToLibrary, selection }: {
   asset: BrowsableAsset;
   title?: string;
   onOpen: () => void;
   onRename?: () => void;
   onDelete?: () => void;
   onSaveToLibrary?: () => void;
+  selection?: { checked: boolean; disabled?: boolean; onChange: () => void };
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
-  const [card, visible] = useNearViewport<HTMLElement>();
+  const [card, visible] = useNearViewport<HTMLElement>(true);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -108,18 +115,22 @@ export function WorkspaceAssetCard({ asset, title, onOpen, onRename, onDelete, o
   }, [menuOpen]);
 
   return <AssetCardShell
+    className={selection?.checked ? "is-selected" : undefined}
     title={title ?? asset.prompt ?? fileName(asset.path)}
-    subtitle={<>{mediaTypeLabel(asset.mediaType)}{asset.referenceOnly ? " · Reference" : ""}{asset.projectName ? ` · ${asset.projectName}` : asset.projects?.length === 1 ? ` · ${asset.projects[0]!.name}` : asset.projects?.length ? ` · ${asset.projects.length} projects` : ""}</>}
+    subtitle={<>{mediaTypeLabel(asset.mediaType)}{asset.referenceOnly ? ` · ${t("assets.reference")}` : ""}{asset.projectName ? ` · ${asset.projectName}` : asset.projects?.length === 1 ? ` · ${asset.projects[0]!.name}` : asset.projects?.length ? ` · ${asset.projects.length} projects` : ""}</>}
     preview={<AssetThumbnail asset={asset} visible={visible} />}
     badge={assetTypeBadge(asset.mediaType)}
-    actions={onRename || onDelete || onSaveToLibrary ? <div className="library-asset-actions">
+    actions={<>
+      {selection ? <label className="library-asset-select"><input type="checkbox" checked={selection.checked} disabled={selection.disabled} onChange={selection.onChange} aria-label={t("library.bulk.selectAsset", { name: fileName(asset.path) })} /></label> : null}
+      {onRename || onDelete || onSaveToLibrary ? <div className="library-asset-actions">
         <button className="library-asset-menu" type="button" aria-label={t("assets.actions", { name: fileName(asset.path) })} aria-expanded={menuOpen} aria-haspopup="menu" onClick={() => setMenuOpen((open) => !open)}><MoreHorizontal size={16} /></button>
         {menuOpen ? <div className="library-asset-actions-menu" role="menu">
           {onSaveToLibrary ? <button type="button" role="menuitem" onClick={() => { setMenuOpen(false); onSaveToLibrary(); }}>{t("workspace.saveToLibrary")}</button> : null}
           {onRename ? <button type="button" role="menuitem" onClick={() => { setMenuOpen(false); onRename(); }}>{t("common.rename")}</button> : null}
           {onDelete ? <button className="library-action-delete" type="button" role="menuitem" onClick={() => { setMenuOpen(false); onDelete(); }}>{t("common.delete")}</button> : null}
         </div> : null}
-      </div> : undefined}
+      </div> : null}
+    </>}
     articleRef={card}
     onOpen={onOpen}
   />;
@@ -127,13 +138,23 @@ export function WorkspaceAssetCard({ asset, title, onOpen, onRename, onDelete, o
 
 /** An asset's thumbnail: an image, a video's first frame, or a still 3D model, loaded once `visible`. Thumbnails sit inside open buttons, so they carry no clip picker. */
 export function AssetThumbnail({ asset, visible }: { asset: BrowsableAsset; visible: boolean }) {
-  const [previewFailed, setPreviewFailed] = useState(false);
-  const preview = useWorkspaceAssetUrl(visible && asset.mediaType !== "audio" ? asset.projectId : undefined, asset.path, asset.revision, visible ? asset.assetId : undefined);
-  const showPreview = Boolean(preview.url) && !previewFailed;
+  const [failedSource, setFailedSource] = useState<{ url?: string }>();
+  const preview = useWorkspaceAssetUrl(visible && asset.mediaType !== "audio" ? asset.projectId : undefined, asset.path.toLowerCase().endsWith(".fbx") && asset.previewPath ? asset.previewPath : asset.path, asset.revision, visible && asset.mediaType !== "audio" ? asset.assetId : undefined);
+  const currentSource = useRef<{ url?: string }>({ url: preview.url });
+  if (currentSource.current.url !== preview.url) currentSource.current = { url: preview.url };
+  const source = currentSource.current;
+  const previewFailed = Boolean(preview.url && failedSource === source);
+  const failPreview = () => { if (source.url && currentSource.current === source) setFailedSource(source); };
+  const showPreview = asset.mediaType !== "audio" && Boolean(preview.url) && !previewFailed;
+  const video = useRef<HTMLVideoElement>(null), image = useRef<HTMLImageElement>(null);
+  useLayoutEffect(() => {
+    const videoElement = video.current, imageElement = image.current;
+    return () => { releaseMedia(videoElement, preview.url); releaseImage(imageElement, preview.url); };
+  }, [preview.url, showPreview, asset.mediaType]);
   const FallbackIcon = asset.mediaType === "video" ? Film : asset.mediaType === "audio" ? Music2 : asset.mediaType === "model" ? Box : preview.error || previewFailed ? X : ImageIcon;
   return <>
-    {showPreview && asset.mediaType === "video" ? <video src={preview.url} muted playsInline preload="metadata" onError={() => setPreviewFailed(true)} onLoadedMetadata={(event) => { event.currentTarget.currentTime = 0.01; }} /> : null}
-    {showPreview && asset.mediaType === "image" ? <img src={preview.url} alt="" onError={() => setPreviewFailed(true)} /> : null}
+    {showPreview && asset.mediaType === "video" ? <video ref={video} src={preview.url} muted playsInline preload="metadata" onError={failPreview} onLoadedMetadata={(event) => { event.currentTarget.currentTime = 0.01; }} /> : null}
+    {showPreview && asset.mediaType === "image" ? <img ref={image} src={preview.url} alt="" onError={failPreview} /> : null}
     {preview.url && !previewFailed && asset.mediaType === "model" ? <ModelPreview source={preview.url} label={fileName(asset.path)} interactive={false} clipPicker={false} /> : null}
     {!showPreview && visible && asset.mediaType === "model" && !preview.error ? <LoaderCircle className="spin" size={18} /> : null}
     {!showPreview && (!visible || asset.mediaType !== "model" || preview.error) ? <FallbackIcon size={FallbackIcon === X ? 22 : 28} /> : null}
@@ -156,13 +177,26 @@ export function WorkspaceAssetDialog({ asset, onClose, onOpenProject, onRename, 
   onSaveToLibrary?: () => void;
   onShowInCode?: () => void;
   /** Shows a video with handles to trim it, saving the kept part as a new video. */
-  trimmer?: { loadSource: () => Promise<Blob>; onSave: (video: Blob, trim: VideoTrim) => Promise<void> };
+  trimmer?: { loadSource: (signal?: AbortSignal, contentSha256?: string) => Promise<Blob>; onSave: (video: Blob, trim: VideoTrim) => Promise<void> };
   /** The name of the video this one was trimmed from. */
   trimmedFrom?: string;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const actions = useRef<HTMLDivElement>(null);
-  const preview = useWorkspaceAssetUrl(asset.projectId, asset.path, asset.revision, asset.assetId);
+  const [modelFailed, setModelFailed] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState<string>();
+  const preview = useWorkspaceAssetUrl(asset.projectId, asset.path.toLowerCase().endsWith(".fbx") && asset.previewPath ? asset.previewPath : asset.path, asset.revision, asset.assetId);
+  useEffect(() => setModelFailed(false), [preview.url]);
+  useEffect(() => setDownloadError(undefined), [asset.path, asset.projectId, asset.assetId]);
+  const download = async () => {
+    setDownloading(true); setDownloadError(undefined);
+    try {
+      const blob = asset.projectId ? await getWorkspaceAsset(asset.projectId, asset.path) : await getLibraryAsset(asset.assetId!);
+      downloadAssetBlob(blob, fileName(asset.path));
+    } catch (cause) { setDownloadError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setDownloading(false); }
+  };
   useEffect(() => {
     if (!menuOpen) return;
     const close = (event: MouseEvent) => {
@@ -179,22 +213,27 @@ export function WorkspaceAssetDialog({ asset, onClose, onOpenProject, onRename, 
     onClose={onClose}
     onEscape={() => { if (menuOpen) setMenuOpen(false); else onClose(); }}
     headerActionsRef={actions}
-    headerActions={onRename || onDelete || onSaveToLibrary ? <>
+    headerActions={<>
+      <button type="button" aria-label={t("assetCanvas.downloadName", { name: fileName(asset.path) })} title={t("assetCanvas.download")} disabled={downloading || (!asset.projectId && !asset.assetId)} onClick={() => void download()}>{downloading ? <LoaderCircle className="spin" size={17} /> : <Download size={17} />}</button>
+      {onRename || onDelete || onSaveToLibrary ? <>
       <button type="button" aria-label={t("assets.actions", { name: fileName(asset.path) })} aria-expanded={menuOpen} aria-haspopup="menu" onClick={() => setMenuOpen((open) => !open)}><MoreHorizontal size={17} /></button>
       {menuOpen ? <div className="library-dialog-actions-menu" role="menu">
         {onSaveToLibrary ? <button type="button" role="menuitem" onClick={() => { setMenuOpen(false); onSaveToLibrary(); }}>{t("workspace.saveToLibrary")}</button> : null}
         {onRename ? <button type="button" role="menuitem" onClick={() => { setMenuOpen(false); onRename(); }}>{t("common.rename")}</button> : null}
         {onDelete ? <button className="library-action-delete" type="button" role="menuitem" onClick={() => { setMenuOpen(false); onDelete(); }}>{t("common.delete")}</button> : null}
       </div> : null}
-    </> : undefined}
+      </> : null}
+    </>}
     preview={<>
           {!preview.url && !preview.error ? <span className="library-dialog-state"><LoaderCircle className="spin" size={18} />{t("assets.loading")}</span> : null}
           {preview.error ? <span className="library-dialog-state library-dialog-error" role="alert"><X size={18} />{preview.error}</span> : null}
+          {downloadError ? <span className="library-dialog-state library-dialog-error" role="alert">{downloadError}</span> : null}
           {preview.url && trimmer && asset.mediaType === "video"
             ? <VideoTrimmer key={asset.assetId ?? asset.path} url={preview.url} label={fileName(asset.path)} loadSource={trimmer.loadSource} onSave={trimmer.onSave} />
-            : preview.url ? <AssetMedia type={asset.mediaType} url={preview.url} label={fileName(asset.path)} /> : null}
+            : preview.url ? <AssetMedia type={asset.mediaType} url={preview.url} label={fileName(asset.path)} onModelError={() => setModelFailed(true)} /> : null}
         </>}
     footer={<footer className={`library-dialog-footer${onOpenProject ? "" : " library-dialog-footer-compact"}${asset.origin || asset.projects?.length ? " library-dialog-footer-library" : ""}`}>
+          <FbxAssetActions assetId={asset.assetId ?? asset.libraryAssetId} projectId={asset.projectId} name={fileName(asset.path)} failed={Boolean(preview.error) || modelFailed} onRebuilt={preview.retry} />
           <dl>
             <div><dt>{t("assets.type")}</dt><dd>{mediaTypeLabel(asset.mediaType)}</dd></div>
             <div><dt>{t("assets.size")}</dt><dd>{fileSize(asset.size)}</dd></div>

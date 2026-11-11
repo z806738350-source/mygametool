@@ -1,3 +1,4 @@
+import { providerControlUrl, providerCredentialValues, fetchProviderArtifact, providerRequest } from "./provider-network.js";
 import { setTimeout as delay } from "node:timers/promises";
 import type { CustomModel3DSettings, Model3DBalance } from "../shared/contracts.js";
 import { model3DPreset } from "../shared/model3d-presets.js";
@@ -10,9 +11,10 @@ const API = "https://api.hyper3d.com/api/v2";
 export class Hyper3DProvider implements Model3DGenerator {
   constructor(private readonly apiKey: () => string | undefined, private readonly request: typeof fetch = fetch,
     private readonly pollIntervalMs = 5_000, private readonly isEnabled: () => boolean = () => true,
-    private readonly connection?: ImageSource & { settings: CustomModel3DSettings }) {}
+    private readonly connection?: ImageSource & { settings?: CustomModel3DSettings }) {}
 
   async generate(input: Model3DGenerationInput, signal?: AbortSignal, settings?: CustomModel3DSettings) {
+    providerControlUrl(this.connection?.baseUrl ?? API, true);
     if (!this.isEnabled()) throw new Model3DGenerationError("Hyper3D provider is disabled", 409);
     const key = this.apiKey();
     if (!key && this.connection?.authentication !== "none") throw new Model3DGenerationError("Hyper3D API key is not configured", 503);
@@ -73,10 +75,10 @@ export class Hyper3DProvider implements Model3DGenerator {
         const file = Array.isArray(downloaded.list) ? downloaded.list.map(record).find((item) => typeof item.name === "string" && item.name.toLowerCase().endsWith(".glb")) : undefined;
         let url: URL;
         try { url = new URL(String(file?.url)); } catch { throw new Model3DGenerationError("Hyper3D completed without a GLB artifact"); }
-        if (url.protocol !== "https:" || url.username || url.password) throw new Model3DGenerationError("Hyper3D completed without a valid GLB artifact");
+        if (url.username || url.password) throw new Model3DGenerationError("Hyper3D completed without a valid GLB artifact");
         // Signed download URLs receive no provider credential or custom headers.
         try {
-          const response = await this.request(url.href, { signal: combined });
+          const response = await fetchProviderArtifact(this.request, url.href, this.connection?.baseUrl ?? API, { signal: combined, protectedSecrets: providerCredentialValues(key, this.connection?.headers) });
           if (!response.ok) throw new Model3DGenerationError("Hyper3D GLB download failed");
           return { bytes: await readModel3DResult(response), mediaType: "model/gltf-binary" as const, requestId: uuid };
         } catch (cause) {
@@ -90,6 +92,7 @@ export class Hyper3DProvider implements Model3DGenerator {
     }
   }
   async accountBalance(signal?: AbortSignal): Promise<Model3DBalance> {
+    providerControlUrl(this.connection?.baseUrl ?? API, true);
     if (!this.isEnabled()) throw new Model3DGenerationError("Hyper3D provider is disabled", 409);
     const key = this.apiKey();
     if (!key && this.connection?.authentication !== "none") throw new Model3DGenerationError("Hyper3D API key is not configured", 503);
@@ -99,7 +102,7 @@ export class Hyper3DProvider implements Model3DGenerator {
   }
   private async json(endpoint: string, key: string | undefined, init: RequestInit): Promise<Record<string, unknown>> {
     let response: Response;
-    try { response = await this.request(`${(this.connection?.baseUrl ?? API).replace(/\/+$/, "")}/${endpoint}`, { ...init, redirect: "error",
+    try { response = await providerRequest(this.request, `${(this.connection?.baseUrl ?? API).replace(/\/+$/, "")}/${endpoint}`, { ...init, redirect: "error",
       signal: AbortSignal.any([AbortSignal.timeout(60_000), ...(init.signal ? [init.signal] : [])]),
       headers: { ...this.connection?.headers, ...(this.connection?.authentication === "none" ? {} : { authorization: `Bearer ${key}` }), ...init.headers } }); }
     catch (cause) {

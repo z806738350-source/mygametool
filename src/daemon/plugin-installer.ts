@@ -1,3 +1,4 @@
+import { assertLocalExecutionAllowed } from "./local-execution-policy.js";
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,6 +7,7 @@ import { PLUGIN_ARCHIVE_ALLOWED_HIDDEN_DIRECTORIES, PLUGIN_ARCHIVE_MAX_BYTES, PL
 import { extractArchive, type ArchiveExtractionFailure } from "./archive-extraction.js";
 import { LocalPluginError, validatePluginBundle, type LocalPluginStore } from "./local-plugins.js";
 import { discoverPlugins, type DiscoveredPlugin } from "./plugin-discovery.js";
+import { projectProcessEnvironment } from "./project-process.js";
 
 const GIT_TIMEOUT_MS = 60_000;
 
@@ -57,6 +59,7 @@ async function withResolvedSource<T>(
     const source = path.resolve(input.path);
     return operation(source, { type: "directory", path: source });
   }
+  assertLocalExecutionAllowed("Remote plugin installation");
   const url = validatedGitUrl(input.url);
   const temporaryRoot = await mkdtemp(path.join(tmpdir(), "ohmygame-plugin-"));
   const clonePath = path.join(temporaryRoot, "repository");
@@ -102,9 +105,10 @@ export function validatedGitUrl(value: string): string {
 }
 
 function runGit(args: string[]): Promise<string> {
+  assertLocalExecutionAllowed("Remote plugin Git execution");
   return new Promise((resolve, reject) => {
     const child = spawn("git", args, {
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      env: { ...projectProcessEnvironment(), GIT_TERMINAL_PROMPT: "0" },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";

@@ -102,13 +102,8 @@ describe("plugin catalog API", () => {
     expect(capabilities.json().plugins).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: "personal:test-plugin", marketplaceId: "personal" }),
     ]));
-    expect(capabilities.json().skills).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        name: "test-skill",
-        pluginDisplayName: "Test Plugin",
-        marketplaceDisplayName: "Personal",
-      }),
-    ]));
+    // Reading an installed Skill is retained; ambient execution remains unavailable.
+    expect(capabilities.json().skills).toEqual([]);
     expect(unknown.statusCode).toBe(404);
     expect(unknownFile.statusCode).toBe(404);
   });

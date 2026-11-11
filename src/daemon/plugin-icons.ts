@@ -10,6 +10,7 @@ import {
 import { isPluginIcon, type PluginIcon } from "../shared/plugins.js";
 import { sniffImageType } from "./image-format.js";
 import { validatePluginSvg } from "./plugin-svg.js";
+import { assertNoKnownSecretBytes } from "./safe-project-file.js";
 
 // Cache successful validation by content. Reads still check paths and current bytes.
 const validatedIcons = new Set<string>();
@@ -19,6 +20,7 @@ export async function validatePluginIconImage(
   bytes: Buffer,
   expected?: string,
 ) {
+  assertNoKnownSecretBytes(bytes);
   if (!bytes.length || bytes.length > PLUGIN_ICON_MAX_BYTES)
     throw new Error("Plugin icons must be between 1 byte and 1 MB");
   const mediaType = sniffImageType(bytes) ?? "image/svg+xml";
@@ -106,6 +108,7 @@ export function registerPluginIconRoutes(
         const image = images.find(Boolean);
         if (!image)
           return reply.code(404).send({ error: "Plugin icon not found" });
+        assertNoKnownSecretBytes(image.bytes);
         const etag = `"${image.revision}"`;
         reply
           .header("Cache-Control", "private, no-cache")

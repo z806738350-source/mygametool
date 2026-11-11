@@ -9,11 +9,13 @@ const electron = vi.hoisted(() => ({
   cursorPoint: { x: 480, y: 320 },
   getDisplayNearestPoint: vi.fn(),
   openExternal: vi.fn(async () => {}),
+  themeOn: vi.fn(),
+  themeOff: vi.fn(),
 }));
 
 vi.mock("electron", () => ({
   shell: { openExternal: electron.openExternal },
-  nativeTheme: { get shouldUseDarkColors() { return electron.dark; } },
+  nativeTheme: { get shouldUseDarkColors() { return electron.dark; }, on: electron.themeOn, off: electron.themeOff },
   screen: {
     getCursorScreenPoint: () => electron.cursorPoint,
     getDisplayNearestPoint: electron.getDisplayNearestPoint,
@@ -39,6 +41,8 @@ vi.mock("electron", () => ({
     readonly once = vi.fn();
     readonly loadURL = vi.fn(async () => {});
     readonly setAspectRatio = vi.fn();
+    readonly setBackgroundColor = vi.fn();
+    readonly isDestroyed = vi.fn(() => false);
     onNavigate?: (event: { preventDefault(): void }, url: string) => void;
     onWindowOpen?: (details: { url: string }) => { action: string };
 
@@ -59,6 +63,8 @@ beforeEach(() => {
   electron.cursorPoint = { x: 480, y: 320 };
   electron.getDisplayNearestPoint.mockReset().mockImplementation(() => ({ workArea: electron.workArea }));
   electron.openExternal.mockClear();
+  electron.themeOn.mockClear();
+  electron.themeOff.mockClear();
 });
 
 afterEach(() => vi.unstubAllGlobals());
@@ -72,10 +78,12 @@ describe("desktop window", () => {
       rendererUrl: "http://127.0.0.1:43120",
       contentSize: { width: 1280, height: 720 },
       nativeTitleBar: true,
+      sidebarInset: true,
     });
     const window = electron.windows[0] as { options: Record<string, unknown> };
     expect(window.options.useContentSize).toBe(true);
     expect(window.options.titleBarStyle).toBeUndefined();
+    expect(window.options.trafficLightPosition).toBeUndefined();
   });
 
   it("starts at a moderate size centered in the display work area", async () => {
@@ -86,6 +94,33 @@ describe("desktop window", () => {
     });
     const window = electron.windows[0] as { options: Record<string, unknown> };
     expect(window.options).toMatchObject({ width: 1200, height: 780, minWidth: 960, minHeight: 640, x: 360, y: 150 });
+  });
+
+  it("updates the opaque sidebar backing with live theme changes and releases its listener", async () => {
+    vi.stubGlobal("process", { ...process, platform: "darwin" });
+    await createDesktopWindow({
+      runtime: { url: "http://127.0.0.1:43110", token: "token" },
+      preloadPath: "/tmp/preload.cjs",
+      rendererUrl: "http://127.0.0.1:43120",
+      sidebarInset: true,
+    });
+    const window = electron.windows[0] as {
+      once: ReturnType<typeof vi.fn>;
+      isDestroyed: ReturnType<typeof vi.fn>;
+      setBackgroundColor: ReturnType<typeof vi.fn>;
+    };
+    const update = electron.themeOn.mock.calls.find(([event]) => event === "updated")![1] as () => void;
+    electron.dark = true;
+    update();
+    expect(window.setBackgroundColor).toHaveBeenLastCalledWith("#171717");
+    electron.dark = false;
+    update();
+    expect(window.setBackgroundColor).toHaveBeenLastCalledWith("#ffffff");
+    window.once.mock.calls.find(([event]) => event === "closed")![1]();
+    expect(electron.themeOff).toHaveBeenCalledWith("updated", update);
+    window.isDestroyed.mockReturnValue(true);
+    update();
+    expect(window.setBackgroundColor).toHaveBeenCalledTimes(2);
   });
 
   it.each([
@@ -178,12 +213,12 @@ describe("desktop window", () => {
     window.webContents.mainFrame.url = pageUrl;
     const page = { senderFrame: window.webContents.mainFrame, returnValue: undefined as unknown };
     answer(page);
-    expect(page.returnValue).toEqual({ url: "http://127.0.0.1:43110", token: "secret-token" });
+    expect(page.returnValue).toEqual({ url: "http://127.0.0.1:43110", token: "secret-token", nativeMedia: false });
 
     window.webContents.mainFrame.url = `${pageUrl}#/playtest/project`;
     const route = { senderFrame: window.webContents.mainFrame, returnValue: undefined as unknown };
     answer(route);
-    expect(route.returnValue).toEqual({ url: "http://127.0.0.1:43110", token: "secret-token" });
+    expect(route.returnValue).toEqual({ url: "http://127.0.0.1:43110", token: "secret-token", nativeMedia: false });
 
     for (const url of ["https://untrusted.example/", new URL("other.html", pageUrl).href, ""]) {
       window.webContents.mainFrame.url = url;
@@ -197,6 +232,16 @@ describe("desktop window", () => {
       answer(embedded);
       expect(embedded.returnValue).toBeNull();
     }
+  });
+
+  it.each([undefined, false, true])("only explicitly enables native media for a trusted main window: %s", async nativeMedia => {
+    const created = await createDesktopWindow({ runtime: { url: "http://127.0.0.1:43110", token: "synthetic" }, preloadPath: "/tmp/preload.cjs", rendererUrl: "http://127.0.0.1:43120", nativeMedia });
+    const window = created as unknown as { webContents: { mainFrame: { url: string } }; ipcHandlers: Map<string, (event: { senderFrame: unknown; returnValue?: unknown }) => void> };
+    const event = { senderFrame: window.webContents.mainFrame, returnValue: undefined as unknown };
+    window.ipcHandlers.get("ohmygame:desktop-runtime")!(event);
+    expect(event.returnValue).toMatchObject({ nativeMedia: nativeMedia === true });
+    const child = { senderFrame: { url: event.senderFrame.url }, returnValue: undefined as unknown };
+    window.ipcHandlers.get("ohmygame:desktop-runtime")!(child); expect(child.returnValue).toBeNull();
   });
 
   it("mutes a hidden window, such as a thumbnail capture", async () => {
@@ -296,7 +341,13 @@ describe("desktop window", () => {
     expect(isValidPlaytestViewport(null)).toBe(false);
   });
 
-  it("limits sidebar window effects to windows that request them", async () => {
+  it.each([
+    ["darwin", false], ["darwin", true],
+    ["win32", false], ["win32", true],
+    ["linux", false], ["linux", true],
+  ] as const)("keeps sidebar windows opaque on %s with dark mode %s", async (platform, dark) => {
+    vi.stubGlobal("process", { ...process, platform });
+    electron.dark = dark;
     await createDesktopWindow({
       runtime: { url: "http://127.0.0.1:43110", token: "token" },
       preloadPath: "/tmp/preload.cjs",
@@ -306,19 +357,24 @@ describe("desktop window", () => {
       runtime: { url: "http://127.0.0.1:43110", token: "token" },
       preloadPath: "/tmp/preload.cjs",
       rendererUrl: "http://127.0.0.1:43120",
-      sidebarVibrancy: true,
+      sidebarInset: true,
     });
 
     const plain = electron.windows[0] as { options: Record<string, unknown> };
     const sidebar = electron.windows[1] as { options: Record<string, unknown> };
-    if (process.platform === "darwin") {
+    for (const window of [plain, sidebar]) {
+      expect(window.options.backgroundColor).toBe(dark ? "#171717" : "#ffffff");
+      expect(window.options.transparent).toBeUndefined();
+      expect(window.options.vibrancy).toBeUndefined();
+      expect(window.options.visualEffectState).toBeUndefined();
+    }
+    if (platform === "darwin") {
       expect(plain.options.transparent).toBeUndefined();
-      expect(plain.options.vibrancy).toBeUndefined();
-      expect(sidebar.options.transparent).toBe(true);
-      expect(sidebar.options.vibrancy).toBe("sidebar");
+      expect(plain.options.trafficLightPosition).toBeUndefined();
+      expect(sidebar.options.trafficLightPosition).toEqual({ x: 24, y: 18 });
+      expect(sidebar.options.titleBarStyle).toBe("hiddenInset");
     } else {
-      expect(plain.options.transparent).toBeUndefined();
-      expect(sidebar.options.transparent).toBeUndefined();
+      expect(sidebar.options.trafficLightPosition).toBeUndefined();
     }
   });
 

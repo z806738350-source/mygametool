@@ -3,6 +3,9 @@
 欢迎提交问题复现、文档改进、小修复、插件，以及实际制作游戏时的反馈。
 [CONTRIBUTING.md](../CONTRIBUTING.md) 是完整贡献规范；本文提供中文入口。
 
+本工作区是本地安全源码版，先读[本地安全策略](local-security.md)。下述上游分支流程
+不代表重新克隆上游即可取得本地改动；运行检查和启动仍待依赖审阅及单独授权。
+
 ## 选择任务
 
 先搜索已有 Issue。新功能和大改动先在 Issue 中讨论，明确范围；简单修复和
@@ -20,17 +23,16 @@ cd ohmygame
 git remote add upstream https://github.com/WhiteTowerAI/ohmygame.git
 git fetch upstream
 git switch --no-track -c fix/short-description upstream/dev
-bun install --frozen-lockfile
-bun run dev
-# 桌面开发改用 bun run dev:desktop
+ELECTRON_SKIP_BINARY_DOWNLOAD=1 bun install --frozen-lockfile --ignore-scripts
 ```
 
-需要 Git、Bun 1.4.2+ 和 Node.js 22.19+（包含 npm）。浏览器开发地址是
-<http://127.0.0.1:43120>。首次启动会联网准备插件和示例。
+需要 Git、Bun 1.4.2+ 和 Node.js 22.19+（包含 npm）。这一步只下载锁定依赖，
+不运行 lifecycle scripts，也不安装 Electron 二进制；不能据此断言构建或启动可用。
 
-普通本地开发和公共检查无需配置 Supabase、私有云仓库或模型密钥。缺少
-Supabase 配置时，本地开发支持调试账户和临时本地发布。测试真实 Agent 对话
-或媒体生成时，再连接对应模型；桌面游戏测试需要 Electron 开发模式。
+本版不提供账号、调试身份、云发布、社区或云额度，不需要登录配置；作者遥测、
+远程更新、远程插件和示例准备已停用，环境变量不能恢复。CLI、MCP、插件代码、
+任意命令、项目依赖及构建/开发服务器执行等待隔离方案。静态编辑与支持的静态预览保留，
+模型端点和功能兼容性需另行验证。浏览器限制不等于操作系统级网络隔离。
 
 代码、文档和测试入口见[文档索引](README.md#where-to-change-things)。
 可选配置和常见启动问题见[完整开发指南](../CONTRIBUTING.md#start-local-development)。
@@ -38,20 +40,20 @@ Supabase 配置时，本地开发支持调试账户和临时本地发布。测�
 ## 检查与 PR
 
 纯文档改动检查链接、示例和格式，并运行 `git diff --check`。
-应用行为、依赖或 CI 改动运行公共检查；其他贡献类型的要求见
+应用行为、依赖或 CI 改动在依赖审阅并获得运行授权后，先执行聚焦检查；要求见
 [验证说明](../CONTRIBUTING.md#make-and-check-your-change)：
 
 ```bash
-bun run prepare:preinstalled-plugins
-bun run changelog:check
 bun run typecheck
-bun run test
+bun run test -- test/auth.test.ts test/cloud-models.test.ts test/desktop-updater.test.ts test/desktop-update-scheduler.test.ts test/model-network-policy.test.ts test/provider-network.test.ts
 bun run build:renderer
-bun run test:node-runtime
 ```
 
-私有云仓库不可用时，远端发布契约测试会跳过。在 PR 中写明跳过情况，相关
-云端验证由有访问权限的维护者补充。CI 仍会检查文档 PR。
+这些检查尚未执行，会运行下载的工具和项目配置，渲染端构建会写入 `dist/renderer`。
+跳过安装脚本可能使原生工具不可用；遇错先检查，不自动补跑脚本。完整测试和
+`test:node-runtime` 还涉及进程或服务启动，应另行审阅授权。云端契约属于已停用的
+上游能力，不配置凭据恢复它们；在 PR 中说明实际结果和未覆盖项。CI 模板仍包含
+更广检查，本轮未触发或验证。
 
 优先扩展已有测试和文档。删除或合并测试前，按
 [测试与文档精简规则](../CONTRIBUTING.md#keep-tests-and-documentation-focused)

@@ -1,3 +1,5 @@
+import { providerRequest } from "./provider-network.js";
+import { isMeshyIdentifier, isMeshyProviderConfiguration, MESHY_DISABLED_MESSAGE } from "../shared/disabled-media-providers.js";
 import { AGENT_REASONING_LEVELS, IMAGE_MAX_REFERENCE_IMAGES, type CustomProviderModel, type CustomThinkingLevelMap, type DiscoveredProviderModels, type CustomProviderPreset, type CustomModelUsages } from "../shared/contracts.js";
 import { defaultImageSettings, defaultModel3DSettings, defaultVideoSettings } from "../shared/custom-models.js";
 import { listOpenRouterImageModels, listOpenRouterVideoModels } from "./openrouter-media.js";
@@ -12,6 +14,7 @@ const MAX_PAGES = 20;
 /** Reads the submitted endpoint without saving the provider or its credentials. */
 export async function discoverProviderModels(value: unknown, request: typeof fetch = fetch, catalog: CustomModelCatalog = new Map()): Promise<DiscoveredProviderModels> {
   if (!isObject(value)) throw new Error("Invalid provider connection");
+  if (isMeshyProviderConfiguration(value) || isMeshyIdentifier(value.providerId)) throw new Error(MESHY_DISABLED_MESSAGE);
   const settings = normalizeCustomProvider({ ...value, name: "Model discovery", models: undefined, hiddenModelIds: undefined });
   if (settings.authentication === "api_key" && !settings.apiKey) throw new Error("API key is required");
   if (usesModel3DPresets(settings.baseUrl, settings.preset)) return {
@@ -41,7 +44,7 @@ export async function discoverProviderModels(value: unknown, request: typeof fet
       if (cursor) url.searchParams.set("pageToken", cursor);
     }
     let response: Response;
-    try { response = await request(url, { headers, signal, redirect: "error" }); }
+    try { response = await providerRequest(request, url, { headers, signal, redirect: "error" }); }
     catch { throw new Error(signal.aborted ? "Fetching models timed out. Retry or add a model manually." : "Could not reach the model endpoint. Check the Base URL or add a model manually."); }
     if (!response.ok) throw new Error(`Fetching models failed (HTTP ${response.status}). Check the endpoint and API key, or add a model manually.`);
     let body: unknown;
@@ -64,8 +67,10 @@ export async function discoverProviderModels(value: unknown, request: typeof fet
           const result = media[index];
           if (result.status === "rejected") { warnings.push(`Could not fetch ${index === 0 ? "image" : "video"} models. Add their IDs manually.`); continue; }
           for (const item of result.value) {
+            if (isMeshyIdentifier(item.id)) continue;
             if (models.size >= MAX_MODELS && !models.has(item.id)) return { models: [...models.values()], truncated: true, warnings };
-            const previous = models.get(item.id) ?? discoveredModel({ id: item.id, name: item.name }, settings.api, catalog, settings.preset)!;
+            const previous = models.get(item.id) ?? discoveredModel({ id: item.id, name: item.name }, settings.api, catalog, settings.preset);
+            if (!previous) continue;
             if ("generationOptions" in item) previous.usages = { ...previous.usages, image: {
               protocol: "openrouter-images", resolutions: [...new Set(item.generationOptions.map((option) => option.resolution))],
               aspectRatios: [...new Set(item.generationOptions.map((option) => option.aspectRatio))],
@@ -91,7 +96,7 @@ function discoveredModel(value: unknown, api: string, catalog: CustomModelCatalo
   const google = api === "google-generative-ai";
   const rawId = string(google ? value.name : value.id);
   const id = google ? rawId?.replace(/^models\//, "") : rawId;
-  if (!id || id.length > 200 || /[\s\x00-\x1f]/.test(id)) return undefined;
+  if (!id || isMeshyIdentifier(id) || id.length > 200 || /[\s\x00-\x1f]/.test(id)) return undefined;
   const architecture = isObject(value.architecture) ? value.architecture : undefined;
   const name = (string(value.displayName) ?? string(value.display_name) ?? string(value.name) ?? id).slice(0, 200);
   const known = knownCustomModel(id, api, catalog);

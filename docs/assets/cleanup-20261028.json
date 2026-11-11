@@ -1,0 +1,24 @@
+{
+  "at": "2026-10-28T05:59:47Z",
+  "method": "Finder Move to Trash, recoverable; Trash not emptied",
+  "items": [
+    {
+      "original": ".runtime/local-execution/tmp/ohmygame-preview-QX9z2h",
+      "allocatedKiB": 8
+    },
+    {
+      "original": ".runtime/local-execution/tmp/ohmygame-preview-OA9xQD",
+      "allocatedKiB": 16
+    }
+  ],
+  "retained": [
+    "tracked source/licenses/docs",
+    "node_modules",
+    "dist",
+    ".runtime/toolchain",
+    ".runtime/local-execution/lima",
+    ".runtime/local-execution/downloads",
+    "prior acceptance evidence"
+  ],
+  "totalAllocatedKiBMoved": 24
+}

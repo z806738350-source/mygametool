@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Composer } from "../src/renderer/composer.js";
 import { composerDrafts } from "../src/renderer/composer-drafts.js";
+import * as api from "../src/renderer/api.js";
 
 let root: ReturnType<typeof createRoot>;
 let container: HTMLDivElement;
@@ -17,7 +18,49 @@ afterEach(async () => {
   await act(async () => root.unmount());
   container.remove();
   composerDrafts.deleteProject("publish-test");
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+describe("composer text-only model", () => {
+  const model = { provider: "kunpo", id: "gpt-6.1-sol" };
+
+  it.each(["image/png", ""])("retains an image draft and refuses button and form submission (%s)", async (type) => {
+    vi.stubGlobal("URL", class extends URL { static createObjectURL() { return "blob:mock"; } static revokeObjectURL() {} });
+    const upload = vi.spyOn(api, "uploadProjectAttachment");
+    const file = new File(["image"], "screenshot.png", { type });
+    const session = composerDrafts.get({ projectId: "publish-test", conversationId: "chat" });
+    session.update({ prompt: "Inspect this screenshot", attachments: [{ id: "shot", file, relativePath: file.name }] });
+    const props = await render({ model });
+    expect(container.querySelector<HTMLButtonElement>(".send-button")!.disabled).toBe(true);
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("cannot receive images");
+    await act(async () => container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    expect(upload).not.toHaveBeenCalled();
+    expect(props.onSubmit).not.toHaveBeenCalled();
+    expect(session.getSnapshot()).toMatchObject({ prompt: "Inspect this screenshot", attachments: [{ id: "shot" }] });
+  });
+
+  it("keeps captured playable context until a vision model is selected", async () => {
+    const props = await render({ model, initialDraft: { prompt: "Inspect this element", mentions: [] }, contexts: [{ key: "pick", kind: "playable-element", label: "Button" }] });
+    expect(container.querySelector<HTMLButtonElement>(".send-button")!.disabled).toBe(true);
+    await act(async () => container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    expect(props.onSubmit).not.toHaveBeenCalled();
+    expect(container.querySelector("textarea")!.value).toBe("Inspect this element");
+    await render({ ...props, model: { provider: "kunpo", id: "gpt-5.6-sol" } });
+    expect(container.querySelector<HTMLButtonElement>(".send-button")!.disabled).toBe(false);
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it("still sends text attachments and ordinary node context", async () => {
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+    const attachment = { id: "notes", batchId: "batch", name: file.name, relativePath: file.name, size: file.size, kind: "text" as const, mediaType: file.type };
+    vi.spyOn(api, "uploadProjectAttachment").mockResolvedValue(attachment);
+    composerDrafts.get({ projectId: "publish-test", conversationId: "chat" }).update({ prompt: "Read these notes", attachments: [{ id: "notes", file, relativePath: file.name }] });
+    const props = await render({ model, contexts: [{ key: "node", kind: "playable-node", label: "Game" }] });
+    expect(container.querySelector<HTMLButtonElement>(".send-button")!.disabled).toBe(false);
+    await act(async () => container.querySelector<HTMLButtonElement>(".send-button")!.click());
+    expect(props.onSubmit).toHaveBeenCalledWith("Read these notes", [], [], "normal", [attachment], [], []);
+  });
 });
 
 async function render(
@@ -47,8 +90,6 @@ async function render(
     onRemovePending: vi.fn(async () => true),
     onSteerPending: vi.fn(async () => true),
     onEditPending: vi.fn(async () => true),
-    canPublish: true,
-    onPublish: vi.fn(),
     ...overrides,
   };
   await act(async () => root.render(<Composer {...props} />));
@@ -56,57 +97,13 @@ async function render(
 }
 
 describe("composer publish command", () => {
-  it("opens publishing from the menu while retaining coding agent quota information", async () => {
-    const props = await render({
-      model: { provider: "codex-cli", id: "test" },
-      onContextUsage: vi.fn(async () => ({
-        tokens: null,
-        contextWindow: 200_000,
-        percent: null,
-        limits: [{ id: "codex/primary", usedPercent: 42, windowMinutes: 300 }],
-      })),
-    });
-    expect(
-      container.querySelector('[role="meter"]')?.getAttribute("aria-valuenow"),
-    ).toBe("42");
-    const command =
-      container.querySelector<HTMLButtonElement>('[role="option"]')!;
-    expect(command.textContent).toContain("Publish game");
-    await act(async () => command.click());
-    expect(props.onPublish).toHaveBeenCalledOnce();
-    expect(props.onSubmit).not.toHaveBeenCalled();
-    expect(container.querySelector("textarea")?.value).toBe("");
-  });
-
-  it("handles the send button locally after the command menu is dismissed", async () => {
-    const props = await render({
-      initialDraft: { prompt: "/PUBLISH", mentions: [] },
-    });
-    await act(async () =>
-      container
-        .querySelector("textarea")!
-        .dispatchEvent(
-          new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
-        ),
-    );
-    expect(container.querySelector('[role="listbox"]')).toBeNull();
-    await act(async () =>
-      container.querySelector<HTMLButtonElement>(".send-button")!.click(),
-    );
-    expect(props.onPublish).toHaveBeenCalledOnce();
-    expect(props.onSubmit).not.toHaveBeenCalled();
-    expect(container.querySelector("textarea")?.value).toBe("");
-  });
-
-  it.each([
-    { running: true },
-    { stopping: true },
-    { canPublish: false },
-    { onPublish: undefined },
-  ])("hides publishing when unavailable: %j", async (overrides) => {
-    const props = await render(overrides);
+  it("keeps the retired publish command local without sending a paid chat turn", async () => {
+    const props = await render({ initialDraft: { prompt: "/PUBLISH", mentions: [] } });
     expect(container.querySelector('[role="option"]')).toBeNull();
-    if (props.onPublish) expect(props.onPublish).not.toHaveBeenCalled();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("cloud publishing");
+    expect(container.querySelector<HTMLButtonElement>(".send-button")!.disabled).toBe(true);
+    await act(async () => container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    expect(props.onSubmit).not.toHaveBeenCalled();
   });
 
   it("preserves ordinary messages that mention publishing", async () => {
@@ -116,7 +113,6 @@ describe("composer publish command", () => {
     await act(async () =>
       container.querySelector<HTMLButtonElement>(".send-button")!.click(),
     );
-    expect(props.onPublish).not.toHaveBeenCalled();
     expect(props.onSubmit).toHaveBeenCalledWith(
       "Explain /publish",
       [],

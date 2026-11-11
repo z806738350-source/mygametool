@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
@@ -9,6 +9,7 @@ import {
 import { afterEach, expect, it, vi } from "vitest";
 import { createApp } from "../src/daemon/app.js";
 import { CheckpointStore } from "../src/daemon/checkpoints.js";
+import { isolatedPreviewFixture } from "./isolated-preview-fixture.js";
 import type {
   ConversationDetail,
   ProjectState,
@@ -73,14 +74,18 @@ async function fixture() {
     authPath: path.join(agentDirectory, "auth.json"),
     modelsPath: null,
     refreshOnCreate: false,
+    allowModelNetwork: false,
   });
-  await runtime.setRuntimeApiKey("anthropic", "test");
+  await runtime.setRuntimeApiKey("anthropic", "preview-checkpoints-fake-credential-20261028");
   runtime.streamSimple = () => reply([{ type: "text", text: "Hi" }]);
   const model = runtime.getModels("anthropic")[0]!;
+  model.baseUrl = "http://127.0.0.1:43199";
+  const guest = await isolatedPreviewFixture("Ready");
   const app = createApp({
     dataDirectory: directory,
     piAgentDirectory: agentDirectory,
     createModelRuntime: async () => runtime,
+    projectExecution: guest.execution,
   });
   cleanups.push(() => app.close());
   const project = (
@@ -129,10 +134,10 @@ async function fixture() {
       url: `/projects/${project.id}/preview/leases/test-editor`,
       payload: { automatic: true },
     });
-  return { app, project, runtime, conversationUrl, readProject, chat, lease };
+  return { app, project, runtime, conversationUrl, readProject, chat, lease, guest };
 }
 
-it.each(["static", "command"] as const)(
+it.each(["static", "script"] as const)(
   "keeps a running %s preview through a text-only turn and a diff read",
   async (previewMode) => {
     const { app, project, conversationUrl, readProject, chat, lease } =
@@ -145,6 +150,7 @@ it.each(["static", "command"] as const)(
       path.join(project.workspacePath, "server.mjs"),
       "import {createServer} from 'node:http';createServer((req,res)=>res.end(String(process.pid))).listen(Number(process.env.PORT),'127.0.0.1');",
     );
+    await writeFile(path.join(project.workspacePath, "package.json"), JSON.stringify({ scripts: { dev: "node server.mjs" } }));
     const settings = await app.inject({
       method: "PUT",
       url: `/projects/${project.id}/settings/run`,
@@ -166,7 +172,7 @@ it.each(["static", "command"] as const)(
     await lease();
     const before = (await readProject()).preview;
     const content =
-      previewMode === "command"
+      previewMode === "script"
         ? await (await fetch(before.url!)).text()
         : expect.stringContaining("<p>Game</p>");
     const originalSnapshot = CheckpointStore.prototype.snapshot;
@@ -219,11 +225,14 @@ it.each(["waiting", "manual"] as const)(
 );
 
 it("lets a preview finish starting while a text-only turn takes snapshots", async () => {
-  const { app, project, readProject, chat, lease } = await fixture();
+  const { app, project, readProject, chat, lease, guest } = await fixture();
+  let release!: () => void;
+  guest.ready.mockImplementationOnce(() => new Promise<void>((resolve) => { release = resolve; }));
   await writeFile(
     path.join(project.workspacePath, "server.mjs"),
     "import {existsSync} from 'node:fs';import {createServer} from 'node:http';const timer=setInterval(()=>{if(!existsSync('.listen'))return;clearInterval(timer);createServer((req,res)=>res.end('Ready')).listen(Number(process.env.PORT),'127.0.0.1');},25);",
   );
+  await writeFile(path.join(project.workspacePath, "package.json"), JSON.stringify({ scripts: { dev: "node server.mjs" } }));
   const settings = await app.inject({
     method: "PUT",
     url: `/projects/${project.id}/settings/run`,
@@ -232,7 +241,7 @@ it("lets a preview finish starting while a text-only turn takes snapshots", asyn
       startupScript: "dev",
       previewPath: "/",
       previewViewport: "fit",
-      previewMode: "command",
+      previewMode: "script",
       previewCommand: `${node} server.mjs`,
     },
   });
@@ -247,8 +256,7 @@ it("lets a preview finish starting while a text-only turn takes snapshots", asyn
     expect(turn.changes).toMatchObject({ files: 0 });
     expect((await readProject()).preview).toEqual(before);
   } finally {
-    // A hidden gate releases this launch without changing the watched source files.
-    await writeFile(path.join(project.workspacePath, ".listen"), "");
+    release();
   }
   await vi.waitFor(async () =>
     expect((await readProject()).preview).toMatchObject({
@@ -259,6 +267,30 @@ it("lets a preview finish starting while a text-only turn takes snapshots", asyn
   expect(await (await fetch((await readProject()).preview.url!)).text()).toBe(
     "Ready",
   );
+});
+
+it("executes the Agent's registered local build and the HTTP build through the same output return", async () => {
+  const { app, project, runtime, chat, guest, lease, readProject } = await fixture();
+  await writeFile(path.join(project.workspacePath, "package.json"), JSON.stringify({ scripts: { dev: "node game.mjs", build: "node build.mjs" } }));
+  let exports = 0;
+  guest.execution.artifacts = async (_project, directory, options) => {
+    expect(options?.playable).toBe(true);
+    const dist = path.join(directory!, "dist");
+    await mkdir(dist, { recursive: true });
+    await writeFile(path.join(dist, "index.html"), "Built " + ++exports);
+  };
+  await lease();
+  await vi.waitFor(async () => expect((await readProject()).preview.status).toBe("ready"));
+  let calls = 0;
+  runtime.streamSimple = () => {
+    return calls++ === 0 ? reply([{ type: "toolCall", id: "local-build", name: "build_game", arguments: {} }], true) : reply([{ type: "text", text: "Done" }]);
+  };
+  await chat("Build the game locally");
+  expect(await readFile(path.join(project.workspacePath, "dist/index.html"), "utf8")).toBe("Built 1");
+  const http = await app.inject({ method: "POST", url: `/projects/${project.id}/build` });
+  expect(http.json()).toEqual({ status: "succeeded", directory: "dist" });
+  expect(await readFile(path.join(project.workspacePath, "dist/index.html"), "utf8")).toBe("Built 2");
+  expect((await readProject()).preview.status).toBe("ready");
 });
 
 it("automatically starts a preview when an agent creates browser output", async () => {

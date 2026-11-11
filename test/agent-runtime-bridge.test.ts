@@ -1,3 +1,4 @@
+// Native execution is retained for future OS-isolated support; agent-local-files.test.ts covers current refusal.
 import { defineTool, SessionManager } from "@earendil-works/pi-coding-agent";
 import { EventEmitter } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -9,6 +10,9 @@ import { Type } from "typebox";
 import { afterEach, expect, it } from "vitest";
 import { setAgentProcessSpawner } from "../src/daemon/agent-runtimes/process.js";
 import { AgentRuntimeService } from "../src/daemon/agent-runtimes/service.js";
+import { QoderDriver, qoderHelperError, type QoderHostConnection } from "../src/daemon/agent-runtimes/qoder.js";
+import { ToolBridge } from "../src/daemon/agent-runtimes/tool-bridge.js";
+import type { NativeTurnSink } from "../src/daemon/agent-runtimes/native-session.js";
 import type { NativeCodingSession } from "../src/daemon/agent-runtimes/native-session.js";
 import type { ApprovalRequestDetails } from "../src/shared/agent-runtimes.js";
 
@@ -16,6 +20,173 @@ const cleanup: Array<() => unknown | Promise<unknown>> = [];
 afterEach(async () => {
   for (const close of cleanup.splice(0).reverse()) await close();
   setAgentProcessSpawner(undefined);
+});
+
+function qoderFixture(execute: (signal: AbortSignal) => Promise<{ content: Array<{ type: "text"; text: string }>; details?: unknown }>) {
+  let receive!: (message: Record<string, unknown>) => void;
+  let turnId = "";
+  let calls = 0;
+  let stops = 0;
+  const replies: Array<{ id: unknown; result: unknown }> = [];
+  const results: unknown[] = [];
+  const bridge = new ToolBridge([defineTool({ name: "generate_image", label: "Image", description: "Existing controlled media handler",
+    parameters: Type.Object({ prompt: Type.String() }),
+    execute: async (_id, _args, signal) => { calls++; const result = await execute(signal ?? new AbortController().signal); return { ...result, details: result.details }; },
+  })], true);
+  const connection: QoderHostConnection = {
+    async start() {},
+    async request(method, params) {
+      if (method === "turn/start") {
+        turnId = String(params?.turnId);
+        receive({ method: "sdk/message", params: { turnId, message: { type: "system", subtype: "init", session_id: "qoder-session" } } });
+      }
+      return {};
+    },
+    respond(id, result) { replies.push({ id, result }); },
+    async stop() { stops++; },
+  };
+  const driver = new QoderDriver({ binaryPath: "/unused/native", workspacePath: "/unused/project", privateDirectory: "/unused/private", env: {},
+    instructions: "Use only controlled project tools", bridge, policy: { workspacePath: "/unused/project", neverTouch: [] }, skillDirectories: [], model: "auto" },
+  (handler) => { receive = handler; return connection; });
+  cleanup.push(() => driver.dispose());
+  const sink: NativeTurnSink = {
+    text() {}, textDone() {}, thinking() {}, thinkingDone() {}, toolCall() {}, toolStarted() {}, toolUpdate() {},
+    toolResult: (id, result, error) => results.push({ id, result, error }), usage() {}, compaction() {}, nativeSession() {},
+    async requestApproval() { return "deny"; },
+  };
+  return { driver, bridge, sink, connection, replies, results, calls: () => calls, stops: () => stops,
+    send: (callId: string, options: Record<string, unknown> = {}) => receive({ id: randomRequestId(), method: "tool/call",
+      params: { turnId, sessionId: "qoder-session", callId, name: "generate_image", arguments: { prompt: "fixture" }, ...options } }),
+    finish: () => receive({ method: "sdk/message", params: { turnId, message: { type: "result", subtype: "success", is_error: false } } }),
+    fail: (code: string, message: string) => receive({ method: "sdk/error", params: { turnId, code, message } }),
+  };
+}
+
+let qoderRequestId = 0;
+function randomRequestId() { return `fixture:${++qoderRequestId}`; }
+async function qoderStarted() { await new Promise<void>((resolve) => setTimeout(resolve, 0)); }
+
+it("Qoder reuses a pending/completed call once and retains host artifact details", async () => {
+  let release!: () => void;
+  const wait = new Promise<void>((resolve) => { release = resolve; });
+  const artifact = { content: [{ type: "text" as const, text: "saved once" }], details: { path: "artifact.png", taskId: "original-job" } };
+  const f = qoderFixture(async () => { await wait; return artifact; });
+  const run = f.driver.runTurn({ text: "fixture", images: [], readOnly: false }, f.sink, new AbortController().signal);
+  await qoderStarted();
+  f.send("call-1"); f.send("call-1");
+  expect(f.calls()).toBe(1);
+  release(); await qoderStarted();
+  f.send("call-1"); await qoderStarted();
+  expect(f.calls()).toBe(1);
+  expect(f.results).toEqual([{ id: "call-1", result: artifact, error: false }]);
+  expect(f.replies).toHaveLength(3);
+  f.finish(); expect(await run).toEqual({ status: "completed", resultSubtype: "success" });
+});
+
+it("Qoder preserves safe initialization failure categories without misreporting a sign-in failure", async () => {
+  const f = qoderFixture(async () => ({ content: [] }));
+  const run = f.driver.runTurn({ text: "fixture", images: [], readOnly: false }, f.sink, new AbortController().signal);
+  await qoderStarted();
+  f.fail("QODER_INVENTORY", "PRIVATE_SDK_ACCOUNT_ERROR_CANARY");
+  const result = await run;
+  expect(result).toMatchObject({ status: "failed", error: expect.stringContaining("Local CLI compatibility:") });
+  expect(result).toMatchObject({ error: expect.stringContaining("tool inventory") });
+  expect(JSON.stringify(result)).not.toMatch(/PRIVATE_|sign-in/);
+  expect(f.calls()).toBe(0);
+});
+
+it("Qoder projects only finite host error codes and discards arbitrary SDK error details", async () => {
+  expect(qoderHelperError({ code: "QODER_MCP", message: "PRIVATE_TOKEN_CANARY" }).message).toContain("project tool bridge");
+  expect(qoderHelperError({ code: "QODER_POLICY", message: "PRIVATE_TOKEN_CANARY" }).message).toContain("session permissions");
+  const protocol = qoderHelperError({ code: "QODER_SDK_DAEMON_PROTOCOL", phase: "session-initialize", message: "PRIVATE_TOKEN_CANARY", details: { auth: "PRIVATE_AUTH_CANARY" } });
+  expect(protocol.message).toContain("daemon protocol frame");
+  expect(protocol.message).toContain("Stage: session initialization");
+  expect(protocol.message).not.toContain("PRIVATE_");
+  expect(qoderHelperError({ code: "QODER_INVENTORY", boundary: "skills", message: "PRIVATE_TOKEN_CANARY" }).message).toContain("Mismatched boundary: registered skills");
+  expect(qoderHelperError({ code: "QODER_INVENTORY", boundary: "PRIVATE_BOUNDARY_CANARY" }).message).not.toContain("PRIVATE_");
+  const refreshed = qoderHelperError({ code: "QODER_RUNTIME_INVENTORY", boundary: "active-tools", phase: "response-stream" }).message;
+  expect(refreshed).toContain("existing tool results are retained");
+  expect(refreshed).toContain("active tools");
+  expect(refreshed).not.toMatch(/no prompt|not sent/i);
+  expect(qoderHelperError({ code: "QODER_PROTOCOL", message: "Qoder returned an initialization snapshot for another session" }).message).toContain("initialization snapshot for another session");
+  expect(qoderHelperError({ code: "QODER_PROTOCOL", message: "PRIVATE_PROTOCOL_CANARY" }).message).not.toContain("PRIVATE_");
+  const arbitrary = qoderHelperError({ code: "PRIVATE_CODE_CANARY", phase: "PRIVATE_PHASE_CANARY", message: "PRIVATE_MESSAGE_CANARY" });
+  expect(arbitrary.message).not.toContain("PRIVATE_");
+  expect(qoderHelperError({ code: "QODER_SDK_TIMEOUT", phase: "mcp-status" }).message).toContain("timed out. Stage: controlled tool bridge verification");
+  for (const value of [undefined, "PRIVATE_TOKEN_CANARY", { code: "PRIVATE_TOKEN_CANARY", message: "PRIVATE_TOKEN_CANARY" }])
+    expect(qoderHelperError(value).message).not.toMatch(/PRIVATE_|sign-in/);
+  const f = qoderFixture(async () => ({ content: [] }));
+  f.connection.request = async () => { throw qoderHelperError({ code: "QODER_POLICY", message: "PRIVATE_TOKEN_CANARY" }); };
+  const result = await f.driver.runTurn({ text: "fixture", images: [], readOnly: false }, f.sink, new AbortController().signal);
+  expect(result).toMatchObject({ status: "failed", error: expect.stringContaining("session permissions") });
+  expect(JSON.stringify(result)).not.toContain("PRIVATE_TOKEN_CANARY");
+});
+
+it("Qoder rejects reused IDs with changed arguments and unrelated sessions/turns", async () => {
+  const f = qoderFixture(async () => ({ content: [{ type: "text", text: "saved" }] }));
+  const run = f.driver.runTurn({ text: "fixture", images: [], readOnly: false }, f.sink, new AbortController().signal);
+  await qoderStarted();
+  f.send("call-1"); await qoderStarted();
+  f.send("call-1", { arguments: { prompt: "different billable request" } });
+  f.send("call-2", { sessionId: "another-project" });
+  f.send("call-3", { turnId: "finished-turn" });
+  f.send("", {});
+  await qoderStarted();
+  expect(f.calls()).toBe(1);
+  expect(f.replies.slice(1)).toHaveLength(4);
+  for (const reply of f.replies.slice(1)) expect(reply.result).toMatchObject({ isError: true });
+  f.finish(); await run;
+});
+
+it("Qoder planning and argument validation still run inside the host bridge", async () => {
+  const f = qoderFixture(async () => ({ content: [{ type: "text", text: "should not execute" }] }));
+  f.bridge.setActive([]);
+  const run = f.driver.runTurn({ text: "plan", images: [], readOnly: true }, f.sink, new AbortController().signal);
+  await qoderStarted(); f.send("blocked"); await qoderStarted();
+  expect(f.calls()).toBe(0);
+  expect(f.replies[0]?.result).toMatchObject({ isError: true });
+  f.bridge.setActive(["generate_image"]);
+  f.send("bad-input", { arguments: { prompt: 42 } }); await qoderStarted();
+  expect(f.calls()).toBe(0);
+  expect(f.replies[1]?.result).toMatchObject({ isError: true });
+  f.finish(); await run;
+});
+
+it("Qoder disposal can stop the owned helper while its interrupt acknowledgement is stuck", async () => {
+  let release!: () => void;
+  const waiting = new Promise<void>((resolve) => { release = resolve; });
+  const f = qoderFixture(async () => ({ content: [] }));
+  const request = f.connection.request;
+  f.connection.request = async (method, params) => {
+    if (method === "turn/interrupt") { await waiting; return {}; }
+    return request(method, params);
+  };
+  const controller = new AbortController();
+  const run = f.driver.runTurn({ text: "fixture", images: [], readOnly: false }, f.sink, controller.signal);
+  await qoderStarted();
+  controller.abort();
+  expect(await run).toEqual({ status: "aborted" });
+  expect(f.stops()).toBe(0);
+  await f.driver.dispose();
+  expect(f.stops()).toBe(1);
+  release();
+});
+
+it("Qoder cancellation revokes later calls and discards a pending artifact without resubmitting", async () => {
+  let release!: () => void;
+  let toolSignal: AbortSignal | undefined;
+  const wait = new Promise<void>((resolve) => { release = resolve; });
+  const f = qoderFixture(async (signal) => { toolSignal = signal; await wait; return { content: [{ type: "text", text: "late asset" }] }; });
+  const controller = new AbortController();
+  const run = f.driver.runTurn({ text: "fixture", images: [], readOnly: false }, f.sink, controller.signal);
+  await qoderStarted(); f.send("submitted-once");
+  controller.abort();
+  expect(await run).toEqual({ status: "aborted" });
+  expect(toolSignal?.aborted).toBe(true);
+  f.send("new-after-cancel"); release(); await qoderStarted();
+  expect(f.calls()).toBe(1);
+  expect(f.results).toHaveLength(0);
+  expect(f.stops()).toBeGreaterThan(0);
 });
 
 async function fixture(nestedWorkspace = false, holdConnection = false) {
@@ -258,7 +429,7 @@ console.log("opencode v2.1.0");
 }
 
 // These cases execute POSIX script fixtures; Windows cannot start them as native CLIs.
-it.skipIf(process.platform === "win32")(
+it.skipIf(true || process.platform === "win32")(
   "resolves native read patterns relative to the v2 session location inside a Git worktree",
   async () => {
     const f = await fixture(true);
@@ -286,7 +457,7 @@ it.skipIf(process.platform === "win32")(
   },
 );
 
-it.skipIf(process.platform === "win32")(
+it.skipIf(true || process.platform === "win32")(
   "mediates child-session approvals without admitting unrelated native sessions",
   async () => {
     const f = await fixture(true);
@@ -332,7 +503,7 @@ it.skipIf(process.platform === "win32")(
   },
 );
 
-it.skipIf(process.platform === "win32")(
+it.skipIf(true || process.platform === "win32")(
   "rotates bridge capabilities each turn and permanently rejects a previous turn's token",
   async () => {
     const f = await fixture();
@@ -354,7 +525,7 @@ it.skipIf(process.platform === "win32")(
   },
 );
 
-it.skipIf(process.platform === "win32")(
+it.skipIf(true || process.platform === "win32")(
   "aborts running bridge tools and revokes their capability when a native turn is cancelled",
   async () => {
     const f = await fixture();
@@ -372,7 +543,7 @@ it.skipIf(process.platform === "win32")(
   },
 );
 
-it.skipIf(process.platform === "win32")(
+it.skipIf(true || process.platform === "win32")(
   "settles a turn and stops the native process if its event stream disconnects",
   async () => {
     const f = await fixture();
@@ -392,7 +563,7 @@ it.skipIf(process.platform === "win32")(
   },
 );
 
-it.skipIf(process.platform === "win32")(
+it.skipIf(true || process.platform === "win32")(
   "waits for the native MCP connection before the model receives its tool catalog",
   async () => {
     const f = await fixture(false, true);
@@ -406,7 +577,7 @@ it.skipIf(process.platform === "win32")(
   },
 );
 
-it.skipIf(process.platform === "win32")(
+it.skipIf(true || process.platform === "win32")(
   "preserves app tool names and structured results without asking for a second approval",
   async () => {
     const f = await fixture();

@@ -13,6 +13,18 @@ import {
   subscribeToModelAuth,
 } from "./api.js";
 import { t } from "./i18n.js";
+import type { AgentRuntimeId } from "../shared/agent-runtimes.js";
+
+export async function openAgentRuntimeAuthExternal(url: string, runtime: AgentRuntimeId): Promise<void> {
+  try {
+    if (runtime === "codex-cli" && window.ohMyGameDesktop) {
+      if (!window.ohMyGameDesktop.openCodexLogin) throw new Error("Missing Codex sign-in channel");
+      await window.ohMyGameDesktop.openCodexLogin(url);
+    } else await openModelAuthExternal(url);
+  } catch {
+    throw new Error(t("codingAgents.loginOpenFailed"));
+  }
+}
 
 export async function openModelAuthExternal(url: string): Promise<void> {
   if (window.ohMyGameDesktop?.openExternal) {

@@ -1,4 +1,5 @@
 import type { AgentUsageLimit } from "./contracts.js";
+import type { IsolatedSourceReview, IsolatedSourceConfirmation } from "./execution-storage.js";
 /**
  * Coding agents: native CLIs (Claude Code, Codex, OpenCode) that run a
  * conversation's agent loop in place of OhMyGame's built-in Pi agent. A
@@ -10,6 +11,7 @@ import type { AgentUsageLimit } from "./contracts.js";
 export const AGENT_RUNTIME_IDS = [
   "claude-code-cli",
   "codex-cli",
+  "qoder-cli",
   "opencode-cli",
 ] as const;
 export type AgentRuntimeId = (typeof AGENT_RUNTIME_IDS)[number];
@@ -47,6 +49,7 @@ export type AgentRuntimeDiagnosticCode =
   | "invalid-executable"
   | "runtime-incompatible"
   | "signed-out"
+  | "check-required"
   | "probe-failed"
   | "models-unavailable";
 
@@ -123,7 +126,7 @@ export interface AgentRuntimeLoginResponse {
 }
 
 /** What an agent asks to be allowed to do. */
-export type ApprovalKind = "command" | "file" | "tool" | "other";
+export type ApprovalKind = "command" | "file" | "tool" | "other" | "volumeMigration";
 
 export type ApprovalDecision = "allow" | "allow-session" | "deny";
 
@@ -139,6 +142,8 @@ export interface ApprovalRequestDetails {
   reason?: string;
   /** Whether "allow for this conversation" can be offered. */
   canAllowSession: boolean;
+  isolatedSourceReview?: IsolatedSourceReview;
+  volumeMigration?: import("./volume-migration.js").VolumeMigrationReview;
   /**
    * What "allow for this conversation" covers when that is broader than this
    * exact request: every use of these commands, or reads in these folders.
@@ -148,4 +153,6 @@ export interface ApprovalRequestDetails {
 
 export interface AnswerApprovalRequest {
   decision: ApprovalDecision;
+  sourceConfirmation?: IsolatedSourceConfirmation;
+  volumeMigrationConfirmation?: import("./volume-migration.js").VolumeMigrationConfirmation;
 }

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { guardedProviderFetch } from "./provider-network.js";
 import {
   createReadToolDefinition,
   type AgentSession,
@@ -108,8 +109,9 @@ export function installDeepSeekImageFiles(
   );
   const stream = session.agent.streamFunction;
   session.agent.streamFunction = (model, context, options) => {
-    if (model.api !== "openai-completions" && model.api !== "openai-responses")
-      return stream(model, context, options);
+    // The session transport already inspects these responses. A second guard
+    // sees no bytes until the first one finishes validating the whole stream.
+    if (!isDeepSeekFileModel(model)) return stream(model, context, options);
     return stream(model, context, {
       ...options,
       fetch: files.wrapFetch(options?.fetch ?? globalThis.fetch),
@@ -127,6 +129,7 @@ export class DeepSeekImageFiles {
   constructor(private readonly cacheDir: string) {}
 
   wrapFetch(delegate: typeof fetch): typeof fetch {
+    delegate = guardedProviderFetch(delegate);
     return async (input, init) => {
       const url = officialUrl(
         input instanceof Request ? input.url : String(input),

@@ -5,6 +5,7 @@ import {
   type CustomModel3DSettings, type CustomModelUsages, type CustomProviderPreset, type ImageProtocol, type VideoProtocol,
 } from "../shared/contracts.js";
 import { defaultImageSettings, defaultModel3DSettings, defaultVideoSettings, IMAGE_PROTOCOL_LABELS, VIDEO_PROTOCOL_LABELS } from "../shared/custom-models.js";
+import { isMeshyEndpoint, isMeshyModelReference } from "../shared/disabled-media-providers.js";
 import { knownImageReferenceLimit } from "../shared/image-reference-limits.js";
 import { t } from "./i18n.js";
 
@@ -17,7 +18,7 @@ export function CustomModelUsageFields({ usages, preset, modelId, onChange }: {
     else if (usage === "language") next.language = true;
     else if (usage === "image") next.image = defaultImageSettings(preset === "google" ? "gemini-generate-content" : preset === "openrouter" ? "openrouter-images" : preset === "seedance" ? "volcengine-images" : "openai-images", modelId);
     else if (usage === "video") next.video = defaultVideoSettings(preset === "seedance" ? "seedance" : "openrouter-videos");
-    else next["3d"] = defaultModel3DSettings("standard", preset === "tripo" ? "tripo" : preset === "hyper3d" ? "hyper3d" : "meshy");
+    else next["3d"] = defaultModel3DSettings("standard", preset === "hyper3d" ? "hyper3d" : "tripo");
     onChange(next);
   }
   const image = usages.image;
@@ -71,6 +72,7 @@ export function Model3DSettingsFields({ value, onChange, lockCapabilities = fals
   value: CustomModel3DSettings; onChange: (value: CustomModel3DSettings) => void;
   lockCapabilities?: boolean; lockProtocol?: boolean; showEndpoint?: boolean;
 }) {
+  const unavailable = isMeshyModelReference(value) || isMeshyEndpoint(value.baseUrl);
   const limit = value.protocol === "hyper3d" ? 2_000_000 : value.protocol === "tripo" ? 1_500_000 : 300_000;
   const minimum = value.protocol === "hyper3d" ? 500 : value.protocol === "tripo" ? 48 : 100;
   const defaults = value.defaults ?? { texture: value.supportsTexture, pbr: false };
@@ -80,7 +82,9 @@ export function Model3DSettingsFields({ value, onChange, lockCapabilities = fals
     onChange({ ...next, defaults: { texture, pbr: texture && next.supportsPbr && (next.defaults?.pbr ?? false) } });
   }
   return <div className="custom-model-use-settings">
-    {!lockProtocol ? <label><span>{t("modelUsage.model3dProtocol")}</span><select value={value.protocol} onChange={(event) => onChange({ ...defaultModel3DSettings("standard", event.target.value as typeof value.protocol), baseUrl: value.baseUrl })}><option value="meshy">Meshy</option><option value="tripo">Tripo V3</option><option value="hyper3d">Hyper3D Rodin</option></select></label> : null}
+    {unavailable ? <p role="status">{t("modelUsage.meshyUnavailable")}</p> : null}
+    {!lockProtocol ? <label><span>{t("modelUsage.model3dProtocol")}</span><select value={value.protocol} onChange={(event) => onChange({ ...defaultModel3DSettings("standard", event.target.value as typeof value.protocol), ...(!isMeshyEndpoint(value.baseUrl) ? { baseUrl: value.baseUrl } : {}) })}>{value.protocol === "meshy" ? <option value="meshy" disabled>Meshy · {t("providers.unavailable")}</option> : null}<option value="tripo">Tripo V3</option><option value="hyper3d">Hyper3D Rodin</option></select></label> : null}
+    <fieldset disabled={unavailable} className="custom-model-capability-fields">
     <NumberField label={t("modelUsage.defaultPolycount")} value={value.polycount.default} min={value.polycount.min} max={value.polycount.max} onChange={(count) => update({ polycount: { ...value.polycount, default: count } })} />
     <NumberListField label={t("modelUsage.polycountPresets")} value={value.polycount.presets} onChange={(presets) => update({ polycount: { ...value.polycount, presets } })} />
     <fieldset className="custom-model-choices"><legend>{t("modelUsage.generationDefaults")}</legend><div className="custom-provider-capabilities">
@@ -113,6 +117,7 @@ export function Model3DSettingsFields({ value, onChange, lockCapabilities = fals
         {!lockCapabilities ? <ChoiceFields label={t("modelUsage.operations")} options={protocolOperations(value.protocol).filter((operation) => operation !== "image")} labels={Object.fromEntries(protocolOperations(value.protocol).map((operation) => [operation, t(`assetCanvas.op.${operation}`)]))} value={value.operations ?? []} onChange={(operations) => update({ operations })} /> : null}
       </fieldset>
     </details>
+    </fieldset>
   </div>;
 }
 

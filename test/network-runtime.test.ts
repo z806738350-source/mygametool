@@ -14,8 +14,10 @@ describe("Node proxy transport", () => {
       path.join(tmpdir(), "ohmygame-proxy-runtime-"),
     );
     // Both ends use real Node: Bun's HTTP compatibility layer does not implement CONNECT.
-    const proxy = spawn("node", ["test/fixtures/network/proxy.mjs"], {
+    const fixtureEnvironment = { HOME: directory, TMPDIR: directory, PATH: process.env.PATH };
+    const proxy = spawn(process.execPath, ["test/fixtures/network/proxy.mjs"], {
       cwd: process.cwd(),
+      env: fixtureEnvironment,
       stdio: ["ignore", "ignore", "pipe", "ipc"],
     });
     try {
@@ -31,6 +33,7 @@ describe("Node proxy transport", () => {
         import OpenAI from 'openai';
         import Anthropic from '@anthropic-ai/sdk';
         import { GoogleGenAI } from '@google/genai';
+        import { fetch as networkFetch } from 'undici';
         import { loadEnvironmentFiles } from './src/daemon/environment.ts';
         import { activateNetworkProxy, resolveNetworkProxy } from './src/daemon/proxy.ts';
         import { NetworkSettingsService } from './src/daemon/network-settings.ts';
@@ -39,7 +42,20 @@ describe("Node proxy transport", () => {
         import { OpenAISessionFiles } from './src/daemon/openai-session-files.ts';
         import { OpenAISessionTransport } from './src/daemon/openai-session-transport.ts';
         loadEnvironmentFiles(${JSON.stringify(directory)}, 'development');
-        const service = new NetworkSettingsService(${JSON.stringify(directory)}, { environment: process.env });
+        assert.equal(process.env.KUNPO_API_KEY, undefined);
+        assert.equal(process.env.HTTP_PROXY, ${JSON.stringify(proxyUrl)});
+        const service = new NetworkSettingsService(${JSON.stringify(directory)}, {
+          environment: process.env,
+          // Use the fixture certificate's reserved hostname while checking the real diagnostic target separately.
+          request: async (url, dispatcher) => {
+            assert.equal(url, 'https://llm.ziy.cc/v1/models');
+            const response = await networkFetch('https://model-probe.invalid/v1/models', {
+              method: 'HEAD', dispatcher, signal: AbortSignal.timeout(5000), redirect: 'manual',
+            });
+            await response.body?.cancel();
+            return { status: response.status };
+          },
+        });
         await service.store.update({ mode: 'auto', proxyUrl: '', noProxy: '' });
         await service.load();
         assert.equal(service.get().active.source, 'environment');
@@ -65,7 +81,7 @@ describe("Node proxy transport", () => {
           assert.ok((await response.text()).includes('resp-network'));
         } finally { transport.dispose(); }
         const diagnostic = await service.test({ mode: 'manual', proxyUrl: ${JSON.stringify(proxyUrl)}, noProxy: '' });
-        assert.equal(diagnostic.reachable, true); assert.equal(diagnostic.statusCode, 401);
+        assert.equal(diagnostic.reachable, true, JSON.stringify(diagnostic)); assert.equal(diagnostic.statusCode, 401);
         assert.equal(service.get().active.source, 'environment');
         const allBypass = activateNetworkProxy(resolveNetworkProxy({ mode: 'manual', proxyUrl: ${JSON.stringify(proxyUrl)}, noProxy: '*' }, {}));
         // Fail this reserved hostname locally so the probe never waits on system DNS.
@@ -92,26 +108,16 @@ describe("Node proxy transport", () => {
       `;
       await writeFile(
         path.join(directory, ".env.development.local"),
-        `HTTP_PROXY=${proxyUrl}\nHTTPS_PROXY=${proxyUrl}\n`,
+        'HTTP_PROXY=http://127.0.0.1:1\nHTTPS_PROXY=http://127.0.0.1:1\nKUNPO_API_KEY=sk-FILE_NOT_READ_FAKE_CANARY\n',
       );
       const environment: NodeJS.ProcessEnv = {
-        ...process.env,
+        ...fixtureEnvironment,
         NODE_EXTRA_CA_CERTS: path.resolve("test/fixtures/network/cert.pem"),
+        HTTP_PROXY: proxyUrl,
+        HTTPS_PROXY: proxyUrl,
       };
-      for (const key of [
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-        "NO_PROXY",
-        "no_proxy",
-        "NODE_USE_ENV_PROXY",
-      ])
-        delete environment[key];
       const result = await run(
-        "node",
+        process.execPath,
         ["--import", "tsx", "--input-type=module", "--eval", script],
         { cwd: process.cwd(), env: environment, timeout: 20_000 },
       );

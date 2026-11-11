@@ -92,6 +92,14 @@ async function prompt(value: ModelAuthPrompt) {
   );
 }
 
+it("requires a fresh method choice when switching providers in the same settings view", async () => {
+  await render({ ...openai, id: "first", name: "First", methods: [{ type: "api_key", label: "First key" }] });
+  expect(api.startModelProviderLogin).toHaveBeenCalledWith("first", "api_key");
+  await render({ ...openai, id: "second", name: "Second" });
+  expect(host.querySelectorAll("button.settings-method-row")).toHaveLength(2);
+  expect(api.startModelProviderLogin).toHaveBeenCalledTimes(1);
+});
+
 it.each([
   [
     "en",

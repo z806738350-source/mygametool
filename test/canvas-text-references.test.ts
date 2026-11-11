@@ -12,7 +12,7 @@ const fixtures: Array<{ app: ReturnType<typeof createApp>; directory: string }> 
 afterEach(async () => {
   for (const fixture of fixtures.splice(0)) { await fixture.app.close(); await rm(fixture.directory, { recursive: true, force: true }); }
 });
-const model: RuntimeModel = { provider: "openai", id: "vision", name: "Vision", api: "openai-completions", baseUrl: "https://fixture.example/v1",
+const model: RuntimeModel = { provider: "openai", id: "vision", name: "Vision", api: "openai-completions", baseUrl: "https://llm.ziy.cc/v1",
   reasoning: false, input: ["text", "image"], contextWindow: 128_000, maxTokens: 16_384,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
 
@@ -21,7 +21,7 @@ async function fixture() {
   const message = { role: "assistant", content: [{ type: "text", text: "Generated document" }], stopReason: "stop" } as Awaited<ReturnType<ModelRuntime["completeSimple"]>>;
   const completeSimple = vi.fn<ModelRuntime["completeSimple"]>().mockResolvedValue(message);
   const streamSimple = vi.fn<ModelRuntime["streamSimple"]>(() => ({ async *[Symbol.asyncIterator]() { yield { type: "done", reason: "stop", message } as const; } }) as unknown as ReturnType<ModelRuntime["streamSimple"]>);
-  const runtime = { getModel: () => model, hasConfiguredAuth: () => true, completeSimple, streamSimple } as unknown as ModelRuntime;
+  const runtime = { getModel: () => model, hasConfiguredAuth: () => true, getAuth: async () => ({ auth: { apiKey: "sk-canvas-text-reference-fixture-only" } }), completeSimple, streamSimple } as unknown as ModelRuntime;
   const app = createApp({ dataDirectory: directory, createModelRuntime: async () => runtime });
   fixtures.push({ app, directory });
   const project = (await app.inject({ method: "POST", url: "/projects", payload: { type: "asset-canvas" } })).json();

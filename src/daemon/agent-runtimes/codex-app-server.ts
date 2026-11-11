@@ -2,6 +2,11 @@ import { AgentProcess, processFailure } from "./process.js";
 import type { AgentUsageLimit } from "../../shared/contracts.js";
 import { record } from "./driver-context.js";
 import {
+  CODEX_TOOL_NAMESPACE,
+  controlledCodexProcess,
+  requireControlledCodexConfig,
+} from "./controlled-codex.js";
+import {
   AgentRuntimeCompatibilityError,
   cliProbeError,
 } from "./compatibility.js";
@@ -11,7 +16,7 @@ export const CODEX_APPROVAL_POLICY = {
     sandbox_approval: false,
     rules: false,
     mcp_elicitations: false,
-    request_permissions: true,
+    request_permissions: false,
     skill_approval: false,
   },
 };
@@ -39,6 +44,7 @@ export async function checkCodexCompatibility(
     { cwd: directory },
     timeoutMs,
   );
+  requireControlledCodexConfig(read.config);
   // Windows' sandbox requires `:root` read access; `:minimal` is rejected.
   // The regular conversation applies the same Windows adjustment.
   const filesystemPermissions: Record<string, unknown> =
@@ -54,7 +60,7 @@ export async function checkCodexCompatibility(
     permissions: {
       [profile]: {
         filesystem: filesystemPermissions,
-        network: { enabled: true },
+        network: { enabled: false },
       },
     },
   };
@@ -74,10 +80,17 @@ export async function checkCodexCompatibility(
       config,
       dynamicTools: [
         {
-          type: "function",
-          name: "ohmygame_compatibility_probe",
-          description: "Compatibility fixture. No turn will be submitted.",
-          inputSchema: { type: "object", properties: {} },
+          type: "namespace",
+          name: CODEX_TOOL_NAMESPACE,
+          description: "OhMyGame controlled-tool compatibility fixture.",
+          tools: [
+            {
+              type: "function",
+              name: "ohmygame_compatibility_probe",
+              description: "Compatibility fixture. No turn will be submitted.",
+              inputSchema: { type: "object", properties: {} },
+            },
+          ],
         },
       ],
     },
@@ -123,23 +136,26 @@ export class CodexAppServer {
       exit?: (failure: string) => void;
     } = {},
   ) {
-    this.process = new AgentProcess({
-      binaryPath,
-      args: ["app-server"],
-      cwd,
-      env,
-      processDirectory: handlers.processDirectory,
-      onLine: (line) => this.#receive(line),
-      onExit: (code, signal, stderr) => {
-        this.#closed = new Error(processFailure("Codex", code, signal, stderr));
-        for (const pending of this.#pending.values()) {
-          clearTimeout(pending.timer);
-          pending.reject(this.#closed);
-        }
-        this.#pending.clear();
-        handlers.exit?.(this.#closed.message);
-      },
-    });
+    this.process = new AgentProcess(
+      controlledCodexProcess({
+        binaryPath,
+        cwd,
+        env,
+        processDirectory: handlers.processDirectory,
+        onLine: (line) => this.#receive(line),
+        onExit: (code, signal, stderr) => {
+          this.#closed = new Error(
+            processFailure("Codex", code, signal, stderr),
+          );
+          for (const pending of this.#pending.values()) {
+            clearTimeout(pending.timer);
+            pending.reject(this.#closed);
+          }
+          this.#pending.clear();
+          handlers.exit?.(this.#closed.message);
+        },
+      }),
+    );
   }
 
   async initialize(timeoutMs = REQUEST_TIMEOUT_MS): Promise<void> {

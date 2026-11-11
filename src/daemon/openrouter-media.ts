@@ -1,3 +1,4 @@
+import { providerRequest } from "./provider-network.js";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
   IMAGE_ASPECT_RATIOS,
@@ -77,21 +78,6 @@ export async function listOpenRouterImageModels(source: OpenRouterMediaSource, r
   return (body.data ?? []).flatMap((record) => imageModel(record)).sort(preferredOrder(PREFERRED_IMAGE_MODELS));
 }
 
-/**
- * OpenRouter's image catalog is public. Its per-model parameters describe what
- * OpenAI and Google image models accept even when they are reached directly.
- */
-export async function listPublicOpenRouterImageModels(request: typeof fetch = fetch, signal?: AbortSignal): Promise<ImageModel[]> {
-  const timeout = AbortSignal.timeout(10_000);
-  const response = await request("https://openrouter.ai/api/v1/images/models", {
-    headers: withOpenRouterAttribution({}),
-    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-  });
-  if (!response.ok) throw new Error(`OpenRouter model request failed (${response.status})`);
-  const body = await response.json() as { data?: OpenRouterImageRecord[] };
-  return (body.data ?? []).flatMap((record) => imageModel(record));
-}
-
 export async function listOpenRouterVideoModels(source: OpenRouterMediaSource, request: typeof fetch = fetch, signal?: AbortSignal): Promise<VideoModel[]> {
   const body = await getCatalog<{ data?: OpenRouterVideoRecord[] }>(source, "/videos/models", request, signal);
   return (body.data ?? []).flatMap((record) => videoModel(record)).sort(preferredOrder(PREFERRED_VIDEO_MODELS));
@@ -164,7 +150,7 @@ function videoModel(record: OpenRouterVideoRecord): VideoModel[] {
 
 async function getCatalog<T>(source: OpenRouterMediaSource, path: string, request: typeof fetch, signal?: AbortSignal): Promise<T> {
   const timeout = AbortSignal.timeout(10_000);
-  const response = await request(`${source.baseUrl}${path}`, {
+  const response = await providerRequest(request, `${source.baseUrl}${path}`, {
     headers: openRouterHeaders(source),
     signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
   });

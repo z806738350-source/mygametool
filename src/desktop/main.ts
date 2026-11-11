@@ -1,30 +1,30 @@
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, session, shell } from "electron";
 import { clipboardFilePaths, loadClipboardFiles } from "./file-clipboard.js";
-import { installExternalMcpLauncher, markExternalMcpApp } from "./external-mcp-install.js";
 import { DaemonSupervisor } from "./daemon-supervisor.js";
-import { isOAuthAuthorizationUrl, OAuthCallbackFlow } from "./oauth.js";
+import { isLoopbackHostHeader } from "../shared/local-security.js";
 import { setGlobalDispatcher } from "undici/index.js";
 import { SYSTEM_PROXY_TARGET } from "../shared/network-settings.js";
 import { createNetworkDispatcher } from "../daemon/proxy.js";
 import { electronProxyConfig, prepareDesktopNetwork, proxyCredentials } from "./network.js";
-import { loadEnvironmentFiles } from "../daemon/environment.js";
+import { localDesktopLaunch } from "./local-launch.js";
+import { StorageCleanupService } from "./storage-cleanup.js";
 import { ignoreBrokenStdio } from "./stdio.js";
 import { RotatingLogFile } from "./log-file.js";
 import { createLogRedactor } from "../shared/log-redaction.js";
 import { desktopDiagnosticsArchive } from "./diagnostics-export.js";
-import { recordConsole, recordUncaughtErrors, rendererConsoleLines, runtimeStateLine, updateFailureLine } from "./console-log.js";
-import { createDesktopWindow, fitPlaytestContentSize, isValidPlaytestViewport, waitForRenderer, windowsTitleBarOverlay } from "./window.js";
-import { DesktopUpdatePreparationError, DesktopUpdater } from "./updater.js";
-import { DesktopUpdateCheckScheduler } from "./update-check-scheduler.js";
+import { recordConsole, recordUncaughtErrors, rendererConsoleLines, runtimeStateLine } from "./console-log.js";
+import { createDesktopWindow, fitPlaytestContentSize, isRendererPage, isValidPlaytestViewport, waitForRenderer, windowsTitleBarOverlay } from "./window.js";
+import { DesktopUpdater } from "./updater.js";
 import { ElectronPlaytestDriver } from "./playtest-driver.js";
 import { WebGamePlayerWindows, type WebGamePlayerTarget } from "./web-game-player.js";
 import { RendererCloseRequest } from "./renderer-close.js";
+import { installNativeMediaGuard } from "./native-media.js";
 import { AsyncTaskPool } from "./async-task-pool.js";
 import { isNodeGraph } from "../shared/playable-graph-validation.js";
 import { isCompiledNodeGraph } from "../shared/playable-compiled.js";
@@ -37,9 +37,27 @@ ignoreBrokenStdio();
 
 const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(moduleDirectory, "../..");
-loadEnvironmentFiles(repositoryRoot, app.isPackaged ? "production" : "development");
+const localLaunch = localDesktopLaunch(process.argv);
+if (localLaunch) {
+  mkdirSync(localLaunch.profileDirectory, { recursive: true, mode: 0o700 });
+  const logs = path.join(localLaunch.profileDirectory, "logs");
+  mkdirSync(logs, { recursive: true, mode: 0o700 });
+  app.setPath("userData", localLaunch.profileDirectory);
+  app.setPath("sessionData", path.join(localLaunch.profileDirectory, "browser"));
+  app.setPath("logs", logs);
+}
 const developmentRendererUrl = process.env.OHMYGAME_RENDERER_URL ?? "http://127.0.0.1:43120";
 const useBuiltRenderer = app.isPackaged || process.argv.includes("--built-renderer");
+const storageCleanup = new StorageCleanupService({
+  root: repositoryRoot,
+  supported: !app.isPackaged && process.platform === "darwin" && process.arch === "arm64" && useBuiltRenderer && Boolean(localLaunch)
+    && localLaunch?.profileDirectory === path.join(repositoryRoot, ".runtime/local-execution/manual-data/desktop")
+    && (!localLaunch.envFile || localLaunch.envFile === path.join(repositoryRoot, ".env")),
+});
+if (!useBuiltRenderer) {
+  const renderer = new URL(developmentRendererUrl);
+  if (renderer.protocol !== "http:" || !isLoopbackHostHeader(renderer.host)) throw new Error("The development renderer must use loopback HTTP");
+}
 let daemon: DaemonSupervisor | undefined;
 const logDirectory = app.getPath("logs");
 const redactLog = createLogRedactor();
@@ -61,6 +79,9 @@ const NODE_THUMBNAIL_CHANNELS = new Set(["ohmygame:capture-page", "ohmygame:fini
 
 function handle(channel: string, listener: Parameters<typeof ipcMain.handle>[1]): void {
   ipcMain.handle(channel, (event, ...args) => {
+    const frame = event.senderFrame;
+    const renderer = useBuiltRenderer ? pathToFileURL(path.join(moduleDirectory, "../renderer/index.html")).href : new URL(developmentRendererUrl).href;
+    if (!frame || frame !== event.sender.mainFrame || !isRendererPage(frame.url, renderer)) throw new Error("Invalid application IPC source");
     if (nodeThumbnails.has(event.sender.id) && !NODE_THUMBNAIL_CHANNELS.has(channel)) {
       throw new Error("Invalid thumbnail request");
     }
@@ -81,48 +102,33 @@ let restartPending = false;
 let rendererClose: RendererCloseRequest | undefined;
 let shutdown: Promise<void> | undefined;
 let updater: DesktopUpdater | undefined;
-let updateChecks: DesktopUpdateCheckScheduler | undefined;
-const oauth = new OAuthCallbackFlow(() => mainWindow?.webContents.send("ohmygame:auth-callback"));
 const windowMenuLabels = new Set(["File", "Edit", "View", "Window"]);
 
-/** Removes the record that tells `ohmygame-mcp` the app is already running. */
-let clearExternalMcpApp: (() => Promise<void>) | undefined;
 
 async function stopServices(): Promise<void> {
-  updateChecks?.stop();
   webGamePlayers.close();
   agentPlaytests.close();
-  await Promise.all([daemon?.stop(), oauth.cancel()]);
-  await clearExternalMcpApp?.().catch(() => undefined);
+  await daemon?.stop();
   await Promise.all([daemonLog.close(), mainLog.close()]);
 }
 
-function prepareShutdown(forUpdate = false): Promise<void> {
+function prepareShutdown(): Promise<void> {
   shutdown ??= (async () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
-      try {
-        await rendererClose?.request();
-      } catch (cause) {
-        if (forUpdate) throw new DesktopUpdatePreparationError("save", cause instanceof Error ? cause.message : String(cause));
-        throw cause;
-      }
+      await rendererClose?.request();
     }
     quitting = true;
     try {
       await stopServices();
     } catch (cause) {
       console.error("Could not stop desktop services", cause);
-      if (forUpdate) {
-        quitting = false;
-        throw new DesktopUpdatePreparationError("shutdown", cause instanceof Error ? cause.message : String(cause));
-      }
     }
   })().catch((cause) => { shutdown = undefined; throw cause; });
   return shutdown;
 }
 
 ipcMain.on("ohmygame:ready-to-close", (event, id: unknown, error: unknown) => {
-  if (!mainWindow || event.sender !== mainWindow.webContents || typeof id !== "number" ||
+  if (!mainWindow || event.sender !== mainWindow.webContents || !event.senderFrame || event.senderFrame !== event.sender.mainFrame || typeof id !== "number" ||
       (error !== undefined && typeof error !== "string")) return;
   rendererClose?.complete(id, error);
 });
@@ -158,13 +164,18 @@ function executeFile(command: string, args: string[]): Promise<void> {
   });
 }
 
-handle("ohmygame:open-auth-url", async (_event, url: unknown) => {
-  if (typeof url !== "string" || !isOAuthAuthorizationUrl(url)) throw new Error("Invalid OAuth authorization URL");
-  await shell.openExternal(url);
+for (const channel of ["ohmygame:open-auth-url", "ohmygame:take-auth-callback", "ohmygame:auth-callback-url", "ohmygame:cancel-auth"]) {
+  handle(channel, () => { throw new Error("Cloud account authentication is disabled in this local build"); });
+}
+handle("ohmygame:open-codex-login-url", async (event, value: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid Codex sign-in source");
+  let target: URL;
+  try { target = new URL(typeof value === "string" ? value : ""); }
+  catch { throw new Error("Invalid Codex sign-in URL"); }
+  if (target.protocol !== "https:" || target.port || target.username || target.password
+    || !["auth.openai.com", "chatgpt.com"].includes(target.hostname)) throw new Error("Invalid Codex sign-in URL");
+  await shell.openExternal(target.toString());
 });
-handle("ohmygame:take-auth-callback", () => oauth.takeCallback());
-handle("ohmygame:auth-callback-url", () => oauth.callbackUrl());
-handle("ohmygame:cancel-auth", () => oauth.cancel());
 handle("ohmygame:clipboard-files", async (event) => {
   if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid clipboard source");
   const paths = await clipboardFilePaths(clipboard);
@@ -245,6 +256,22 @@ handle("ohmygame:open-logs-directory", async (event) => {
 handle("ohmygame:export-diagnostics", async (event) => {
   if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid diagnostics source");
   return desktopDiagnosticsArchive({ logDirectory, logs: [mainLog, daemonLog], service: () => daemon?.state(), redact: redactLog });
+});
+handle("ohmygame:storage-scan", async (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid storage cleanup source");
+  return storageCleanup.scan();
+});
+handle("ohmygame:storage-plan", async (event, request) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid storage cleanup source");
+  return storageCleanup.plan(request);
+});
+handle("ohmygame:storage-execute", async (event, request) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid storage cleanup source");
+  return storageCleanup.execute(request);
+});
+handle("ohmygame:storage-result", async (event, planId) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid storage cleanup source");
+  return storageCleanup.result(planId);
 });
 handle("ohmygame:select-plugin-directory", async (event) => {
   if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Invalid directory selection source");
@@ -452,7 +479,7 @@ handle("ohmygame:show-playtest-editor", async (event, projectId: unknown) => {
   mainWindow.focus();
 });
 handle("ohmygame:update-state", () => updater?.state() ?? null);
-handle("ohmygame:check-for-update", () => (updateChecks ? updateChecks.manual() : updater?.check()));
+handle("ohmygame:check-for-update", () => updater?.check());
 handle("ohmygame:download-update", () => updater?.download());
 handle("ohmygame:install-update", () => updater?.install());
 handle("ohmygame:restart-app", (event) => {
@@ -462,8 +489,8 @@ handle("ohmygame:restart-app", (event) => {
   app.quit();
 });
 
-// On macOS, closing the last window keeps the app and its services running
-// until Quit, and clicking the Dock icon opens the main window again.
+// The main window explicitly requests Quit below. Player and thumbnail windows
+// do not own the application's lifetime.
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
@@ -480,10 +507,21 @@ app.on("before-quit", (event) => {
   if (quitPending) return;
   quitPending = true;
   void prepareShutdown().then(() => {
+    if (restartPending && localLaunch) { app.exit(75); return; }
     if (restartPending) app.relaunch();
     app.quit();
   }).catch(() => { quitPending = false; restartPending = false; });
 });
+
+if (localLaunch) {
+  const closeLocalLaunch = () => { void prepareShutdown().finally(() => app.exit(0)); };
+  process.once("SIGINT", closeLocalLaunch);
+  process.once("SIGTERM", closeLocalLaunch);
+  process.on("SIGUSR2", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) { mainWindow.show(); mainWindow.focus(); }
+    else if (daemon && !quitting) void openMainWindow();
+  });
+}
 
 try {
   await app.whenReady();
@@ -494,13 +532,13 @@ try {
   await systemProxySession.setProxy({ mode: "system" });
   const network = await prepareDesktopNetwork({
     dataDirectory,
-    environment: app.isPackaged ? await packagedEnvironment() : { ...process.env },
+    environment: desktopEnvironment(),
     resolveProxy: (url) => systemProxySession.resolveProxy(url),
   });
   // Main uses the same local bypasses; preserve the original environment for daemon policy resolution.
   setGlobalDispatcher(createNetworkDispatcher(network.active));
   const proxyConfig = electronProxyConfig(network.active);
-  const startupSessions = [session.defaultSession, session.fromPartition("electron-updater", { cache: false })];
+  const startupSessions = [session.defaultSession];
   app.on("login", (event, _contents, _request, authInfo, callback) => {
     if (!authInfo.isProxy) return;
     const credentials = proxyCredentials(network.active, authInfo.host, authInfo.port);
@@ -512,35 +550,17 @@ try {
     void createdSession.setProxy(proxyConfig).catch((error) => console.warn("Could not configure session proxy", error));
   });
   await Promise.all(startupSessions.map((startupSession) => startupSession.setProxy(proxyConfig)));
-  // A missing launcher only leaves external agents unable to connect; the app still starts.
-  const externalMcpLauncher = await installExternalMcpLauncher({
-    binDirectory: path.join(app.getPath("userData"), "bin"),
-    executable: process.execPath,
-    entry: path.join(moduleDirectory, "external-mcp-main.js"),
-    dataDirectory,
-    ...(app.isPackaged ? {} : { appPath: repositoryRoot }),
-  }).catch((error) => { console.warn("Could not install the OhMyGame MCP launcher", error); return undefined; });
-  clearExternalMcpApp = await markExternalMcpApp(dataDirectory).catch(() => undefined);
   daemon = new DaemonSupervisor({
     daemonEntry: path.join(moduleDirectory, "../daemon/server.js"),
     dataDirectory,
     token: randomBytes(32).toString("base64url"),
     allowedOrigins: [rendererOrigin],
     piAgentDirectory: process.env.PI_CODING_AGENT_DIR ?? path.join(app.getPath("userData"), "pi-agent"),
+    ...(localLaunch ? { localEnvFile: localLaunch.envFile, reuseLocalEnv: localLaunch.reuseLocalEnv, localLaunchId: localLaunch.launchId } : {}),
     bundledPluginsDirectory: app.isPackaged ? path.join(process.resourcesPath, "plugins") : undefined,
-    preinstalledPluginsDirectory: app.isPackaged
-      ? path.join(process.resourcesPath, "preinstalled-plugins")
-      : path.join(repositoryRoot, ".runtime", "preinstalled-plugins"),
-    examplesDirectory: app.isPackaged
-      ? path.join(process.resourcesPath, "examples")
-      : path.join(repositoryRoot, ".runtime", "examples"),
     playerDirectory: app.isPackaged
       ? path.join(process.resourcesPath, "app.asar.unpacked", "dist", "player")
       : undefined,
-    ...(externalMcpLauncher ? { externalMcpLauncher } : {}),
-    externalSkillDirectory: app.isPackaged
-      ? path.join(process.resourcesPath, "integrations", "skills", "ohmygame-studio")
-      : path.join(repositoryRoot, "integrations", "skills", "ohmygame-studio"),
     runtimeBin: app.isPackaged
       ? process.platform === "win32"
         ? path.join(process.resourcesPath, "runtime", "node")
@@ -569,22 +589,10 @@ try {
     },
   });
   await daemon.start();
-  updater = new DesktopUpdater(app.getVersion(), () => prepareShutdown(true));
+  updater = new DesktopUpdater(app.getVersion());
 
   if (!useBuiltRenderer) await waitForRenderer(developmentRendererUrl);
-  updater.subscribe((state) => mainWindow?.webContents.send("ohmygame:update-state", state));
-  // The same failure is published again with every other change to the update state.
-  let updateFailure: string | undefined;
-  updater.subscribe((state) => {
-    const failure = updateFailureLine(state);
-    if (failure && failure !== updateFailure) mainLog.line(failure);
-    updateFailure = failure;
-  });
   await openMainWindow();
-  if (app.isPackaged) {
-    updateChecks = new DesktopUpdateCheckScheduler(updater);
-    updateChecks.start();
-  }
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   console.error(error);
@@ -601,18 +609,24 @@ async function openMainWindow(): Promise<void> {
     preloadPath: path.join(moduleDirectory, "preload.cjs"),
     rendererUrl: useBuiltRenderer ? undefined : developmentRendererUrl,
     rendererFile: useBuiltRenderer ? path.join(moduleDirectory, "../renderer/index.html") : undefined,
-    sidebarVibrancy: true,
+    sidebarInset: true,
     integratedMenuBar: true,
+    nativeMedia: true,
     beforeLoad: (window) => {
       mainWindow = window;
+      const media = installNativeMediaGuard(window.webContents.session, {
+        getEditor: () => mainWindow?.webContents,
+        getRuntime: () => daemon?.runtime,
+        rendererTarget: useBuiltRenderer
+          ? pathToFileURL(path.join(moduleDirectory, "../renderer/index.html")).href
+          : new URL(developmentRendererUrl).href,
+      });
       window.webContents.on("console-message", (details) => {
         for (const line of rendererConsoleLines(details)) mainLog.line(line);
       });
       window.on("show", () => {
         webGamePlayers.synchronize();
-        updateChecks?.onFocus();
       });
-      window.on("focus", () => updateChecks?.onFocus());
       window.on("hide", () => webGamePlayers.synchronize());
       window.on("minimize", () => webGamePlayers.synchronize());
       window.on("restore", () => webGamePlayers.synchronize());
@@ -622,17 +636,15 @@ async function openMainWindow(): Promise<void> {
         (id, error) => { if (!window.isDestroyed()) window.webContents.send("ohmygame:cancel-close", id, error); },
       );
       rendererClose = close;
-      let allowClose = false;
       window.on("close", (event) => {
-        if (quitting || allowClose) return;
+        if (quitting) return;
         event.preventDefault();
-        void close.request().then(() => {
-          if (quitPending || quitting || allowClose || window.isDestroyed()) return;
-          allowClose = true;
-          window.close();
-        }).catch(() => {});
+        // Reuse before-quit's save, cleanup and retry gate instead of closing
+        // the renderer before its daemon has finished shutting down.
+        if (!quitPending) app.quit();
       });
       window.once("closed", () => {
+        media.close();
         if (mainWindow === window) { mainWindow = undefined; rendererClose = undefined; }
         webGamePlayers.close();
         for (const playtest of playtestWindows.values()) {
@@ -646,21 +658,12 @@ async function openMainWindow(): Promise<void> {
   });
 }
 
-async function packagedEnvironment(): Promise<NodeJS.ProcessEnv> {
+function desktopEnvironment(): NodeJS.ProcessEnv {
   const environment = { ...process.env };
   // esbuild spawns a native binary, which cannot run from inside app.asar.
-  environment.ESBUILD_BINARY_PATH ??= packagedEsbuildBinary();
-  if (!environment.CLOUD_API_URL && !environment.PUBLISH_API_URL) {
-    const config = JSON.parse(readFileSync(path.join(process.resourcesPath, "desktop-config.json"), "utf8")) as {
-      cloudApiUrl?: unknown;
-      publishApiUrl?: unknown;
-    };
-    const cloudApiUrl = typeof config.cloudApiUrl === "string" && config.cloudApiUrl
-      ? config.cloudApiUrl
-      : typeof config.publishApiUrl === "string" && config.publishApiUrl ? config.publishApiUrl : undefined;
-    if (cloudApiUrl) {
-      environment.CLOUD_API_URL = cloudApiUrl;
-    }
+  if (app.isPackaged) environment.ESBUILD_BINARY_PATH ??= packagedEsbuildBinary();
+  for (const name of Object.keys(environment)) {
+    if (/^(?:CLOUD_API_URL|PUBLISH_API_URL|DESKTOP_UPDATE_URL|SENTRY_.+|VITE_(?:POSTHOG|SUPABASE)_.+)$/i.test(name)) delete environment[name];
   }
   return environment;
 }

@@ -1,3 +1,4 @@
+import { isMeshyProviderConfiguration } from "../shared/disabled-media-providers.js";
 import { usesModel3DPresets } from "../shared/model3d-presets.js";
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { createPortal } from "react-dom";
@@ -66,6 +67,7 @@ export function CustomProviderForm({ settings, initialProvider, initialFocus = "
   const [truncated, setTruncated] = useState(false);
   const [fetchedCount, setFetchedCount] = useState<number>();
   const [discoverySource, setDiscoverySource] = useState<"provider" | "presets">("provider");
+  const unavailable = isMeshyProviderConfiguration({ ...form, id: settings?.id });
   const usesPresets = usesModel3DPresets(form.baseUrl, form.preset);
   const [manualOpen, setManualOpen] = useState(false);
   const [manual, setManual] = useState<CustomProviderModel>(() => emptyModel(form));
@@ -115,6 +117,7 @@ export function CustomProviderForm({ settings, initialProvider, initialFocus = "
   }
 
   async function fetchModels(): Promise<void> {
+    if (unavailable) { setDiscoveryError(t("modelUsage.meshyUnavailable")); return; }
     if (!endpointInput.current?.reportValidity() || (keyInput.current && !keyInput.current.reportValidity())) return;
     cancelDiscovery();
     const controller = new AbortController();
@@ -162,6 +165,7 @@ export function CustomProviderForm({ settings, initialProvider, initialFocus = "
 
   async function submit(event: FormEvent): Promise<void> {
     event.preventDefault();
+    if (unavailable) { setError(t("modelUsage.meshyUnavailable")); return; }
     if (savingRef.current) return;
     if (!nameInput.current?.reportValidity() || !endpointInput.current?.reportValidity() || (keyInput.current && !keyInput.current.reportValidity())) return;
     for (const row of rows) {
@@ -203,6 +207,7 @@ export function CustomProviderForm({ settings, initialProvider, initialFocus = "
       {modal ? <header><h2 id={titleId}>{settings ? t("customProvider.edit") : initialProvider ? t("customProvider.connect", { name: initialProvider.name }) : t("providers.add")}</h2><button type="button" disabled={saving} aria-label={t("common.close")} onClick={onClose}><X size={16} /></button></header> : null}
       <form noValidate onSubmit={(event) => void submit(event)}>
         <div className="custom-provider-dialog-body">
+          {unavailable ? <p role="status">{t("modelUsage.meshyUnavailable")}</p> : null}
           <fieldset className="project-settings-section" disabled={saving}>
             <label><span>{t("models.displayName")}</span><input ref={nameInput} value={form.name} onChange={(event) => field("name", event.target.value)} placeholder={t("customProvider.namePlaceholder")} maxLength={100} required autoComplete="off" /></label>
             <label><span>{t("providers.baseUrl")}</span><input ref={endpointInput} type="url" value={form.baseUrl} onChange={(event) => field("baseUrl", event.target.value)} placeholder="https://api.example.com/v1" required autoComplete="off" spellCheck={false} /><small>{t("customProvider.baseUrlHint")}</small></label>
@@ -215,7 +220,7 @@ export function CustomProviderForm({ settings, initialProvider, initialFocus = "
           <section className="custom-provider-model-picker" aria-label={t("customProvider.modelSettings")}>
             <div className="custom-provider-model-heading">
               <h3>{t("models.title")} <small>{t("customProvider.enabledCount", { count: enabledCount })}</small></h3>
-              <button ref={fetchButton} className="settings-secondary-button" type="button" disabled={saving || fetching} onClick={() => void fetchModels()}>{fetching ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />}{fetching ? usesPresets ? t("common.loading") : t("customProvider.fetching") : usesPresets ? t("customProvider.loadPresets") : t("customProvider.fetch")}</button>
+              <button ref={fetchButton} className="settings-secondary-button" type="button" disabled={saving || fetching || unavailable} onClick={() => void fetchModels()}>{fetching ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />}{fetching ? usesPresets ? t("common.loading") : t("customProvider.fetching") : usesPresets ? t("customProvider.loadPresets") : t("customProvider.fetch")}</button>
             </div>
             {discoveryWarnings.map((warning) => <p className="custom-provider-hint" role="status" key={warning}>{warning}</p>)}
             {discoveryError ? <p className="project-settings-error" role="alert">{discoveryError}</p> : null}
@@ -247,7 +252,7 @@ export function CustomProviderForm({ settings, initialProvider, initialFocus = "
           </section>
           {error ? <p className="project-settings-error" role="alert">{error}</p> : null}
         </div>
-        <footer><button type="button" disabled={saving} onClick={onClose}>{t("common.cancel")}</button><button className="project-settings-submit" type="submit" disabled={saving}>{saving ? <LoaderCircle className="spin" size={14} /> : null}{saving ? t("common.saving") : settings ? t("common.saveChanges") : initialProvider ? t("providers.action.connect") : t("providers.add")}</button></footer>
+        <footer><button type="button" disabled={saving} onClick={onClose}>{t("common.cancel")}</button><button className="project-settings-submit" type="submit" disabled={saving || unavailable}>{saving ? <LoaderCircle className="spin" size={14} /> : null}{saving ? t("common.saving") : settings ? t("common.saveChanges") : initialProvider ? t("providers.action.connect") : t("providers.add")}</button></footer>
       </form>
     </section>;
   return modal ? createPortal(<div className="project-settings-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !savingRef.current) onClose(); }}>{content}</div>, document.body) : content;

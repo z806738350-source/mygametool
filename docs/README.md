@@ -1,5 +1,22 @@
 # Documentation
 
+Optional VM backend: [project storage lifecycle, recovery and activation](isolated-storage-lifecycle.md).
+
+For this modified checkout, read [local security policy](local-security.md)
+first. Accounts, author Cloud services, telemetry, updates and arbitrary
+execution are disabled; environment variables cannot restore them. The guides
+below retain upstream framework contracts and do not establish that a disabled
+workflow is available or that runtime verification has passed.
+
+The [controlled Codex and first-stage Qoder connections](coding-agents.md)
+document the optional local main-agent paths and their verification limits.
+
+The [current Kunpo adapter scope](kunpo-local.md) records the model lists,
+project defaults, simulated verification and remaining real-provider checks.
+
+Source launcher instructions and human checks are in [manual acceptance](manual-acceptance.md);
+[pre-acceptance results](pre-acceptance-check.md) supersede the earlier selected-test counts.
+
 Start with [CONTRIBUTING.md](../CONTRIBUTING.md) for your first contribution.
 The [中文快速指引](contributing.zh-CN.md) summarizes the same workflow in Chinese.
 [maintaining.md](maintaining.md) covers triage, review, the `dev`/`main` transition,
@@ -15,15 +32,15 @@ desktop lifecycle and native game windows; shared modules define contracts.
 | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | Agent, chat, and model requests  | `src/daemon/agent.ts`, `src/daemon/pi-agent.ts`, `src/daemon/session-images.ts`, `src/renderer/agent-timeline.tsx`                            | [Runtime](runtime.md), [agent errors](agent-errors.md), [image history](model-image-history.md)                         | `test/agent.test.ts`, `test/agent-errors.test.ts`, `test/session-images.test.ts`                                                    |
 | Design and Asset Canvas          | `src/daemon/canvas-workspace.ts`, `src/daemon/canvas-routes.ts`, `src/renderer/canvas-workspace.tsx`, `src/shared/canvas-workspace.ts`        | [Canvas file contract](canvas-agent.md)                                                                                 | `test/canvas-api.test.ts`, `test/asset-canvas-document.test.ts`, `test/canvas-table.test.ts`                                        |
-| Preview and game use             | `src/daemon/preview.ts`, `src/daemon/preview-proxy.ts`, `src/desktop/web-game-player.ts`, `src/desktop/playtest-driver.ts`                    | [Preview lifecycle](preview-runtime.md), [service recovery](runtime-recovery.md), [game use](runtime.md#agent-game-use) | `test/preview.test.ts`, `test/web-game-player.test.ts`, `test/playtest-driver.test.ts`                                              |
-| Coding agents (Claude Code, Codex, OpenCode) | `src/daemon/agent-runtimes/`, `src/renderer/coding-agents-settings.tsx`, `src/renderer/approval-card.tsx`, `src/shared/agent-runtimes.ts` | [Coding agents](coding-agents.md)                                                                                         | `test/agent-runtime-session.test.ts`, `test/agent-runtime-drivers.test.ts`, `test/agent-runtime-routes.test.ts`                    |
+| Preview and game use             | `src/daemon/preview.ts`, `src/daemon/preview-proxy.ts`, `src/daemon/checked-media-snapshot.ts`, `src/daemon/media-snapshot-response.ts`, `src/desktop/native-media.ts`, `src/shared/native-media.ts`, `src/desktop/web-game-player.ts`, `src/desktop/playtest-driver.ts` | [Preview lifecycle and checked media](preview-runtime.md), [service recovery](runtime-recovery.md), [game use](runtime.md#agent-game-use) | `test/preview.test.ts`, `test/preview-static.test.ts`, `test/checked-media-snapshot.test.ts`, `test/native-media.test.ts`, `test/web-game-player.test.ts`, `test/playtest-driver.test.ts` |
+| Coding agents (controlled Codex/Qoder locally) | `src/daemon/agent-runtimes/`, `src/renderer/coding-agents-settings.tsx`, `src/renderer/approval-card.tsx`, `src/shared/agent-runtimes.ts` | [Coding agents](coding-agents.md)                                                                                         | `test/agent-runtime-session.test.ts`, `test/agent-runtime-drivers.test.ts`, `test/agent-runtime-routes.test.ts`                    |
 | External agents (OhMyGame as an MCP server) | `src/daemon/external-mcp.ts`, `src/daemon/external-agent-clients.ts`, `src/desktop/external-mcp-launcher.ts`, `src/renderer/external-agents-settings.tsx` | [External agents](external-agents.md) | `test/external-mcp.test.ts`, `test/external-mcp-launcher.test.ts`, `test/external-agent-clients.test.ts` |
 | Providers and media              | `src/daemon/provider-model-settings.ts`, `src/daemon/provider-models3d.ts`, `src/daemon/cloud-models.ts`, `src/renderer/provider-models.tsx`  | [Custom models](custom-models.md), [3D workflows](3d-providers.md), [free cloud models](free-cloud-models.md)           | `test/provider-model-settings.test.ts`, `test/model3d-workflows.test.ts`, `test/cloud-models.test.ts`                               |
 | Audio providers                  | `src/shared/audio.ts`, `src/daemon/audio-generation.ts`, `src/daemon/volcengine-tts-provider.ts`, `src/daemon/volcengine-seed-audio-provider.ts`, `src/daemon/canvas-workspace.ts` | [Audio providers](audio-providers.md) | `test/volcengine-tts-provider.test.ts`, `test/volcengine-tts-settings.test.ts`, `test/volcengine-seed-audio-provider.test.ts`, `test/volcengine-seed-audio-settings.test.ts`, `test/tools.test.ts`, `test/game-design.test.ts` |
 | Interactive Stories              | `src/shared/playable-*.ts`, `src/story-web/`, `src/daemon/story-web-project.ts`, `src/daemon/playable-project.ts`, `src/renderer/playable-editor-workspace.tsx` | [Playable Nodes](playable-nodes/README.md)                                                                              | `test/playable-graph.test.ts`, `test/playable-runtime.test.ts`, `test/story-web-project.test.ts`                                     |
 | Plugins, Skills, and MCP         | `src/daemon/plugin-capabilities.ts`, `src/daemon/plugin-runtime.ts`, `src/daemon/plugin-authoring.ts`, `src/renderer/plugins.tsx`, `plugins/` | [Plugin package and runtime contract](plugins.md)                                                                       | `test/plugin-capabilities.test.ts`, `test/plugin-builder.test.ts`, `test/bundled-plugins.test.ts`                                   |
 | Desktop lifecycle and updates    | `src/desktop/main.ts`, `src/desktop/daemon-supervisor.ts`, `src/desktop/updater.ts`, `src/desktop/update-check-scheduler.ts`, `src/renderer/changelog-panel.tsx`, `src/shared/changelog.ts`                                                           | [Runtime](runtime.md), [service recovery](runtime-recovery.md), [desktop releases](desktop-releases.md)                 | `test/daemon-supervisor.test.ts`, `test/desktop-updater.test.ts`, `test/desktop-update-scheduler.test.ts`, `test/desktop-runtime-packaging.test.ts`, `test/desktop-release-notes.test.ts`, `test/changelog-panel.test.tsx`                          |
-| Publishing and Community         | `src/daemon/publish/`, `src/shared/publish-v1.ts`, `src/renderer/publish-dialog.tsx`                                                          | [Cloud integration](../CONTRIBUTING.md#cloud-integration), [runtime publishing](runtime.md#publishing)                  | `test/publish-client.test.ts`, `test/publish-dialog.test.tsx`; remote contracts in `test/publish.test.ts` need private cloud access |
+| Publishing and Community (disabled locally) | `src/daemon/publish/`, `src/shared/publish-v1.ts`, `src/renderer/publish-dialog.tsx`                                                   | [Local security policy](local-security.md), [upstream runtime publishing](runtime.md#publishing)                       | `test/publish-client.test.ts`, `test/publish-dialog.test.tsx`; private remote contracts do not verify this edition |
 | Shared UI and project navigation | `src/renderer/app.tsx`, `src/renderer/projects.tsx`, `src/renderer/project-shell.tsx`, `src/renderer/styles.css`                              | [Local setup](../CONTRIBUTING.md#start-local-development), [project navigation](runtime.md#project-navigation)            | `test/projects-page.test.ts`, `test/project-card.test.ts`, `test/project-types.test.ts`                                             |
 | Project export and import       | `src/daemon/project-archive.ts`, `src/daemon/archive-extraction.ts`, `src/shared/project-archive.ts`, `src/renderer/project-card.tsx`, `src/renderer/projects.tsx` | [Project archives](project-archives.md) | `test/project-archive.test.ts`, `test/project-archive-assets.test.ts`, `test/project-archive-ui.test.tsx` |
 | First-run setup                  | `src/renderer/onboarding.tsx`, `src/renderer/onboarding-demo.tsx`, `src/renderer/use-onboarding.ts`, `src/renderer/use-model-provider-auth.ts`, `src/renderer/custom-provider-dialog.tsx`, `src/daemon/onboarding.ts`       | [First run](../README.md#first-run), [setup state](runtime.md#first-run-setup)                                             | `test/onboarding.test.ts`, `test/onboarding-renderer.test.tsx`                                                                         |
@@ -54,6 +71,7 @@ and how an import becomes a new project.
 
 | Document                                         | Purpose                                                                                                                        |
 | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| [local-security.md](local-security.md)             | Current local edition restrictions, network/execution boundaries, and pending verification; takes precedence over upstream feature guides. |
 | [runtime.md](runtime.md)                         | Process boundaries, toolchains, proxies, trust boundary, game use, persistence, and publishing.                                |
 | [agent-runtimes.md](agent-runtimes.md) | Native runtime architecture, accepted design decisions, delivery status, and validation boundaries. |
 | [preview-runtime.md](preview-runtime.md)         | Startup modes, dependency installation, leases, browser storage, and diagnostics.                                              |
@@ -64,12 +82,12 @@ and how an import becomes a new project.
 | [plugins.md](plugins.md)                         | Plugin packages, configuration, credentials, MCP sessions, authoring, and migration.                                           |
 | [custom-models.md](custom-models.md)             | Provider protocols, capabilities, visibility, model definitions, and defaults.                                                 |
 | [3d-providers.md](3d-providers.md)               | 3D operations, provider compatibility, paid-task recovery, and GLB validation.                                                 |
-| [free-cloud-models.md](free-cloud-models.md)     | Account models, personal quotas, and the desktop/cloud contract. Cloud deployment sections need access to the private service. |
+| [free-cloud-models.md](free-cloud-models.md)     | Upstream account/quota contract; these services are disabled in the local edition. |
 | [agent-errors.md](agent-errors.md)               | Error classification, diagnostics, redaction, and the Pi compatibility patch.                                                  |
 | [model-image-history.md](model-image-history.md) | Request image budgets, recall, OpenAI continuation, and file lifecycle.                                                        |
 | [desktop-releases.md](desktop-releases.md)       | Maintainer packaging, signing, update feeds, publishing, and rollback.                                                         |
 | [ui-languages.md](ui-languages.md)               | Renderer translations, language selection, what stays in English, and terminology.                                             |
-| [diagnostics.md](diagnostics.md)                 | Desktop log files, redaction, rotation, and the diagnostics export for bug reports.                                            |
+| [diagnostics.md](diagnostics.md)                 | Desktop log files, passive provider request monitoring, redaction, rotation, and diagnostics export.                         |
 
 [Video trimming](video-trimming.md) covers Library and Asset Canvas video
 trimming, the shared preview controls, encoding, and the Library record.
@@ -86,7 +104,7 @@ trimming, the shared preview controls, encoding, and the Library record.
 | -------------------------------------------------- | ---------------------------------------------------------------------------------- |
 | [README.md](../README.md)                          | Product overview, installation, and first-run instructions.                        |
 | [CHANGELOG.md](../CHANGELOG.md)                    | User-visible changes collected during release preparation.                        |
-| [CONTRIBUTING.md](../CONTRIBUTING.md)              | Setup, branches, verification, PRs, and optional integrations.                     |
+| [CONTRIBUTING.md](../CONTRIBUTING.md)              | Script-free dependency setup, local verification gates, branches, and PRs.        |
 | [中文快速指引](contributing.zh-CN.md)              | A short Chinese entry point; the full contribution rules are in `CONTRIBUTING.md`. |
 | [maintaining.md](maintaining.md)                   | Maintainer triage, reviews, repository settings, and releases.                     |
 | [AGENTS.md](../AGENTS.md)                          | Repository instructions for coding agents.                                         |

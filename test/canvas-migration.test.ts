@@ -6,13 +6,31 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { AssetLibrary } from "../src/daemon/asset-library.js";
 import { checkCanvasWorkspace } from "../src/daemon/canvas-check.js";
-import { CanvasStore } from "../src/daemon/canvas-workspace.js";
+import { CanvasStore, ensureCanvasContract } from "../src/daemon/canvas-workspace.js";
 import { ProjectManager } from "../src/daemon/projects.js";
 import { ToolRunner } from "../src/daemon/tools.js";
 
 const directories: string[] = [];
 afterEach(async () => { await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))); });
 describe("offline canvas migration", () => {
+  it("updates the previous generated Canvas guide while preserving customized instructions", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-canvas-guide-"));
+    directories.push(directory);
+    await mkdir(path.join(directory, "canvas"));
+    await ensureCanvasContract(directory);
+    const file = path.join(directory, "canvas/AGENTS.md");
+    const current = await readFile(file, "utf8");
+    const previous = current.replace(/Before submitting new project media,[^\n]+?outside the board\./, "After each media result is saved, register its path in assets.json and add or update its board node before the next long-running step. Do not defer board writes until the final response.");
+    expect(previous).not.toBe(current);
+    await writeFile(file, previous);
+    await ensureCanvasContract(directory);
+    expect(await readFile(file, "utf8")).toBe(current);
+    const custom = previous + "\nUse the team's original art.";
+    await writeFile(file, custom);
+    await ensureCanvasContract(directory);
+    expect(await readFile(file, "utf8")).toBe(custom);
+  });
+
   it("backs up old files, preserves IDs/content/media/layout and is repeatable", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-design-migration-")); directories.push(directory);
     const library = new AssetLibrary(directory), projects = new ProjectManager(directory, library);
@@ -43,7 +61,10 @@ describe("offline canvas migration", () => {
     await writeFile(path.join(assetCanvas.workspacePath, "editor/layout.json"), JSON.stringify(old.editorLayout));
     await writeFile(path.join(assetCanvas.workspacePath, "AGENTS.md"), "My custom instructions. Read canvas.json and editor/layout.json.");
     await store.close();
-    const migrate = () => promisify(execFile)(process.execPath, ["--no-env-file", path.resolve("scripts/migrate-canvas-workspaces.ts"), directory]);
+    const args = process.versions.bun ? ["--no-env-file"] : ["--import", "tsx"];
+    const migrate = () => promisify(execFile)(process.execPath, [...args, path.resolve("scripts/migrate-canvas-workspaces.ts"), directory], {
+      env: { HOME: directory, TMPDIR: tmpdir(), PATH: path.dirname(process.execPath), PI_OFFLINE: "1" },
+    });
     await migrate();
     expect((await store.board(project.id, boardId)).board.nodes[0]).toMatchObject({ id: "reference", position: { x: 320, y: 120 } });
     const assets = (await store.workspace(project.id)).assets;

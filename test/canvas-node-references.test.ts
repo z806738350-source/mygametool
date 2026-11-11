@@ -21,6 +21,26 @@ function canvas(nodes: AssetCanvasNode[]) {
 }
 
 describe("Text and Document node references", () => {
+  it("pins adopted voice assets through source changes, deletion and duplication", () => {
+    const digest = "a".repeat(64);
+    const voice = { id: "voice", type: "voice" as const, position, data: { description: "Warm", sampleText: "Hello", assetId: "new", selectedAssetId: "old", selectedSha256: digest } };
+    const speech = { id: "speech", type: "speech" as const, position, data: { text: "Hello", referenceAssetId: "old", referenceSha256: digest, voiceSourceNodeId: "voice" } };
+    expect(connectionRelation({ ...voice, data: { ...voice.data, voiceDescription: "Warm" } }, { ...speech, data: { text: "Hello" } }, "out", [], [], [])).toBe("voice-reference");
+    expect(connectionRelation({ ...voice, data: { voiceDescription: "Warm", sampleText: "Hello" } }, speech, "out", [], [], [])).toBeUndefined();
+    expect(connectionRelation({ ...voice, data: { voiceDescription: "Warm", sampleText: "Hello", assetId: "candidate" } }, { ...speech, data: { text: "Hello" } }, "out", [], [], [])).toBe("voice-reference");
+    expect(connectionRelation(speech, { ...voice, data: { voiceDescription: "Warm", sampleText: "Hello" } }, "out", [], [], [])).toBeUndefined();
+
+    const removed = removeNodesAndReferences([voice, speech], new Set([voice.id]));
+    expect(removed[0]!.data).toMatchObject({ referenceAssetId: "old", referenceSha256: digest });
+    expect(removed[0]!.data.voiceSourceNodeId).toBeUndefined();
+    let sequence = 0;
+    const copied = duplicateCanvasSelection([voice, speech], [], { x: 100, y: 100 }, () => "copy-" + ++sequence);
+    expect(copied.nodes[1]!.data).toMatchObject({ voiceSourceNodeId: "copy-1", referenceAssetId: "old", referenceSha256: digest });
+    expect(isAssetCanvasDocument(canvas(copied.nodes))).toBe(true);
+    const alone = duplicateCanvasSelection([speech], [], position).nodes[0]!;
+    expect(alone.data).toMatchObject({ referenceAssetId: "old", referenceSha256: digest });
+    expect("voiceSourceNodeId" in alone.data).toBe(false);
+  });
   it("saves multiple reference kinds and still accepts nodes without references", () => {
     expect(isAssetCanvasDocument(canvas([source, document, image, text]))).toBe(true);
     expect(isAssetCanvasDocument(canvas([source]))).toBe(true);

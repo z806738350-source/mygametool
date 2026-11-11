@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/daemon/app.js";
+import { isolatedPreviewFixture } from "./isolated-preview-fixture.js";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); vi.unstubAllEnvs(); });
@@ -26,7 +27,7 @@ describe("player preview startup", () => {
     await save(true);
     expect((await app.inject(`/projects/${project.id}`)).json().preview).toMatchObject({ status: "stopped", stopReason: "manual" });
   });
-  it("keeps health, files, and other projects available after a missing-manager failure", async () => {
+  it("keeps health, files, and other projects available after a refused host-script preview", async () => {
     const dataDirectory = await mkdtemp(path.join(tmpdir(), "ohmygame-preview-isolation-"));
     const app = createApp({ dataDirectory });
     cleanups.push(async () => { await app.close(); await rm(dataDirectory, { recursive: true, force: true }); });
@@ -37,16 +38,17 @@ describe("player preview startup", () => {
     vi.stubEnv("PATH", dataDirectory);
     const failed = await app.inject({ method: "POST", url: `/projects/${project.id}/preview` });
     expect(failed.statusCode).toBe(503);
-    expect(failed.json().error).toContain("bun was not found");
+    expect(failed.json().error).toContain("temporarily unavailable");
     expect((await app.inject("/health")).statusCode).toBe(200);
     expect((await app.inject("/projects")).statusCode).toBe(200);
     expect((await app.inject(`/projects/${project.id}/files`)).statusCode).toBe(200);
     expect((await app.inject({ method: "POST", url: "/projects", payload: { name: "Another project" } })).statusCode).toBe(201);
     expect((await app.inject(`/projects/${project.id}`)).json().preview.status).toBe("error");
   });
-  it("reuses a development server for concurrent opens without changing its URL or process", async () => {
+  it("reuses an isolated development transport for concurrent opens and restarts it explicitly", async () => {
     const dataDirectory = await mkdtemp(path.join(tmpdir(), "ohmygame-player-preview-"));
-    const app = createApp({ dataDirectory });
+    const guest = await isolatedPreviewFixture("game");
+    const app = createApp({ dataDirectory, projectExecution: guest.execution });
     cleanups.push(async () => { await app.close(); await rm(dataDirectory, { recursive: true, force: true }); });
     const project = (await app.inject({ method: "POST", url: "/projects", payload: { name: "Player test" } })).json();
     await mkdir(path.join(project.workspacePath, "node_modules", ".bin"), { recursive: true });
@@ -63,13 +65,14 @@ describe("player preview startup", () => {
     expect(first.statusCode, first.body).toBe(200);
     expect(first.json().title).toBe("Player test");
     expect(concurrent.json().url).toBe(first.json().url);
-    const pid = await readFile(path.join(project.workspacePath, "server.pid"), "utf8");
+    expect(guest.start).toHaveBeenCalledOnce();
     expect((await open()).json().url).toBe(first.json().url);
-    expect(await readFile(path.join(project.workspacePath, "server.pid"), "utf8")).toBe(pid);
+    expect(guest.start).toHaveBeenCalledOnce();
     expect(await (await fetch(first.json().url)).text()).toBe("game");
     const restart = await app.inject({ method: "POST", url: `/projects/${project.id}/preview` });
     expect(restart.statusCode, restart.body).toBe(200);
-    expect(await readFile(path.join(project.workspacePath, "server.pid"), "utf8")).not.toBe(pid);
+    expect(guest.start).toHaveBeenCalledTimes(2);
+    await expect(readFile(path.join(project.workspacePath, "server.pid"))).rejects.toThrow();
   });
 
   it("rejects missing and empty projects and stories without a page, and serves a web story's page", async () => {

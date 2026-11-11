@@ -1,5 +1,6 @@
 import type { LibraryUploadMediaType } from "../shared/contracts.js";
 import { fileExtension, mediaFileInfo } from "../shared/media-files.js";
+import { isPrivateProjectPath } from "../shared/private-project-paths.js";
 import type { TransferredFile } from "./file-transfer.js";
 
 export type CanvasImportKind =
@@ -25,6 +26,7 @@ export function canvasImportKind(name: string): CanvasImportKind {
 
 /** System files that a dropped folder or archive carries along, which nobody means to import. */
 export function isIgnoredImportPath(relativePath: string): boolean {
+  if (isPrivateProjectPath(relativePath)) return true;
   const parts = relativePath.split(/[\\/]/);
   const name = parts.at(-1) ?? "";
   if (
@@ -55,6 +57,7 @@ export function droppedFolders(transferred: readonly TransferredFile[]): {
   const folders = new Map<string, DroppedFolder>();
   const files: TransferredFile[] = [];
   for (const item of transferred) {
+    if (isIgnoredImportPath(item.relativePath ?? item.file.name)) continue;
     const parts = (item.relativePath ?? "").split("/");
     if (parts.length < 2) {
       files.push(item);

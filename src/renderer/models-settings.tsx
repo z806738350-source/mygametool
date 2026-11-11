@@ -1,5 +1,6 @@
+import { isMeshyEndpoint, isMeshyModelReference, isMeshyProviderConfiguration } from "../shared/disabled-media-providers.js";
 import { ArrowLeft, ChevronDown, ChevronRight, Code2, ExternalLink, LoaderCircle, Pencil, Search, Server, Plus, Plug, RefreshCw, Settings, Trash2, UserRound } from "./icons.js";
-import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import type {
   CustomProviderDetails,
   CustomProviderModel,
@@ -9,7 +10,6 @@ import type {
   ModelProviderSummary,
   ProviderCapability,
   ProviderSummary,
-  VideoModel,
 } from "../shared/contracts.js";
 import {
   getCustomProvider,
@@ -20,42 +20,33 @@ import {
   listImageModelCatalog,
   notifyAgentModelsChanged,
   updateOpenAIEndpointSettings,
-  updateModel3DProviderApiKey,
-  updateMinimaxApiKey,
-  updateSeedanceApiKey,
-  updateVolcengineTtsApiKey,
-  updateVolcengineSeedAudioApiKey,
-  getVolcengineTtsSettings,
-  saveVolcengineTtsDefaultVoiceId,
-  previewVolcengineTtsSpeech,
-  listVideoModelCatalog,
+  clearLegacyMediaKey,
+  listLegacyMediaKeys,
   listAudioModelCatalog,
   loginAgentRuntime,
   recheckCodexImages,
 } from "./api.js";
-import { AUDIO_VOICE_ID_MAX_LENGTH, AUDIO_VOICE_ID_PATTERN, VOLCENGINE_TTS_VOICES, type AudioModel } from "../shared/audio.js";
+import { type AudioModel } from "../shared/audio.js";
 import { PROVIDER_ICONS } from "./provider-icons.js";
 import { CustomProviderDialog, PROVIDER_API_LABELS, type CustomProviderField } from "./custom-provider-dialog.js";
 import { ProviderModels } from "./provider-models.js";
 import { OpenAIImageModels } from "./openai-image-models.js";
 import { ProviderResponsesTransport } from "./responses-transport-settings.js";
 import { Provider3DBalance } from "./provider-3d-balance.js";
-import { MODEL3D_CONNECTION_ID } from "../shared/model3d-operations.js";
 import { GlobalMediaModelDefaults } from "./media-model-defaults.js";
-import { openModelAuthExternal as openExternal, useModelProviderAuth } from "./use-model-provider-auth.js";
+import { openAgentRuntimeAuthExternal, openModelAuthExternal as openExternal, useModelProviderAuth } from "./use-model-provider-auth.js";
 import { SegmentedControl } from "./segmented-control.js";
-import { useAuth } from "./auth.js";
-import { accountCloudState, cloudQuotaSummary, CloudQuotaDetails } from "./cloud-quota.js";
-import { getCloudQuotas, MODELS_CHANGED_EVENT } from "./api.js";
-import { HYPER3D_CONNECTION_ID } from "../shared/cloud-models.js";
-import { isLocalModelProvider, LOCAL_MODEL_PROVIDERS, withLocalModelProviders, type LocalModelProviderId } from "./local-model-providers.js";
+import { LocalEditionNotice } from "./local-edition-notice.js";
+import { cloudQuotaSummary } from "./cloud-quota.js";
+import { MODELS_CHANGED_EVENT } from "./api.js";
+import { isLocalModelProvider, LOCAL_MODEL_PROVIDERS, type LocalModelProviderId } from "./local-model-providers.js";
+import { KUNPO_MODEL_OPTIONS, KUNPO_MODEL_ROLES } from "../shared/kunpo-models.js";
 import { groupProviders } from "./provider-groups.js";
 import { t } from "./i18n.js";
 
 export type ModelsView = { page: "providers" } | { page: "provider"; provider: ProviderSummary };
 
-const SEEDANCE_PROVIDER_IDS = new Set(["volcengine-ark", "byteplus-modelark"]);
-const MINIMAX_PROVIDER_IDS = new Set(["minimax-video-cn", "minimax-video-global"]);
+const LEGACY_MEDIA_PROVIDERS = new Set(["meshy", "tripo", "hyper3d", "volcengine-ark", "byteplus-modelark", "minimax-video-cn", "minimax-video-global"]);
 const PROVIDER_CAPABILITY_FILTERS: Array<{ value: "all" | ProviderCapability; label: string }> = [
   { value: "all", label: t("common.all") },
   { value: "language", label: t("capability.language") },
@@ -79,8 +70,6 @@ export function ModelsSettings({ view, onViewChange, onOpenAgents }: { view: Mod
 }
 
 function ProviderList({ onProvider }: { onProvider: (provider: ProviderSummary) => void }) {
-  const auth = useAuth();
-  const userId = auth.state.status === "signed-in" ? auth.state.user.id : undefined;
   const [providers, setProviders] = useState<ProviderSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
@@ -111,8 +100,9 @@ function ProviderList({ onProvider }: { onProvider: (provider: ProviderSummary) 
     window.addEventListener("focus", load);
     const timer = setInterval(load, 30_000);
     return () => { active = false; clearInterval(timer); window.removeEventListener(MODELS_CHANGED_EVENT, load); window.removeEventListener("focus", load); };
-  }, [userId]);
+  }, []);
   async function toggleProvider(provider: ProviderSummary, enabled: boolean): Promise<void> {
+    if (isMeshyProviderConfiguration(provider)) return;
     setPending((current) => new Set(current).add(provider.id));
     setError(undefined);
     setProviders((current) => current.map((item) => item.id === provider.id ? { ...item, enabled } : item));
@@ -131,16 +121,11 @@ function ProviderList({ onProvider }: { onProvider: (provider: ProviderSummary) 
     if (!provider.custom && isLocalModelProvider(provider)) setAdding(provider.preset);
     else onProvider(provider);
   };
-  const availableProviders = (loading ? providers : withLocalModelProviders(providers)).map((provider) => {
-    if (!provider.managed) return provider;
-    const cloud = accountCloudState(provider.cloud, userId);
-    return { ...provider, cloud, ...(provider.cloud?.userId !== userId || !userId ? { configured: false, status: "not_configured" as const } : {}) };
-  });
+  const availableProviders = providers.filter((provider) => (!isMeshyProviderConfiguration(provider) || provider.configured) && provider.managed !== "free_cloud" && !provider.id.startsWith("cloud-")
+    && !["openai", "volcengine-ark", "volcengine-tts", "volcengine-seed-audio", "tripo"].includes(provider.id));
   const normalizedQuery = query.trim().toLowerCase();
   const visibleProviders = availableProviders.filter((provider) => (
-    // Hyper3D's account and key connections share one settings entry.
-    (provider.id !== HYPER3D_CONNECTION_ID || !availableProviders.some((item) => item.id === "hyper3d"))
-    && (capability === "all" || provider.capabilities.includes(capability))
+    (capability === "all" || provider.capabilities.includes(capability))
     && (!normalizedQuery || [
       provider.name,
       ...(isLocalModelProvider(provider) ? [LOCAL_MODEL_PROVIDERS[provider.preset].name] : []),
@@ -152,7 +137,7 @@ function ProviderList({ onProvider }: { onProvider: (provider: ProviderSummary) 
     connected: connectedProviders, free: freeProviders, popular: popularProviders, local: localProviders, more: moreProviders,
   } = groupProviders(visibleProviders, {
     isConnected: (provider) => provider.status === "connected",
-    isFree: (provider) => provider.managed === "free_cloud" || provider.id === "hyper3d",
+    isFree: () => false,
     isLocal: (provider) => provider.id === "codex-cli" || isLocalModelProvider(provider),
   });
   const filteredProviders = [...connectedProviders, ...freeProviders, ...popularProviders, ...localProviders, ...moreProviders];
@@ -194,6 +179,7 @@ function ProviderList({ onProvider }: { onProvider: (provider: ProviderSummary) 
             {moreOpen ? moreProviders.map((provider) => <ProviderRow {...rowActions} provider={provider} onProvider={openProvider} key={provider.id} />) : null}
           </section>
         ) : null}
+        {!filtering ? <LegacyMediaKeys /> : null}
         {error ? <p className="settings-error" role="alert">{error}</p> : null}
       </div>
     </section>
@@ -212,6 +198,7 @@ function ProviderGroup({ detail, onProvider, providers, title, ...actions }: { d
 }
 
 function ProviderRow({ detail, featured = false, onProvider, provider, onToggle, pending }: { detail?: string; featured?: boolean; onProvider: (provider: ProviderSummary) => void; provider: ProviderSummary } & ProviderRowActions) {
+  const unavailable = isMeshyProviderConfiguration(provider);
   const combined = provider.id === "hyper3d";
   const ActionIcon = combined ? Settings : provider.status === "connecting" ? LoaderCircle : provider.status === "error" ? RefreshCw : provider.configured ? Settings : Plug;
   const actionLabel = combined ? t("providers.manageHyper3d") : t("providers.rowAction", { action: providerAction(provider), name: provider.name });
@@ -221,15 +208,15 @@ function ProviderRow({ detail, featured = false, onProvider, provider, onToggle,
       <span className="settings-provider-copy">
         <strong className="settings-provider-name"><span>{provider.name}</span>{featured ? <small>{t("providers.recommended")}</small> : null}</strong>
         <span className="settings-provider-details">
-          <span className="settings-provider-description">{provider.managed ? cloudQuotaSummary(provider.cloud) : providerDescription(provider)}{detail ? <><i>·</i>{detail}</> : null}</span>
-          <span className="settings-provider-capabilities" aria-label={t("providers.labels", { labels: [...provider.capabilities.map((capability) => PROVIDER_CAPABILITY_LABELS[capability]), ...(provider.custom && !isLocalModelProvider(provider) ? [t("providers.custom")] : [])].join(", ") })}>
+          <span className="settings-provider-description">{unavailable ? t("modelUsage.meshyUnavailable") : provider.managed ? cloudQuotaSummary(provider.cloud) : providerDescription(provider)}{detail ? <><i>·</i>{detail}</> : null}</span>
+          <span className="settings-provider-capabilities" aria-label={t("providers.labels", { labels: [...provider.capabilities.map((capability) => PROVIDER_CAPABILITY_LABELS[capability]), ...(provider.custom && provider.id !== "kunpo" && !isLocalModelProvider(provider) ? [t("providers.custom")] : [])].join(", ") })}>
             {provider.capabilities.map((capability) => <small key={capability}>{PROVIDER_CAPABILITY_LABELS[capability]}</small>)}
-            {provider.custom && !isLocalModelProvider(provider) ? <small>{t("providers.custom")}</small> : null}
+            {provider.custom && provider.id !== "kunpo" && !isLocalModelProvider(provider) ? <small>{t("providers.custom")}</small> : null}
           </span>
         </span>
       </span>
       {combined || provider.configured ? <label className="settings-toggle settings-provider-toggle" title={provider.enabled !== false ? t("common.enabled") : t("common.disabled")}>
-        <input type="checkbox" role="switch" aria-label={t("providers.enableProvider", { name: provider.name })} checked={provider.enabled !== false} disabled={pending.has(provider.id)} onChange={(event) => onToggle(provider, event.target.checked)} /><span aria-hidden="true" />
+        <input type="checkbox" role="switch" aria-label={t("providers.enableProvider", { name: provider.name })} checked={provider.enabled !== false} disabled={pending.has(provider.id) || unavailable} onChange={(event) => onToggle(provider, event.target.checked)} /><span aria-hidden="true" />
       </label> : provider.status === "not_configured" ? null : <em className={`settings-provider-status is-${provider.status}`}>{providerStatus(provider)}</em>}
       <button className="icon-button settings-provider-action" type="button" data-tooltip={actionLabel} aria-label={actionLabel} disabled={provider.status === "connecting" || pending.has(provider.id)} onClick={() => onProvider(provider)}><ActionIcon size={17} className={provider.status === "connecting" ? "spin" : undefined} aria-hidden="true" /></button>
     </div>
@@ -243,19 +230,63 @@ function ProviderMark({ provider }: { provider: Pick<ProviderSummary, "id" | "pr
 }
 
 export function ProviderAuthView({ provider, onBack, onCompleted, onOpenAgents }: { provider: ProviderSummary; onBack: () => void; onCompleted: () => void; onOpenAgents?: () => void }) {
+  if (provider.id === "kunpo") return <KunpoProviderDetail provider={provider} onBack={onBack} onCompleted={onCompleted} />;
   if (provider.id === "codex-cli") return <CodexImageProviderDetail provider={provider} onBack={onBack} onOpenAgents={onOpenAgents} />;
-  if (provider.id === "hyper3d" || provider.id === HYPER3D_CONNECTION_ID) return <Hyper3DProviderDetail provider={provider} onBack={onBack} onRemoved={onCompleted} />;
-  if (provider.managed === "free_cloud") return <FreeCloudProviderDetail provider={provider} onBack={onBack} />;
-  if (provider.custom) return <CustomProviderDetail provider={provider} onBack={onBack} onRemoved={onCompleted} />;
-  if (provider.id === "meshy" || provider.id === "tripo") return <Native3DProviderAuthView provider={provider} onBack={onBack} onCompleted={onCompleted} />;
-  if (SEEDANCE_PROVIDER_IDS.has(provider.id)) return <SeedanceAuthView provider={provider} onBack={onBack} onCompleted={onCompleted} />;
-  if (MINIMAX_PROVIDER_IDS.has(provider.id)) return <MinimaxAuthView provider={provider} onBack={onBack} onCompleted={onCompleted} />;
-  if (provider.id === "volcengine-tts") return <VolcengineTtsAuthView provider={provider} onBack={onBack} onCompleted={onCompleted} />;
-  if (provider.id === "volcengine-seed-audio") return <VolcengineSeedAudioAuthView provider={provider} onBack={onBack} onCompleted={onCompleted} />;
+  if (provider.managed === "free_cloud" || provider.id.startsWith("cloud-")) return <LocalEditionNotice />;
+  if (isMeshyProviderConfiguration(provider)) return <section className="settings-panel settings-provider-detail"><ProviderDetailHeader provider={provider} description={t("modelUsage.meshyUnavailable")} onBack={onBack} /><p role="status">{t("modelUsage.meshyUnavailable")}</p></section>;
+  if (provider.custom) return <CustomProviderDetail key={provider.id} provider={provider} onBack={onBack} onRemoved={onCompleted} />;
+  if (LEGACY_MEDIA_PROVIDERS.has(provider.id)) return (
+    <section className="settings-panel settings-provider-detail">
+      <ProviderDetailHeader provider={provider} description={t("providers.legacyMediaRetired")} onBack={onBack} />
+      <LegacyMediaKeys providerId={provider.id} />
+    </section>
+  );
+  if (provider.id === "volcengine-tts" || provider.id === "volcengine-seed-audio") return (
+    <section className="settings-panel settings-provider-detail">
+      <ProviderDetailHeader provider={provider} description={t(provider.id === "volcengine-tts" ? "providers.audioDescription" : "providers.seedAudioDescription")} onBack={onBack} />
+      <AudioModels providerId={provider.id} />
+    </section>
+  );
+  return <StandardProviderAuth key={provider.id} provider={provider} onBack={onBack} onCompleted={onCompleted} />;
+}
+
+function StandardProviderAuth({ provider, onBack, onCompleted }: { provider: ProviderSummary; onBack: () => void; onCompleted: () => void }) {
   const [method, setMethod] = useState<ModelAuthMethod | undefined>(provider.configured ? undefined : provider.methods.length === 1 ? provider.methods[0]?.type : undefined);
   if (provider.configured || provider.id === "openai") return <ConnectedProvider provider={provider} onBack={onBack} onRemoved={onCompleted} />;
   if (!method) return <AuthMethodChoice provider={provider} onBack={onBack} onChoose={setMethod} />;
   return <ActiveProviderAuth provider={provider} method={method} onBack={onBack} onCompleted={onCompleted} />;
+}
+
+function KunpoProviderDetail({ provider, onBack, onCompleted }: { provider: ProviderSummary; onBack: () => void; onCompleted: () => void }) {
+  const deletion = useProviderDeletion(provider.id, onCompleted);
+  const [connected, setConnected] = useState(provider.configured);
+  const [editing, setEditing] = useState(!provider.configured);
+  return <section className="settings-panel settings-provider-detail">
+    <ProviderDetailHeader provider={{ ...provider, configured: connected }} onBack={onBack}>
+      {connected ? <ProviderDeleteButton deletion={deletion} disabled={editing} /> : null}
+      <ProviderEnableControl provider={provider} disabled={editing} />
+    </ProviderDetailHeader>
+    <ProviderDeleteConfirmation provider={{ ...provider, custom: false }} deletion={deletion} disabled={editing} />
+    <section className="settings-detail-section" aria-label={t("providers.connection.title")}>
+      <div className="settings-provider-connection">
+        <div className="settings-provider-setting-row">
+          <span className="settings-search-field-label">{t("providers.apiKey")}</span>
+          <span className="settings-provider-setting-value">{connected ? "••••••••" : t("providers.status.notConfigured")}</span>
+          <button className="icon-button settings-provider-setting-edit" type="button" aria-label={t("providers.editApiKey")} disabled={editing} onClick={() => setEditing(true)}><Pencil size={15} aria-hidden="true" /></button>
+        </div>
+        {editing ? <div className="settings-provider-setting-editor"><ActiveProviderAuth provider={provider} method="api_key" inline onBack={() => setEditing(false)} onCompleted={() => { setEditing(false); setConnected(true); onCompleted(); }} /></div> : null}
+      </div>
+    </section>
+    {KUNPO_MODEL_ROLES.map((role) => <section className="settings-detail-section provider-models" key={role} aria-label={t(`kunpoModels.roles.${role}`)}>
+      <div className="provider-models-heading"><h4>{t(`kunpoModels.roles.${role}`)}</h4></div>
+      <div className="provider-models-list" role="list" aria-label={t(`kunpoModels.roles.${role}`)}>
+        {KUNPO_MODEL_OPTIONS.filter((model) => model.role === role).map((model) => <div className="provider-model-row" role="listitem" key={`${model.provider}/${model.id}`} aria-disabled={model.status === "pending"} title={model.status === "pending" ? t("kunpoModels.pendingHelp") : role === "speech" ? t("kunpoModels.speechHelp") : role === "music" ? t("kunpoModels.musicHelp") : t("kunpoModels.unverifiedHelp")}>
+          <div className="provider-model-readonly"><span className="provider-model-copy"><strong>{model.name}</strong></span></div>
+          {model.status === "pending" ? <small className="provider-model-custom">{t("kunpoModels.status.pending")}</small> : null}
+        </div>)}
+      </div>
+    </section>)}
+  </section>;
 }
 
 function CodexImageProviderDetail({ provider, onBack, onOpenAgents }: { provider: ProviderSummary; onBack: () => void; onOpenAgents?: () => void }) {
@@ -280,7 +311,7 @@ function CodexImageProviderDetail({ provider, onBack, onOpenAgents }: { provider
     setBusy(true); setError(undefined); setCommand(undefined);
     try {
       const result = await loginAgentRuntime("codex-cli");
-      if (result.url) await openExternal(result.url);
+      if (result.url) await openAgentRuntimeAuthExternal(result.url, "codex-cli");
       if (result.command) setCommand(result.command);
     } catch (cause) { setError(errorMessage(cause)); }
     finally { setBusy(false); }
@@ -305,420 +336,36 @@ function CodexImageProviderDetail({ provider, onBack, onOpenAgents }: { provider
   </section>;
 }
 
-function Hyper3DProviderDetail({ provider, onBack, onRemoved }: { provider: ProviderSummary; onBack: () => void; onRemoved: () => void }) {
-  const auth = useAuth();
-  const userId = auth.state.status === "signed-in" ? auth.state.user.id : undefined;
-  const [providers, setProviders] = useState([provider]);
+function LegacyMediaKeys({ providerId }: { providerId?: string }) {
+  const [keys, setKeys] = useState<Array<{ id: string; name: string }>>([]);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
-  const [refreshing, setRefreshing] = useState(false);
-  const [modelsRevision, setModelsRevision] = useState(0);
-  const [savingKey, setSavingKey] = useState(false);
-  const deletion = useProviderDeletion("hyper3d", onRemoved);
-  const refreshRef = useRef<(force?: boolean) => Promise<void>>(async () => {});
-  useEffect(() => {
-    let active = true, sequence = 0;
-    const load = async (force = false) => {
-      const revision = ++sequence;
-      setRefreshing(true);
-      try {
-        if (force) await getCloudQuotas?.();
-        const loaded = await listProviders();
-        if (active && revision === sequence) { setProviders(loaded); setError(undefined); if (force) setModelsRevision((value) => value + 1); }
-      } catch (cause) { if (active && revision === sequence) setError(errorMessage(cause)); }
-      finally { if (active && revision === sequence) setRefreshing(false); }
-    };
-    refreshRef.current = load;
-    const refresh = () => { void load(); };
-    refresh();
-    window.addEventListener("focus", refresh);
-    window.addEventListener(MODELS_CHANGED_EVENT, refresh);
-    const timer = setInterval(refresh, 30_000);
-    return () => { active = false; clearInterval(timer); window.removeEventListener("focus", refresh); window.removeEventListener(MODELS_CHANGED_EVENT, refresh); };
-  }, [userId]);
-  const keyProvider = providers.find((item) => item.id === "hyper3d");
-  const account = providers.find((item) => item.id === HYPER3D_CONNECTION_ID);
-  const current = keyProvider ?? { ...provider, id: "hyper3d", name: "Hyper3D" };
-  return <section className="settings-panel settings-provider-detail">
-    <ProviderDetailHeader provider={current} description={t("providers.hyper3d.description")} onBack={onBack}>
-      {keyProvider?.configured ? <ProviderDeleteButton deletion={deletion} disabled={savingKey} label={t("providers.delete.removeKey")} /> : null}
-      <ProviderEnableControl provider={current} disabled={deletion.busy || savingKey} onChanged={() => void refreshRef.current()} />
-    </ProviderDetailHeader>
-    <ProviderDeleteConfirmation provider={keyProvider ?? current} deletion={deletion} disabled={savingKey} />
-    <FreeCloudAccount provider={account} refreshing={refreshing} onRefresh={() => void refreshRef.current(true)} />
-    {keyProvider ? <Native3DProviderKeyForm key={String(keyProvider.configured)} provider={keyProvider} deletion={deletion} onSavingChange={setSavingKey} /> : null}
-    {error ? <p className="settings-error" role="alert">{error}</p> : null}
-    <ProviderModels key={`${userId}-${keyProvider?.configured}-${modelsRevision}`} providerId="hyper3d" additionalProviderId={account?.id}
-      sourceLabels={{ hyper3d: keyProvider?.configured ? t("providers.hyper3d.yourKey") : t("providers.hyper3d.keyRequired"), [HYPER3D_CONNECTION_ID]: t("providers.hyper3d.freeAccount") }} />
-  </section>;
-}
-
-function FreeCloudAccount({ provider, refreshing, onRefresh }: { provider?: ProviderSummary; refreshing: boolean; onRefresh: () => void }) {
-  const auth = useAuth();
-  const userId = auth.state.status === "signed-in" ? auth.state.user.id : undefined;
-  const cloud = accountCloudState(provider?.cloud, userId);
-  const needsSignIn = !userId || cloud?.availability === "sign_in_required";
-  const quota = cloud?.quota;
-  return <>
-    <div className="settings-provider-connection">
-      <div className="settings-provider-setting-row settings-provider-auth-row">
-        <span className="settings-search-field-label">{t("providers.account")}</span>
-        <span className="settings-provider-setting-value" title={auth.state.status === "signed-in" ? auth.state.user.email : undefined}>{auth.state.status === "signed-in" ? auth.state.user.email ?? auth.state.user.name : t("providers.ohMyGameAccount")}</span>
-        {needsSignIn ? <button type="button" className="settings-add-button" onClick={auth.openSignIn}>{t("common.signIn")}</button> : null}
-      </div>
-    </div>
-    <section className="settings-detail-section provider-models" aria-label={t("providers.quota.title")}>
-      <div className="provider-models-heading">
-        <h4>{t("providers.quota.title")}</h4>
-        {userId ? <button type="button" className="icon-button settings-provider-setting-edit" disabled={refreshing} onClick={onRefresh} aria-label={t("providers.quota.refresh")} data-tooltip={t("providers.quota.refresh")}><RefreshCw size={15} className={refreshing ? "spin" : undefined} aria-hidden="true" /></button> : null}
-      </div>
-      {quota ? <CloudQuotaDetails quota={quota} /> : <p className="settings-detail-hint" role="status">{needsSignIn ? t("providers.quota.signIn") : refreshing ? t("providers.quota.checking") : cloudQuotaSummary(cloud)}</p>}
-      {quota && cloud?.availability !== "ready" ? <p className="settings-detail-hint" role="status">{cloud?.availability === "personal_exhausted" ? t("providers.quota.exhausted") : cloudQuotaSummary(cloud)}</p> : null}
-    </section>
-  </>;
-}
-
-function FreeCloudProviderDetail({ provider, onBack }: { provider: ProviderSummary; onBack: () => void }) {
-  const auth = useAuth();
-  const userId = auth.state.status === "signed-in" ? auth.state.user.id : undefined;
-  const [current, setCurrent] = useState(provider);
-  const [modelsRevision, setModelsRevision] = useState(0);
-  const [error, setError] = useState<string>();
-  const [refreshing, setRefreshing] = useState(false);
-  const refreshRef = useRef<(force?: boolean) => void>(() => {});
-  useEffect(() => {
-    let active = true, sequence = 0;
-    const load = (force = false) => {
-      const revision = ++sequence;
-      setRefreshing(true);
-      void (force ? getCloudQuotas?.() ?? Promise.resolve() : Promise.resolve()).then(listProviders).then((providers) => {
-        if (!active || revision !== sequence) return;
-        setCurrent(providers.find((item) => item.id === provider.id) ?? provider);
-        setError(undefined);
-        if (force) setModelsRevision((value) => value + 1);
-      }).catch((cause) => { if (active && revision === sequence) setError(errorMessage(cause)); })
-        .finally(() => { if (active && revision === sequence) setRefreshing(false); });
-    };
-    refreshRef.current = load;
-    const refresh = () => load();
-    refresh();
-    window.addEventListener(MODELS_CHANGED_EVENT, refresh);
-    const timer = setInterval(refresh, 30_000);
-    return () => { active = false; clearInterval(timer); window.removeEventListener(MODELS_CHANGED_EVENT, refresh); };
-  }, [provider.id, userId]);
-  return <section className="settings-panel settings-provider-detail">
-    <ProviderDetailHeader provider={current} onBack={onBack}>
-      <ProviderEnableControl provider={current} onChanged={() => refreshRef.current()} />
-    </ProviderDetailHeader>
-    <FreeCloudAccount provider={current} refreshing={refreshing} onRefresh={() => refreshRef.current(true)} />
-    {error ? <p className="settings-error" role="alert">{error}</p> : null}
-    <ProviderModels key={`${provider.id}-${userId}-${modelsRevision}`} providerId={provider.id} />
-  </section>;
-}
-
-function SeedanceAuthView({ provider, onBack, onCompleted }: { provider: ProviderSummary; onBack: () => void; onCompleted: () => void }) {
-  const deletion = useProviderDeletion(provider.id, onCompleted);
-  const [apiKey, setApiKey] = useState("");
-  const [error, setError] = useState<string>();
-  const [saving, setSaving] = useState(false);
-  const [modelsRevision, setModelsRevision] = useState(0);
-  async function save(event: FormEvent): Promise<void> {
-    event.preventDefault();
-    setSaving(true);
-    setError(undefined);
-    try {
-      await updateSeedanceApiKey(provider.id, apiKey);
-      onCompleted();
-    } catch (cause) {
-      setError(errorMessage(cause));
-    } finally {
-      setSaving(false);
-    }
-  }
-  const inputId = `${provider.id}-api-key`;
-  return (
-    <section className="settings-panel settings-provider-detail">
-      <ProviderDetailHeader provider={provider} onBack={onBack}>
-        {provider.configured ? <><ProviderDeleteButton deletion={deletion} disabled={saving} /><ProviderEnableControl provider={provider} disabled={deletion.busy} onChanged={() => setModelsRevision((value) => value + 1)} /></> : null}
-      </ProviderDetailHeader>
-      <ProviderDeleteConfirmation provider={provider} deletion={deletion} disabled={saving} />
-      <form className="settings-detail-field" onSubmit={(event) => void save(event)}>
-        <label className="settings-search-field-label" htmlFor={inputId}>{t("providers.apiKey")}</label>
-        <div className="settings-detail-inline">
-          <input
-            id={inputId}
-            className="settings-search-input"
-            type="password"
-            value={apiKey}
-            onChange={(event) => setApiKey(event.target.value)}
-            placeholder={provider.configured ? t("providers.replaceKeyPlaceholder") : t("providers.keyPlaceholder", { name: provider.name })}
-            disabled={saving || deletion.busy}
-          />
-          <button className="settings-primary-button" type="submit" disabled={saving || deletion.busy || !apiKey.trim()}>
-            {saving ? t("common.saving") : t("common.save")}
-          </button>
-        </div>
-      </form>
-      {error || deletion.error ? <p className="settings-error" role="alert">{deletion.error ?? error}</p> : null}
-      {provider.configured && provider.id === "volcengine-ark" ? <ProviderImageModels key={`seedream-${modelsRevision}`} providerId={provider.id} /> : null}
-      {provider.configured ? <SeedanceModels key={`seedance-${modelsRevision}`} providerId={provider.id} /> : null}
-    </section>
-  );
-}
-
-function MinimaxAuthView({ provider, onBack, onCompleted }: { provider: ProviderSummary; onBack: () => void; onCompleted: () => void }) {
-  const deletion = useProviderDeletion(provider.id, onCompleted);
-  const [apiKey, setApiKey] = useState("");
-  const [error, setError] = useState<string>();
-  const [saving, setSaving] = useState(false);
-  const [modelsRevision, setModelsRevision] = useState(0);
-  async function save(event: FormEvent): Promise<void> {
-    event.preventDefault();
-    setSaving(true);
-    setError(undefined);
-    try {
-      await updateMinimaxApiKey(provider.id, apiKey);
-      onCompleted();
-    } catch (cause) {
-      setError(errorMessage(cause));
-    } finally {
-      setSaving(false);
-    }
-  }
-  const inputId = `${provider.id}-api-key`;
-  return (
-    <section className="settings-panel settings-provider-detail">
-      <ProviderDetailHeader provider={provider} onBack={onBack}>
-        {provider.configured ? <><ProviderDeleteButton deletion={deletion} disabled={saving} /><ProviderEnableControl provider={provider} disabled={deletion.busy} onChanged={() => setModelsRevision((value) => value + 1)} /></> : null}
-      </ProviderDetailHeader>
-      <ProviderDeleteConfirmation provider={provider} deletion={deletion} disabled={saving} />
-      <form className="settings-detail-field" onSubmit={(event) => void save(event)}>
-        <label className="settings-search-field-label" htmlFor={inputId}>{t("providers.apiKey")}</label>
-        <div className="settings-detail-inline">
-          <input
-            id={inputId}
-            className="settings-search-input"
-            type="password"
-            value={apiKey}
-            onChange={(event) => setApiKey(event.target.value)}
-            placeholder={provider.configured ? t("providers.replaceKeyPlaceholder") : t("providers.keyPlaceholder", { name: provider.name })}
-            disabled={saving || deletion.busy}
-          />
-          <button className="settings-primary-button" type="submit" disabled={saving || deletion.busy || !apiKey.trim()}>
-            {saving ? t("common.saving") : t("common.save")}
-          </button>
-        </div>
-      </form>
-      {error || deletion.error ? <p className="settings-error" role="alert">{deletion.error ?? error}</p> : null}
-      {provider.configured ? <SeedanceModels key={`minimax-${modelsRevision}`} providerId={provider.id} /> : null}
-    </section>
-  );
-}
-
-function VolcengineTtsAuthView({ provider, onBack, onCompleted }: { provider: ProviderSummary; onBack: () => void; onCompleted: () => void }) {
-  const deletion = useProviderDeletion(provider.id, onCompleted);
-  const [apiKey, setApiKey] = useState("");
-  const [keyError, setKeyError] = useState<string>();
-  const [savingKey, setSavingKey] = useState(false);
-  const [defaultVoiceId, setDefaultVoiceId] = useState("");
-  const [voiceError, setVoiceError] = useState<string>();
-  const [savingVoice, setSavingVoice] = useState(false);
-  const [modelsRevision, setModelsRevision] = useState(0);
-  const [previewText, setPreviewText] = useState(t("providers.previewSampleText"));
-  const [previewUrl, setPreviewUrl] = useState<string>();
-  const [previewBusy, setPreviewBusy] = useState(false);
-  const [previewError, setPreviewError] = useState<string>();
-
   useEffect(() => {
     let active = true;
-    void getVolcengineTtsSettings().then((settings) => {
-      if (active) setDefaultVoiceId(settings.defaultVoiceId ?? "");
-    }).catch(() => undefined);
+    void listLegacyMediaKeys().then((saved) => { if (active) setKeys(saved); })
+      .catch((cause) => { if (active) setError(errorMessage(cause)); });
     return () => { active = false; };
   }, []);
-  useEffect(() => () => { if (previewUrl) URL.revokeObjectURL(previewUrl); }, [previewUrl]);
 
-  async function saveKey(event: FormEvent): Promise<void> {
-    event.preventDefault();
-    setSavingKey(true);
-    setKeyError(undefined);
-    try {
-      await updateVolcengineTtsApiKey(apiKey.trim());
-      setApiKey("");
-      onCompleted();
-    } catch (cause) { setKeyError(errorMessage(cause)); }
-    finally { setSavingKey(false); }
-  }
-  async function saveVoice(event: FormEvent): Promise<void> {
-    event.preventDefault();
-    setSavingVoice(true);
-    setVoiceError(undefined);
-    try {
-      const settings = await saveVolcengineTtsDefaultVoiceId(defaultVoiceId.trim() || null);
-      setDefaultVoiceId(settings.defaultVoiceId ?? "");
-      setModelsRevision((value) => value + 1);
-    } catch (cause) { setVoiceError(errorMessage(cause)); }
-    finally { setSavingVoice(false); }
-  }
-  async function runPreview(): Promise<void> {
-    if (previewBusy) return;
-    setPreviewBusy(true);
-    setPreviewError(undefined);
-    try {
-      const blob = await previewVolcengineTtsSpeech({
-        text: previewText.trim(),
-        ...(defaultVoiceId.trim() ? { voiceId: defaultVoiceId.trim() } : {}),
-      });
-      setPreviewUrl(URL.createObjectURL(blob));
-    } catch (cause) { setPreviewError(errorMessage(cause)); }
-    finally { setPreviewBusy(false); }
-  }
-
-  const voiceGroups = [
-    { language: "zh-cn" as const, label: t("providers.chineseVoices") },
-    { language: "en" as const, label: t("providers.englishVoices") },
-  ];
-  const knownVoice = VOLCENGINE_TTS_VOICES.some((voice) => voice.id === defaultVoiceId);
-  const inputId = "volcengine-tts-api-key";
-  return (
-    <section className="settings-panel settings-provider-detail">
-      <ProviderDetailHeader provider={provider} description={t("providers.audioDescription")} onBack={onBack}>
-        {provider.configured ? <><ProviderDeleteButton deletion={deletion} disabled={savingKey} /><ProviderEnableControl provider={provider} disabled={deletion.busy} onChanged={() => setModelsRevision((value) => value + 1)} /></> : null}
-      </ProviderDetailHeader>
-      {provider.configured ? <ProviderDeleteConfirmation provider={provider} deletion={deletion} disabled={savingKey} /> : null}
-      <form className="settings-detail-field" onSubmit={(event) => void saveKey(event)}>
-        <label className="settings-search-field-label" htmlFor={inputId}>{t("providers.apiKey")}</label>
-        <div className="settings-detail-inline">
-          <input
-            id={inputId}
-            className="settings-search-input"
-            type="password"
-            value={apiKey}
-            onChange={(event) => setApiKey(event.target.value)}
-            placeholder={provider.configured ? t("providers.replaceKeyPlaceholder") : t("providers.keyPlaceholder", { name: provider.name })}
-            disabled={savingKey || deletion.busy}
-          />
-          <button className="settings-primary-button" type="submit" disabled={savingKey || deletion.busy || !apiKey.trim()}>
-            {savingKey ? t("common.saving") : t("common.save")}
-          </button>
-        </div>
-      </form>
-      {keyError ? <p className="settings-error" role="alert">{keyError}</p> : null}
-      {provider.configured ? (
-        <form className="settings-detail-field" onSubmit={(event) => void saveVoice(event)}>
-          <label className="settings-search-field-label" htmlFor="volcengine-tts-voice-select">{t("providers.defaultVoiceId")}</label>
-          <select
-            id="volcengine-tts-voice-select"
-            className="settings-search-input"
-            value={knownVoice ? defaultVoiceId : ""}
-            onChange={(event) => setDefaultVoiceId(event.target.value)}
-            disabled={savingVoice || deletion.busy}
-          >
-            <option value="">{t("providers.voiceSelectCustom")}</option>
-            {voiceGroups.map((group) => (
-              <optgroup key={group.language} label={group.label}>
-                {VOLCENGINE_TTS_VOICES.filter((voice) => voice.language === group.language).map((voice) => (
-                  <option key={voice.id} value={voice.id} title={voice.id}>{voice.name}</option>
-                ))}
-              </optgroup>
-            ))}
-          </select>
-          <label className="settings-search-field-label" htmlFor="volcengine-tts-voice-id">{t("providers.voiceIdInputLabel")}</label>
-          <div className="settings-detail-inline">
-            <input
-              id="volcengine-tts-voice-id"
-              className="settings-search-input"
-              value={defaultVoiceId}
-              onChange={(event) => setDefaultVoiceId(event.target.value)}
-              maxLength={AUDIO_VOICE_ID_MAX_LENGTH}
-              pattern={AUDIO_VOICE_ID_PATTERN}
-              placeholder={t("providers.defaultVoiceIdPlaceholder")}
-              disabled={savingVoice || deletion.busy}
-            />
-            <button className="settings-primary-button" type="submit" disabled={savingVoice || deletion.busy}>
-              {savingVoice ? t("common.saving") : t("common.save")}
-            </button>
-          </div>
-          <p className="settings-detail-hint">{t("providers.defaultVoiceIdHint")}</p>
-          {voiceError ? <p className="settings-error" role="alert">{voiceError}</p> : null}
-        </form>
-      ) : null}
-      {provider.configured ? (
-        <section className="settings-detail-section" aria-label={t("providers.previewTitle")}>
-          <div className="provider-models-heading">
-            <h4>{t("providers.previewTitle")}</h4>
-          </div>
-          <label className="settings-search-field-label" htmlFor="volcengine-tts-preview-text">{t("providers.previewTextLabel")}</label>
-          <div className="settings-detail-inline">
-            <input
-              id="volcengine-tts-preview-text"
-              className="settings-search-input"
-              value={previewText}
-              onChange={(event) => setPreviewText(event.target.value)}
-              maxLength={500}
-              disabled={previewBusy}
-            />
-            <button className="settings-primary-button" type="button" disabled={previewBusy || !previewText.trim()} onClick={() => void runPreview()}>
-              {previewBusy ? <span className="settings-loading-inline"><LoaderCircle className="spin" size={14} />{t("common.saving")}</span> : t("providers.previewAction")}
-            </button>
-          </div>
-          {previewUrl ? <audio controls src={previewUrl} className="settings-audio-preview" /> : null}
-          {previewError ? <p className="settings-error" role="alert">{previewError}</p> : null}
-          <p className="settings-detail-hint">{t("providers.previewHint")}</p>
-        </section>
-      ) : null}
-      {provider.configured ? <AudioModels key={`audio-${modelsRevision}`} providerId={provider.id} /> : null}
-    </section>
-  );
-}
-
-function VolcengineSeedAudioAuthView({ provider, onBack, onCompleted }: { provider: ProviderSummary; onBack: () => void; onCompleted: () => void }) {
-  const deletion = useProviderDeletion(provider.id, onCompleted);
-  const [apiKey, setApiKey] = useState("");
-  const [error, setError] = useState<string>();
-  const [saving, setSaving] = useState(false);
-  const [modelsRevision, setModelsRevision] = useState(0);
-
-  async function save(event: FormEvent): Promise<void> {
-    event.preventDefault();
-    setSaving(true);
+  async function clear(id: string) {
+    setBusy(true);
     setError(undefined);
     try {
-      await updateVolcengineSeedAudioApiKey(apiKey.trim());
-      setApiKey("");
-      onCompleted();
+      await clearLegacyMediaKey(id);
+      setKeys((current) => current.filter((key) => key.id !== id));
     } catch (cause) { setError(errorMessage(cause)); }
-    finally { setSaving(false); }
+    finally { setBusy(false); }
   }
-
-  const inputId = "volcengine-seed-audio-api-key";
-  return (
-    <section className="settings-panel settings-provider-detail">
-      <ProviderDetailHeader provider={provider} description={t("providers.seedAudioDescription")} onBack={onBack}>
-        {provider.configured ? <><ProviderDeleteButton deletion={deletion} disabled={saving} /><ProviderEnableControl provider={provider} disabled={deletion.busy} onChanged={() => setModelsRevision((value) => value + 1)} /></> : null}
-      </ProviderDetailHeader>
-      {provider.configured ? <ProviderDeleteConfirmation provider={provider} deletion={deletion} disabled={saving} /> : null}
-      <form className="settings-detail-field" onSubmit={(event) => void save(event)}>
-        <label className="settings-search-field-label" htmlFor={inputId}>{t("providers.apiKey")}</label>
-        <div className="settings-detail-inline">
-          <input
-            id={inputId}
-            className="settings-search-input"
-            type="password"
-            value={apiKey}
-            onChange={(event) => setApiKey(event.target.value)}
-            placeholder={provider.configured ? t("providers.replaceKeyPlaceholder") : t("providers.keyPlaceholder", { name: provider.name })}
-            disabled={saving || deletion.busy}
-          />
-          <button className="settings-primary-button" type="submit" disabled={saving || deletion.busy || !apiKey.trim()}>
-            {saving ? t("common.saving") : t("common.save")}
-          </button>
-        </div>
-        <p className="settings-detail-hint">{t("providers.seedAudioHint")}</p>
-      </form>
-      {error || deletion.error ? <p className="settings-error" role="alert">{deletion.error ?? error}</p> : null}
-      {provider.configured ? <AudioModels key={`seed-audio-${modelsRevision}`} providerId={provider.id} /> : null}
-    </section>
-  );
+  const visible = keys.filter((key) => !providerId || key.id === providerId);
+  if (!visible.length && !error) return null;
+  return <section className="settings-detail-section">
+    <h4>{t("providers.legacyMediaKeys")}</h4>
+    {visible.map(({ id, name }) => <div className="settings-provider-setting-row" key={id}>
+      <span>{name}</span>
+      <button type="button" className="settings-secondary-button" disabled={busy} aria-label={t("providers.clearNamedLegacyMediaKey", { name })} onClick={() => void clear(id)}>{t("providers.clearLegacyMediaKey")}</button>
+    </div>)}
+    {error ? <p className="settings-error" role="alert">{error}</p> : null}
+  </section>;
 }
 
 function AudioModels({ providerId }: { providerId: string }) {
@@ -807,44 +454,6 @@ function ProviderImageModels({ providerId }: { providerId: string }) {
   );
 }
 
-function SeedanceModels({ providerId }: { providerId: string }) {
-  const [models, setModels] = useState<VideoModel[]>();
-  const [error, setError] = useState<string>();
-  useEffect(() => {
-    let active = true;
-    void listVideoModelCatalog().then((catalog) => {
-      if (active) setModels(catalog.models.filter((model) => model.provider === providerId));
-    }).catch((cause) => {
-      if (active) setError(errorMessage(cause));
-    });
-    return () => { active = false; };
-  }, [providerId]);
-
-  return (
-    <section className="settings-detail-section provider-models" aria-label={t("providers.videoModels")}>
-      <div className="provider-models-heading">
-        <h4>{t("providers.videoModels")} <small>{models?.length ?? ""}</small></h4>
-      </div>
-      {error ? <p className="settings-error" role="alert">{error}</p> : null}
-      {models ? (
-        <div className="provider-models-list" role="list" aria-label={t("providers.videoModels")}>
-          {models.map((model) => (
-            <div className="provider-model-row" key={model.id} role="listitem">
-              <div className="provider-model-readonly">
-                <span className="provider-model-copy">
-                  <strong title={model.name}>{model.name}</strong>
-                  <small title={model.id}>{model.id}</small>
-                </span>
-              </div>
-            </div>
-          ))}
-          {!models.length ? <p className="settings-empty">{t("providers.noVideoModels")}</p> : null}
-        </div>
-      ) : !error ? <div className="settings-loading"><LoaderCircle className="spin" size={16} />{t("providers.loadingModels")}</div> : null}
-    </section>
-  );
-}
-
 function useProviderDeletion(providerId: string, onRemoved?: () => void) {
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -920,10 +529,11 @@ function CustomProviderDetail({ provider, onBack, onRemoved }: { provider: Provi
   const balanceConnections = new Map<string, CustomProviderModel>();
   for (const model of settings?.models ?? []) {
     const config = model.usages?.["3d"];
-    if (!config) continue;
+    if (!config || isMeshyProviderConfiguration(settings) || isMeshyModelReference({ provider: provider.id, id: model.id, protocol: config.protocol }) || isMeshyEndpoint(config.baseUrl)) continue;
     const connection = JSON.stringify([config.protocol, (config.baseUrl ?? settings!.baseUrl).replace(/\/+$/, "")]);
     if (!balanceConnections.has(connection)) balanceConnections.set(connection, model);
   }
+  if (settings && isMeshyProviderConfiguration(settings)) return <section className="settings-panel settings-provider-detail"><ProviderDetailHeader provider={provider} description={t("modelUsage.meshyUnavailable")} onBack={onBack} /><p role="status">{t("modelUsage.meshyUnavailable")}</p></section>;
   return <section className="settings-panel settings-provider-detail">
     <ProviderDetailHeader provider={{ ...provider, name: settings?.name ?? provider.name }} onBack={onBack}>
       <ProviderDeleteButton deletion={deletion} disabled={openingEditor || Boolean(editing)} />
@@ -945,57 +555,6 @@ function CustomProviderDetail({ provider, onBack, onRemoved }: { provider: Provi
       <ProviderResponsesTransport key={provider.id} providerId={provider.id} disabled={deleting || openingEditor || Boolean(editing)} />
     </ProviderAdvanced> : null}
   </section>;
-}
-
-function Native3DProviderAuthView({ provider, onBack, onCompleted }: { provider: ProviderSummary; onBack: () => void; onCompleted: () => void }) {
-  const deletion = useProviderDeletion(provider.id, onCompleted);
-  const [savingKey, setSavingKey] = useState(false);
-  return <section className="settings-panel settings-provider-detail">
-    <ProviderDetailHeader provider={provider} description={t("providers.apiKey")} onBack={onBack}>
-      {provider.configured ? <><ProviderDeleteButton deletion={deletion} disabled={savingKey} /><ProviderEnableControl provider={provider} disabled={deletion.busy || savingKey} /></> : null}
-    </ProviderDetailHeader>
-    <ProviderDeleteConfirmation provider={provider} deletion={deletion} disabled={savingKey} />
-    <Native3DProviderKeyForm provider={provider} deletion={deletion} onSaved={onCompleted} onSavingChange={setSavingKey} />
-    {provider.configured ? <ProviderModels providerId={provider.id} /> : null}
-  </section>;
-}
-
-function Native3DProviderKeyForm({ provider, deletion, onSaved, onSavingChange }: { provider: ProviderSummary; deletion: ReturnType<typeof useProviderDeletion>; onSaved?: () => void; onSavingChange?: (saving: boolean) => void }) {
-  const [apiKey, setApiKey] = useState("");
-  const [error, setError] = useState<string>();
-  const [saving, setSaving] = useState(false);
-  async function save(event: FormEvent): Promise<void> {
-    event.preventDefault();
-    setSaving(true);
-    onSavingChange?.(true);
-    setError(undefined);
-    try {
-      await updateModel3DProviderApiKey(provider.id, apiKey);
-      setApiKey("");
-      onSaved?.();
-    } catch (cause) {
-      setError(errorMessage(cause));
-    } finally {
-      setSaving(false);
-      onSavingChange?.(false);
-    }
-  }
-
-  return <>
-    <form className="settings-detail-field" onSubmit={(event) => void save(event)}>
-      <div className="provider-models-heading">
-        <label className="settings-search-field-label" htmlFor={`${provider.id}-api-key`}>{provider.id === "hyper3d" ? t("providers.hyper3d.yourKey") : t("providers.apiKey")}</label>
-      </div>
-      <div className="settings-detail-inline">
-        <input id={`${provider.id}-api-key`} className="settings-search-input" type="password" autoComplete="off" spellCheck={false} value={apiKey} onChange={(event) => setApiKey(event.target.value)}
-          placeholder={provider.configured ? t("providers.replaceKeyPlaceholder") : t("providers.keyPlaceholder", { name: provider.name })} disabled={saving || deletion.busy} />
-        <button className="settings-primary-button" type="submit" disabled={saving || deletion.busy || !apiKey.trim()}>{saving ? t("common.saving") : t("common.save")}</button>
-      </div>
-    </form>
-    {provider.id === "hyper3d" ? <p className="settings-detail-hint">{t("providers.hyper3d.keyHint")}</p> : null}
-    {provider.configured ? <Provider3DBalance model={{ provider: provider.id, id: MODEL3D_CONNECTION_ID }} /> : null}
-    {error || deletion.error ? <p className="settings-error" role="alert">{deletion.error ?? error}</p> : null}
-  </>;
 }
 
 function authMethodLabel(method: ModelProviderSummary["methods"][number]): string {
@@ -1318,6 +877,7 @@ function useProviderEndpoint(providerId: string) {
 }
 
 function providerDescription(provider: Pick<ProviderSummary, "id" | "methods" | "custom" | "preset" | "managed">): string {
+  if (provider.id === "kunpo") return t("kunpoModels.connectionDescription");
   if (provider.id === "codex-cli") return t("codexImages.description");
   if (provider.id === "hyper3d") return t("providers.description.hyper3d");
   if (provider.managed) return t("providers.group.free");

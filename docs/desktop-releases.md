@@ -1,5 +1,14 @@
 # Desktop releases
 
+> Local build policy: remote updates, telemetry SDKs, source-map uploads, Cloud
+> configuration injection and remote release publishing are disabled in this
+> checkout. Environment variables do not enable them. Local packaging remains
+> available with `package:mac:dir`, `package:mac` and `package:win`; these commands
+> never publish. See [local security policy](local-security.md) before building.
+> The upstream release instructions below are retained for historical reference
+> and do not apply to this local build. Do not follow their upload or service
+> configuration steps.
+
 OhMyGame uses `electron-updater` with a generic HTTPS update feed. Release
 artifacts are built by GitHub Actions and copied to a public, read-only
 Cloudflare R2 custom domain, so updates do not depend on GitHub.

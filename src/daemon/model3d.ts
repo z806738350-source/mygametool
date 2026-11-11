@@ -28,12 +28,15 @@ export interface Model3DAnimationInput {
 
 export interface Generated3DModel {
   bytes: Buffer;
-  mediaType: "model/gltf-binary";
+  mediaType: "model/gltf-binary" | "application/vnd.autodesk.fbx";
   requestId?: string;
   metadata?: Partial<Model3DMetadata>;
 }
 
 export interface Model3DGenerator {
+  /** Policy-only admission; no credentials, task submission or remote recovery. */
+  assertGenerationAllowed?(model?: Model3DModelRef): Promise<void>;
+  assertOperationAllowed?(model?: Model3DModelRef): Promise<void>;
   generate(input: Model3DGenerationInput, signal?: AbortSignal): Promise<Generated3DModel>;
   /** Rigging and animation; providers without it cannot animate models. */
   animate?(input: Model3DAnimationInput, signal?: AbortSignal): Promise<Generated3DModel>;
@@ -46,36 +49,58 @@ export interface Model3DGenerator {
 
 /** Private durable task credentials; never sent to the renderer. */
 export interface Model3DExecution {
+  /** Recovery may only query/download recorded stages, never create an upload or task. */
+  readonly recoveryOnly?: boolean;
+  /** Private saved stage results (downloads or bounded local merge proofs); an omitted callback performs a cache-only read. */
+  result?(stage: string, taskId: string, download?: () => Promise<Buffer>): Promise<Buffer | undefined>;
   submitted<T extends Record<string, string>>(stage: string, scope: string, input: unknown, create: () => Promise<T>): Promise<T>;
 }
 export class Model3DGenerationError extends Error {
-  constructor(message: string, readonly statusCode = 502) {
+  constructor(message: string, readonly statusCode = 502, readonly notSubmitted = false) {
     super(message);
   }
 }
 
 /** Bound downloaded artifacts while streaming, before allocating a complete GLB. */
-export async function readModel3DResult(response: Response): Promise<Buffer> {
+export async function readModel3DResult(response: Response, signal?: AbortSignal): Promise<Buffer> {
+  signal?.throwIfAborted();
   const maximum = 100 * 1024 * 1024;
   if (!response.body) throw new Model3DGenerationError("Generated model download is empty");
   if (Number(response.headers.get("content-length")) > maximum) {
-    await response.body.cancel().catch(() => {});
+    void response.body.cancel().catch(() => {});
     throw new Model3DGenerationError("Generated model is too large", 413);
   }
+  const timeout = new AbortController();
+  const timer = setTimeout(() => timeout.abort(), 120_000);
+  const bounded = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
   const reader = response.body.getReader();
+  const onAbort = () => { void reader.cancel().catch(() => {}); };
+  bounded.addEventListener("abort", onAbort, { once: true });
   const chunks: Uint8Array[] = [];
   let size = 0;
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      bounded.throwIfAborted();
+      const { done, value } = await new Promise<ReadableStreamReadResult<Uint8Array>>((resolve, reject) => {
+        const abort = () => reject(bounded.reason);
+        bounded.addEventListener("abort", abort, { once: true });
+        if (bounded.aborted) { bounded.removeEventListener("abort", abort); reject(bounded.reason); return; }
+        void reader.read().then((value) => { bounded.removeEventListener("abort", abort); resolve(value); }, (cause) => { bounded.removeEventListener("abort", abort); reject(cause); });
+      });
+      bounded.throwIfAborted();
       if (done) break;
       size += value.byteLength;
       if (size > maximum) throw new Model3DGenerationError("Generated model is too large", 413);
       chunks.push(value);
     }
+  } catch (cause) {
+    if (timeout.signal.aborted && !signal?.aborted) throw new Model3DGenerationError("Generated model download timed out; resume the existing task", 504);
+    throw cause;
   } finally {
-    await reader.cancel().catch(() => {});
-    reader.releaseLock();
+    clearTimeout(timer);
+    bounded.removeEventListener("abort", onAbort);
+    void reader.cancel().catch(() => {});
+    try { reader.releaseLock(); } catch { /* A cancelled native reader may still be settling. */ }
   }
   if (!size) throw new Model3DGenerationError("Generated model download is empty");
   return Buffer.concat(chunks);

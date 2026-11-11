@@ -1,5 +1,5 @@
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, writeFile } from "node:fs/promises";
+import { temporaryTestDirectory } from "./temporary-test-directory.js";
 import path from "node:path";
 import sharp from "sharp";
 import { describe, expect, it } from "vitest";
@@ -60,7 +60,7 @@ describe("bundled plugins", () => {
   });
 
   it("loads a standard skill-only OhMyGame plugin directory", async () => {
-    const root = await mkdtemp(path.join(tmpdir(), "ohmygame-bundled-plugins-"));
+    const root = await temporaryTestDirectory("ohmygame-bundled-plugins-");
     const plugin = path.join(root, "reference-modeler");
     await mkdir(path.join(plugin, ".ohmygame-plugin"), { recursive: true });
     await mkdir(path.join(plugin, "skills", "reference-modeler"), { recursive: true });

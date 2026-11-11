@@ -76,13 +76,13 @@ describe("workspace Markdown preview", () => {
     expect(api.getWorkspaceAsset).toHaveBeenCalledWith(
       "project",
       "assets/logo.png",
+      expect.any(AbortSignal),
     );
     expect(
       container.querySelector<HTMLImageElement>('img[alt="Logo"]')?.src,
     ).toBe("blob:workspace-image");
-    expect(
-      container.querySelector<HTMLImageElement>('img[alt="Remote"]')?.src,
-    ).toBe("https://example.com/logo.png");
+    expect(container.querySelector('img[alt="Remote"]')).toBeNull();
+    expect(container.textContent).toContain("Remote resources are disabled in this local edition. (Remote)");
     expect(container.querySelector('img[alt="Blocked"]')).toBeNull();
     await render("docs/guide.md", text, 1);
     expect(api.getWorkspaceAsset).toHaveBeenCalledTimes(2);

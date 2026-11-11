@@ -145,10 +145,14 @@ native ID is unchanged, and after intervening Pi work, incompatible model
 changes, or legacy metadata.
 
 When context is absent or invalid, start fresh with a deterministic, bounded
-handoff: recent visible turns, changed files, the structured plan, and restore
+handoff: recent visible turns, changed files, bounded tool results with original
+call/job IDs and unknown-outcome warnings, the structured plan, and restore
 notices. Exclude private prompt context and do not make another model call.
 An explicitly expired/not-found native resume receives one fresh-context retry,
-without appending the user message twice. Other failures remain visible.
+without appending the user message twice. Other failures remain visible; explicitly
+classified safe interruptions may use [shared bounded continuation](agent-errors.md#automatic-continuation-after-an-interruption)
+after tool reconciliation. Cancellation, normal completion, unknown outcomes and
+safety failures never acquire a continuation automatically.
 Moving back to Pi uses the shared messages; native hidden state is not imported.
 Native turns are replayed to Pi as text (`replay.ts`): the agent's words, each
 tool it used with bounded arguments, and bounded results, merged per turn,

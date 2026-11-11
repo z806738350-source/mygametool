@@ -18,6 +18,47 @@ const scope = { projectId: "project-a", conversationId: "chat-a" };
 const plugin = { name: "game-helper", displayName: "Game helper", marketplaceId: "local" };
 
 describe("conversation composer drafts", () => {
+  it("reports scoped persisted drafts without rewriting or clearing them", () => {
+    const storage = memoryStorage();
+    createComposerDraftStore(storage).get(scope).update({ prompt: "keep this text" });
+    const store = createComposerDraftStore(storage);
+    const before = [...storage.values];
+    const set = vi.spyOn(storage, "setItem"), remove = vi.spyOn(storage, "removeItem");
+    expect(store.projectStatus(scope.projectId)).toBe("pending");
+    expect(store.projectStatus(`${scope.projectId}-other`)).toBe("clear");
+    storage.values.set("ohmygame:composer-draft:v1:unrelated:chat", "broken");
+    expect(store.projectStatus(scope.projectId)).toBe("pending");
+    expect(store.projectStatus("unrelated")).toBe("unknown");
+    expect([...storage.values].slice(0, 1)).toEqual(before);
+    expect(set).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it("protects memory-only attachments, submitting messages and escaped project scopes", () => {
+    const store = createComposerDraftStore();
+    const projectId = "项目:a";
+    const session = store.get({ projectId, conversationId: "chat" });
+    session.update({ attachments: [{ id: "attachment", file: new File(["text"], "notes.txt") as unknown as globalThis.File, relativePath: "notes.txt" }] });
+    expect(store.projectStatus(projectId)).toBe("pending");
+    expect(store.projectStatus(`${projectId}:other`)).toBe("clear");
+    session.update({ attachments: [], submitting: true });
+    expect(store.projectStatus(projectId)).toBe("pending");
+    session.update({ submitting: false });
+    expect(store.projectStatus(projectId)).toBe("clear");
+  });
+
+  it("does not treat inaccessible or malformed matching storage as an empty composer", () => {
+    const storage = memoryStorage();
+    const key = "ohmygame:composer-draft:v1:project-a:chat";
+    const store = createComposerDraftStore(storage);
+    for (const value of ["broken", "null", JSON.stringify({ version: 2 }), JSON.stringify({ version: 1, prompt: "", mentions: [null], planning: false })]) {
+      storage.values.set(key, value);
+      expect(store.projectStatus("project-a")).toBe("unknown");
+    }
+    vi.spyOn(storage, "getItem").mockImplementation(() => { throw new Error("read denied"); });
+    expect(store.projectStatus("project-a")).toBe("unknown");
+  });
+
   it("retains complete drafts across input remounts and isolates projects and conversations", () => {
     const store = createComposerDraftStore(memoryStorage());
     const draft = store.get(scope);

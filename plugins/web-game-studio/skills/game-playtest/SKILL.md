@@ -26,6 +26,10 @@ Test the game as a player experiences it. Match the depth of verification to the
 7. Check representative desktop and mobile viewport sizes when layout is affected. Reinspect and recapture after resizing.
 8. Record build, runtime, interaction, visual, and responsive results separately, including anything that remains unverified.
 
+For video or audio, trigger the intended playback in the game and compare two game_use snapshots separated by a short wait. Check the media element's source, errorCode, advancing currentTime and, for video, totalVideoFrames and a capture. Chromium can log a failed preload request even when the same file plays. Inspect playback of the existing asset before making a replacement.
+
+For new games or changes to rendering, test switching between standard and high-density displays. Open `game_use` with `viewport.deviceScaleFactor` set to 1 and reach a playable scene. In that session, send a `resize` action with the same width and height and a factor of 2, then another with a factor of 1. At each step, inspect the reported `viewport.deviceScaleFactor`, capture the scene and try an input at a visible target. The playfield should keep its intended bounds, with the camera, HUD and hit targets aligned. If a transition cannot be exercised, record which one still needs testing.
+
 ## Game Use Policy
 
 - `game_use` is the OhMyGame path for game interaction and verification. Use `open`, `inspect`, `act`, `capture`, and `close`; it starts or reuses the current project preview and does not accept arbitrary external sites.

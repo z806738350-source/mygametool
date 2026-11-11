@@ -1,3 +1,4 @@
+import { isMeshyModelReference } from "../shared/disabled-media-providers.js";
 import { useState, type FormEvent } from "react";
 import type { Model3DDefinition } from "../shared/contracts.js";
 import { MODEL_3D_PRESETS, model3DPreset, normalizeNativeModel3D, type Native3DProviderId } from "../shared/model3d-presets.js";
@@ -14,8 +15,10 @@ export function ProviderModel3DForm({ protocol, initial, busy, onSave, onCancel,
   const [model, setModel] = useState<Model3DDefinition>(initial ?? { id: "", name: "", settings: presets[0]!.settings });
   const [error, setError] = useState<string>();
   const official = Boolean(initial && model3DPreset(protocol, initial.id));
+  const unavailable = isMeshyModelReference({ protocol, id: model.id });
   function submit(event: FormEvent) {
     event.preventDefault();
+    if (unavailable) return;
     try {
       const normalized = normalizeNativeModel3D(protocol, model);
       setError(undefined);
@@ -23,7 +26,8 @@ export function ProviderModel3DForm({ protocol, initial, busy, onSave, onCancel,
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
   }
   return <form className="provider-model-form provider-model3d-form" aria-label={initial ? t("model3dForm.edit") : t("model3dForm.add")} onSubmit={submit}>
-    <fieldset disabled={busy}>
+    {unavailable ? <p role="status">{t("modelUsage.meshyUnavailable")}</p> : null}
+    <fieldset disabled={busy || unavailable}>
       <div className="provider-model-form-grid">
         <label className="settings-detail-field"><span className="settings-search-field-label">{t("models.modelId")}</span><input className="settings-search-input" value={model.id} disabled={Boolean(initial)} onChange={(event) => setModel({ ...model, id: event.target.value })} placeholder={t("model3dForm.idPlaceholder")} maxLength={200} required autoFocus={!initial} autoComplete="off" spellCheck={false} /></label>
         <label className="settings-detail-field"><span className="settings-search-field-label">{t("models.displayName")}</span><input className="settings-search-input" value={model.name} onChange={(event) => setModel({ ...model, name: event.target.value })} placeholder={model.id || t("customProvider.sameAsId")} maxLength={200} /></label>
@@ -36,10 +40,10 @@ export function ProviderModel3DForm({ protocol, initial, busy, onSave, onCancel,
     </fieldset>
     {error ? <p className="settings-error" role="alert">{error}</p> : null}
     <div className="provider-model-form-footer">
-      {official && onReset ? <button className="settings-secondary-button" type="button" disabled={busy} onClick={onReset}>{t("model3dForm.restore")}</button> : <span />}
+      {official && onReset ? <button className="settings-secondary-button" type="button" disabled={busy || unavailable} onClick={onReset}>{t("model3dForm.restore")}</button> : <span />}
       <div className="provider-model-form-actions">
         <button className="settings-secondary-button" type="button" disabled={busy} onClick={onCancel}>{t("common.cancel")}</button>
-        <button className="settings-primary-button" type="submit" disabled={busy || !model.id.trim()}>{busy ? <LoaderCircle className="spin" size={13} /> : null}{initial ? t("common.save") : t("common.add")}</button>
+        <button className="settings-primary-button" type="submit" disabled={busy || unavailable || !model.id.trim()}>{busy ? <LoaderCircle className="spin" size={13} /> : null}{initial ? t("common.save") : t("common.add")}</button>
       </div>
     </div>
   </form>;

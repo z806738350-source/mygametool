@@ -1,81 +1,41 @@
-import { access, mkdtemp, readFile } from "node:fs/promises";
+import { access, chmod, link, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { VolcengineTtsSettingsStore } from "../src/daemon/volcengine-tts-settings.js";
+import { containsKnownSensitiveValue } from "../src/shared/sensitive-values.js";
 
 describe("Volcengine TTS settings", () => {
-  it("persists and clears the API key without exposing it", async () => {
-    const directory = await mkdtemp(
-      path.join(tmpdir(), "ohmygame-volcengine-tts-"),
-    );
-    const settings = new VolcengineTtsSettingsStore(directory);
-    await settings.load();
-    expect(settings.get()).toEqual({ configured: false });
-
-    await settings.update("  secret-key  ", " zh_female_popo_mars_bigtts ");
-    expect(settings.get()).toEqual({
-      configured: true,
-      defaultVoiceId: "zh_female_popo_mars_bigtts",
-    });
-    expect(
-      JSON.parse(
-        await readFile(path.join(directory, "volcengine-tts.json"), "utf8"),
-      ),
-    ).toEqual({
-      version: 1,
-      apiKey: "secret-key",
-      defaultVoiceId: "zh_female_popo_mars_bigtts",
-    });
-
-    const restored = new VolcengineTtsSettingsStore(directory);
-    await restored.load();
-    expect(restored.key()).toBe("secret-key");
-    expect(restored.defaultVoiceId()).toBe("zh_female_popo_mars_bigtts");
-    await restored.clear();
-    await expect(
-      access(path.join(directory, "volcengine-tts.json")),
-    ).rejects.toMatchObject({ code: "ENOENT" });
+  it("protects a retired credential without consuming its Speaker ID or changing the legacy file", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-legacy-speech-"));
+    const filename = path.join(directory, "volcengine-tts.json");
+    const stored = { version: 1, apiKey: "sk-legacy-speech-test-canary", defaultVoiceId: "obsolete-speaker" };
+    try {
+      await writeFile(filename, JSON.stringify(stored), { mode: 0o600 });
+      const settings = new VolcengineTtsSettingsStore(directory);
+      await settings.load();
+      expect(containsKnownSensitiveValue(stored.apiKey)).toBe(true);
+      expect(JSON.parse(await readFile(filename, "utf8"))).toEqual(stored);
+      await settings.clear();
+      await expect(access(filename)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { await rm(directory, { recursive: true, force: true }); }
   });
 
-  it("rejects empty and control-character keys", async () => {
-    const settings = new VolcengineTtsSettingsStore(
-      await mkdtemp(path.join(tmpdir(), "ohmygame-volcengine-tts-invalid-")),
-    );
-    await expect(settings.update(" ")).rejects.toThrow("printable ASCII");
-    await expect(settings.update("key\nvalue")).rejects.toThrow(
-      "printable ASCII",
-    );
-    await expect(settings.update("key", "invalid voice id")).rejects.toThrow(
-      "Speaker ID",
-    );
-  });
-
-  it("updates the default voice without re-entering the API key", async () => {
-    const settings = new VolcengineTtsSettingsStore(
-      await mkdtemp(path.join(tmpdir(), "ohmygame-volcengine-tts-voice-")),
-    );
-    await settings.load();
-    await settings.update("secret-key", "zh_female_popo_mars_bigtts");
-
-    await settings.update(undefined, "zh_male_m191_uranus_bigtts");
-    expect(settings.get()).toEqual({
-      configured: true,
-      defaultVoiceId: "zh_male_m191_uranus_bigtts",
-    });
-    expect(settings.key()).toBe("secret-key");
-
-    await settings.update(undefined, null);
-    expect(settings.get()).toEqual({ configured: true });
-    expect(settings.defaultVoiceId()).toBeUndefined();
-
-    await expect(
-      settings.update(undefined, "invalid voice id"),
-    ).rejects.toThrow("Speaker ID");
-    await expect(
-      new VolcengineTtsSettingsStore(
-        await mkdtemp(path.join(tmpdir(), "ohmygame-volcengine-tts-nokey-")),
-      ).update(undefined, "zh_male_m191_uranus_bigtts"),
-    ).rejects.toThrow("API key");
+  it.skipIf(process.platform === "win32")("rejects symlink, hard-link and non-private legacy credential files", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-speech-private-file-"));
+    const file = path.join(directory, "volcengine-tts.json"), target = path.join(directory, "fixture.json");
+    try {
+      await writeFile(target, JSON.stringify({ version: 1, apiKey: "sk-legacy-private-speech-canary" }), { mode: 0o600 });
+      await symlink(target, file);
+      await expect(new VolcengineTtsSettingsStore(directory).load()).rejects.toThrow();
+      await rm(file);
+      await link(target, file);
+      await expect(new VolcengineTtsSettingsStore(directory).load()).rejects.toThrow("not private");
+      await rm(file);
+      await writeFile(file, JSON.stringify({ version: 1, apiKey: "sk-legacy-private-speech-canary" }), { mode: 0o644 });
+      await chmod(file, 0o644);
+      await expect(new VolcengineTtsSettingsStore(directory).load()).rejects.toThrow("not private");
+      expect(await readFile(target, "utf8")).toContain("sk-legacy-private-speech-canary");
+    } finally { await rm(directory, { recursive: true, force: true }); }
   });
 });

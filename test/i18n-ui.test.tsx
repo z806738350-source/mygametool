@@ -4,7 +4,7 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, expect, it, vi } from "vitest";
-import type { AgentModel } from "../src/shared/contracts.js";
+import type { AgentModel, ThreadItem } from "../src/shared/contracts.js";
 import type { PlayablePresetSummary } from "../src/shared/playable-editor.js";
 
 // The saved preference is read once, when the i18n module loads.
@@ -15,10 +15,10 @@ vi.doMock(path.resolve("src/renderer/api.ts"), async () => ({
   updateResponsesTransport: vi.fn(),
   listProviders: vi.fn(async () => [
     {
-      id: "deepseek",
-      name: "DeepSeek",
+      id: "kunpo",
+      name: "KunpoAPI",
       configured: true,
-      capabilities: ["language"],
+      capabilities: ["language", "image", "video", "3d", "audio"],
       status: "connected",
       methods: [],
     },
@@ -119,40 +119,16 @@ it("translates all three onboarding steps and preserves provider names", async (
   expect(host.querySelector("footer")?.textContent).toBe("下一步");
   await act(async () => root!.render(<Onboarding step="connect" {...props} />));
   expect(host.querySelector("h1")?.textContent).toBe("连接你的 AI。");
-  expect(host.querySelector(".onboarding-section-heading")?.textContent).toBe("连接智能体");
-  expect(host.querySelector(".onboarding-agents-hint")?.textContent).toBe("可连接多个智能体，随时切换使用。");
-  expect(host.querySelector(".onboarding-picker")).toBeNull();
-  await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="OhMyGame"]')!.click());
-  expect(host.querySelector(".onboarding-selected-agent button")?.textContent).toBe("切换");
+  expect(host.querySelector(".onboarding-agent-options")).toBeNull();
   expect(host.querySelector(".onboarding-agents-hint")).toBeNull();
-  expect(host.querySelector('[aria-label="DeepSeek"]')?.textContent).toBe(
-    "DeepSeek",
-  );
+  expect(host.querySelector('[aria-label="KunpoAPI"]')?.textContent).toBe("KunpoAPI");
+  expect(host.querySelector('[aria-label="KunpoAPI"] button')?.getAttribute("aria-label")).toBe("已连接");
+  expect(host.querySelector('[aria-label="添加自定义服务商"]')).toBeNull();
   expect(host.querySelector("footer")?.textContent).toBe("下一步跳过并开始");
-  await act(async () =>
-    host
-      .querySelector<HTMLButtonElement>('[aria-label="添加自定义服务商"]')!
-      .click(),
-  );
-  expect(host.querySelector("h1")?.textContent).toBe("添加你的服务商。");
-  expect(host.querySelector('[role="dialog"]')).toBeNull();
-  expect(
-    host.querySelector('[aria-label="自定义服务商"]')?.textContent,
-  ).toContain("显示名称");
-  await act(async () =>
-    host
-      .querySelector<HTMLButtonElement>(
-        ".onboarding-progress > button:nth-child(2)",
-      )!
-      .click(),
-  );
-  expect(
-    host
-      .querySelector('[aria-label="DeepSeek"] button')
-      ?.getAttribute("aria-label"),
-  ).toBe("已连接");
   await act(async () => root!.render(<Onboarding step="media" {...props} />));
   expect(host.querySelector("h1")?.textContent).toBe("添加创作工具。");
+  expect(host.querySelector('[aria-label="KunpoAPI"]')).not.toBeNull();
+  expect(host.querySelector('[aria-label="添加自定义服务商"]')).toBeNull();
   expect(host.querySelector("footer")?.textContent).toBe("开始创作");
   expect(host.querySelectorAll(".onboarding-progress > button")).toHaveLength(
     3,
@@ -204,4 +180,38 @@ it("localizes all Scene templates in the dialog and canvas menu without changing
   await act(async () => entries[6]!.click());
   expect(onChoose).toHaveBeenLastCalledWith("story-map");
   expect(presets.slice(0, 8)).toEqual(original);
+});
+
+it("localizes a system-issued paid confirmation without treating an ordinary question ID as approval", async () => {
+  const { QuestionnaireCard } = await import("../src/renderer/questionnaire-card.js");
+  const request: Extract<ThreadItem, { type: "userInputRequest" }> = { id: "item", turnId: "turn", type: "userInputRequest", requestId: "call",
+    status: "inProgress", questions: [{ id: "new-paid-media", prompt: "Original question", allowOther: false,
+      options: [{ value: "keep", label: "Keep the old request" }, { value: "new", label: "Authorize another" }] }] };
+  const callbacks = { onSubmit: vi.fn(), onSkip: vi.fn() };
+  const trusted = renderToStaticMarkup(<QuestionnaireCard request={{ ...request, paidMediaTool: "generate-image" }} {...callbacks} />);
+  expect(trusted).toContain(t("questionnaire.paidPrompt", { media: t("assetCanvas.node.image"), count: 1 }));
+  expect(trusted).toContain("允许再付费生成一次");
+  const ordinary = renderToStaticMarkup(<QuestionnaireCard request={request} {...callbacks} />);
+  expect(ordinary).toContain("Original question");
+  expect(ordinary).not.toContain("允许再付费生成一次");
+});
+
+it("localizes retained-file review details, risks and separate unselected confirmations", async () => {
+  const { ApprovalCard } = await import("../src/renderer/approval-card.js");
+  const request: Extract<ThreadItem, { type: "approvalRequest" }> = {
+    id: "review-fixture", turnId: "review-fixture", requestId: "review-fixture", type: "approvalRequest", status: "inProgress",
+    request: { kind: "tool", tool: "recover_isolated_changes", canAllowSession: false, isolatedSourceReview: {
+      reviewId: "a".repeat(64), projectId: "fixture", generation: "22", snapshotId: "b".repeat(64), blockers: [], approved: false, expiresAt: "2099-01-01T00:00:00Z",
+      files: [{ path: "sprites.json", change: "added", kind: "code", bytes: 2, afterSha256: "c".repeat(64), preview: "{}" }],
+    } },
+  };
+  const markup = renderToStaticMarkup(<ApprovalCard request={request} waiting={0} onDecide={vi.fn()} />);
+  expect(markup).toContain("审查第 22 代");
+  expect(markup).toContain("回传 SHA-256");
+  expect(markup).toContain("整批改动");
+  expect(markup).toContain("不代表视觉效果已验收");
+  expect(markup).toContain("之后的构建和预览");
+  expect(markup).toContain("我另行同意");
+  expect(markup).not.toContain("approval.source");
+  expect(markup).not.toContain("checked=");
 });

@@ -1,15 +1,44 @@
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { PluginDetail } from "../src/shared/plugins.js";
 import type { LocalPluginStore } from "../src/daemon/local-plugins.js";
 import { pluginSkillFolders, resolvePluginSkillPaths, resolvePluginSkills } from "../src/daemon/plugin-runtime.js";
 import { stageSkills } from "../src/daemon/agent-runtimes/skills.js";
 import { PluginSettingsStore } from "../src/daemon/plugin-settings.js";
+import { workflowGuideTools } from "../src/daemon/workflow-guide.js";
 import { BundledPluginStore } from "../src/daemon/bundled-plugins.js";
 
+const directories: string[] = [];
+afterEach(async () => { await Promise.all(directories.splice(0).map(directory => rm(directory, { recursive: true, force: true }))); });
+async function temporary(prefix: string) {
+  const directory = await mkdtemp(path.join(tmpdir(), prefix));
+  directories.push(directory);
+  return directory;
+}
+
 describe("plugin runtime", () => {
+  it("reads the selected bundled workflow and its named references within project and component settings", async () => {
+    const store = new BundledPluginStore(path.resolve("plugins"));
+    await store.load();
+    const settings = await settingsStore();
+    const tool = workflowGuideTools("web-game", store, settings)[0]!;
+    const read = async (guide: string, reference?: string) => {
+      const result = await tool.execute("read", { guide, reference }, undefined, undefined, {} as never);
+      return result.content.map(block => block.type === "text" ? block.text : "").join("\n");
+    };
+    expect(await read("web-game-studio")).toContain("generate_canvas_media");
+    expect(await read("threejs-world", "world-contract.md")).toContain("Three.js");
+    const blender = await read("blender-assets");
+    expect(blender).toContain("external Blender session");
+    expect(blender).not.toContain("--python");
+    await expect(read("threejs-world", "../SKILL.md")).rejects.toThrow("filename");
+    await expect(read("game-studio")).rejects.toThrow("unavailable");
+    await settings.updateComponent(store.read("ohmygame:threejs-world")!, "skill:skills/threejs-world/SKILL.md", false);
+    await expect(read("threejs-world")).rejects.toThrow("unavailable");
+  });
+
   it("only exposes Maker skills after the user enables the plugin", async () => {
     const store = new BundledPluginStore(path.resolve("plugins"));
     await store.load();
@@ -32,7 +61,7 @@ describe("plugin runtime", () => {
     const settings = await settingsStore();
     await settings.update(store.read("ohmygame:taptap-maker")!, { enabled: true, components: {} });
     const skills = await resolvePluginSkills([store], settings, "general");
-    const target = await mkdtemp(path.join(tmpdir(), "ohmygame-staged-skills-"));
+    const target = await temporary("ohmygame-staged-skills-");
     const staged = await stageSkills(pluginSkillFolders(skills), target);
     expect(staged).toHaveLength(skills.length);
     expect(staged).toEqual(expect.arrayContaining(["taptap-maker", "game-studio", "blender-assets"]));
@@ -99,7 +128,7 @@ describe("plugin runtime", () => {
 });
 
 async function settingsStore(): Promise<PluginSettingsStore> {
-  const store = new PluginSettingsStore(await mkdtemp(path.join(tmpdir(), "ohmygame-plugin-runtime-")));
+  const store = new PluginSettingsStore(await temporary("ohmygame-plugin-runtime-"));
   await store.load();
   return store;
 }

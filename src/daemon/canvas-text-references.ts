@@ -1,14 +1,15 @@
 import { readFile, stat } from "node:fs/promises";
-import type { AssetCanvasTextGenerationSource } from "../shared/contracts.js";
+import type { AssetCanvasTextGenerationSource, PromptImage } from "../shared/contracts.js";
 import { canvasNodeTitle } from "../shared/canvas-assets.js";
 import { resolveAssetCanvasImageAssetId } from "../shared/asset-canvas.js";
 import { readCanvasAssets } from "./canvas-assets.js";
 import { CanvasError, readCanvasBoard, readCanvasDocument } from "./canvas-workspace.js";
 import { getWorkspaceMedia } from "./workspace.js";
 import type { TextGenerationReference } from "./text-generation.js";
+import type { AssetLibrary } from "./asset-library.js";
 
 /** Resolve direct dependencies only: a reference uses a node's current output. */
-export async function resolveCanvasTextReferences(workspace: string, source: AssetCanvasTextGenerationSource, documentId?: string): Promise<TextGenerationReference[]> {
+export async function resolveCanvasTextReferences(workspace: string, source: AssetCanvasTextGenerationSource, documentId?: string, library?: AssetLibrary): Promise<TextGenerationReference[]> {
   const detail = await readCanvasBoard(workspace, source.boardId);
   const node = detail?.board.nodes.find((node) => node.id === source.nodeId);
   if (!node || (node.type !== "text" && node.type !== "document") ||
@@ -35,8 +36,10 @@ export async function resolveCanvasTextReferences(workspace: string, source: Ass
       throw new CanvasError("Reference images must be PNG, JPEG, WebP or GIF");
     }
     if ((await stat(file.absolutePath)).size > 10 * 1024 * 1024) throw new CanvasError("Each reference image must be no larger than 10 MB");
-    return { type: "image", label: canvasNodeTitle(linked, [], [{ id: assetId!, name: asset.name }]), image: {
+    const image: PromptImage = {
       mediaType: file.contentType, data: (await readFile(file.absolutePath)).toString("base64"),
-    } };
+    };
+    if (asset.libraryAssetId && library) await library.attachImageSource(asset.libraryAssetId, image);
+    return { type: "image", label: canvasNodeTitle(linked, [], [{ id: assetId!, name: asset.name }]), image };
   }));
 }

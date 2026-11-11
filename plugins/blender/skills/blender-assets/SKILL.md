@@ -7,6 +7,12 @@ description: Create or refine game assets with a local Blender installation, kee
 
 For a new asset, deliver an editable `.blend`, a runtime GLB, and a preview render. Follow the project's asset location, scale, axes, naming, and material conventions. For export-only tasks, leave the source untouched.
 
+Before modeling a production asset from concept art, inspect separate full-object front, left profile and back views at the same scale and pose. The right profile is optional. Reuse matching views and prepare any missing angles from the design before shaping the mesh.
+
+## Local studio workflow
+
+The local secure edition can prepare views, inspect an existing model, and integrate its runtime assets. Host Blender and the export script need an external Blender session. When the request requires an editable .blend, explain what must be done in Blender. For an existing GLB use the project model tools and verify it in the game. A different paid modeling workflow requires the user to choose it.
+
 ## Run Blender
 
 Find the executable on PATH or in its usual location (macOS `/Applications/Blender.app/Contents/MacOS/Blender`, Windows `Program Files/Blender Foundation`) and check `--version`. `bpy` exists only in Blender's bundled Python, so run scripts through Blender; put an existing `.blend` before `--python`:

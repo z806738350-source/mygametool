@@ -48,6 +48,7 @@ export function registerCheckpointRoutes(
   // Upgrading a story and copying its Library media take the workspace to themselves, as Undo does.
   const exempt = (url: string) =>
     /\/checkpoints\/|\/events(?:\?|$)/.test(url) ||
+    /\/execution-storage(?:\/|\?|$)/.test(url) ||
     /\/cancel(?:\?|$)/.test(url) ||
     /\/interactive-story\/(?:upgrade|library-media)(?:\/|\?|$)/.test(url);
   app.addHook("preHandler", async (request, reply) => {
@@ -108,11 +109,13 @@ export function registerCheckpointRoutes(
       // that has not observed its version. Still drain it before a restore.
       const read = request.method === "GET" || request.method === "HEAD" ||
         (request.method === "POST" && request.routeOptions.url === "/projects/:projectId/export");
+      // Naming changes project metadata, not an editor's workspace content.
+      const metadata = request.method === "PATCH" && request.routeOptions.url === "/projects/:projectId";
       writes.track(
         request,
         await writes.enter(
           id,
-          read,
+          metadata ? "metadata" : read,
           read ? undefined : (request.headers["x-workspace-version"] as string | undefined),
         ),
       );

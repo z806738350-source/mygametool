@@ -193,7 +193,8 @@ bound project does not have returns an error that says why.
 | `get_job`, `wait_job`, `cancel_job`                                         | Generation jobs, see below                                                  |
 | `generate_image`, `generate_video`, `generate_3d_asset`, `animate_3d_asset` | Run as jobs                                                                 |
 | `generate_speech`, `generate_sound_effect`, `generate_music`                | Run as jobs                                                                 |
-| `canvas_check`, `canvas_initialize`, `generate_canvas_media`                | `generate_canvas_media` runs as a job                                       |
+| `canvas_check`, `canvas_initialize`, `generate_canvas_media`, `recover_canvas_media` | Canvas generation and recovery run as jobs |
+| `recover_media` | Recovers an existing direct generation as a job |
 | `game_use`                                                                  | Needs the desktop app and a project with a game preview; opens a window     |
 | `playable_add_node`, `playable_check`                                       | Interactive Story projects only                                             |
 

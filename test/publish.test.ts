@@ -19,7 +19,10 @@ const cloudRepository = configuredCloudRepository
   : path.resolve(import.meta.dirname, "../../ohmygame-cloud");
 const publishServerModule = path.join(cloudRepository, "apps", "api", "src", "app.ts");
 const publishServerDependencies = path.join(cloudRepository, "node_modules", "fastify", "package.json");
-const createPublishApp = existsSync(publishServerModule) && existsSync(publishServerDependencies)
+// Retained upstream contract for a future separate online edition. Local secure edition
+// deliberately neither imports nor executes the private Cloud repository.
+const onlineEditionEnabled = false;
+const createPublishApp = onlineEditionEnabled && existsSync(publishServerModule) && existsSync(publishServerDependencies)
   ? (await import(pathToFileURL(publishServerModule).href) as {
       createPublishApp: (options: {
         dataDirectory: string;
@@ -33,7 +36,7 @@ const createPublishApp = existsSync(publishServerModule) && existsSync(publishSe
 const describePublishContract = createPublishApp ? describe : describe.skip;
 afterEach(async () => { await Promise.all(apps.splice(0).map((app) => app.close())); });
 
-describePublishContract("remote publish", () => {
+describePublishContract("remote publish (retired in local secure edition; private contract retained)", () => {
   it("does not expose the removed Plugin marketplace", async () => {
     const runtime = await testRuntime();
 

@@ -31,7 +31,7 @@ export interface NetworkConnectionTest {
   error?: string;
 }
 
-export const SYSTEM_PROXY_TARGET = "https://api.openai.com";
+export const SYSTEM_PROXY_TARGET = "https://llm.ziy.cc";
 export const NETWORK_TEST_URL = `${SYSTEM_PROXY_TARGET}/v1/models`;
 export const DEFAULT_NETWORK_SETTINGS: NetworkSettings = {
   mode: "direct",

@@ -1,8 +1,9 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { Home } from "./home.js";
+import { LocalEditionNotice } from "./local-edition-notice.js";
 // Only lazy routes use this; loading it eagerly keeps it ahead of styles.css as before code splitting.
 import "./plugin-builder.css";
-import { communityHash, createdProjectView, conversationHash, DEFAULT_SETTINGS_SECTION, gameHash, parseAppRoute, pluginHash, projectHash, projectsHash, settingsHash, sidebarHash, type AppNavigationTarget, type SettingsSection, type SidebarPage } from "./routes.js";
+import { createdProjectView, conversationHash, DEFAULT_SETTINGS_SECTION, parseAppRoute, pluginHash, projectHash, projectsHash, settingsHash, sidebarHash, type AppNavigationTarget, type SettingsSection, type SidebarPage } from "./routes.js";
 import { historyState, useAppNavigation } from "./app-navigation.js";
 import { invalidateQuickStartModels, loadQuickStartModels } from "./asset-canvas-quick-start.js";
 import { SidebarPageLayout } from "./sidebar-page.js";
@@ -18,9 +19,6 @@ import { useOnboarding } from "./use-onboarding.js";
 import { usePluginIntegrationGate } from "./plugin-integration.js";
 
 // Home and onboarding stay in the main chunk; every other route loads on first visit.
-const CommunityProfilePage = lazy(() => import("./community-profile.js").then((module) => ({ default: module.CommunityProfilePage })));
-const GamesPage = lazy(() => import("./games.js").then((module) => ({ default: module.GamesPage })));
-const GamePlayer = lazy(() => import("./games.js").then((module) => ({ default: module.GamePlayer })));
 const LibraryPage = lazy(() => import("./library.js").then((module) => ({ default: module.LibraryPage })));
 const ProjectsPage = lazy(() => import("./projects.js").then((module) => ({ default: module.ProjectsPage })));
 const ProjectShell = lazy(() => import("./project-shell.js").then((module) => ({ default: module.ProjectShell })));
@@ -74,11 +72,7 @@ export function App() {
   if (route.page === "home") {
     return <><Home inert={welcoming} onNavigate={navigateToSidebarPage} onCreate={openCreatedProject} onOpen={openProject} />{welcoming ? <OnboardingArrival onComplete={() => setWelcoming(false)} /> : null}</>;
   }
-  if (route.page === "community") {
-    return <Suspense fallback={sidebarFallback("community")}><GamesPage onNavigate={navigateToSidebarPage} onOhMyGame={ohMyGame} /></Suspense>;
-  }
-  if (route.page === "community-profile") return <Suspense fallback={sidebarFallback("community")}><CommunityProfilePage authorId={route.authorId} onNavigate={navigateToSidebarPage} onBack={goToGames} onOpenGame={ohMyGame} /></Suspense>;
-  if (route.page === "game") return <Suspense fallback={sidebarFallback("community")}><GamePlayer gameId={route.gameId} onBack={goToGames} onNavigate={navigateToSidebarPage} onOhMyGame={ohMyGame} /></Suspense>;
+  if (route.page === "community" || route.page === "community-profile" || route.page === "game") return <SidebarPageLayout active="projects" onNavigate={navigateToSidebarPage}><LocalEditionNotice /></SidebarPageLayout>;
   if (route.page === "projects") return <Suspense fallback={sidebarFallback("projects")}><ProjectsPage projectType={route.projectType} query={route.query} sort={route.sort} onFiltersChange={(filters, replace) => navigate(projectsHash(filters), { replace })} onNavigate={navigateToSidebarPage} onOpenProject={openProject} /></Suspense>;
   if (route.page === "general" || route.page === "web-game" || route.page === "interactive-story" || route.page === "godot") return <Suspense fallback={sidebarFallback(route.page)}><GameStudioHome key={route.page} projectType={route.page === "godot" ? "godot-game" : route.page} onNavigate={navigateToSidebarPage} onCreate={openCreatedProject} onOpenProject={openProject} /></Suspense>;
   if (route.page === "asset-canvas") return <Suspense fallback={sidebarFallback("asset-canvas")}><AssetCanvasHome onNavigate={navigateToSidebarPage} onOpenProject={openAssetCanvasProject} /></Suspense>;
@@ -164,15 +158,6 @@ export function App() {
     const current = parseAppRoute(window.location.hash);
     const view = initialView ?? (current.page === "project" && current.projectId === projectId ? current.view : undefined);
     navigate(conversationHash(projectId, conversationId, view), { replace });
-  }
-
-  function ohMyGame(gameId: string): void {
-    navigate(gameHash(gameId));
-  }
-
-  function goToGames(): void {
-    const hash = communityHash();
-    navigate(hash, { replace: true });
   }
 
   function navigateToSidebarPage(page: AppNavigationTarget): void {

@@ -56,6 +56,32 @@ function manager(
 }
 
 describe("preview policy and lifecycle", () => {
+  it("blocks new leases and launch entry points while still permitting lifecycle drain", async () => {
+    const { project } = await fixture();
+    const preview = manager({ assertAvailable: () => { throw new Error("Project deletion is pending"); } });
+    expect(() => preview.acquire(project, "editor:blocked")).toThrow("deletion is pending");
+    expect(() => preview.touch(project, "editor:blocked")).toThrow("deletion is pending");
+    await expect(preview.start(project)).rejects.toThrow("deletion is pending");
+    await expect(preview.ensureStarted(project)).rejects.toThrow("deletion is pending");
+    await expect(preview.automatic(project)).rejects.toThrow("deletion is pending");
+    expect(() => preview.touch(project, "editor:blocked", false)).not.toThrow();
+    await expect(preview.stop(project)).resolves.toBeUndefined();
+    expect(project.preview.status).toBe("stopped");
+  });
+
+  it("rechecks project admission after asynchronous workspace inspection", async () => {
+    const { project } = await fixture();
+    let available = true;
+    const gate = vi.fn(() => { if (!available) throw new Error("Project deletion is pending"); });
+    const preview = manager({ assertAvailable: gate });
+    const starting = preview.start(project);
+    available = false;
+    await expect(starting).rejects.toThrow("deletion is pending");
+    expect(gate).toHaveBeenCalledTimes(2);
+    expect(project.preview.url).toBeUndefined();
+    expect(project.preview.status).toBe("stopped");
+  });
+
   it.each(["stop", "disable", "release"])(
     "cancels automatic inspection when users %s before it completes",
     async (action) => {
@@ -144,46 +170,16 @@ describe("preview policy and lifecycle", () => {
   );
 
   it.each(["command", "script"] as const)(
-    "does not spawn a %s after its launch is cancelled",
+    "refuses an unregistered %s preview before executing project code",
     async (mode) => {
       const { project, directory } = await fixture();
       project.previewMode = mode;
-      const executable = `'${process.execPath.replaceAll("'", "'\\''")}'`;
-      project.previewCommand = `${executable} server.mjs`;
-      await writeFile(
-        path.join(directory, "server.mjs"),
-        "import {writeFileSync} from 'node:fs';writeFileSync('server.pid',String(process.pid));setInterval(()=>{},1000);",
-      );
-      if (mode === "script") {
-        await writeFile(
-          path.join(directory, "package.json"),
-          JSON.stringify({ scripts: { dev: "node server.mjs" } }),
-        );
-        await mkdir(path.join(directory, "node_modules"));
-      }
-      const events = new RuntimeEventBus();
-      const preview = new PreviewManager(events);
-      cleanups.push(() => preview.stopAll());
-      let stopping: Promise<void> | undefined;
-      const unsubscribe = events.subscribe(project.id, (event) => {
-        if (
-          event.type === "preview.updated" &&
-          event.data.preview.phase === "launching"
-        )
-          stopping = preview.stop(project);
-      });
-      try {
-        await expect(preview.start(project)).rejects.toThrow("cancelled");
-        await stopping;
-        expect(stopping).toBeDefined();
-        expect(project.preview.status).toBe("stopped");
-        await new Promise((resolve) => setTimeout(resolve, 150));
-        await expect(
-          readFile(path.join(directory, "server.pid")),
-        ).rejects.toMatchObject({ code: "ENOENT" });
-      } finally {
-        unsubscribe();
-      }
+      project.previewCommand = "unreviewed-server";
+      if (mode === "script") await writeFile(path.join(directory, "package.json"), JSON.stringify({ scripts: { dev: "unreviewed-server" } }));
+      const preview = manager();
+      await expect(preview.start(project)).rejects.toThrow("temporarily unavailable");
+      expect(project.preview.status).toBe("error");
+      await expect(readFile(path.join(directory, "server.pid"))).rejects.toMatchObject({ code: "ENOENT" });
     },
   );
 
@@ -392,66 +388,27 @@ describe("preview policy and lifecycle", () => {
     ).toContain("Static General game");
   });
 
-  it("runs arbitrary local server commands without Node dependencies and cancels their process tree", async () => {
+  it("keeps arbitrary host command previews disabled without an isolated executor", async () => {
     const { directory, project } = await fixture();
-    // Windows runs custom commands through cmd.exe, which only understands double quotes.
-    const executable =
-      process.platform === "win32"
-        ? `"${process.execPath}"`
-        : `'${process.execPath.replaceAll("'", "'\\''")}'`;
-    await writeFile(
-      path.join(directory, "server.mjs"),
-      `import {createServer} from 'node:http'; import {writeFileSync} from 'node:fs'; writeFileSync('command.pid', String(process.pid)); createServer((q,r)=>r.end('Custom General game')).listen(Number(process.env.PORT),process.env.HOST);`,
-    );
     project.previewMode = "command";
-    project.previewCommand = `${executable} server.mjs`;
-    const preview = manager({ readinessTimeoutMs: 2_000 });
-    expect(
-      await (await fetch(await preview.ensureStarted(project))).text(),
-    ).toBe("Custom General game");
-    const pid = Number(
-      await readFile(path.join(directory, "command.pid"), "utf8"),
-    );
+    project.previewCommand = "unreviewed-host-command";
+    const preview = manager();
+    await expect(preview.ensureStarted(project)).rejects.toThrow("temporarily unavailable");
+    await expect(readFile(path.join(directory, "command.pid"))).rejects.toMatchObject({ code: "ENOENT" });
     await preview.stop(project);
-    // The shell's close event can precede the OS reaping its descendants.
-    await vi.waitFor(() => expect(() => process.kill(pid, 0)).toThrow(), { timeout: 2_000 });
-    project.previewCommand = `${executable} -e "setInterval(()=>{},1000)"`;
-    const pending = preview.start(project);
-    const rejection = expect(pending).rejects.toThrow("superseded");
-    await vi.waitFor(() => expect(project.preview.phase).toBe("connecting"));
-    await preview.stop(project);
-    await rejection;
     expect(project.preview.status).toBe("stopped");
   });
 });
 
-it("bounds dependency installation and leaves cancelled installs retryable", async () => {
+it("refuses dependency installation before any lifecycle script can run on the host", async () => {
   const { directory, project } = await fixture();
   project.previewMode = "script";
-  await writeFile(
-    path.join(directory, "package.json"),
-    JSON.stringify({
-      scripts: { dev: "node server.mjs", postinstall: "node install.mjs" },
-    }),
-  );
-  await writeFile(
-    path.join(directory, "install.mjs"),
-    "import {writeFileSync} from 'node:fs';writeFileSync('installer.pid',String(process.pid));console.log('Installing fixture');setInterval(()=>{},1000);",
-  );
+  await writeFile(path.join(directory, "package.json"), JSON.stringify({ scripts: { dev: "node server.mjs", postinstall: "node install.mjs" } }));
   const preview = manager({ installTimeoutMs: 2_000 });
-  const pending = preview.start(project);
-  const rejected = expect(pending).rejects.toThrow("installation timed out");
-  await vi.waitFor(() => expect(project.preview.phase).toBe("installing"));
-  await rejected;
+  await expect(preview.start(project)).rejects.toThrow("temporarily unavailable");
   expect(project.preview.status).toBe("error");
-  expect(project.preview.logs).toContain("Installing fixture");
-  const pid = Number(
-    await readFile(path.join(directory, "installer.pid"), "utf8"),
-  );
-  expect(() => process.kill(pid, 0)).toThrow();
-  expect(
-    await readFile(path.join(directory, ".ohmygame-install-pending"), "utf8"),
-  ).toContain("not completed");
+  await expect(readFile(path.join(directory, "installer.pid"))).rejects.toMatchObject({ code: "ENOENT" });
+  await expect(readFile(path.join(directory, ".ohmygame-install-pending"))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 describe("General project startup configuration", () => {

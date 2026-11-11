@@ -1,5 +1,7 @@
 import { referencedIntegration, usePluginIntegrationGate } from "./plugin-integration.js";
 import { isAgentRuntimeId, type ApprovalDecision } from "../shared/agent-runtimes.js";
+import type { IsolatedSourceConfirmation } from "../shared/execution-storage.js";
+import type { VolumeMigrationConfirmation } from "../shared/volume-migration.js";
 import {
   ArrowLeft,
   LoaderCircle,
@@ -20,9 +22,9 @@ import {
   lazy,
   Suspense,
 } from "react";
-import type { AgentContextUsage, AgentModel, AgentModelRef, AgentReasoningLevel, CheckpointChangeItem, ConversationCapabilities, ConversationSummary, PendingPrompt, PluginMention, ProjectState, PromptAttachment, PromptContext, PromptImage, PromptMode, PromptReference, ThreadItem } from "../shared/contracts.js";
+import type { AgentContextUsage, AgentModel, AgentModelRef, AgentReasoningLevel, CheckpointChangeItem, ConversationCapabilities, ConversationSummary, PendingPrompt, PluginMention, PromptAttachment, PromptContext, PromptImage, PromptMode, PromptReference, ThreadItem } from "../shared/contracts.js";
 import { findAgentModel, preferredAgentModel } from "../shared/agent-models.js";
-import { isWebRuntimeProjectType, supportsWebPreview } from "../shared/project-runtime.js";
+import { supportsWebPreview } from "../shared/project-runtime.js";
 import {
   ApiError,
   acquirePreview,
@@ -46,7 +48,6 @@ import {
   getUnfinishedRestore,
   listModels,
   listConversations,
-  publishProject,
   removePendingPrompt,
   renameConversation,
   restoreCheckpoint,
@@ -76,10 +77,7 @@ import { ApprovalCard } from "./approval-card.js";
 import { PlanApprovalCard } from "./plan-approval-card.js";
 import { initialRendererState, rendererReducer } from "./state.js";
 import { useAgentModels } from "./model-selector.js";
-import { useAuth } from "./auth.js";
 import { readChatLayout, type ChatLayout } from "./chat-layout.js";
-import { forgetPendingPublish, rememberPendingPublish, takePendingPublish } from "./pending-publish.js";
-import type { PublishDetails } from "./publish-dialog.js";
 import { usePlaytestAskRequests } from "./playable-playtest.js";
 import { useRuntimeConnection } from "./runtime-connection.js";
 import { ErrorBoundary } from "./error-boundary.js";
@@ -127,7 +125,6 @@ export function ProjectShell({
   onHome,
   homeLabel = t("navigation.backTo", { page: t("sidebar.projects") }),
 }: ProjectShellProps) {
-  const auth = useAuth();
   const runtime = useRuntimeConnection();
   const openedGeneration = useRef(runtime.generation);
   const previewPaused = runtime.generation !== openedGeneration.current || runtime.status !== "ready";
@@ -145,8 +142,6 @@ export function ProjectShell({
   }, [onViewChange]);
   const [godotWorkspaceOpen, setGodotWorkspaceOpen] = useState(readGodotWorkspaceOpen);
   const [chatLayout] = useState<ChatLayout>(readChatLayout);
-  const [publishing, setPublishing] = useState(false);
-  const [publishDialog, setPublishDialog] = useState<{ projectId: string; status: "open" | "success" }>();
   const [workspaceRevision, setWorkspaceRevision] = useState(0);
   const [workspaceEpoch, setWorkspaceEpoch] = useState(() => workspaceVersion(projectId));
   const [restoring, setRestoring] = useState(false);
@@ -166,7 +161,10 @@ export function ProjectShell({
   // The chat takes the request once its conversation is open.
   usePlaytestAskRequests(state.conversation ? state.project?.id : undefined, requestPrompt);
   const modelCatalog = useAgentModels({ agentRuntimes: true });
-  const effectiveModel = findAgentModel(modelCatalog.hiddenModels ?? [], state.settings.model) ?? preferredAgentModel(modelCatalog.models, state.settings.model, modelCatalog.defaultModel);
+  const selectedModelReference = state.settings.model ?? state.project?.modelSelections?.agent;
+  const effectiveModel = selectedModelReference
+    ? findAgentModel(modelCatalog.hiddenModels ?? [], selectedModelReference) ?? findAgentModel(modelCatalog.models, selectedModelReference)
+    : preferredAgentModel(modelCatalog.models, undefined, modelCatalog.defaultModel);
   const initialPromptAttempted = useRef(false);
   const unsubscribeEvents = useRef<(() => void) | undefined>(undefined);
   const timeline = useRef<HTMLDivElement>(null);
@@ -269,7 +267,7 @@ export function ProjectShell({
         const requestedConversation = availableConversations.find((item) => item.id === conversationId);
         let selected = requestedConversation ?? availableConversations[0];
         if (!selected) {
-          const model = await initialConversationModel();
+          const model = await initialConversationModel(project.modelSelections?.agent);
           if (disposed) return;
           selected = await createConversation(projectId, model);
         }
@@ -393,24 +391,10 @@ export function ProjectShell({
     return () => observer.disconnect();
   }, [state.conversation?.id, state.agent.status, state.plan.mode]);
 
-  useEffect(() => {
-    const project = state.project;
-    const busy = sendingInitialPrompt ||
-      state.agent.status === "running" || state.agent.status === "cancelling";
-    if (runtime.recovered || !project || (!isWebRuntimeProjectType(project.type) && project.type !== "interactive-story") || auth.state.status !== "signed-in" || state.phase !== "ready" || publishing || busy) return;
-    const pending = takePendingPublish(sessionStorage, project.id);
-    if (pending) void publish(pending).catch(() => undefined);
-  }, [auth.state.status, state.phase, state.project?.id, state.project?.type, state.agent.status, sendingInitialPrompt, publishing]);
-
-  if (state.phase === "fatal") {
-    return <FatalState message={state.notice ?? t("projectShell.runtimeUnreachable")} onHome={onHome} homeLabel={homeLabel} />;
-  }
-
   const project = state.project;
   const conversation = state.conversation;
-  const publishDialogStatus = publishDialog?.projectId === project?.id ? publishDialog?.status : undefined;
 
-  const displayedModel = state.settings.model ?? modelCatalog.defaultModel ?? modelCatalog.models[0];
+  const displayedModel = selectedModelReference ?? modelCatalog.defaultModel ?? modelCatalog.models[0];
   const activeTurn = state.turns.findLast((turn) => turn.status === "inProgress");
   const items = state.turns.flatMap((turn) => turn.items);
   const questionnaire = activeTurn?.items.find((item): item is Extract<ThreadItem, { type: "userInputRequest" }> => (
@@ -528,10 +512,10 @@ export function ProjectShell({
     }
   }
 
-  async function respondToApproval(decision: ApprovalDecision): Promise<boolean> {
+  async function respondToApproval(decision: ApprovalDecision, sourceConfirmation?: IsolatedSourceConfirmation, volumeMigrationConfirmation?: VolumeMigrationConfirmation): Promise<boolean> {
     if (!project || !conversation || !approval) return false;
     try {
-      await answerApproval(project.id, conversation.id, approval.requestId, decision);
+      await answerApproval(project.id, conversation.id, approval.requestId, decision, sourceConfirmation, volumeMigrationConfirmation);
       return true;
     } catch (error) {
       dispatch({ type: "notice", message: errorMessage(error) });
@@ -567,7 +551,7 @@ export function ProjectShell({
   }, [project, conversation, agentBusy, state.pendingPrompts.length, state.connection]);
 
   const restoreToMessage = useCallback((checkpointId: string) => {
-    if (!project || !conversation || agentBusy || restoring || unfinishedRestore || publishing || state.pendingPrompts.length > 0 || state.connection !== "open") return;
+    if (!project || !conversation || agentBusy || restoring || unfinishedRestore || state.pendingPrompts.length > 0 || state.connection !== "open") return;
     if (!window.confirm(t("checkpoints.restoreConfirm"))) return;
     dispatch({ type: "notice", message: undefined });
     setRestoring(true);
@@ -580,10 +564,10 @@ export function ProjectShell({
         dispatch({ type: "notice", message: errorMessage(error) });
       } finally { setRestoring(false); }
     })();
-  }, [project, conversation, agentBusy, restoring, unfinishedRestore, publishing, state.pendingPrompts.length, state.connection]);
+  }, [project, conversation, agentBusy, restoring, unfinishedRestore, state.pendingPrompts.length, state.connection]);
 
   const loadedConversationId = conversation?.id;
-  const turnChangesDisabled = agentBusy || restoring || unfinishedRestore || publishing || state.connection !== "open";
+  const turnChangesDisabled = agentBusy || restoring || unfinishedRestore || state.connection !== "open";
   const turnChanges = useMemo((): TurnChangesControls | undefined => {
     if (loadedConversationId === undefined) return undefined;
     const change = (operation: typeof undoCheckpoint): TurnChangesControls["undo"] => async (checkpointId, conflicts, expected) => {
@@ -655,39 +639,6 @@ export function ProjectShell({
     }
   }
 
-  async function publish(details: PublishDetails): Promise<boolean> {
-    if (!project || publishing || agentBusy) return false;
-    const resumeAfterWebSignIn = !window.ohMyGameDesktop && auth.state.status !== "signed-in";
-    if (resumeAfterWebSignIn) rememberPendingPublish(sessionStorage, project.id, details);
-    setPublishing(true);
-    dispatch({ type: "notice", message: undefined });
-    try {
-      const accessToken = await auth.requestAccessToken();
-      if (!accessToken) {
-        if (resumeAfterWebSignIn) forgetPendingPublish(sessionStorage);
-        return false;
-      }
-      forgetPendingPublish(sessionStorage);
-      const result = await publishProject(project.id, accessToken, details);
-      const publication = {
-        gameId: result.game.id,
-        deploymentId: result.game.deploymentId,
-        playUrl: result.game.playUrl,
-        publishedAt: result.game.publishedAt,
-        title: result.game.title,
-        description: result.game.description,
-      };
-      dispatch({ type: "publication-updated", projectId: project.id, publication });
-      setPublishDialog({ projectId: project.id, status: "success" });
-      return true;
-    } catch (error) {
-      dispatch({ type: "notice", message: errorMessage(error) });
-      throw error;
-    } finally {
-      setPublishing(false);
-    }
-  }
-
   async function newConversation() {
     if (!project || creatingConversation) return;
     setCreatingConversation(true);
@@ -712,7 +663,7 @@ export function ProjectShell({
       const settings = await setConversationModel(project.id, conversation.id, model);
       dispatch({ type: "conversation-settings", settings });
     } catch (error) {
-      dispatch({ type: "notice", message: errorMessage(error) });
+      dispatch({ type: "notice", message: error instanceof ApiError && error.code === "image_history_incompatible" ? t("modelSelector.imageHistoryIncompatible") : errorMessage(error) });
     } finally {
       setModelChanging(false);
     }
@@ -794,6 +745,10 @@ export function ProjectShell({
 
   const agentIsCollapsed = !isGodotProject && agentCollapsed;
   const viewerCollapsed = isGodotProject && !godotWorkspaceOpen && !designOpen;
+
+  if (state.phase === "fatal") {
+    return <FatalState message={state.notice ?? t("projectShell.runtimeUnreachable")} onHome={onHome} homeLabel={homeLabel} />;
+  }
 
   return (
     <>
@@ -922,10 +877,11 @@ export function ProjectShell({
             notice={state.connection === "reconnecting" ? t("projectShell.reconnecting") : state.notice}
             models={modelCatalog.models}
             modelStatus={modelCatalog.status}
-            model={effectiveModel}
+            model={effectiveModel ?? selectedModelReference}
             reasoningLevel={state.settings.reasoningLevel}
             nativeReasoningLevel={state.settings.nativeReasoningLevel}
             modelChanging={modelChanging}
+            hasImageHistory={items.some((item) => item.type === "imageRead" && item.count > 0 || "images" in item && !!item.images?.length)}
             promptHistory={[
               ...items.flatMap((item) => item.type === "userMessage" && item.text.trim()
                 ? [{ prompt: item.text, mentions: item.mentions ?? [] }]
@@ -954,8 +910,6 @@ export function ProjectShell({
             onRemovePending={removeFollowUp}
             onSteerPending={steerFollowUp}
             onEditPending={editFollowUp}
-            canPublish={Boolean(project && (isWebRuntimeProjectType(project.type) || project.type === "interactive-story") && !publishing && !agentBusy)}
-            onPublish={project ? () => setPublishDialog({ projectId: project.id, status: "open" }) : undefined}
           /> : null}
       </WorkspaceAgentPane>}
     >
@@ -963,15 +917,9 @@ export function ProjectShell({
       {!project ? <section className="viewer-pane" /> : project.type !== "interactive-story" && project.type !== "asset-canvas" ? (
         <CodingWorkspace
           project={project}
-          agentBusy={agentBusy}
-          publishing={publishing}
           workspaceRevision={workspaceRevision}
           previewPaused={previewPaused}
           openFileRequest={openFileRequest}
-          onPublish={publish}
-          publishDialog={publishDialogStatus}
-          onOpenPublish={() => setPublishDialog({ projectId: project.id, status: "open" })}
-          onClosePublish={() => setPublishDialog(undefined)}
           onRestart={restartPreview}
           onStop={async () => {
             try { await stopPreview(project.id); } catch (cause) { dispatch({ type: "notice", message: errorMessage(cause) }); }
@@ -1013,13 +961,8 @@ export function ProjectShell({
         onDesignSaveReady={registerDesignSave}
         onDesignContextChange={setDesignContext}
         agentBusy={agentBusy}
-        publishing={publishing}
         workspaceRevision={workspaceRevision}
         openFileRequest={openFileRequest}
-        onPublish={publish}
-        publishDialog={publishDialogStatus}
-        onOpenPublish={() => setPublishDialog({ projectId: project.id, status: "open" })}
-        onClosePublish={() => setPublishDialog(undefined)}
         chatOnRight={chatLayout === "right"}
         chatCollapsed={agentIsCollapsed}
         onHome={requestHome}
@@ -1125,7 +1068,8 @@ function leftUnfinished(error: unknown): boolean {
   return error instanceof ApiError && (error.code === "CHECKPOINT_INCOMPLETE" || error.code === "workspace_recovery");
 }
 
-async function initialConversationModel(): Promise<AgentModelRef | undefined> {
+async function initialConversationModel(selected?: AgentModelRef): Promise<AgentModelRef | undefined> {
+  if (selected) return selected;
   try {
     // OhMyGame's own models come first; with none connected, the first coding agent that is set up.
     const catalog = await listModels({ agentRuntimes: true });

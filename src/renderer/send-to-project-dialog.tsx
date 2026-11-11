@@ -34,7 +34,7 @@ export function SendToProjectDialog({ assetId, name, onClose }: { assetId: strin
     setPhase({ kind: "sending", projectId: project.id });
     try {
       const result = await addLibraryAssetToProject(project.id, assetId);
-      setPhase({ kind: "sent", project, path: result.path });
+      setPhase({ kind: "sent", project, path: result.modelRuntimePath ?? result.path });
     } catch (cause) {
       setPhase({ kind: "error", message: t("sendToProject.failed", { project: project.name, error: errorMessage(cause) }), retry: () => setPhase({ kind: "ready" }) });
     }

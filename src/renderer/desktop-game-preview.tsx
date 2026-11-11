@@ -95,7 +95,7 @@ export function DesktopGamePreview({ bridge, refresh, projectId, url, reload, vi
 
   useLayoutEffect(() => { synchronize.current(); }, [visible, error]);
 
-  return <div ref={element} className="preview-frame" data-native-game-preview={projectId}>
+  return <div ref={element} className="preview-frame" data-native-game-preview={projectId} data-native-preview-visible={visible && !error}>
     {error ? <div className="preview-status-panel" role="alert">{error}</div> : null}
   </div>;
 }

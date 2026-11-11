@@ -11,6 +11,7 @@ export type DesktopUpdateErrorCode =
   | "unknown";
 
 export type DesktopUpdateStatus =
+  | { type: "disabled" }
   | { type: "idle" }
   | { type: "checking" }
   | { type: "up-to-date" }

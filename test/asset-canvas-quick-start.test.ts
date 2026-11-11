@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ImageModel, ProjectState, VideoModel } from "../src/shared/contracts.js";
+import { kunpoVideoModels, seedanceModel } from "../src/daemon/seedance-models.js";
 
 const api = {
   createProject: vi.fn(),
@@ -107,6 +108,14 @@ describe("Asset Canvas quick start", () => {
     }) }));
   });
 
+  it.each([seedanceModel("volcengine-ark", "doubao-seedance-2-5-260628")!, ...kunpoVideoModels()])("starts $id in no-reference text mode with a fixed ratio", async (model) => {
+    api.listVideoModels.mockResolvedValue([model]);
+    await createAssetCanvasQuickStart(starter("video"));
+    expect(api.saveCanvasBoard).toHaveBeenCalledWith(PROJECT.id, expect.objectContaining({ board: expect.objectContaining({
+      nodes: [expect.objectContaining({ type: "video", data: expect.objectContaining({ aspectRatio: "16:9", referenceMode: "reference", references: [] }) })],
+    }) }));
+  });
+
   it.each([
     ["seedance-2.0", OFFICIAL_SEEDANCE_20],
     ["seedance-2.5", OFFICIAL_SEEDANCE_25],
@@ -150,20 +159,13 @@ describe("Asset Canvas quick start", () => {
     }) }));
   });
 
-  it("removes a project when its starter canvas cannot be written", async () => {
-    api.saveCanvasBoard.mockRejectedValue(new Error("Could not write canvas"));
-
-    await expect(createAssetCanvasQuickStart(starter("video"))).rejects.toThrow("Could not write canvas");
-    expect(api.deleteProject).toHaveBeenCalledWith(PROJECT.id);
-  });
-
-  it("reports when a failed starter project cannot be removed", async () => {
-    api.saveCanvasBoard.mockRejectedValue(new Error("Could not write canvas"));
-    api.deleteProject.mockRejectedValue(new Error("Could not delete project"));
-
-    await expect(createAssetCanvasQuickStart(starter("model-3d"))).rejects.toThrow(
-      "Could not write canvas. The empty canvas could not be removed.",
+  it.each(["getCanvasWorkspace", "getCanvasBoard", "saveCanvasBoard"] as const)("keeps the new project without deletion when %s fails", async (boundary) => {
+    api[boundary].mockRejectedValue(new Error("Could not initialize canvas"));
+    await expect(createAssetCanvasQuickStart(starter("video"))).rejects.toThrow(
+      "Could not initialize canvas. The new project has been kept. Check it in the project list before deleting it manually.",
     );
+    expect(api.createProject).toHaveBeenCalledExactlyOnceWith({ type: "asset-canvas" });
+    expect(api.deleteProject).not.toHaveBeenCalled();
   });
 });
 

@@ -139,7 +139,20 @@ async function setup() {
   };
 }
 
-describe("Codex CLI image provider", () => {
+describe("local secure Codex image boundary", () => {
+  it("does not discover, advertise or run a native image connection", async () => {
+    const connect = vi.fn();
+    const provider = new CodexImageProvider("/never-created", connect);
+    expect((await provider.summary(true)).enabled).toBe(false);
+    expect((await provider.catalog()).models).toEqual([]);
+    await expect(provider.generate({ prompt: "test" })).rejects.toThrow("temporarily unavailable");
+    expect(connect).not.toHaveBeenCalled();
+    provider.close();
+  });
+});
+
+// Retained for future OS-isolated execution; the local secure boundary test above covers current refusal.
+describe.skip("Codex CLI image provider", () => {
   it("ignores login discovery that finishes after daemon shutdown", async () => {
     const cli = fakeServer();
     const { provider, connect, connection } = await setup();

@@ -125,7 +125,34 @@ export function createComposerDraftStore(storage?: DraftStorage) {
     } catch { /* Memory drafts are still cleared when storage is unavailable. */ }
   }
 
-  return { get, deleteProject };
+  function projectStatus(projectId: string, savedStorage = storage): "clear" | "pending" | "unknown" {
+    const prefix = projectPrefix(projectId);
+    for (const [key, entry] of sessions) {
+      if (!key.startsWith(prefix)) continue;
+      const draft = entry.session.getSnapshot();
+      if (serializeDraft(draft) || draft.attachments.length || draft.mentions.length || draft.submitting) return "pending";
+    }
+    try {
+      if (!savedStorage) return "clear";
+      for (let index = 0; index < savedStorage.length; index++) {
+        const key = savedStorage.key(index);
+        if (!key) return "unknown";
+        if (!key.startsWith(prefix)) continue;
+        const raw = savedStorage.getItem(key);
+        if (raw === null) return "unknown";
+        const value: unknown = JSON.parse(raw);
+        if (!isRecord(value) || value.version !== 1 || typeof value.prompt !== "string" || !Array.isArray(value.mentions) || !value.mentions.every(isPluginMention) || typeof value.planning !== "boolean"
+          || value.selectedSkill !== undefined && typeof value.selectedSkill !== "string"
+          || value.selectedPlugin !== undefined && !isPluginMention(value.selectedPlugin)
+          || value.reference !== undefined && (!isRecord(value.reference) || typeof value.reference.text !== "string")
+          || value.designReference !== undefined && (!isRecord(value.designReference) || !Array.isArray(value.designReference.references) || !isRecord(value.designReference.context))) return "unknown";
+        if (value.prompt || value.mentions.length || value.planning || value.selectedSkill || value.selectedPlugin || value.reference || value.designReference) return "pending";
+      }
+      return "clear";
+    } catch { return "unknown"; }
+  }
+
+  return { get, deleteProject, projectStatus };
 }
 
 function projectPrefix(projectId: string): string {

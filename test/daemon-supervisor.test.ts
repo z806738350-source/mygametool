@@ -12,20 +12,31 @@ afterEach(async () => {
 });
 
 async function fixture(
-  options: { maxAutomaticRestarts?: number; projectChild?: boolean } = {},
+  options: { maxAutomaticRestarts?: number; projectChild?: boolean; localEnv?: boolean; start?: boolean; failFirst?: boolean } = {},
 ) {
   const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-supervisor-"));
   cleanups.push(() => rm(directory, { recursive: true, force: true }));
   const entry = path.join(directory, "daemon.mjs");
+  const envFile = path.join(directory, "fake.env");
+  if (options.localEnv) await writeFile(envFile, "KUNPO_API_KEY=sk-FIRST_FAKE\n", { mode: 0o600 });
   await writeFile(
     entry,
     `
     import { existsSync, readFileSync, writeFileSync } from 'node:fs';
     import { spawn } from 'node:child_process';
     import { createServer } from 'node:http';
+    import { createHash } from 'node:crypto';
     const count = existsSync(${JSON.stringify(path.join(directory, "count"))}) ? Number(readFileSync(${JSON.stringify(path.join(directory, "count"))}, 'utf8')) + 1 : 1;
     writeFileSync(${JSON.stringify(path.join(directory, "count"))}, String(count));
     writeFileSync(${JSON.stringify(path.join(directory, "pid"))}, String(process.pid));
+    const args = process.argv.slice(2), importIndex = args.indexOf('--local-env');
+    const snapshot = ${JSON.stringify(path.join(directory, "snapshot"))}, reads = ${JSON.stringify(path.join(directory, "env-reads"))};
+    if (importIndex >= 0) {
+      writeFileSync(snapshot, readFileSync(args[importIndex + 1]), { mode: 0o600 });
+      writeFileSync(reads, String(existsSync(reads) ? Number(readFileSync(reads, 'utf8')) + 1 : 1));
+    }
+    writeFileSync(${JSON.stringify(path.join(directory, "generation-"))} + count + '.json', JSON.stringify({ args, configuration: existsSync(snapshot) ? createHash('sha256').update(readFileSync(snapshot)).digest('hex') : null }));
+    if (${options.failFirst ?? false} && count === 1) process.exit(8);
     const server = createServer((request, response) => {
       response.end('ready');
       if (request.url === '/crash') setImmediate(() => process.exit(9));
@@ -48,7 +59,7 @@ async function fixture(
   `,
   );
   const states: DesktopRuntimeState[] = [];
-  const supervisor = new DaemonSupervisor({
+  const launchOptions = {
     daemonEntry: entry,
     dataDirectory: directory,
     token: "test-token",
@@ -57,14 +68,46 @@ async function fixture(
     environment: {},
     healthTimeoutMs: 2_000,
     maxAutomaticRestarts: options.maxAutomaticRestarts,
-    onState: (state) => states.push(state),
-  });
+    ...(options.localEnv ? { localEnvFile: envFile } : {}),
+    onState: (state: DesktopRuntimeState) => states.push(state),
+  };
+  const supervisor = new DaemonSupervisor(launchOptions);
   cleanups.push(() => supervisor.stop());
-  await supervisor.start();
-  return { supervisor, directory, states };
+  if (options.start !== false) await supervisor.start();
+  return { supervisor, directory, states, envFile, launchOptions };
 }
 
 describe("background service recovery", () => {
+  it("imports once per desktop lifetime and reuses the snapshot on automatic and manual daemon restarts", async () => {
+    const { supervisor, directory, envFile, launchOptions } = await fixture({ localEnv: true });
+    const generation = async (number: number) => JSON.parse(await readFile(path.join(directory, `generation-${number}.json`), "utf8"));
+    const first = await generation(1);
+    expect(first.args).toEqual(["--local-env", envFile]);
+    await writeFile(envFile, "KUNPO_API_KEY=sk-EDITED_FAKE\n");
+    await fetch(`${supervisor.runtime.url}/crash`);
+    await vi.waitFor(() => expect(supervisor.state()).toMatchObject({ status: "ready", generation: 2 }));
+    expect(await generation(2)).toEqual({ args: ["--reuse-local-env"], configuration: first.configuration });
+    await supervisor.restart();
+    expect(await generation(3)).toEqual({ args: ["--reuse-local-env"], configuration: first.configuration });
+    expect(await readFile(path.join(directory, "env-reads"), "utf8")).toBe("1");
+    await supervisor.stop();
+    const newDesktop = new DaemonSupervisor(launchOptions);
+    cleanups.push(() => newDesktop.stop());
+    await newDesktop.start();
+    expect((await generation(4)).args).toEqual(["--local-env", envFile]);
+    expect((await generation(4)).configuration).not.toBe(first.configuration);
+    expect(await readFile(path.join(directory, "env-reads"), "utf8")).toBe("2");
+  });
+
+  it("does not accept a failed initial startup as a successful credential import", async () => {
+    const { supervisor, directory, envFile } = await fixture({ localEnv: true, start: false, failFirst: true });
+    await expect(supervisor.start()).rejects.toThrow("Daemon exited before becoming ready (8)");
+    await writeFile(envFile, "KUNPO_API_KEY=sk-RETRY_FAKE\n");
+    await supervisor.restart();
+    const next = JSON.parse(await readFile(path.join(directory, "generation-2.json"), "utf8"));
+    expect(next.args).toEqual(["--local-env", envFile]);
+    expect(await readFile(path.join(directory, "env-reads"), "utf8")).toBe("2");
+  });
   it("contains failed daemon spawns without hanging cleanup", async () => {
     const before = Date.now();
     await expect(

@@ -1,9 +1,47 @@
 import { describe, expect, it } from "vitest";
 import type { ImageModel, VideoModel, Model3DModel } from "../src/shared/contracts.js";
 import type { AudioModel } from "../src/shared/audio.js";
-import { applyRememberedSettings, canvasNodeTypeAvailable, nodeGenerationSettings } from "../src/renderer/asset-canvas-workspace.js";
+import { applyRememberedSettings, canvasNodeTypeAvailable, compatibleImageSettings, compatibleVideoDraft, nodeGenerationSettings, tripoRigTypes } from "../src/renderer/asset-canvas-workspace.js";
+import { kunpoVideoModels, seedanceModel } from "../src/daemon/seedance-models.js";
+import { videoReferenceAspectRatios } from "../src/shared/video-references.js";
 
 type FlowNode = Parameters<typeof applyRememberedSettings>[0];
+
+it.each([seedanceModel("volcengine-ark", "doubao-seedance-2-5-260628")!, ...kunpoVideoModels()])("normalizes explicit draft edits for $id without losing references or modifying input", (model) => {
+  for (const referenceMode of ["frame", "reference"] as const) for (const count of [0, 1, 2, 3]) {
+    const references = Array.from({ length: count }, (_, index) => ({ type: "library" as const, assetId: `fixture-${index}` }));
+    const input = { videoModel: { provider: model.provider, id: model.id }, videoResolution: "unsupported" as VideoModel["resolutions"][number], videoAspectRatio: "16:9" as const, duration: 99, referenceMode, references };
+    const snapshot = structuredClone(input), result = compatibleVideoDraft(input, [model]);
+    expect(result.references).toBe(references); expect(result.references).toHaveLength(count);
+    expect(model.resolutions).toContain(result.videoResolution); expect(model.durations).toContain(result.duration);
+    expect(videoReferenceAspectRatios(model, count, referenceMode)).toContain(result.videoAspectRatio);
+    expect(result.videoAspectRatio).toBe(referenceMode === "frame" ? "adaptive" : "16:9");
+    expect(input).toEqual(snapshot);
+  }
+});
+
+it.each([seedanceModel("volcengine-ark", "doubao-seedance-2-5-260628")!, ...kunpoVideoModels()])("limits no-reference ratios and preserves reference modes for $id", (model) => {
+  const noReferences = videoReferenceAspectRatios(model, 0, "reference");
+  expect(noReferences).not.toContain("adaptive"); expect(noReferences).toContain("16:9");
+  expect(videoReferenceAspectRatios(model, 1, "reference")).toContain("adaptive");
+  expect(videoReferenceAspectRatios(model, 2, "reference")).toContain("16:9");
+  expect(videoReferenceAspectRatios(model, 1, "frame")).toEqual(["adaptive"]);
+  expect(videoReferenceAspectRatios(model, 0, "frame")).toEqual(["adaptive"]);
+  const node: FlowNode = { id: "new-video", type: "video", position: { x: 0, y: 0 }, data: { prompt: "", references: [] } };
+  const settings = { videoModel: { provider: model.provider, id: model.id }, videoAspectRatio: "adaptive" as const };
+  const selected = applyRememberedSettings(node, settings, { imageModels: [], videoModels: [model], textModels: [] });
+  expect(selected.data.videoAspectRatio).toBe("16:9");
+  expect(selected.data.referenceMode).toBe("reference");
+  const frame = applyRememberedSettings({ ...node, data: { ...node.data, referenceMode: "frame" } }, settings, { imageModels: [], videoModels: [model], textModels: [] });
+  expect(frame.data.referenceMode).toBe("frame"); expect(frame.data.videoAspectRatio).toBe("adaptive");
+  expect(settings.videoAspectRatio).toBe("adaptive"); expect(node.data.videoAspectRatio).toBeUndefined();
+});
+
+it("preserves another protocol's configured default ratio order", () => {
+  const model: VideoModel = { provider: "legacy", id: "other-video", providerName: "Legacy", name: "Other video", resolutions: ["720p"], durations: [6], aspectRatios: ["1:1", "16:9"], maxImageReferences: 1 };
+  const node: FlowNode = { id: "new-other-video", type: "video", position: { x: 0, y: 0 }, data: { prompt: "", references: [] } };
+  expect(applyRememberedSettings(node, undefined, { imageModels: [], videoModels: [model], defaultVideoModel: model, textModels: [] }).data.videoAspectRatio).toBe("1:1");
+});
 
 const openRouterImage = { provider: "openrouter", id: "gpt-image-2", name: "GPT Image 2", providerName: "OpenRouter", generationOptions: [{ resolution: "1K", aspectRatio: "1:1" }] } as unknown as ImageModel;
 const openAIImage = {
@@ -106,14 +144,16 @@ describe("Asset Canvas remembered settings", () => {
     expect(applyRememberedSettings(base, settings, catalogs)).toBe(base);
   });
 
-  it("carries speech voice settings and defaults the model to the catalog entry", () => {
+  it("does not inherit legacy IDs or reference audio, but remembers rate and model and defaults the model to the catalog entry", () => {
     const base: FlowNode = { id: "speech-1", type: "speech", position: { x: 0, y: 0 }, data: { text: "" } };
     const audioModel = { provider: "volcengine-tts", id: "seed-tts-2.0", name: "Seed TTS", providerName: "Doubao Speech", protocol: "volcengine-tts-v3", capabilities: { operations: ["speech"], executionModes: ["streaming"], formats: ["mp3"] } } satisfies AudioModel;
-    const settings = nodeGenerationSettings({ type: "speech", data: { audioModel: { provider: "volcengine-tts", id: "seed-tts-2.0" }, voiceId: "zh_female_vv_uranus_bigtts", speed: 25 } });
-    expect(settings).toEqual({ audioModel: { provider: "volcengine-tts", id: "seed-tts-2.0" }, voiceId: "zh_female_vv_uranus_bigtts", speed: 25 });
-    expect(applyRememberedSettings(base, settings, { ...catalogs, audioModels: [audioModel] }).data).toMatchObject({ audioModel: { provider: "volcengine-tts", id: "seed-tts-2.0" }, voiceId: "zh_female_vv_uranus_bigtts", speed: 25 });
+    const settings = nodeGenerationSettings({ type: "speech", data: { audioModel: { provider: "volcengine-tts", id: "seed-tts-2.0" }, voiceId: "zh_female_vv_uranus_bigtts", referenceAssetId: "old-private-reference", speed: 25 } });
+    expect(settings).not.toHaveProperty("referenceAssetId");
+    expect(settings).not.toHaveProperty("voiceId");
+    expect(settings).toEqual({ audioModel: { provider: "volcengine-tts", id: "seed-tts-2.0" }, speed: 25 });
+    expect(applyRememberedSettings(base, settings, { ...catalogs, audioModels: [audioModel] }).data).toMatchObject({ audioModel: { provider: "volcengine-tts", id: "seed-tts-2.0" }, speed: 25 });
     expect(applyRememberedSettings(base, undefined, { ...catalogs, audioModels: [audioModel] }).data.audioModel).toEqual({ provider: "volcengine-tts", id: "seed-tts-2.0" });
-    expect(applyRememberedSettings(base, settings, { ...catalogs }).data).toMatchObject({ audioModel: { provider: "volcengine-tts", id: "seed-tts-2.0" }, voiceId: "zh_female_vv_uranus_bigtts" });
+    expect(applyRememberedSettings(base, settings, { ...catalogs }).data).toMatchObject({ audioModel: { provider: "volcengine-tts", id: "seed-tts-2.0" } });
   });
 
   it.each(["sound-effect", "music"] as const)("remembers %s settings and only selects a model with that capability", (type) => {
@@ -124,6 +164,23 @@ describe("Asset Canvas remembered settings", () => {
     expect(applyRememberedSettings(base, settings, { ...catalogs, audioModels: [speechModel, model] }).data).toMatchObject({
       audioModel: { provider: "audio-lab", id: type }, durationSeconds: 30, loop: true, ...(type === "music" ? { instrumental: false } : {}),
     });
-    expect(applyRememberedSettings(base, undefined, { ...catalogs, audioModels: [speechModel, model] }).data.audioModel).toEqual({ provider: "audio-lab", id: type });
+    expect(applyRememberedSettings(base, undefined, { ...catalogs, audioModels: [speechModel, model] }).data.audioModel).toEqual(type === "music" ? undefined : { provider: "audio-lab", id: type });
+  });
+
+  it("uses explicit project speech choices without inventing a full music default or replacing unavailable models", () => {
+    const speech: FlowNode = { id: "speech", type: "speech", position: { x: 0, y: 0 }, data: { text: "" } };
+    const music: FlowNode = { id: "music", type: "music", position: { x: 0, y: 0 }, data: { prompt: "", instrumental: true } };
+    const selected = { provider: "volcengine-tts", id: "seed-audio-1.0" };
+    expect(applyRememberedSettings(speech, undefined, { ...catalogs, modelSelections: { speech: selected } }).data.audioModel).toEqual(selected);
+    expect(applyRememberedSettings(music, undefined, { ...catalogs, audioModels: [{ ...selected, capabilities: { operations: ["music"] } } as AudioModel] }).data.audioModel).toBeUndefined();
+  });
+
+  it("clears mask and alpha-only settings when switching to a model that cannot honor them", () => {
+    const image = { ...openAIImage, qualities: ["auto", "medium", "max"], outputFormats: ["png", "jpeg"], supportsTransparency: true, supportsMask: true } as ImageModel;
+    const settings = { quality: "max", outputFormat: "jpeg", background: "transparent", outputCompression: 50, mask: { type: "library", assetId: "mask" } } as const;
+    expect(compatibleImageSettings(settings, image)).toEqual({ quality: "max", outputFormat: "png", background: "transparent", outputCompression: undefined, mask: settings.mask });
+    expect(compatibleImageSettings(settings, { ...image, qualities: undefined, outputFormats: undefined, supportsTransparency: false, supportsMask: false })).toEqual({ quality: undefined, outputFormat: undefined, background: undefined, outputCompression: undefined, mask: undefined });
+    expect(tripoRigTypes("v3.0-20260909")).toEqual(["biped", "others"]);
+    expect(tripoRigTypes("v2.5-20260210")).toContain("quadruped");
   });
 });

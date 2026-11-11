@@ -6,9 +6,10 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const root = path.resolve(__dirname, '..');
 const directory = process.argv[2];
+const nativeTransitions = !process.argv.includes('--skip-native-transitions');
 app.setPath('userData', path.join(directory, 'profile'));
 app.on('window-all-closed', () => {});
-const deadline = setTimeout(() => { console.error('Desktop game check timed out'); app.exit(2); }, 45000);
+const deadline = setTimeout(() => { console.error('Desktop game check timed out'); app.exit(2); }, 60000);
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 async function eventually(predicate) {
   const end = Date.now() + 5000;
@@ -18,6 +19,7 @@ async function eventually(predicate) {
   }
 }
 async function fullscreen(window, frame, enabled) {
+  if (!nativeTransitions) return;
   console.log(`Fullscreen ${window.getTitle()} ${enabled}`);
   let timer;
   const transition = new Promise((resolve, reject) => {
@@ -29,10 +31,33 @@ async function fullscreen(window, frame, enabled) {
     await transition;
   } finally { clearTimeout(timer); }
 }
-const html = `<!doctype html><head></head><body style="background:#245;color:white"><h1>Shared game</h1><button id="add">Add point</button><script>
-window.game = { id: crypto.randomUUID(), memory: 0, frames: 0 };
+const backgroundSamples = [];
+const unsupportedStorageContracts = [
+  'Migrating legacy/default iframe saves into the local native private partition',
+  'Persisting native game saves after disposing and replacing the view',
+];
+async function activity(frame, label, milliseconds) {
+  const snapshot = () => frame.executeJavaScript('({ frames: game.frames, ticks: game.ticks, visibility: document.visibilityState })');
+  const before = await snapshot();
+  const started = Date.now();
+  await sleep(milliseconds);
+  const after = await snapshot();
+  const sample = { label, milliseconds: Date.now() - started, frames: after.frames - before.frames, ticks: after.ticks - before.ticks, visibility: after.visibility };
+  backgroundSamples.push(sample);
+  return sample;
+}
+function backgroundActivity(visible, hidden) {
+  assert.ok(visible.frames >= 2 && visible.ticks >= 2, `${visible.label} advances animation and timers`);
+  assert.equal(hidden.visibility, 'hidden', `${hidden.label} reports hidden`);
+  assert.ok(hidden.frames <= 1, `${hidden.label} stops continuous animation`);
+  assert.ok(hidden.ticks / hidden.milliseconds < visible.ticks / visible.milliseconds / 2, `${hidden.label} throttles timers`);
+}
+const html = `<!doctype html><head></head><body style="background:#245;color:white"><h1>Shared game</h1><button id="add">Add point</button><canvas width="80" height="80"></canvas><script>
+window.game = { id: crypto.randomUUID(), memory: 0, frames: 0, ticks: 0 };
 window.addEventListener('keydown', event => { game.lastKey = event.key; });
-const render = () => { game.frames++; requestAnimationFrame(render); }; requestAnimationFrame(render);
+const context = document.querySelector('canvas').getContext('2d');
+const render = () => { game.frames++; context.fillStyle = '#48a'; context.fillRect(0, 0, 80, 80); requestAnimationFrame(render); }; requestAnimationFrame(render);
+setInterval(() => { game.ticks++; }, 16);
 async function database() {
   return await new Promise((resolve, reject) => {
     const request = indexedDB.open('qa-game', 1);
@@ -91,19 +116,21 @@ app.whenReady().then(async () => {
     const native = webContents.getAllWebContents().find(contents => contents.getURL() === hostUrl);
     assert.ok(native, 'Native game WebContents exists');
     const frame = () => native.mainFrame.frames.find(frame => frame.url.startsWith(proxy.url));
-    assert.deepEqual(await frame().executeJavaScript('readSave()'), { localStorage: '64', indexedDB: 64 }, 'Existing iframe saves are retained');
+    assert.deepEqual(await frame().executeJavaScript('readSave()'), { localStorage: null, indexedDB: null }, 'Local private native storage is isolated from legacy/default iframe saves');
+    await frame().executeJavaScript('save(64)');
+    assert.deepEqual(await frame().executeJavaScript('readSave()'), { localStorage: '64', indexedDB: 64 }, 'Native localStorage and IndexedDB saves work within the view lifetime');
     assert.equal(await frame().executeJavaScript('typeof window.ohMyGameDesktop'), 'undefined');
     assert.equal(await native.executeJavaScript('typeof window.ohMyGameDesktop'), 'undefined');
     const identity = await frame().executeJavaScript('game.id');
-    console.log('Checking native game fullscreen...');
+    console.log(nativeTransitions ? 'Checking native game fullscreen...' : 'Skipping native fullscreen/minimize transitions (--skip-native-transitions).');
     await fullscreen(editor, frame(), true);
     await fullscreen(editor, frame(), false);
-    console.log('Native game fullscreen passed.');
+    if (nativeTransitions) console.log('Native game fullscreen passed.');
     await frame().executeJavaScript('game.memory = 42; history.pushState({}, "", "/scene?level=2#boss")');
     await eventually(() => navigation.at(-1)?.path === '/scene?level=2#boss');
     const frameId = frame().frameTreeNodeId;
     await fullscreen(editor, frame(), true);
-    const editorExit = new Promise(resolve => editor.once('leave-full-screen', resolve));
+    const editorExit = nativeTransitions ? new Promise(resolve => editor.once('leave-full-screen', resolve)) : Promise.resolve();
     await games.open('game', { path: '/', viewport: { width: 375, height: 667 } }, target);
     await editorExit;
     await eventually(() => !editor.isFullScreen());
@@ -126,6 +153,30 @@ app.whenReady().then(async () => {
     await eventually(async () => await frame().executeJavaScript('innerWidth') === 768);
     games.layout('game', 'mount', { ...layout, visible: false });
     assert.equal(native.isAudioMuted(), false, 'Editor overlays cannot mute the separate Play window');
+    await eventually(async () => await frame().executeJavaScript('document.visibilityState') === 'visible');
+    const visiblePlay = await activity(frame(), 'visible Play', 400);
+    player.hide();
+    await eventually(async () => native.isAudioMuted() && !player.isVisible() && await frame().executeJavaScript('document.visibilityState') === 'hidden');
+    await sleep(100);
+    backgroundActivity(visiblePlay, await activity(frame(), 'hidden Play', 1200));
+    player.show();
+    await eventually(async () => !native.isAudioMuted() && await frame().executeJavaScript('document.visibilityState') === 'visible');
+    const shownPlay = await activity(frame(), 'shown Play', 400);
+    assert.ok(shownPlay.frames >= 2 && shownPlay.ticks >= 2, 'Showing Play resumes animation and timers');
+    if (nativeTransitions) {
+      player.minimize();
+      await eventually(async () => player.isMinimized() && native.isAudioMuted() && await frame().executeJavaScript('document.visibilityState') === 'hidden');
+      await sleep(100);
+      backgroundActivity(shownPlay, await activity(frame(), 'minimized Play', 1200));
+      player.restore();
+      await eventually(async () => !player.isMinimized() && !native.isAudioMuted() && await frame().executeJavaScript('document.visibilityState') === 'visible');
+    }
+    const restoredPlay = await activity(frame(), 'restored Play', 400);
+    assert.ok(restoredPlay.frames >= 2 && restoredPlay.ticks >= 2, 'Restoring Play resumes animation and timers');
+    assert.equal(frame().frameTreeNodeId, frameId, 'Hide/show and minimize/restore retain the game frame');
+    assert.equal(await frame().executeJavaScript('game.id'), identity);
+    assert.equal(await frame().executeJavaScript('game.memory'), 42);
+    assert.deepEqual(await frame().executeJavaScript('Array.from(document.querySelector("canvas").getContext("2d").getImageData(0, 0, 1, 1).data)'), [68, 136, 170, 255], 'The child-frame Canvas keeps rendering after restore');
     games.closeProject('game');
     assert.equal(games.state('game').open, false);
     assert.equal(frame().frameTreeNodeId, frameId);
@@ -141,8 +192,15 @@ app.whenReady().then(async () => {
     assert.equal(native.isAudioMuted(), true, 'Hidden Preview is muted');
     const hiddenState = await frame().executeJavaScript('document.visibilityState');
     assert.equal(hiddenState, 'hidden', 'Hidden native views report background visibility');
+    await sleep(100);
+    backgroundActivity(restoredPlay, await activity(frame(), 'hidden Preview', 1200));
     games.layout('game', 'mount', layout);
-    await eventually(() => !native.isAudioMuted());
+    await eventually(async () => !native.isAudioMuted() && await frame().executeJavaScript('document.visibilityState') === 'visible');
+    const shownPreview = await activity(frame(), 'shown Preview', 400);
+    assert.ok(shownPreview.frames >= 2 && shownPreview.ticks >= 2, 'Showing Preview resumes animation and timers');
+    assert.equal(frame().frameTreeNodeId, frameId, 'Showing Preview retains the game frame');
+    assert.equal(await frame().executeJavaScript('game.id'), identity);
+    assert.equal(await frame().executeJavaScript('game.memory'), 42);
     const image = await games.capture('game');
     assert.ok(image.length > 100, 'Captures the native game itself');
     await games.refresh('game', target, true);
@@ -164,11 +222,11 @@ app.whenReady().then(async () => {
     assert.equal(native.isDestroyed(), true, 'Closing the last host releases its game WebContents');
     await games.attach('game', 'again', editor, url, layout, target);
     const reloaded = webContents.getAllWebContents().find(contents => contents.getURL() === hostUrl);
-    assert.deepEqual(await reloaded.mainFrame.frames[0].executeJavaScript('readSave()'), { localStorage: '99', indexedDB: 99 });
+    assert.deepEqual(await reloaded.mainFrame.frames[0].executeJavaScript('readSave()'), { localStorage: null, indexedDB: null }, 'A fully replaced local native view starts with empty private storage');
     games.close();
     await eventually(() => reloaded.isDestroyed());
     assert.equal(reloaded.isDestroyed(), true, 'Service shutdown releases game WebContents');
-    console.log(JSON.stringify({ electron: process.versions.electron, checks: 'existing localStorage/IndexedDB saves, live frame identity, in-memory state, game frame focus, routing, source/diagnostics, fullscreen and transfer, resizing, AI storage isolation, visibility/audio, native capture, reload, renderer crash recovery, project leave, shutdown', hiddenVisibility: hiddenState, result: 'passed' }, null, 2));
+    console.log(JSON.stringify({ electron: process.versions.electron, skippedChecks: nativeTransitions ? [] : ['native fullscreen transitions', 'native minimize/restore transitions'], nativeChecks: nativeTransitions ? ['fullscreen transitions', 'minimize/restore transitions'] : [], checks: 'view-lifetime localStorage/IndexedDB saves, legacy/default storage isolation, live frame identity, in-memory state, game frame focus, routing, source/diagnostics, window transfer, resizing, AI storage isolation, native hide/show, visibility/audio, background animation/timers, child-frame Canvas, native capture, reload, renderer crash recovery, project leave, shutdown', unsupportedStorageContracts, hiddenVisibility: hiddenState, backgroundSamples, result: 'passed' }, null, 2));
   } catch (error) { console.error(error); process.exitCode = 1; }
   finally {
     clearTimeout(deadline);

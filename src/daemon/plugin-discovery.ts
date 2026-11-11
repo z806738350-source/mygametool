@@ -34,7 +34,7 @@ export async function discoverPlugins(root: string): Promise<DiscoveredPlugin[]>
     if (!await exists(path.join(root, candidate.path))) continue;
     const manifest = candidate.format === "ohmygame"
       ? await readOhMyGameManifest(path.join(root, candidate.path))
-      : await normalizeManifest(root, await readJson(path.join(root, candidate.path)), candidate.format);
+      : await normalizeManifest(root, await readJson(path.join(root, candidate.path)));
     const issue = pluginCompatibilityIssue(manifest);
     if (issue) throw new LocalPluginError(issue);
     return [await installCandidate(root, candidate.format, manifest, PERSONAL_MARKETPLACE)];
@@ -81,9 +81,9 @@ async function discoverMarketplace(root: string, manifestPath: string): Promise<
     const claudePath = path.join(sourceRoot, ".claude-plugin", "plugin.json");
     if (await exists(nativePath)) {
       manifest = await readOhMyGameManifest(nativePath);
-    } else if (await exists(codexPath)) manifest = await normalizeManifest(sourceRoot, await readJson(codexPath), "codex");
-    else if (await exists(claudePath)) manifest = await normalizeManifest(sourceRoot, await readJson(claudePath), "claude");
-    else manifest = await normalizeManifest(sourceRoot, entry, format, rawSkills.length ? rawSkills : undefined);
+    } else if (await exists(codexPath)) manifest = await normalizeManifest(sourceRoot, await readJson(codexPath));
+    else if (await exists(claudePath)) manifest = await normalizeManifest(sourceRoot, await readJson(claudePath));
+    else manifest = await normalizeManifest(sourceRoot, entry, rawSkills.length ? rawSkills : undefined);
     // One plugin that needs a newer host must not hide the rest of the marketplace.
     const issue = pluginCompatibilityIssue(manifest);
     if (issue) {
@@ -103,7 +103,6 @@ async function discoverMarketplace(root: string, manifestPath: string): Promise<
 async function normalizeManifest(
   root: string,
   value: unknown,
-  format: "codex" | "claude",
   declaredSkills?: string[],
 ): Promise<ResolvedPluginManifest> {
   const source = asRecord(value);

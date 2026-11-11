@@ -8,15 +8,19 @@ import {
   createServer,
   request,
   type IncomingMessage,
+  type IncomingHttpHeaders,
   type ServerResponse,
 } from "node:http";
 import type { Socket } from "node:net";
+import type { Duplex } from "node:stream";
 import {
   MAX_PREVIEW_DIAGNOSTIC_LENGTH,
   previewDiagnostic,
   type PreviewDiagnostic,
 } from "../shared/preview-diagnostics.js";
 import { annotatePlayableSourceLocations } from "../shared/playable-source-locations.js";
+import { isAllowedLocalOrigin, isLoopbackHostHeader, localPreviewCsp } from "../shared/local-security.js";
+import { containsKnownSensitiveValue } from "../shared/sensitive-values.js";
 
 const BRIDGE_PATH = "/__ohmygame_preview_bridge__.js";
 /** The web story editor bridge, served beside the preview bridge for Interactive Story pages. */
@@ -39,6 +43,8 @@ export async function createPreviewProxy(
   ) => void,
   options: {
     port?: number;
+    /** A VM transport owns the connection; the target URL remains a logical loopback origin. */
+    createConnection?: () => Duplex;
     onActivity?: (id: string, active: boolean) => void;
     onNavigation?: (
       client: string,
@@ -73,7 +79,8 @@ export async function createPreviewProxy(
     reloadStreams.delete(document);
   };
   const upstreamHeaders = (incoming: IncomingMessage) => {
-    const headers = { ...incoming.headers, host: target.host };
+    const headers: IncomingHttpHeaders = { ...incoming.headers, host: target.host };
+    for (const name of ["authorization", "proxy-authorization", "x-api-key", "x-ohmygame-daemon-token"]) delete headers[name];
     if (headers.origin === origin) headers.origin = target.origin;
     if (headers.referer) {
       const referer = new URL(headers.referer);
@@ -148,6 +155,12 @@ export async function createPreviewProxy(
   };
   const server = createServer((incoming, outgoing) => {
     try {
+      if (!isLoopbackHostHeader(incoming.headers.host) || !isAllowedLocalOrigin(incoming.headers.origin, incoming.headers.host) || containsKnownSensitiveValue(incoming.url ?? "")) {
+        incoming.resume(); outgoing.writeHead(403).end(); return;
+      }
+      outgoing.setHeader("content-security-policy", localPreviewCsp(origin));
+      outgoing.setHeader("referrer-policy", "no-referrer");
+      outgoing.setHeader("x-content-type-options", "nosniff");
       if (options.story && incoming.url?.split("?")[0] === STORY_BRIDGE_PATH) {
         void options.story.bridge().then(
           (script) => outgoing.writeHead(200, { "content-type": "text/javascript", "cache-control": "no-store" }).end(script),
@@ -264,21 +277,24 @@ export async function createPreviewProxy(
       incomingUrl.searchParams.delete(PREVIEW_CLIENT_QUERY);
       incomingUrl.searchParams.delete(PREVIEW_SOURCE_QUERY);
       const upstream = request(target, {
+        ...(options.createConnection ? { createConnection: options.createConnection } : {}),
         path: `${incomingUrl.pathname}${incomingUrl.search}`,
         method: incoming.method,
         headers: {
           ...upstreamHeaders(incoming),
+          ...(options.createConnection ? { connection: "close" } : {}),
           "accept-encoding": "identity",
         },
       });
       upstreamRequests.add(upstream);
       upstream.once("close", () => upstreamRequests.delete(upstream));
+      let responseEnded = false;
       incoming.once("aborted", () => upstream.destroy());
       outgoing.once("close", () => {
         if (!outgoing.writableFinished) upstream.destroy();
       });
       upstream.on("error", (error) => {
-        if (closed) return;
+        if (closed || responseEnded || incoming.aborted || outgoing.destroyed) return;
         report(document, incoming.url ?? "/", {
           kind: "load",
           message: `The preview server could not be reached: ${error.message}`,
@@ -288,7 +304,17 @@ export async function createPreviewProxy(
         outgoing.end("The preview server could not be reached.");
       });
       upstream.on("response", (response) => {
+        // A pipe-backed VM transport has no HTTP agent to reclaim idle sockets.
+        // Release its slot once the response is consumed, even if the browser requested keep-alive.
+        response.once("end", () => {
+          responseEnded = true;
+          if (options.createConnection) upstream.socket?.destroy();
+        });
         response.on("error", () => outgoing.destroy());
+        response.headers["content-security-policy"] = localPreviewCsp(origin);
+        response.headers["referrer-policy"] = "no-referrer";
+        response.headers["x-content-type-options"] = "nosniff";
+        for (const header of ["content-security-policy-report-only", "report-to", "reporting-endpoints", "nel"]) delete response.headers[header];
         const status = response.statusCode ?? 502;
         const contentType = String(response.headers["content-type"] ?? "");
         const destination = incoming.headers["sec-fetch-dest"];
@@ -404,6 +430,7 @@ export async function createPreviewProxy(
           (diagnostic) => report(document, incoming.url ?? "/", diagnostic),
           scene ? { scene } : options.story ? { bridge: true } : undefined,
         ).catch((error) => {
+          if (closed || incoming.aborted || outgoing.destroyed) return;
           report(document, incoming.url ?? "/", {
             kind: "load",
             message: `The preview response failed: ${error.message}`,
@@ -424,7 +451,11 @@ export async function createPreviewProxy(
   // Vite and other development servers retain their own WebSocket protocols.
   server.on("upgrade", (incoming, socket, head) => {
     try {
+      if (!isLoopbackHostHeader(incoming.headers.host) || !isAllowedLocalOrigin(incoming.headers.origin, incoming.headers.host) || containsKnownSensitiveValue(incoming.url ?? "")) {
+        socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); return;
+      }
       const upstream = request(target, {
+        ...(options.createConnection ? { createConnection: options.createConnection } : {}),
         path: incoming.url,
         headers: upstreamHeaders(incoming),
       });

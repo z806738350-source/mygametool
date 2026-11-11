@@ -1,10 +1,11 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/daemon/app.js";
 import { writePlayableFixtureWorkspace } from "./playable-fixture.js";
 import { LOCAL_DEBUG_ACCESS_TOKEN } from "../src/shared/local-debug.js";
+import { registerSensitiveValue } from "../src/shared/sensitive-values.js";
 
 const apps: ReturnType<typeof createApp>[] = [];
 const directories: string[] = [];
@@ -25,10 +26,33 @@ async function fixture(type = "web-game", localDebug = false) {
     method: "PUT", url: `${url}${source ? `?source=${source}` : ""}`,
     headers: { "content-type": "image/webp" }, payload: image,
   });
-  return { app, project, url, put };
+  return { app, project, url, put, directory };
 }
 
 describe("project cover API", () => {
+  it("blocks known credentials in cover and thumbnail writes and in bytes already stored on disk", async () => {
+    const { app, project, url, put, directory } = await fixture("interactive-story");
+    await writePlayableFixtureWorkspace(project.workspacePath);
+    const canary = "CANARY_COVER_THUMBNAIL_BINARY_KEY_ONLY"; registerSensitiveValue(canary);
+    const protectedImage = webp(canary);
+    const coverWrite = await put(protectedImage);
+    expect(coverWrite.statusCode).toBe(403); expect(coverWrite.body).not.toContain(canary);
+    expect((await app.inject({ url })).statusCode).toBe(404);
+    const thumbnailUrl = `/projects/${project.id}/playable/thumbnails/menu`;
+    const thumbnailWrite = await app.inject({ method: "PUT", url: `${thumbnailUrl}?hash=0123abcd`, headers: { "content-type": "image/webp" }, payload: protectedImage });
+    expect(thumbnailWrite.statusCode).toBe(403); expect(thumbnailWrite.body).not.toContain(canary);
+    expect((await app.inject({ url: thumbnailUrl })).statusCode).toBe(404);
+    await expect(readFile(path.join(directory, "projects", project.id, "cover.webp"))).rejects.toMatchObject({ code: "ENOENT" });
+    await mkdir(path.join(project.workspacePath, ".ohmygame", "thumbnails"), { recursive: true });
+    await writeFile(path.join(project.workspacePath, ".ohmygame", "thumbnails", "menu.webp"), protectedImage);
+    const existingThumbnail = await app.inject({ url: thumbnailUrl });
+    expect(existingThumbnail.statusCode).toBe(403); expect(existingThumbnail.body).not.toContain(canary);
+    await put(webp("safe cover"));
+    const projectDirectory = path.join(directory, "projects", project.id);
+    await writeFile(path.join(projectDirectory, "cover.webp"), protectedImage);
+    const existingCover = await app.inject({ url });
+    expect(existingCover.statusCode).toBe(403); expect(existingCover.body).not.toContain(canary);
+  });
   it("toggles automatic replacement without uploading a custom cover", async () => {
     const { app, url, put } = await fixture();
     const mode = (value: string) => app.inject({ method: "PUT", url: `${url}/state`, payload: { mode: value } });
@@ -109,18 +133,21 @@ describe("project cover API", () => {
     expect((await app.inject({ method: "GET", url })).rawPayload).toEqual(webp("updated scene"));
   });
 
-  it("keeps the Community cover at its published snapshot until the next publication", async () => {
+  it("keeps local covers editable while author publishing and Community remain unavailable without requests", async () => {
+    const outbound = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected outbound request"));
+    try {
     const { app, project, url, put } = await fixture("web-game", true);
     await writeFile(path.join(project.workspacePath, "index.html"), "<h1>Game</h1>");
     await put(webp("automatic"), "auto");
     const publish = () => app.inject({ method: "POST", url: `/projects/${project.id}/publish`, payload: { accessToken: LOCAL_DEBUG_ACCESS_TOKEN, title: "Game" } });
-    const first = (await publish()).json();
-    const coverUrl = `/community/games/${first.game.id}/deployments/${first.deployment.id}/cover`;
+    expect((await publish()).statusCode).toBe(410);
+    const coverUrl = "/community/games/retired-game/deployments/retired-deployment/cover";
     await put(webp("custom"));
     expect((await app.inject({ method: "GET", url })).rawPayload).toEqual(webp("custom"));
-    expect((await app.inject({ method: "GET", url: coverUrl })).rawPayload).toEqual(webp("automatic"));
-    const second = (await publish()).json();
-    expect((await app.inject({ method: "GET", url: `/community/games/${second.game.id}/deployments/${second.deployment.id}/cover` })).rawPayload).toEqual(webp("custom"));
-    expect((await app.inject({ method: "GET", url: coverUrl })).rawPayload).toEqual(webp("automatic"));
+    expect((await app.inject({ method: "GET", url: coverUrl })).statusCode).toBe(410);
+    expect((await publish()).statusCode).toBe(410);
+    expect((await app.inject({ method: "GET", url })).rawPayload).toEqual(webp("custom"));
+    expect(outbound).not.toHaveBeenCalled();
+    } finally { outbound.mockRestore(); }
   });
 });

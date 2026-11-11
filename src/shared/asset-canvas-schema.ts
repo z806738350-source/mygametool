@@ -6,7 +6,7 @@ import {
   VIDEO_ASPECT_RATIOS,
   VIDEO_RESOLUTIONS,
 } from "./contracts.js";
-import { AUDIO_VOICE_ID_MAX_LENGTH, AUDIO_VOICE_ID_PATTERN } from "./audio.js";
+import { AUDIO_SAMPLE_RATES, AUDIO_VOICE_ID_MAX_LENGTH, AUDIO_VOICE_ID_PATTERN } from "./audio.js";
 import { EDITOR_LAYOUT_SCHEMA } from "./editor-layout-schema.js";
 import { MAX_ANIMATION_ACTIONS, MODEL_3D_MAX_POLYCOUNT, MODEL_3D_MAX_REFERENCE_IMAGES } from "./generation-config.js";
 
@@ -47,6 +47,10 @@ const reference = {
   ],
 } as const;
 const nodeReferences = { type: "array", maxItems: MAX_TEXT_NODE_REFERENCES, uniqueItems: true, items: reference.oneOf[1] } as const;
+const audioOutput = { type: "object", additionalProperties: false, properties: {
+  format: { enum: ["mp3", "wav"] }, sampleRate: { enum: AUDIO_SAMPLE_RATES }, channels: { enum: [1, 2] },
+} } as const;
+const speechSettings = { language: { type: "string", maxLength: 40 }, style: { type: "string", maxLength: 2000 }, speed: { type: "number", minimum: -50, maximum: 100 }, output: audioOutput } as const;
 const node = (type: string, data: object) => ({
   type: "object",
   additionalProperties: false,
@@ -54,8 +58,10 @@ const node = (type: string, data: object) => ({
   properties: { id, type: { const: type }, title: { type: "string", maxLength: 200 }, description: { type: "string", maxLength: 2000 }, data },
 });
 const model3DOptions = { type: "object", additionalProperties: false, properties: {
+  referenceMode: { enum: ["turnaround", "provided-views"] },
   pose: { enum: ["a-pose", "t-pose"] }, textureModel: id, textureQuality: { enum: ["fast", "standard", "detailed", "extreme"] },
-  rigModel: { enum: ["v1.0-20240301", "v2.5-20260210", "v3.0-20260909"] }, rigType: { enum: ["biped", "quadruped", "hexapod", "octopod", "serpentine", "aquatic"] }, animateInPlace: { type: "boolean" },
+  rigModel: { enum: ["v1.0-20240301", "v2.5-20260210", "v3.0-20260909"] }, rigType: { enum: ["biped", "quadruped", "hexapod", "octopod", "avian", "serpentine", "aquatic", "others"] }, animateInPlace: { type: "boolean" },
+  quad: { type: "boolean" }, smartUv: { type: "boolean" }, geometryQuality: { enum: ["standard", "detailed"] },
 } } as const;
 const nodes = [
   node("table", { type: "object", additionalProperties: false, required: ["tableId"], properties: { tableId: { type: "string", pattern: "^[a-zA-Z0-9_-]{1,100}$" } } }),
@@ -77,6 +83,11 @@ const nodes = [
       model,
       resolution: { enum: IMAGE_RESOLUTIONS },
       aspectRatio: { enum: IMAGE_ASPECT_RATIOS },
+      quality: { enum: ["auto", "low", "medium", "high", "xhigh", "max"] },
+      outputFormat: { enum: ["png", "jpeg"] },
+      outputCompression: { type: "integer", minimum: 0, maximum: 100 },
+      background: { enum: ["auto", "opaque", "transparent"] },
+      mask: reference,
       images: { type: "array", maxItems: IMAGE_MAX_REFERENCE_IMAGES, items: reference },
       assetId: id,
     },
@@ -107,8 +118,20 @@ const nodes = [
       promptSource: { type: "object", additionalProperties: false, required: ["type", "nodeId"], properties: { type: { const: "node" }, nodeId: id } },
       model,
       voiceId: { type: "string", minLength: 1, maxLength: AUDIO_VOICE_ID_MAX_LENGTH, pattern: AUDIO_VOICE_ID_PATTERN },
-      speed: { type: "number", minimum: -50, maximum: 100 },
+      referenceAssetId: id,
+      referenceSha256: { type: "string", pattern: "^[a-f0-9]{64}$" },
+      voiceSourceNodeId: id,
+      ...speechSettings,
       assetId: id,
+    },
+  }),
+  node("voice", {
+    type: "object", additionalProperties: false, required: ["description", "sampleText"],
+    properties: {
+      description: { type: "string", maxLength: 2000 },
+      sampleText: { type: "string", maxLength: 3000 },
+      model, ...speechSettings, assetId: id, selectedAssetId: id,
+      selectedSha256: { type: "string", pattern: "^[a-f0-9]{64}$" },
     },
   }),
   node("sound-effect", {
@@ -122,6 +145,7 @@ const nodes = [
       durationSeconds: { type: "number", minimum: 0.1, maximum: 600 },
       loop: { type: "boolean" },
       negativePrompt: { type: "string", maxLength: 4_000 },
+      output: audioOutput,
       assetId: id,
     },
   }),
@@ -135,6 +159,7 @@ const nodes = [
       model,
       instrumental: { type: "boolean" },
       lyrics: { type: "string", maxLength: 20_000 },
+      output: audioOutput,
       durationSeconds: { type: "number", minimum: 0.1, maximum: 600 },
       loop: { type: "boolean" },
       assetId: id,

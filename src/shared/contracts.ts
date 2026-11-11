@@ -42,6 +42,8 @@ export type AgentModelRef = ModelRef;
 export interface AgentModel extends AgentModelRef {
   name: string;
   providerName: string;
+  /** Effective input capability of this configured connection, not the upstream model family. */
+  supportsImages?: boolean;
   /** Pi's reasoning levels; empty for a coding agent's model, whose provider is the agent's ID. */
   reasoningLevels: AgentReasoningLevel[];
   /** A coding agent model's own effort/variant values, kept separate from Pi's reasoning enum. */
@@ -80,6 +82,9 @@ export type ProviderCapability = "language" | "image" | "3d" | "video" | "audio"
 export type MediaModelUsage = "image" | "3d" | "video";
 /** Missing entries inherit the global default for that kind of generation. */
 export type MediaModelDefaults = Partial<Record<MediaModelUsage, ModelRef>>;
+/** Explicit per-project choices; absent on legacy projects and never backfilled. */
+export type ProjectModelSelections = Partial<Record<import("./kunpo-models.js").KunpoModelRole, ModelRef>>;
+export type ProjectModelSelectionPatch = Partial<Record<import("./kunpo-models.js").KunpoModelRole, ModelRef | null>>;
 
 export interface ProviderSummary extends ModelProviderSummary {
   /** Saved sign-in status for a local CLI provider. */
@@ -118,7 +123,7 @@ export interface CustomImageModelSettings {
   maxOutputs: ImageOutputCount;
 }
 
-export type VideoProtocol = "openrouter-videos" | "seedance";
+export type VideoProtocol = "openrouter-videos" | "seedance" | "kunpo-videos";
 export interface CustomVideoModelSettings {
   protocol: VideoProtocol;
   baseUrl?: string;
@@ -132,21 +137,32 @@ export interface CustomVideoModelSettings {
 export type Model3DOperation = "image" | "text" | "retexture" | "remesh" | "animate";
 export type Model3DActionId = number | string;
 export interface Model3DOptions {
+  /** Local image preparation intent. Turnaround views are front, left, back and optionally right. */
+  referenceMode?: "turnaround" | "provided-views";
   pose?: "a-pose" | "t-pose";
   textureModel?: string;
   textureQuality?: "fast" | "standard" | "detailed" | "extreme";
   rigModel?: "v1.0-20240301" | "v2.5-20260210" | "v3.0-20260909";
-  rigType?: "biped" | "quadruped" | "hexapod" | "octopod" | "serpentine" | "aquatic";
+  rigType?: "biped" | "quadruped" | "hexapod" | "octopod" | "avian" | "serpentine" | "aquatic" | "others";
+  quad?: boolean;
+  smartUv?: boolean;
+  geometryQuality?: "standard" | "detailed";
   animateInPlace?: boolean;
 }
 export interface Model3DMetadata {
+  originalSha256?: string;
+  /** FBX remains the original; this describes a separate static, triangulated preview. */
+  preview?: { status: "ready" | "unavailable"; materialApproximation: true; sha256?: string };
   triangles: number;
   textured: boolean;
   rigged: boolean;
   animations: string[];
+  /** Structural clip facts; looping and root motion require runtime validation. */
+  animationClips?: Array<{ name: string; durationSeconds: number; channels: number }>;
   forwardAxis?: "+X" | "+Z";
   provider?: string;
   operation?: Model3DOperation;
+  generation?: GenerationProvenance;
 }
 export interface Model3DBalance { balance: number; frozen?: number; }
 
@@ -350,6 +366,10 @@ export interface ImageModel extends ImageModelRef {
   protocol: ImageProtocol | "codex-cli";
   supportsResolution?: boolean;
   supportsAspectRatio?: boolean;
+  qualities?: readonly NonNullable<ImageGenerationSettings["quality"]>[];
+  outputFormats?: readonly NonNullable<ImageGenerationSettings["outputFormat"]>[];
+  supportsTransparency?: boolean;
+  supportsMask?: boolean;
 }
 
 export type ImageProtocol = "openai-images" | "gemini-generate-content" | "openrouter-images" | "volcengine-images";
@@ -385,7 +405,7 @@ export interface PreviewRuntimeState {
   managerSource?: string;
   revision?: number;
   pages?: { client: string; source: import("./preview-page.js").PreviewPageSource; path: string }[];
-  stopReason?: "manual" | "idle" | "settings" | "recovery";
+  stopReason?: "manual" | "idle" | "settings" | "recovery" | "execution";
 }
 
 export type ProjectNameSource = "default" | "ai" | "manual";
@@ -413,6 +433,7 @@ export interface ProjectState extends ProjectPreviewSettings {
   /** Device preset selected when a Web Game preview starts. */
   previewViewport?: PreviewViewport;
   mediaModelDefaults?: MediaModelDefaults;
+  modelSelections?: ProjectModelSelections;
   /** Internal OhMyGame data kept separately from a user-selected workspace. */
   storagePath?: string;
   /** Whether OhMyGame owns the workspace directory or only references it. */
@@ -442,7 +463,7 @@ export interface ProjectActivitySnapshot {
   names: Pick<ProjectState, "id" | "name" | "nameSource">[];
 }
 
-export type AssetCanvasNodeType = "text" | "image" | "video" | "speech" | "sound-effect" | "music" | "model-3d" | "animate-3d" | "asset" | "document" | "table" | "file";
+export type AssetCanvasNodeType = "text" | "image" | "video" | "speech" | "voice" | "sound-effect" | "music" | "model-3d" | "animate-3d" | "asset" | "document" | "table" | "file";
 
 export interface AssetCanvasPosition {
   x: number;
@@ -511,6 +532,11 @@ export type AssetCanvasNode = (
     model?: ImageModelRef;
     resolution: ImageResolution;
     aspectRatio: ImageAspectRatio;
+    quality?: ImageGenerationSettings["quality"];
+    outputFormat?: ImageGenerationSettings["outputFormat"];
+    outputCompression?: ImageGenerationSettings["outputCompression"];
+    background?: ImageGenerationSettings["background"];
+    mask?: AssetCanvasReference;
     images: AssetCanvasReference[];
     assetId?: string;
   } }
@@ -531,11 +557,29 @@ export type AssetCanvasNode = (
     text: string;
     promptSource?: AssetCanvasTextReference;
     model?: ModelRef;
-    /** Speaker ID; uses the provider's configured default voice when omitted. */
+    /** Legacy data only; never sent upstream. */
     voiceId?: string;
+    referenceAssetId?: string;
+    referenceSha256?: string;
+    voiceSourceNodeId?: string;
     /** Speech rate in provider units (Volcengine speech_rate: -50..100, 0 = normal). */
     speed?: number;
+    language?: string;
+    style?: string;
+    output?: import("./audio.js").AudioOutputSettings;
     assetId?: string;
+  } }
+  | { id: string; type: "voice"; position: AssetCanvasPosition; data: {
+    description: string;
+    sampleText: string;
+    model?: ModelRef;
+    language?: string;
+    style?: string;
+    speed?: number;
+    output?: import("./audio.js").AudioOutputSettings;
+    assetId?: string;
+    selectedAssetId?: string;
+    selectedSha256?: string;
   } }
   | { id: string; type: "sound-effect"; position: AssetCanvasPosition; data: {
     prompt: string;
@@ -544,6 +588,7 @@ export type AssetCanvasNode = (
     durationSeconds?: number;
     loop?: boolean;
     negativePrompt?: string;
+    output?: import("./audio.js").AudioOutputSettings;
     assetId?: string;
   } }
   | { id: string; type: "music"; position: AssetCanvasPosition; data: {
@@ -554,6 +599,7 @@ export type AssetCanvasNode = (
     lyrics?: string;
     durationSeconds?: number;
     loop?: boolean;
+    output?: import("./audio.js").AudioOutputSettings;
     assetId?: string;
   } }
   | { id: string; type: "model-3d"; position: AssetCanvasPosition; data: {
@@ -623,7 +669,8 @@ export type TurnStatus = Extract<ItemStatus, "inProgress" | "completed" | "cance
 export type ThreadItemErrorCode = "model_not_configured" | "authentication_failed" | "access_denied" |
   "quota_exceeded" | "rate_limited" | "invalid_request" | "model_unavailable" | "provider_unavailable" |
   "dns_error" | "connection_refused" | "connection_reset" | "timeout" | "tls_error" |
-  "stream_error" | "network_error" | "runtime_incompatible" | "runtime_probe_failed";
+  "sse_idle_timeout" | "sse_validation_failed" | "sse_connection_interrupted" |
+  "stream_error" | "network_error" | "runtime_incompatible" | "runtime_probe_failed" | "repeated_media_arguments";
 
 export interface AgentErrorCause {
   name?: string;
@@ -679,6 +726,8 @@ export type PromptImageMediaType = "image/png" | "image/jpeg" | "image/webp" | "
 export interface PromptImage {
   mediaType: PromptImageMediaType;
   data: string;
+  /** Local identity hint only; daemon receipts and exact current bytes must independently verify it. */
+  libraryAssetId?: string;
   name?: string;
   /** Display-only reference. UI projections leave data empty; model inputs retain it. */
   url?: string;
@@ -832,6 +881,9 @@ export type ThreadItem = (
       turnId: string;
       type: "userInputRequest";
       requestId: string;
+      /** Set by the daemon when it requests a single paid replacement during execution. */
+      paidMediaTool?: ToolId;
+      previousPaidCount?: number;
       questions: QuestionnaireQuestion[];
       status: Extract<ItemStatus, "inProgress" | "completed" | "cancelled" | "failed">;
       answers?: QuestionnaireAnswer[];
@@ -983,9 +1035,12 @@ export type LibraryAssetPurpose = "asset" | "reference";
 
 export interface LibraryAsset {
   model3d?: Model3DMetadata;
+  generation?: GenerationProvenance;
   id: string;
   name: string;
   size: number;
+  /** SHA-256 of content when it was added; absent for older Library records. */
+  contentSha256?: string;
   mediaType: NonNullable<WorkspaceFile["mediaType"]>;
   contentType: string;
   createdAt: string;
@@ -1131,6 +1186,8 @@ export interface VideoModel extends VideoModelRef {
   /** A narrower ratio set used when image references are present. */
   imageAspectRatios?: readonly VideoAspectRatio[];
   frameAspectRatios?: readonly VideoAspectRatio[];
+  /** A narrower ratio set for prompts without reference media. */
+  textAspectRatios?: readonly VideoAspectRatio[];
 }
 export const VIDEO_RESOLUTIONS = ["480p", "720p", "768p", "1080p", "1K", "2K", "4K"] as const;
 export type VideoResolution = (typeof VIDEO_RESOLUTIONS)[number];
@@ -1165,7 +1222,14 @@ interface RunConfiguredImageToolRequest {
   images?: PromptImage[];
 }
 
-export type RunImageToolRequest = RunSizedImageToolRequest | RunConfiguredImageToolRequest;
+export interface ImageGenerationSettings {
+  quality?: "auto" | "low" | "medium" | "high" | "xhigh" | "max";
+  outputFormat?: "png" | "jpeg";
+  outputCompression?: number;
+  background?: "auto" | "opaque" | "transparent";
+  mask?: PromptImage;
+}
+export type RunImageToolRequest = (RunSizedImageToolRequest | RunConfiguredImageToolRequest) & ImageGenerationSettings;
 
 export interface Run3DToolRequest {
   operation?: Exclude<Model3DOperation, "animate">;
@@ -1218,9 +1282,23 @@ export interface ToolRun {
   toolId: ToolId;
   createdAt: string;
   files: ToolRunFile[];
+  generation?: GenerationProvenance;
+}
+
+/** Non-secret parameters only: never prompts, reference bytes, credentials or signed URLs. */
+export interface GenerationProvenance {
+  model?: string;
+  protocol: string;
+  parameters: Record<string, string | number | boolean>;
+  taskId?: string;
+  taskIds?: string[];
 }
 
 export type ToolJobStatus = "running" | "succeeded" | "failed" | "cancelled";
+
+export interface ImageDownloadNetworkStatus {
+  state: "ready" | "fake-ip" | "blocked" | "unavailable";
+}
 
 export interface ToolJobContext {
   projectId: string;
@@ -1228,7 +1306,50 @@ export interface ToolJobContext {
   boardId?: string;
 }
 
+export type ProviderErrorCode = "invalid-request" | "authentication" | "rate-limit" | "quota" | "content-policy" | "model-unavailable" | "bad-response-status" | "unclassified";
+
+export interface VideoRequestDiagnostic {
+  phase: "submission" | "status" | "download";
+  category: "http" | "timeout" | "dns" | "connection" | "cancelled" | "local-policy" | "unknown" | "invalid-response";
+  timeoutKind?: "connect" | "headers" | "body" | "deadline" | "unknown";
+  httpStatus?: number;
+  providerCode?: ProviderErrorCode;
+}
+
+/** Transport observations only; upload completion does not prove upstream acceptance. */
+export interface AudioRequestDiagnostic {
+  /** request means the transport did not expose a more precise stage. */
+  phase: "request" | "connect" | "upload" | "headers" | "body";
+  category: VideoRequestDiagnostic["category"];
+  timeoutKind?: VideoRequestDiagnostic["timeoutKind"];
+  httpStatus?: number;
+  providerCode?: ProviderErrorCode;
+  requestBytes: number;
+  elapsedMs: number;
+}
+
 export interface ToolJob {
+  /** Immutable Library identities actually used by this request, independent of later node edits. */
+  sources?: Array<{ assetId: string; name: string }>;
+  /** Daemon-owned transport receipt; never an upstream ID, request body or credential. */
+  videoSubmission?: "not-submitted" | "attempted";
+  /** Closed counters only; original assets and previously submitted input identities stay unchanged. */
+  videoReferencePreparation?: import("./video-reference-preparation.js").VideoReferencePreparation;
+  /** Bounded enum/numeric diagnostics only; never a provider message, request ID or URL. */
+  videoDiagnostic?: VideoRequestDiagnostic;
+  audioDiagnostic?: AudioRequestDiagnostic;
+  /** The daemon found a validated saved image result. This never contains the result URL. */
+  canRecoverImage?: boolean;
+  /** A validated video task is saved; no task ID or private URL is exposed. */
+  canRecoverVideo?: boolean;
+  /** A 3D task was recorded and can be queried without submitting another paid stage. */
+  canRecoverModel3D?: boolean;
+  /** This image job only retrieves a saved result; it cannot submit a new generation. */
+  imageRecoveryOnly?: boolean;
+  /** Only query/download an existing video task; never submit a generation. */
+  videoRecoveryOnly?: boolean;
+  /** Query/download recorded 3D stages only; never continue with new paid stages. */
+  model3DRecoveryOnly?: boolean;
   model?: ModelRef;
   id: string;
   toolId: ToolId;
@@ -1238,6 +1359,8 @@ export interface ToolJob {
   context?: ToolJobContext;
   run?: ToolRun;
   error?: string;
+  /** A synchronous request may have been billed; retry must not submit it again. */
+  submissionOutcome?: "unknown";
 }
 
 export type ToolArtifact =

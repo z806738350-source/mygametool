@@ -85,6 +85,7 @@ beforeEach(async () => {
     jobs: async () => [],
     generate: vi.fn(),
     cancel: vi.fn(),
+    recoverImage: vi.fn(),
   };
   container = document.createElement("div");
   document.body.appendChild(container);

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { FastifyInstance } from "fastify";
@@ -9,34 +9,29 @@ import { PreinstalledPluginManager } from "../src/daemon/preinstalled-plugins.js
 import { createPluginArchive } from "../src/daemon/publish/archive.js";
 import { isPreparedPluginIndex, type PreparedPluginIndex } from "../src/shared/preinstalled-plugins.js";
 
-const apps: FastifyInstance[] = [];
-afterEach(async () => { await Promise.all(apps.splice(0).map((app) => app.close())); });
+const apps: FastifyInstance[] = [], directories: string[] = [];
+afterEach(async () => {
+  await Promise.all(apps.splice(0).map((app) => app.close()));
+  await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+  vi.restoreAllMocks();
+});
+async function secureApp(preparedDirectory?: string, dataDirectory?: string) {
+  const request = vi.fn<typeof fetch>(async () => { throw new Error("Startup must not download Plugins"); });
+  const directory = dataDirectory ?? await temporary("ohmygame-preinstalled-data-");
+  const app = createApp({ dataDirectory: directory, bundledPluginsDirectory: await temporary("ohmygame-preinstalled-bundled-"), preinstalledPluginsDirectory: preparedDirectory, publishFetch: request });
+  apps.push(app);
+  await app.ready();
+  return { app, directory, request };
+}
 
-describe("preinstalled plugins", () => {
-  it("waits for first-run plugin installation beyond the default ten-second hook timeout", async () => {
-    const dataDirectory = await temporary("ohmygame-preinstalled-slow-");
-    const bundledPluginsDirectory = await temporary("ohmygame-preinstalled-bundled-");
-    let started!: () => void;
-    const installing = new Promise<void>((resolve) => { started = resolve; });
-    const seed = vi.spyOn(PreinstalledPluginManager.prototype, "seed").mockImplementation(async () => {
-      started();
-      await new Promise((resolve) => setTimeout(resolve, 10_001));
-      return [];
-    });
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    try {
-      const app = createApp({ dataDirectory, bundledPluginsDirectory });
-      apps.push(app);
-      const ready = Promise.resolve(app.ready());
-      void ready.catch(() => {});
-      await installing;
-      await vi.advanceTimersByTimeAsync(10_001);
-      await ready;
-      expect((await app.inject({ method: "GET", url: "/health" })).statusCode).toBe(200);
-    } finally {
-      vi.useRealTimers();
-      seed.mockRestore();
-    }
+describe("preinstalled plugins in the local edition", () => {
+  it("does not call the seed executor or wait for prepared Plugin installation at startup", async () => {
+    const seed = vi.spyOn(PreinstalledPluginManager.prototype, "seed");
+    const prepared = await preparedPlugin();
+    const { app, request } = await secureApp(prepared.directory);
+    expect((await app.inject({ method: "GET", url: "/health" })).statusCode).toBe(200);
+    expect(seed).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
   });
 
   it("rejects archive paths outside the prepared directory", () => {
@@ -52,156 +47,46 @@ describe("preinstalled plugins", () => {
     })).toBe(false);
   });
 
-  it("installs a prepared Plugin enabled by default without replacing it on restart", async () => {
-    const dataDirectory = await temporary("ohmygame-preinstalled-data-");
-    const bundledPluginsDirectory = await temporary("ohmygame-preinstalled-bundled-");
+
+  it("keeps a prepared archive uninstalled even when supplied through the old startup option", async () => {
     const prepared = await preparedPlugin();
-    const first = createApp({
-      dataDirectory,
-      bundledPluginsDirectory,
-      preinstalledPluginsDirectory: prepared.directory,
-      publishFetch: async () => Response.json([]),
-    });
-    apps.push(first);
-    await first.ready();
-
-    const detail = await first.inject({ method: "GET", url: "/plugins/ohmygame%3Areference-tools" });
-    expect(detail.statusCode).toBe(200);
-    expect(detail.json()).toMatchObject({
-      id: "ohmygame:reference-tools",
-      installed: true,
-      enabled: true,
-      preinstalled: true,
-      source: { type: "preinstalled", pluginId: prepared.pluginId, releaseId: prepared.releaseId },
-      origin: { type: "github", repository: "example/reference-tools", commit: "abc123" },
-      skills: [{ id: "skills/reference/SKILL.md", name: "Reference", enabled: true }],
-    });
-    const icon = await first.inject({ method: "GET", url: "/plugins/ohmygame%3Areference-tools/icon" });
-    expect(icon.statusCode).toBe(200);
-    expect(icon.headers["content-type"]).toContain("image/svg+xml");
-    expect(icon.body).toBe(prepared.iconContent);
-
-    const installedSkill = path.join(
-      dataDirectory, "plugins", "installed", "marketplace", "ohmygame", "reference-tools", "1.0.0",
-      "skills", "reference", "SKILL.md",
-    );
-    expect((await first.inject({
-      method: "PUT",
-      url: "/plugins/ohmygame%3Areference-tools/settings",
-      payload: { enabled: false, components: {} },
-    })).statusCode).toBe(200);
-    await writeFile(installedSkill, `${prepared.skillContent}\nLocal marker`);
-    await first.close();
-    apps.splice(apps.indexOf(first), 1);
-
-    const second = createApp({
-      dataDirectory,
-      bundledPluginsDirectory,
-      preinstalledPluginsDirectory: prepared.directory,
-      publishFetch: async () => Response.json([]),
-    });
-    apps.push(second);
-    await second.ready();
-    expect(await readFile(installedSkill, "utf8")).toContain("Local marker");
-    expect((await second.inject({ method: "GET", url: "/plugins/ohmygame%3Areference-tools" })).json().enabled).toBe(false);
+    const { app, directory, request } = await secureApp(prepared.directory);
+    expect((await app.inject({ method: "GET", url: "/plugins/ohmygame%3Areference-tools" })).statusCode).toBe(404);
+    await expect(stat(path.join(directory, "plugins", "installed", "marketplace", "ohmygame", "reference-tools"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await app.inject({ method: "GET", url: "/composer/capabilities" })).json().skills).toEqual([]);
+    expect(request).not.toHaveBeenCalled();
   });
 
-  it.each(["1.0.0", "2.0.0"])("replaces a prepared release at version %s while preserving switches", async (version) => {
-    const dataDirectory = await temporary("ohmygame-preinstalled-upgrade-");
-    const bundledPluginsDirectory = await temporary("ohmygame-preinstalled-bundled-");
-    const firstPrepared = await preparedPlugin();
-    const first = createApp({
-      dataDirectory,
-      bundledPluginsDirectory,
-      preinstalledPluginsDirectory: firstPrepared.directory,
-    });
-    apps.push(first);
-    await first.ready();
-    await first.inject({
-      method: "PUT",
-      url: "/plugins/ohmygame%3Areference-tools/settings",
-      payload: { enabled: false, components: {} },
-    });
-    await first.close();
-    apps.splice(apps.indexOf(first), 1);
-
-    const secondPrepared = await preparedPlugin({
-      releaseId: "33333333-3333-4333-8333-333333333333",
-      version,
-      skillContent: "---\nname: reference\ndescription: Rebuild a newer reference.\n---\n",
-      iconContent: firstPrepared.iconContent.replace("#f00", "#00f"),
-    });
-    const second = createApp({
-      dataDirectory,
-      bundledPluginsDirectory,
-      preinstalledPluginsDirectory: secondPrepared.directory,
-    });
-    apps.push(second);
-    await second.ready();
-
-    expect((await second.inject({ method: "GET", url: "/plugins/ohmygame%3Areference-tools" })).json()).toMatchObject({
-      version,
-      enabled: false,
-      source: { type: "preinstalled", releaseId: secondPrepared.releaseId },
-      skills: [{ description: "Rebuild a newer reference." }],
-    });
-    expect((await second.inject({ method: "GET", url: "/plugins/ohmygame%3Areference-tools/icon" })).body)
-      .toBe(secondPrepared.iconContent);
-    if (version !== "1.0.0") {
-      await expect(readFile(path.join(
-        dataDirectory, "plugins", "installed", "marketplace", "ohmygame", "reference-tools", "1.0.0",
-        "skills", "reference", "SKILL.md",
-      ))).rejects.toMatchObject({ code: "ENOENT" });
-    }
-    expect(JSON.parse(await readFile(path.join(dataDirectory, "plugins", "preinstalled-plugins.json"), "utf8")))
-      .toMatchObject({ plugins: { [secondPrepared.pluginId]: { seededReleaseId: secondPrepared.releaseId, removed: false } } });
+  it.each(["1.0.0", "2.0.0"])("does not auto-install or replace user files from prepared version %s after restart", async (version) => {
+    const initial = await secureApp();
+    const marker = path.join(initial.directory, "plugins", "user-note.md");
+    await mkdir(path.dirname(marker), { recursive: true });
+    await writeFile(marker, "User-managed data");
+    await initial.app.close(); apps.splice(apps.indexOf(initial.app), 1);
+    const prepared = await preparedPlugin({ version });
+    const second = await secureApp(prepared.directory, initial.directory);
+    expect(await readFile(marker, "utf8")).toBe("User-managed data");
+    expect((await second.app.inject({ method: "GET", url: "/plugins/ohmygame%3Areference-tools" })).statusCode).toBe(404);
+    expect(second.request).not.toHaveBeenCalled();
   });
 
-  it("does not restore a preinstalled Plugin after the user removes it", async () => {
-    const dataDirectory = await temporary("ohmygame-preinstalled-remove-");
-    const bundledPluginsDirectory = await temporary("ohmygame-preinstalled-bundled-");
-    const prepared = await preparedPlugin();
-    const first = createApp({
-      dataDirectory,
-      bundledPluginsDirectory,
-      preinstalledPluginsDirectory: prepared.directory,
-      publishFetch: async () => Response.json([]),
-    });
-    apps.push(first);
-    await first.ready();
-    expect((await first.inject({ method: "DELETE", url: "/plugins/ohmygame%3Areference-tools" })).statusCode).toBe(204);
-    await first.close();
-    apps.splice(apps.indexOf(first), 1);
-
-    const second = createApp({
-      dataDirectory,
-      bundledPluginsDirectory,
-      preinstalledPluginsDirectory: prepared.directory,
-      publishFetch: async () => Response.json([]),
-    });
-    apps.push(second);
-    await second.ready();
-
-    expect((await second.inject({ method: "GET", url: "/plugins/ohmygame%3Areference-tools" })).statusCode).toBe(404);
-    expect(JSON.parse(await readFile(path.join(dataDirectory, "plugins", "preinstalled-plugins.json"), "utf8")))
-      .toMatchObject({ plugins: { [prepared.pluginId]: { seededReleaseId: prepared.releaseId, removed: true } } });
-  });
-
-  it("keeps startup available when one prepared archive fails verification", async () => {
+  it("keeps startup available without opening a damaged prepared archive", async () => {
     const prepared = await preparedPlugin();
     await writeFile(path.join(prepared.directory, `${prepared.releaseId}.zip`), "damaged");
-    const app = createApp({
-      dataDirectory: await temporary("ohmygame-preinstalled-invalid-"),
-      bundledPluginsDirectory: await temporary("ohmygame-preinstalled-bundled-"),
-      preinstalledPluginsDirectory: prepared.directory,
-      publishFetch: async () => Response.json([]),
-    });
-    apps.push(app);
-
-    await app.ready();
+    const { app, request } = await secureApp(prepared.directory);
+    expect((await app.inject({ method: "GET", url: "/health" })).statusCode).toBe(200);
     expect((await app.inject({ method: "GET", url: "/plugins/ohmygame%3Areference-tools" })).statusCode).toBe(404);
+    expect(request).not.toHaveBeenCalled();
   });
 
+  it("retains local prepared-index parsing and provenance decoration without installing code", async () => {
+    const prepared = await preparedPlugin();
+    const manager = new PreinstalledPluginManager(prepared.directory, await temporary("ohmygame-preinstalled-metadata-"));
+    await manager.load();
+    const plugin = manager.decorate({ installed: true, source: { type: "preinstalled", pluginId: prepared.pluginId, releaseId: prepared.releaseId } } as Parameters<PreinstalledPluginManager["decorate"]>[0]);
+    expect(plugin).toMatchObject({ preinstalled: true, origin: { type: "github", repository: "example/reference-tools", commit: "abc123" } });
+    expect(isPreparedPluginIndex(JSON.parse(await readFile(path.join(prepared.directory, "index.json"), "utf8")))).toBe(true);
+  });
 });
 
 async function preparedPlugin(options: { releaseId?: string; version?: string; skillContent?: string; iconContent?: string } = {}) {
@@ -249,5 +134,7 @@ async function preparedPlugin(options: { releaseId?: string; version?: string; s
 }
 
 async function temporary(prefix: string): Promise<string> {
-  return mkdtemp(path.join(tmpdir(), prefix));
+  const directory = await mkdtemp(path.join(tmpdir(), prefix));
+  directories.push(directory);
+  return directory;
 }

@@ -1,3 +1,14 @@
+> [!IMPORTANT]
+> **本地安全源码版——部分本地工作流已完成运行验证。**
+> 账号登录、社区、云发布及额度、Sentry/PostHog 上传、作者更新服务已在代码中停用，
+> 环境变量不能恢复这些功能。宿主 Shell 与外部 MCP/插件仍停用；可选的受控 Codex 与第一阶段 Qoder 接入见[编码 Agent](docs/coding-agents.md)。
+> 登记的 VM 已提供隔离命令工具及带冲突校验的源码回传。
+> 受控公共 npm 安装、构建及动态 Web 预览已在专用启动项存储及登记的 VM 测试存储中验收；
+> 其他项目存储仍关闭执行。详见[本地安全策略](docs/local-security.md)。
+> 本地启动项说明和剩余检查见[人工验收记录](docs/manual-acceptance.md)。
+> 下方功能与首次运行介绍保留的是**上游框架能力**，不代表本版所有流程可用。
+> 上游下载按钮和发行版**不包含**这些本地修改。版权与上游参考链接继续保留。
+
 <div align="center">
 
 <img src="docs/assets/banner.webp" alt="OhMyGame：用 AI 做游戏的开源工作室" width="100%" />
@@ -161,7 +172,8 @@ OhMyGame 不会把你绑定在某一个模型上，也不按次收费。
 - **自定义服务商和模型别名**：可以选择语言、图片、视频和 3D 用途，配置协议模板和生成默认值。
   详见[自定义模型配置](docs/custom-models.md)。
 
-密钥只保存在本地守护进程里，永远不会进入 Agent 的工作区、你的游戏或渲染进程。
+密钥由本地守护进程保存，渲染接口、项目工作区和导出路径设有凭据隔离与过滤。
+选中发送的代码与素材仍会交给模型服务，不能把过滤机制当作任意秘密的完整识别器。
 
 ## 快速开始
 
@@ -170,11 +182,16 @@ OhMyGame 不会把你绑定在某一个模型上，也不按次收费。
 每个版本的变化可查看[更新日志](CHANGELOG.md)，或在应用内打开
 **设置 → 关于 → 更新日志**。
 
-点击页面顶部的按钮，或者前往 [Releases](https://github.com/WhiteTowerAI/ohmygame/releases)
-下载安装包。目前提供 macOS（Apple 芯片）和 Windows（x64）版本。Windows 版暂时还没有代码签名，
-安装时 Windows 可能会弹出 SmartScreen 警告。
+顶部按钮及 [Releases](https://github.com/WhiteTowerAI/ohmygame/releases) 指向上游发行版，
+不是本地安全版安装包。上游提供 macOS（Apple 芯片）和 Windows（x64）版本，
+上游 Windows 版尚未代码签名。本地改版尚无已验证的安装包。
 
 ### 首次运行
+
+下列引导介绍的是上游流程。本版没有账号登录或公共网页搜索，外部编程 Agent 与
+插件/MCP 执行暂不可用。现已提供 KunpoAPI 统一连接和项目模型列表，主 Agent 与
+媒体适配器已做模拟验收；真实账号权限与生成质量仍未验证。使用真实 Key 前请先读
+[当前 Kunpo 适配范围](docs/kunpo-local.md)。
 
 ![首次运行 AI 连接页](docs/assets/first-run-onboarding.png)
 
@@ -221,7 +238,7 @@ OhMyGame 不内置模型。首次启动时，一个小小的游戏世界逐渐�
 
 3. **选择模型，描述你的游戏。** 在首页的输入框里选择模型，然后描述你想做什么。
 
-网页搜索无需配置即可使用。只有想发布游戏时才需要在 **Account** 里登录；在本地做游戏不需要账号。
+上游提供公共网页搜索与账号发布，本版已停用这两条链路；本地项目不需要账号。
 可在 **设置 → 关于 → 查看入门引导** 中重新打开欢迎页。
 
 要把项目搬到另一台电脑，在项目卡片菜单中选择 **导出项目**。导出的 ZIP 文件包含工作区、项目设置和封面，不含依赖、构建产物和 `.env` 文件。故事设置中的 **导出项目** 使用相同格式。在 **项目** 页点击 **导入项目**，即可把它打开为新项目。详见 [Project archives](docs/project-archives.md)。
@@ -229,31 +246,34 @@ OhMyGame 不内置模型。首次启动时，一个小小的游戏世界逐渐�
 ### 从源码运行
 
 工具链需要 Bun 1.4.2 或更高版本，守护进程需要 Node.js 22.19 及以上。
+请使用这份已修改的工作区；重新克隆上游 `main` 不会包含本版安全修改。
 
 ```bash
-git clone --branch main https://github.com/WhiteTowerAI/ohmygame.git
-cd ohmygame
-bun install --frozen-lockfile
-bun run dev            # 网页渲染端 + 本地守护进程
-# 或者
-bun run dev:desktop    # Electron 桌面应用
+ELECTRON_SKIP_BINARY_DOWNLOAD=1 bun install --frozen-lockfile --ignore-scripts
 ```
 
-这里用的是发布分支。如果要参与开发，请按照 [CONTRIBUTING.md](CONTRIBUTING.md#fork-and-create-a-branch)
-从 `dev` 分支开始。本地开发不需要任何云端配置即可启动；可选的集成配置见
-[CONTRIBUTING.md](CONTRIBUTING.md#configuration)。
+这只下载锁定的依赖并跳过 lifecycle scripts，不会安装 Electron 二进制，也不证明
+原生依赖或构建已经可用。应先审阅下载的依赖，再单独授权类型检查、聚焦测试、
+渲染端构建或启动，详见 [CONTRIBUTING.md](CONTRIBUTING.md#make-and-check-your-change)。
+已用假 Key 执行选定测试、构建和隔离应用工作流，不代表上游全部功能通过。本地源码开发不需要云端账号或
+认证环境变量；已停用流程及剩余边界见[本地安全策略](docs/local-security.md)。
+向上游贡献仍遵循[分支流程](CONTRIBUTING.md#fork-and-create-a-branch)。
 
 设计空间和素材画布共用 `canvas/` 目录下的画板、Markdown 文档和本地媒体文件。
 文件约定和离线迁移说明见 [Canvas workspace](docs/canvas-agent.md)。
 
 ## 隐私
 
-你的项目和密钥都留在你自己的电脑上。提示词和生成请求直接发送给你选择的模型服务商。
-发布游戏需要 OhMyGame 账号，并且只上传游戏的静态构建产物。正式版会检查更新，
-并发送匿名使用数据（PostHog，不录制会话）和崩溃报告（Sentry，不含个人数据）。
-从源码构建的版本不发送任何遥测数据。
-桌面应用会在本机保留已脱敏的日志，只有当你在 **设置 → 关于 → 诊断信息** 中导出并分享文件时，
-日志才会离开你的电脑。详见[日志与诊断](docs/diagnostics.md)。
+本版移除了应用的 Sentry/PostHog 初始化与上传依赖，停用了作者云服务、账号、发布客户端和
+远程更新，启动时也不再下载作者示例或预装插件。环境变量不能恢复这些链路。
+
+显式发起模型请求仍可能将提示词、代码、截图和所选素材发送至已配置的模型端点，
+生成产物也可能需要单独下载。本地数据和已脱敏诊断日志仍应按敏感资料对待；
+导出文件在你分享时会离开电脑，详见[日志与诊断](docs/diagnostics.md)。
+
+这些是源码策略修改，不代表已经证明零外联或完整隔离。已下载依赖、浏览器/WebRTC 行为、
+官方二进制和私有服务仍有各自的验证边界；浏览器内容尚未纳入操作系统级网络沙箱。
+真实 Kunpo/媒体请求和通用执行仍未验收，详见[本地安全策略](docs/local-security.md)。
 
 ## 路线图
 

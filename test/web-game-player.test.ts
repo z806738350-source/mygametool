@@ -1,6 +1,7 @@
 import { previewPagePath, previewPageUrl } from "../src/shared/preview-page.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { webGamePlayerUrl } from "../src/shared/web-game-player.js";
+import { localGameRequestAllowed } from "../src/desktop/game-network.js";
 
 const electron = vi.hoisted(() => {
   class Events {
@@ -9,6 +10,7 @@ const electron = vi.hoisted(() => {
     emit(name: string, ...args: any[]) { for (const handler of this.handlers.get(name) ?? []) handler(...args); }
   }
   class Contents extends Events {
+    session = { webRequest: { onBeforeRequest: vi.fn() }, setPermissionCheckHandler: vi.fn(), setPermissionRequestHandler: vi.fn(), on: vi.fn() };
     destroyed = false;
     frame = { url: "", executeJavaScript: vi.fn(async () => {}) };
     mainFrame = { frames: [this.frame] };
@@ -62,6 +64,12 @@ import { WebGamePlayerWindows } from "../src/desktop/web-game-player.js";
 beforeEach(() => { electron.windows.length = 0; electron.views.length = 0; });
 const request = { path: "/play?mode=story#start", viewport: { width: 375, height: 667 } };
 const target = { url: "http://127.0.0.1:43123", title: "My game" };
+it("blocks game network requests outside its own preview and the app host", () => {
+  expect(localGameRequestAllowed(`${target.url}/asset.png`, target.url)).toBe(true);
+  expect(localGameRequestAllowed("ws://127.0.0.1:43123/hmr", target.url)).toBe(true);
+  expect(localGameRequestAllowed("data:image/png;base64,AA==", target.url)).toBe(true);
+  for (const url of ["https://author.example/upload", "http://127.0.0.1:43110/projects", "file:///etc/passwd"]) expect(localGameRequestAllowed(url, target.url)).toBe(false);
+});
 const url = previewPageUrl(`${target.url}${request.path}`, "editor", "editor-client");
 const layout = { bounds: { x: 300, y: 100, width: 600, height: 500 }, visible: true };
 const create = (states = vi.fn()) => new WebGamePlayerWindows(states, "file:///editor/web-game-host.html");
@@ -76,7 +84,9 @@ describe("shared desktop game", () => {
     const resolve = vi.fn(async () => target);
     await games.attach("game", "mount", owner, url, layout, resolve);
     const view = electron.views[0]!;
-    expect(view.options.webPreferences).toEqual({ sandbox: true, contextIsolation: true, nodeIntegration: false });
+    expect(view.options.webPreferences).toMatchObject({ sandbox: true, contextIsolation: true, nodeIntegration: false });
+    expect(view.options.webPreferences.partition).toMatch(/^ohmygame-player-/);
+    expect(view.options.webPreferences.partition).not.toMatch(/^persist:/);
     view.webContents.frame.url = `${target.url}/scene?level=2#boss`;
     await Promise.all([games.open("game", request, resolve), games.open("game", request, resolve)]);
     const player = electron.windows[1]!;
@@ -223,6 +233,35 @@ describe("shared desktop game", () => {
     expect(view.setVisible).toHaveBeenLastCalledWith(true);
     expect(view.webContents.setAudioMuted).toHaveBeenLastCalledWith(false);
     expect(await games.capture("game")).toEqual(new Uint8Array([1, 2, 3]));
+    games.close();
+  });
+
+  it("updates Play visibility and audio when its window is hidden, shown, minimized, and restored", async () => {
+    const games = create();
+    await games.attach("game", "mount", editor(), url, layout, async () => target);
+    await games.open("game", request, async () => target);
+    const view = electron.views[0]!;
+    const player = electron.windows[1]!;
+    const document = view.webContents.frame;
+    document.url = `${target.url}/scene?level=2#boss`;
+
+    for (const hidden of [true, false]) {
+      player.visible = !hidden;
+      player.emit(hidden ? "hide" : "show");
+      expect(view.setVisible).toHaveBeenLastCalledWith(!hidden);
+      expect(view.webContents.setAudioMuted).toHaveBeenLastCalledWith(hidden);
+    }
+    for (const minimized of [true, false]) {
+      player.minimized = minimized;
+      player.emit(minimized ? "minimize" : "restore");
+      expect(view.setVisible).toHaveBeenLastCalledWith(!minimized);
+      expect(view.webContents.setAudioMuted).toHaveBeenLastCalledWith(minimized);
+    }
+
+    expect(view.webContents.frame).toBe(document);
+    expect(document.url).toBe(`${target.url}/scene?level=2#boss`);
+    expect(loads()).toHaveLength(1);
+    expect(view.webContents.destroyed).toBe(false);
     games.close();
   });
 

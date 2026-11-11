@@ -3,7 +3,7 @@ import {
   previewSettings,
   type PreviewMode,
 } from "../shared/preview-settings.js";
-import { ChevronDown, ExternalLink, LoaderCircle, X } from "./icons.js";
+import { ChevronDown, ExternalLink, LoaderCircle, Square, X } from "./icons.js";
 import {
   useEffect,
   useId,
@@ -551,20 +551,6 @@ export function ProjectSettingsDialog({
                   ? t("projectSettings.restartPreview")
                   : t("projectSettings.startPreview")}
               </button>
-              {previewActions.onStop ? (
-                <button
-                  className="project-settings-browser"
-                  type="button"
-                  disabled={
-                    !["ready", "starting"].includes(project.preview.status)
-                  }
-                  onClick={previewActions.onStop}
-                >
-                  {project.preview.status === "starting"
-                    ? t("projectSettings.cancelStartup")
-                    : t("projectSettings.stopPreview")}
-                </button>
-              ) : null}
               <button
                 className="project-settings-browser"
                 type="button"
@@ -587,22 +573,39 @@ export function ProjectSettingsDialog({
             </fieldset>
           </details>
         ) : null}
-        {webPreviewEnabled && previewUrl ? (
-          <button
-            className="project-settings-browser"
-            type="button"
-            disabled={saving}
-            onClick={() =>
-              window.open(
-                previewPageUrl(previewUrl, "external"),
-                "_blank",
-                "noopener,noreferrer",
-              )
-            }
-          >
-            <ExternalLink size={14} />
-            {t("projectSettings.openInBrowser")}
-          </button>
+        {(webPreviewEnabled && previewUrl) || previewActions?.onStop ? (
+          <div className="project-settings-preview-shortcuts">
+            {webPreviewEnabled && previewUrl ? (
+              <button
+                className="project-settings-browser"
+                type="button"
+                disabled={saving}
+                onClick={() =>
+                  window.open(
+                    previewPageUrl(previewUrl, "external"),
+                    "_blank",
+                    "noopener,noreferrer",
+                  )
+                }
+              >
+                <ExternalLink size={14} aria-hidden="true" />
+                {t("projectSettings.openInBrowser")}
+              </button>
+            ) : null}
+            {previewActions?.onStop ? (
+              <button
+                className="project-settings-browser"
+                type="button"
+                disabled={saving || !["ready", "starting"].includes(project.preview.status)}
+                onClick={previewActions.onStop}
+              >
+                <Square size={14} aria-hidden="true" />
+                {project.preview.status === "starting"
+                  ? t("projectSettings.cancelStartup")
+                  : t("projectSettings.stopPreview")}
+              </button>
+            ) : null}
+          </div>
         ) : null}
         {error ? (
           <p className="project-settings-error" role="alert">

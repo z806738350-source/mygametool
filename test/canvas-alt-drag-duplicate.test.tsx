@@ -50,6 +50,7 @@ vi.doMock(path.resolve("src/renderer/api.ts"), async (original) => ({
   ...(await original<typeof import("../src/renderer/api.js")>()),
   listImageModelCatalog: async () => ({ models: [], providers: [] }),
   listVideoModelCatalog: async () => ({ models: [], providers: [] }),
+  listAudioModelCatalog: async () => ({ models: [], providers: [] }),
   listModel3DCatalog: async () => ({ models: [], providers: [] }),
   listModel3DOperations: async () => [],
 }));
@@ -148,6 +149,7 @@ async function mount(board: AssetCanvasDocument) {
     jobs: async () => [],
     generate: vi.fn(),
     cancel: vi.fn(),
+    recoverImage: vi.fn(),
   };
   container = document.createElement("div");
   document.body.appendChild(container);

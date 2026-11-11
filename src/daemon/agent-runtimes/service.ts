@@ -1,3 +1,4 @@
+import { assertLocalExecutionAllowed, LOCAL_EXECUTION_ENABLED } from "../local-execution-policy.js";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -18,10 +19,12 @@ import {
   type UpdateAgentRuntimeRequest,
 } from "../../shared/agent-runtimes.js";
 import type { SkillCatalogItem } from "../agent.js";
+import { AutoContinueTools } from "../agent-auto-continue.js";
 import type { EffectiveMcpConfig, PluginMcpHost } from "../plugin-mcp-host.js";
 import { AGENT_RUNTIME_DEFINITIONS, commandSandbox } from "./definitions.js";
 import {
   AgentRuntimeCompatibilityError,
+  AgentRuntimeProbeError,
   checkRuntimeVersionRequirement,
   runtimeStartupError,
 } from "./compatibility.js";
@@ -49,8 +52,10 @@ import { stagedSkillsRoot } from "./skills.js";
 import { ClaudeCodeDriver } from "./claude-code.js";
 import { CodexAppServer } from "./codex-app-server.js";
 import { CodexDriver } from "./codex.js";
-import { codexServerIdentity } from "./codex-server-pool.js";
+import { controlledCodexEnvironment, requireControlledCodexVersion, verifyControlledCodexBinary, CONTROLLED_CODEX_VERSION } from "./controlled-codex.js";
 import { OpenCodeDriver } from "./opencode.js";
+import { QoderConnection, QoderDriver } from "./qoder.js";
+import { controlledQoderEnvironment, resolveControlledQoder, CONTROLLED_QODER_VERSION } from "./controlled-qoder.js";
 
 const STATUS_TTL_MS = 60_000;
 
@@ -71,6 +76,13 @@ interface ProbeCache {
   diagnostics: AgentRuntimeDiagnostic[];
   checkedAt: number;
   requirementError?: Error;
+}
+
+interface QoderAccountProbe {
+  cancelled: boolean;
+  signature: string;
+  connection?: QoderConnection;
+  stopping?: Promise<void>;
 }
 
 export interface NativeSessionRequest {
@@ -110,8 +122,11 @@ export interface NativeSessionRequest {
 export class AgentRuntimeService {
   readonly settings: AgentRuntimeSettingsStore;
   #revisions = new Map<AgentRuntimeId, number>();
+  #configurationRevisions = new Map<AgentRuntimeId, number>();
   #probes = new Map<AgentRuntimeId, ProbeCache>();
   #probing = new Map<AgentRuntimeId, Promise<ProbeCache | undefined>>();
+  #qoderProbe?: QoderAccountProbe;
+  #closed = false;
   #models = new Map<
     AgentRuntimeId,
     { signature: string; models: AgentModel[]; at: number }
@@ -178,8 +193,129 @@ export class AgentRuntimeService {
     return Promise.all(AGENT_RUNTIME_IDS.map((id) => this.status(id, recheck)));
   }
 
+  async #qoderStatus(recheck: boolean): Promise<AgentRuntimeStatus> {
+    const id = "qoder-cli";
+    const revision = this.#revisions.get(id);
+    const settings = this.settings.get(id);
+    const current = () => this.#revisions.get(id) === revision && this.settings.get(id).enabled === settings.enabled
+      && this.settings.get(id).binaryPath === settings.binaryPath;
+    const base = { id: "qoder-cli" as const, name: "Qoder", enabled: settings.enabled,
+      testedVersion: CONTROLLED_QODER_VERSION, commandSandbox: "none" as const, permissionMode: "standard" as const,
+      ...(settings.binaryPath ? { configuredBinaryPath: settings.binaryPath } : {}) };
+    let binary: Awaited<ReturnType<typeof resolveControlledQoder>>;
+    try { binary = await resolveControlledQoder(settings.binaryPath); }
+    catch {
+      if (!current()) return this.#qoderStatus(false);
+      if (this.#probes.has(id) || this.#models.has(id) || (this.#qoderProbe && !this.#qoderProbe.cancelled)) this.#invalidate(id);
+      return { ...base, installed: false, auth: { status: "unknown", billing: "unknown" },
+        diagnostics: [{ code: "runtime-incompatible", message: "The reviewed Qoder SDK/native installation is unavailable. No program was started." }] };
+    }
+    if (!current()) return this.#qoderStatus(false);
+    if (!binary) {
+      if (this.#probes.has(id) || this.#models.has(id) || (this.#qoderProbe && !this.#qoderProbe.cancelled)) this.#invalidate(id);
+      return { ...base, installed: false, auth: { status: "unknown", billing: "unknown" },
+        diagnostics: [{ code: "not-installed", message: "Install the reviewed Qoder SDK 1.0.59 and native runtime 1.1.83 separately." }] };
+    }
+    if (this.#qoderProbe && !this.#qoderProbe.cancelled && this.#qoderProbe.signature !== binary.signature) {
+      this.#invalidate(id);
+      return this.#qoderStatus(false);
+    }
+    let cached = this.#probes.get(id);
+    if (cached?.signature !== binary.signature) {
+      cached = undefined;
+      this.#probes.delete(id);
+      this.#models.delete(id);
+    }
+    if (!this.#closed && (recheck || (settings.enabled && !cached))) {
+      cached = await this.#probeQoder(binary);
+      if (!current() || (!this.#closed && settings.enabled && !cached)) return this.#qoderStatus(false);
+    }
+    return { ...base, installed: true, binaryPath: binary.path, binarySource: binary.source, version: binary.version,
+      auth: cached?.auth ?? { status: "unknown", billing: "unknown" },
+      diagnostics: cached?.diagnostics ?? [{ code: "check-required", message: "Qoder sign-in has not been checked in this app session. Check again to verify the existing sign-in before selecting a model." }],
+      ...(cached ? { checkedAt: new Date(cached.checkedAt).toISOString() } : {}) };
+  }
+
+  /** Revalidate an enabled agent's existing sign-in once per daemon, without constructing a model query. */
+  #probeQoder(binary: NonNullable<Awaited<ReturnType<typeof resolveControlledQoder>>>): Promise<ProbeCache | undefined> {
+    const id = "qoder-cli";
+    const running = this.#probing.get(id);
+    if (running) return running;
+    const revision = this.#revisions.get(id);
+    const settings = this.settings.get(id);
+    const state: QoderAccountProbe = { cancelled: false, signature: binary.signature };
+    this.#qoderProbe = state;
+    const active = () => !this.#closed && !state.cancelled && this.#revisions.get(id) === revision
+      && this.settings.get(id).enabled === settings.enabled && this.settings.get(id).binaryPath === settings.binaryPath;
+    const assertActive = () => { if (!active()) throw new Error("The Qoder account check was cancelled"); };
+    const work = (async (): Promise<ProbeCache | undefined> => {
+      let folder: Awaited<ReturnType<typeof privateFolder>> | undefined;
+      let phase: "startup" | "account" | "models" = "startup";
+      let verifiedAuth: AuthProbe = { status: "unknown", billing: "unknown" };
+      let models: AgentModel[] | undefined;
+      let diagnostics: AgentRuntimeDiagnostic[] = [];
+      const failed = (): AgentRuntimeDiagnostic[] => [{
+        code: phase === "models" ? "models-unavailable" : "probe-failed", message: phase === "models"
+          ? "Qoder sign-in was verified, but its model catalog could not be checked. Check again; no model task was sent."
+          : "Qoder sign-in could not be verified. Check again before preparing another sign-in; no model task was sent.",
+      }];
+      try {
+        assertActive();
+        await mkdir(path.join(this.#root, "probes"), { recursive: true, mode: 0o700 });
+        assertActive();
+        folder = await privateFolder(path.join(this.#root, "probes"), id);
+        assertActive();
+        const env = await controlledQoderEnvironment(this.#root);
+        assertActive();
+        state.connection = new QoderConnection({ binaryPath: binary.path, env, privateDirectory: folder.path,
+          processDirectory: path.join(this.#root, "processes") }, () => {});
+        await state.connection.start();
+        assertActive();
+        phase = "account";
+        const rawAccount = await state.connection.request("account/read");
+        assertActive();
+        const account = rawAccount && typeof rawAccount === "object" ? rawAccount as Record<string, unknown> : {};
+        if (typeof account.userId !== "string" || !account.userId.trim()) throw new Error("Qoder sign-in has not been verified");
+        verifiedAuth = { status: "signed-in", billing: "unknown" };
+        phase = "models";
+        const catalog = await state.connection.request("models/list", { live: true });
+        assertActive();
+        models = qoderModels(catalog);
+        if (!models.length) diagnostics = [{ code: "models-unavailable", message: "Qoder returned no available models" }];
+      } catch {
+        models = undefined;
+        diagnostics = failed();
+      } finally {
+        // Cleanup failures must not turn every subsequent status read into another account request.
+        try { await (state.stopping ?? state.connection?.stop()); } catch { models = undefined; diagnostics = failed(); }
+        try { await folder?.remove(); } catch { models = undefined; diagnostics = failed(); }
+      }
+      if (!active()) return undefined;
+      const cached = { signature: binary.signature, version: binary.version, auth: verifiedAuth, diagnostics, checkedAt: Date.now() };
+      if (models) this.#models.set(id, { signature: binary.signature, models, at: Date.now() });
+      else this.#models.delete(id);
+      this.#probes.set(id, cached);
+      return cached;
+    })().finally(() => {
+      if (this.#probing.get(id) === work) this.#probing.delete(id);
+      if (this.#qoderProbe === state) this.#qoderProbe = undefined;
+    });
+    this.#probing.set(id, work);
+    return work;
+  }
+
+  #cancelQoderProbe(): void {
+    if (!this.#qoderProbe) return;
+    this.#qoderProbe.cancelled = true;
+    if (this.#qoderProbe.connection && !this.#qoderProbe.stopping) {
+      this.#qoderProbe.stopping = this.#qoderProbe.connection.stop();
+      void this.#qoderProbe.stopping.catch(() => {});
+    }
+  }
+
   /** Media can use Codex's sign-in without enabling it as a conversation agent. */
   async codexImageConnection(recheck = false) {
+    if (!LOCAL_EXECUTION_ENABLED) return undefined;
     const binary = await resolveBinary("codex-cli", this.settings.get("codex-cli").binaryPath, recheck);
     if (!binary) return undefined;
     const probe = await this.#probe("codex-cli", binary, recheck);
@@ -195,6 +331,13 @@ export class AgentRuntimeService {
     id: AgentRuntimeId,
     recheck = false,
   ): Promise<AgentRuntimeStatus> {
+    if (id === "qoder-cli") return this.#qoderStatus(recheck);
+    if (id !== "codex-cli" && !LOCAL_EXECUTION_ENABLED) return {
+      id, name: AGENT_RUNTIME_DEFINITIONS[id].name, enabled: false, installed: false,
+      commandSandbox: "none", permissionMode: "standard",
+      auth: { status: "unknown", billing: "unknown" },
+      diagnostics: [{ code: "runtime-incompatible", message: "Native CLI execution is temporarily unavailable pending isolated execution." }],
+    };
     if (recheck) this.#invalidate(id);
     const revision = this.#revisions.get(id);
     const definition = AGENT_RUNTIME_DEFINITIONS[id];
@@ -205,10 +348,10 @@ export class AgentRuntimeService {
     const base = {
       id,
       name: definition.name,
-      testedVersion: definition.testedVersion,
+      testedVersion: id === "codex-cli" ? CONTROLLED_CODEX_VERSION : definition.testedVersion,
       enabled: settings.enabled,
       commandSandbox: commandSandbox(id),
-      permissionMode: settings.permissionMode,
+      permissionMode: id === "codex-cli" ? "standard" as const : settings.permissionMode,
       ...(settings.binaryPath
         ? { configuredBinaryPath: settings.binaryPath }
         : {}),
@@ -234,7 +377,7 @@ export class AgentRuntimeService {
     if (this.#revisions.get(id) !== revision) return this.status(id);
     // Enabling or rechecking a CLI checks the same protocol used by model
     // discovery. A timeout remains a probe/catalog failure, not incompatibility.
-    if (settings.enabled) await this.#loadModels(id).catch(() => {});
+    if (settings.enabled && probe?.auth.status === "signed-in") await this.#loadModels(id).catch(() => {});
     if (this.#revisions.get(id) !== revision) return this.status(id);
     return {
       ...base,
@@ -268,6 +411,9 @@ export class AgentRuntimeService {
     id: AgentRuntimeId,
     request: UpdateAgentRuntimeRequest,
   ): Promise<AgentRuntimeStatus> {
+    const previous = this.settings.get(id);
+    if (request.enabled && id !== "codex-cli" && id !== "qoder-cli") assertLocalExecutionAllowed("Native CLI execution");
+    if ((id === "codex-cli" || id === "qoder-cli") && request.permissionMode === "full") throw new Error("This agent uses controlled project tools; Full access is unavailable.");
     if (
       request.binaryPath !== undefined &&
       request.binaryPath !== "" &&
@@ -297,8 +443,12 @@ export class AgentRuntimeService {
         ? { binaryPath: request.binaryPath }
         : {}),
     });
-    this.#invalidate(id);
-    return this.status(id, request.binaryPath !== undefined);
+    if ((request.enabled !== undefined && request.enabled !== previous.enabled) ||
+      (request.binaryPath !== undefined && request.binaryPath !== previous.binaryPath) ||
+      (request.permissionMode !== undefined && request.permissionMode !== previous.permissionMode))
+      this.#configurationRevisions.set(id, (this.#configurationRevisions.get(id) ?? 0) + 1);
+    if (id !== "qoder-cli" || request.binaryPath !== undefined || (this.#qoderProbe && request.enabled !== undefined && request.enabled !== previous.enabled)) this.#invalidate(id);
+    return this.status(id, id !== "qoder-cli" && request.binaryPath !== undefined);
   }
 
   /** Models of the enabled agents that are installed. One that is slow to answer is left out this time, not waited for. */
@@ -306,7 +456,7 @@ export class AgentRuntimeService {
     const loading: AgentRuntimeId[] = [];
     const lists = await Promise.all(
       AGENT_RUNTIME_IDS.map(async (id) => {
-        if (!this.settings.get(id).enabled) return [];
+        if ((id !== "codex-cli" && id !== "qoder-cli" && !LOCAL_EXECUTION_ENABLED) || !this.settings.get(id).enabled) return [];
         const load = this.#loadModels(id).catch(() => [] as AgentModel[]);
         const late = Symbol("late");
         let timer: ReturnType<typeof setTimeout> | undefined;
@@ -328,6 +478,7 @@ export class AgentRuntimeService {
     id: AgentRuntimeId,
     modelId: string,
   ): Promise<AgentModel | undefined> {
+    if (id !== "codex-cli" && id !== "qoder-cli" && !LOCAL_EXECUTION_ENABLED) return undefined;
     if (!this.settings.get(id).enabled) return undefined;
     const models = await this.#loadModels(id).catch(() => []);
     return models.find((model) => model.id === modelId);
@@ -335,9 +486,23 @@ export class AgentRuntimeService {
 
   /** Starts the CLI's own sign-in. A browser page comes back when the CLI hands one out; otherwise the command to run. */
   async login(id: AgentRuntimeId): Promise<AgentRuntimeLoginResponse> {
+    if (id === "qoder-cli") {
+      const binary = await resolveControlledQoder(this.settings.get(id).binaryPath);
+      if (!binary) throw new Error("Install the reviewed Qoder SDK and runtime before preparing sign-in");
+      const env = await controlledQoderEnvironment(this.#root);
+      const loginDirectory = path.join(env.HOME!, "login");
+      await mkdir(loginDirectory, { recursive: true, mode: 0o700 });
+      const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+      return { command: `/usr/bin/env -i ${Object.entries(env).map(([key, value]) => `${key}=${quote(value)}`).join(" ")} ${quote(binary.path)} --cwd ${quote(loginDirectory)} login` };
+    }
+    if (id !== "codex-cli") assertLocalExecutionAllowed("Native CLI sign-in");
     const definition = AGENT_RUNTIME_DEFINITIONS[id];
     const binary = await resolveBinary(id, this.settings.get(id).binaryPath);
     if (!binary) throw new Error(`${definition.name} is not installed`);
+    if (id === "codex-cli") {
+      const probe = await this.#probe(id, binary, true);
+      if (probe?.requirementError) throw probe.requirementError;
+    }
     const env = await this.#environment(id, binary.path);
     await mkdir(this.#root, { recursive: true, mode: 0o700 });
     const forget = () => this.#invalidate(id);
@@ -358,9 +523,8 @@ export class AgentRuntimeService {
           "account/login/start",
           { type: "chatgpt" },
         );
-        return typeof started.authUrl === "string"
-          ? { url: started.authUrl }
-          : { command: definition.loginCommand };
+        if (typeof started.authUrl !== "string") throw new Error("Codex did not provide a browser sign-in URL. Check the connection and try again.");
+        return { url: started.authUrl };
       } catch (cause) {
         await server.stop();
         throw cause;
@@ -402,23 +566,36 @@ export class AgentRuntimeService {
   async createSession(
     request: NativeSessionRequest,
   ): Promise<NativeCodingSession> {
+    if (request.runtime !== "codex-cli" && request.runtime !== "qoder-cli") assertLocalExecutionAllowed("Native CLI execution");
     const settings = this.settings.get(request.runtime);
     const definition = AGENT_RUNTIME_DEFINITIONS[request.runtime];
     if (!settings.enabled)
       throw new Error(
         `${definition.name} is turned off. Turn it on in Providers & Models to continue.`,
       );
-    const binary = await resolveBinary(request.runtime, settings.binaryPath);
+    if (request.runtime === "qoder-cli") await this.#qoderStatus(false);
+    const binary = request.runtime === "qoder-cli" ? await resolveControlledQoder(settings.binaryPath) : await resolveBinary(request.runtime, settings.binaryPath);
     if (!binary)
       throw new Error(
         `${definition.name} is not installed. Install it, then check again in Providers & Models.`,
       );
-    const probe = await this.#probe(request.runtime, binary, false);
+    const probe = request.runtime === "qoder-cli" ? this.#probes.get("qoder-cli") : await this.#probe(request.runtime, binary, false);
+    if (request.runtime === "qoder-cli" && (this.#closed || !this.settings.get(request.runtime).enabled || (probe && probe.signature !== binary.signature)))
+      throw new AgentRuntimeProbeError("The Qoder setup changed during its account check. Check again before sending a prompt; no model task was sent.");
     if (probe?.requirementError) throw probe.requirementError;
+    if (probe?.auth.status !== "signed-in") {
+      if (request.runtime === "qoder-cli" && probe?.auth.status !== "signed-out")
+        throw new AgentRuntimeProbeError("Qoder sign-in has not been verified in this app session. Check again in Settings → Agents before sending a prompt; no model task was sent.");
+      throw new Error("Sign in to the separate OhMyGame agent connection, then check again in Settings → Agents before sending a prompt.");
+    }
     // Do not offer a catalog during setup then reject the same CLI only after
     // its first message. This uses the discovery cache and sends no model turn.
+    let supportsImages = false;
     try {
-      await this.#loadModels(request.runtime);
+      const models = await this.#loadModels(request.runtime);
+      supportsImages = models.find(model => model.id === request.model)?.supportsImages === true;
+      if (request.runtime === "qoder-cli" && !models.some(model => model.id === request.model))
+        throw new AgentRuntimeProbeError("Qoder's current model catalog has not verified the selected model. Check again in Settings → Agents; no model task was sent.");
     } catch (cause) {
       throw runtimeStartupError(cause);
     }
@@ -434,7 +611,7 @@ export class AgentRuntimeService {
       { tool: ToolDefinition; close: () => Promise<void> } | undefined;
     try {
       if (
-        request.pluginMcp &&
+        request.runtime !== "codex-cli" && request.runtime !== "qoder-cli" && request.pluginMcp &&
         Object.keys(request.pluginMcp.config.mcpServers).length
       ) {
         pluginTool = await request.pluginMcp.host.tool(
@@ -446,21 +623,46 @@ export class AgentRuntimeService {
       // Plugin servers that cannot start leave the agent without them, as a failed MCP server does in Pi.
       pluginTool = undefined;
     }
-    const bridge = new ToolBridge([
+    const admissionRevision = this.#configurationRevisions.get(request.runtime);
+    const admissionPolicy = JSON.stringify(request.policy);
+    const currentSettings = () => {
+      const current = this.settings.get(request.runtime);
+      return !this.#closed && current.enabled && current.binaryPath === settings.binaryPath &&
+        current.permissionMode === settings.permissionMode && this.#configurationRevisions.get(request.runtime) === admissionRevision &&
+        JSON.stringify(request.policy) === admissionPolicy;
+    };
+    const assertToolOwner = () => {
+      if (!currentSettings()) throw new Error("The agent connection changed; controlled tool dispatch was stopped");
+    };
+    let taskAccount: ProbeCache | undefined;
+    const beginTask = () => { assertToolOwner(); taskAccount = this.#probes.get(request.runtime); };
+    const assertContinuation = async () => {
+      const valid = () => {
+        const account = this.#probes.get(request.runtime);
+        const catalog = this.#models.get(request.runtime);
+        return currentSettings() && account === taskAccount &&
+          account?.signature === binary.signature && account.auth.status === "signed-in" && catalog?.signature === binary.signature &&
+          catalog.models.some(model => model.id === request.model);
+      };
+      if (!valid()) throw new Error("The agent connection changed; automatic continuation was stopped");
+      // Static detection only: never sign in, launch a probe, or refresh a remote catalog here.
+      const currentBinary = request.runtime === "qoder-cli" ? await resolveControlledQoder(settings.binaryPath) : await resolveBinary(request.runtime, settings.binaryPath);
+      if (!valid() || currentBinary?.signature !== binary.signature)
+        throw new Error("The controlled agent runtime changed; automatic continuation was stopped");
+    };
+    const continuationTools = new AutoContinueTools([
       ...request.tools,
       ...(pluginTool ? [pluginTool.tool] : []),
-    ]);
+    ], { sessionManager: request.sessionManager, assertCurrent: assertToolOwner });
+    let nativeSession: NativeCodingSession | undefined;
+    const guardedTools = continuationTools.wrap();
+    const bridge = new ToolBridge(guardedTools, request.runtime === "qoder-cli", request.runtime === "codex-cli" || request.runtime === "qoder-cli", { getBranch: () => request.sessionManager.getBranch() }, () => {
+      assertToolOwner();
+      const catalog = this.#models.get(request.runtime);
+      const verifiedImages = catalog?.signature === binary.signature && catalog.models.find(model => model.id === request.model)?.supportsImages === true;
+      return { id: request.model, provider: request.runtime, input: verifiedImages ? ["text", "image"] : ["text"] };
+    });
     const env = await this.#environment(request.runtime, binary.path);
-    // Codex conversations with the same executable, environment and Skills share one app server.
-    const codexServer =
-      request.runtime === "codex-cli"
-        ? await codexServerIdentity(
-            this.#root,
-            binary.path,
-            env,
-            request.skillDirectories,
-          )
-        : undefined;
     const revoke = new Set<() => void>();
     const context = (
       resume: string | undefined,
@@ -472,12 +674,12 @@ export class AgentRuntimeService {
       env,
       privateDirectory: folder.path,
       processDirectory: path.join(this.#root, "processes"),
-      instructions: `${request.instructions}\n\n${NATIVE_INSTRUCTIONS}`,
+      instructions: `${request.instructions}\n\n${NATIVE_INSTRUCTIONS}\n\nUse only OhMyGame dynamic tools for project files, execution and media. All images, video, audio, 3D and generated text assets use the configured Kunpo tools. Never substitute native generation, shell, external MCP, browser or API requests. Recover existing media jobs by ID; never resubmit a job with an unknown outcome.`,
       bridge,
       saveGeneratedImage: request.saveGeneratedImage,
       policy: {
         ...request.policy,
-        fullAccess: settings.permissionMode === "full",
+        fullAccess: false,
         // Claude Code runs every command in its sandbox. Codex asks only for
         // what would leave its sandbox, so its requests are judged strictly.
         sandboxedCommands:
@@ -487,12 +689,11 @@ export class AgentRuntimeService {
         readablePaths: [
           stagedSkillsRoot(
             request.runtime,
-            codexServer?.directory ?? folder.path,
+            folder.path,
           ),
         ],
       },
-      ...(codexServer ? { codexServer } : {}),
-      skillDirectories: request.skillDirectories,
+      skillDirectories: [],
       httpBridge: async (handlers) => {
         const registered = this.#registerBridge(bridge, handlers);
         const stop = () => {
@@ -525,15 +726,25 @@ export class AgentRuntimeService {
         return new ClaudeCodeDriver(driverContext);
       if (request.runtime === "codex-cli")
         return new CodexDriver(driverContext);
+      if (request.runtime === "qoder-cli")
+        return new QoderDriver(driverContext);
       return new OpenCodeDriver(driverContext);
     };
-    return new NativeCodingSession({
+    nativeSession = new NativeCodingSession({
       runtime: request.runtime,
+      // Native tool schemas and image-preparation instructions are fixed at session creation.
+      ...(request.runtime === "codex-cli" ? { contextVersion: "controlled-codex-v15" } : {}),
+      // Retain the existing Skill restrictions while rebuilding older image/tool contracts.
+      ...(request.runtime === "qoder-cli" ? { contextVersion: "controlled-qoder-v14" } : {}),
       model: request.model,
+      supportsImages,
       ...(request.reasoningLevel
         ? { nativeReasoningLevel: request.reasoningLevel }
         : {}),
       sessionManager: request.sessionManager,
+      continuationTools,
+      assertContinuation,
+      beginTask,
       createDriver,
       ...(request.snapshotBeforeMessage
         ? { snapshotBeforeMessage: request.snapshotBeforeMessage }
@@ -551,6 +762,7 @@ export class AgentRuntimeService {
         await folder.remove();
       },
     });
+    return nativeSession;
   }
 
   /**
@@ -607,8 +819,11 @@ export class AgentRuntimeService {
 
   /** Stops every CLI still running: sessions let go of theirs without waiting, sign-ins may still be open. */
   async close(): Promise<void> {
+    this.#closed = true;
+    this.#cancelQoderProbe();
     this.#bridges.clear();
     await stopAgentProcesses();
+    await this.#probing.get("qoder-cli");
   }
 
   #registerBridge(
@@ -652,7 +867,8 @@ export class AgentRuntimeService {
     this.#probes.delete(id);
     this.#models.delete(id);
     this.#modelErrors.delete(id);
-    this.#probing.delete(id);
+    if (id === "qoder-cli") this.#cancelQoderProbe();
+    else this.#probing.delete(id);
     this.#modelLoads.delete(id);
   }
 
@@ -660,6 +876,7 @@ export class AgentRuntimeService {
   async cli(
     id: AgentRuntimeId,
   ): Promise<{ path: string; env: Record<string, string> } | undefined> {
+    if (!LOCAL_EXECUTION_ENABLED) return undefined;
     const binary = await resolveBinary(id, this.settings.get(id).binaryPath);
     return binary
       ? { path: binary.path, env: await this.#environment(id, binary.path) }
@@ -670,6 +887,8 @@ export class AgentRuntimeService {
     id: AgentRuntimeId,
     binaryPath: string,
   ): Promise<Record<string, string>> {
+    if (id === "codex-cli") return controlledCodexEnvironment(this.#root);
+    if (id === "qoder-cli") return controlledQoderEnvironment(this.#root);
     return agentEnvironment(
       id,
       binaryPath,
@@ -701,6 +920,7 @@ export class AgentRuntimeService {
       let version: string | undefined;
       let auth: AuthProbe = { status: "unknown", billing: "unknown" };
       try {
+        if (id === "codex-cli") await verifyControlledCodexBinary(binary.path);
         [version, auth] = await Promise.all([
           probeVersion(binary.path, id, env),
           probeAuth(binary.path, id, env),
@@ -713,6 +933,7 @@ export class AgentRuntimeService {
       }
       let requirementError: Error | undefined;
       try {
+        if (id === "codex-cli") requireControlledCodexVersion(version);
         checkRuntimeVersionRequirement(
           id,
           version,
@@ -742,7 +963,7 @@ export class AgentRuntimeService {
         diagnostics.push({
           code: "signed-out",
           message: `${definition.name} is not signed in`,
-          command: definition.loginCommand,
+          ...(id !== "codex-cli" ? { command: definition.loginCommand } : {}),
         });
       const result: ProbeCache = {
         signature: binary.signature,
@@ -762,6 +983,13 @@ export class AgentRuntimeService {
   }
 
   #loadModels(id: AgentRuntimeId): Promise<AgentModel[]> {
+    if (id === "qoder-cli") {
+      if (this.#closed || !this.settings.get(id).enabled) return Promise.resolve([]);
+      return this.#qoderStatus(false).then((status) =>
+        !this.#closed && status.installed && status.enabled && status.auth.status === "signed-in" && this.settings.get(id).enabled
+          ? this.#models.get(id)?.models ?? [] : [],
+      );
+    }
     const running = this.#modelLoads.get(id);
     if (running) return running;
     const revision = this.#revisions.get(id);
@@ -771,6 +999,7 @@ export class AgentRuntimeService {
       if (!binary) return [];
       const probe = await this.#probe(id, binary, false);
       if (probe?.requirementError) throw probe.requirementError;
+      if (id === "codex-cli" && probe?.auth.status !== "signed-in") return [];
       const cached = this.#models.get(id);
       if (
         cached?.signature === binary.signature &&
@@ -846,6 +1075,29 @@ export class AgentRuntimeService {
     this.#modelLoads.set(id, work);
     return work;
   }
+}
+
+/** Project agents use only Qoder's own catalog; configured BYOK endpoints are not imported. */
+export function qoderModels(value: unknown): AgentModel[] {
+  const rows = Array.isArray(value) ? value : value && typeof value === "object" ? (value as { models?: unknown }).models : undefined;
+  if (!Array.isArray(rows)) return [];
+  const seen = new Set<string>();
+  return rows.slice(0, 500).flatMap((row) => {
+    if (!row || typeof row !== "object") return [];
+    const model = row as Record<string, unknown>;
+    const id = model.value;
+    if (typeof id !== "string" || !/^[a-zA-Z0-9_./:+-]{1,200}$/.test(id) || id === "lite" || seen.has(id) || model.isEnabled === false ||
+      model.source !== undefined && model.source !== "system") return [];
+    seen.add(id);
+    const efforts = Array.isArray(model.efforts) ? model.efforts.filter((entry): entry is string => typeof entry === "string" && ["low", "medium", "high", "max"].includes(entry)) : [];
+    const context = model.defaultContextWindow;
+    return [{ provider: "qoder-cli", providerName: "Qoder", id,
+      name: typeof model.displayName === "string" ? model.displayName.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 150) || id : id,
+      reasoningLevels: [], supportsImages: model.isVl === true,
+      ...(efforts.length ? { nativeReasoningLevels: [...new Set(efforts)] } : {}),
+      ...(typeof context === "number" && Number.isSafeInteger(context) && context > 0 && context <= 10_000_000 ? { contextWindow: context } : {}),
+    }];
+  });
 }
 
 function isUsageLimit(value: unknown): value is AgentUsageLimit {

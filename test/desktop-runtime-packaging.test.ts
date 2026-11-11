@@ -21,7 +21,7 @@ const {
 } = require("app-builder-lib/out/fileMatcher.js");
 
 describe("desktop runtime packaging", () => {
-  it("includes the generated story resources and template licenses in the application", async () => {
+  it("includes story resources, template licenses and the offline Three.js add-ons in the application", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-story-packaging-"));
     try {
       const config = parse(await readFile("electron-builder.yml", "utf8")) as Configuration;
@@ -39,6 +39,12 @@ describe("desktop runtime packaging", () => {
           contents,
         };
       }));
+      const examples = path.join("node_modules", "three", "examples", "jsm");
+      const addons = ["loaders/GLTFLoader.js", "utils/BufferGeometryUtils.js"].map(file => path.join(examples, file));
+      for (const file of addons) {
+        await mkdir(path.dirname(path.join(directory, file)), { recursive: true });
+        await writeFile(path.join(directory, file), await readFile(file));
+      }
       const destination = path.join(directory, "app");
       const matchers = getFileMatchers(config, "files", destination, {
         defaultSrc: directory,
@@ -46,15 +52,18 @@ describe("desktop runtime packaging", () => {
         customBuildOptions: {},
         globalOutDir: path.join(directory, "release"),
       });
-      await copyFiles(matchers.filter((matcher: { from: string }) => matcher.from === directory));
+      await copyFiles(matchers.filter((matcher: { from: string }) => [directory, path.join(directory, examples)].includes(matcher.from)));
       expect(await readFile(path.join(destination, relative), "utf8")).toBe("story resources");
       const archive = path.join(directory, "app.asar");
       await createPackage(destination, archive);
       // ASAR's promise can resolve before its output stream has finished writing.
-      await vi.waitFor(() => {
+      await vi.waitFor(async () => {
         expect(extractFile(archive, path.join("dist", "story-web", "resources.json")).toString()).toBe("story resources");
         for (const { archivePath, contents } of notices) {
           expect(extractFile(archive, archivePath)).toEqual(contents);
+        }
+        for (const addon of addons) {
+          expect(extractFile(archive, addon)).toEqual(await readFile(addon));
         }
       });
     } finally {
@@ -99,16 +108,15 @@ describe("desktop runtime packaging", () => {
           "plugins/skill.txt": "plugins/skill.txt",
           "integrations/skills/ohmygame-studio/SKILL.md":
             "integrations/skills/ohmygame-studio/SKILL.md",
-          ".runtime/preinstalled-plugins/skill.txt":
-            "preinstalled-plugins/skill.txt",
-          ".runtime/examples/catalog.json": "examples/catalog.json",
-          ".runtime/desktop-config.json": "desktop-config.json",
         };
         const sourceFiles = [
           ...runtimeFiles.map((file) => `.runtime/node/${file}`),
           ...Object.keys(sharedFiles),
           ".runtime/node-archive.zip",
           ".runtime/typebox/index.mjs",
+          ".runtime/preinstalled-plugins/skill.txt",
+          ".runtime/examples/catalog.json",
+          ".runtime/desktop-config.json",
         ];
         for (const file of sourceFiles) {
           const target = path.join(directory, file);
@@ -133,6 +141,9 @@ describe("desktop runtime packaging", () => {
           expect(
             await readFile(path.join(resources, destination), "utf8"),
           ).toBe(source);
+        }
+        for (const excluded of ["preinstalled-plugins", "examples", "desktop-config.json"]) {
+          await expect(readFile(path.join(resources, excluded))).rejects.toMatchObject({ code: "ENOENT" });
         }
         expect(await readdir(path.join(resources, "runtime"))).toEqual([
           "node",

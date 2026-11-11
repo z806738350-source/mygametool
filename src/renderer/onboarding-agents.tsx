@@ -23,7 +23,7 @@ import {
   LogIn,
 } from "./icons.js";
 import { PROVIDER_ICONS } from "./provider-icons.js";
-import { openModelAuthExternal } from "./use-model-provider-auth.js";
+import { openAgentRuntimeAuthExternal, openModelAuthExternal } from "./use-model-provider-auth.js";
 import { t } from "./i18n.js";
 import { useReadyRuntimeGeneration } from "./runtime-connection.js";
 import brandMark from "../shared/assets/ohmygame-mark-v2.svg";
@@ -221,7 +221,7 @@ export function OnboardingAgents({
     loginId.current = id;
     setCopied(false);
     setLogin({ id, ...started });
-    if (started.url) await openModelAuthExternal(started.url);
+    if (started.url) await openAgentRuntimeAuthExternal(started.url, id);
   }
 
   const selected = agents?.find((agent) => agent.id === selectedAgent);
@@ -319,7 +319,7 @@ export function OnboardingAgents({
               <span>OhMyGame</span>
               <small>{t("onboarding.builtInHint")}</small>
             </button>
-            {(agents ?? []).map((agent) => {
+            {(agents ?? []).filter((agent) => agent.id !== "qoder-cli").map((agent) => {
               const icon = PROVIDER_ICONS[agent.id];
               const ready =
                 agent.installed &&
@@ -506,7 +506,7 @@ export function OnboardingAgents({
                   type="button"
                   className="onboarding-text-button"
                   onClick={() =>
-                    void run(login.id, () => openModelAuthExternal(login.url!))
+                    void run(login.id, () => openAgentRuntimeAuthExternal(login.url!, login.id))
                   }
                 >
                   {t("codingAgents.openAgain")}

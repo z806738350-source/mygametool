@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { WEB_GAME_USE_CAPABILITIES, type GameRuntimeAdapter, type PlaytestIpcMessage, type PlaytestRequest, type PlaytestResult } from "../shared/playtest.js";
+import { WEB_GAME_USE_CAPABILITIES, playtestActionError, playtestOpenError, type GameRuntimeAdapter, type PlaytestIpcMessage, type PlaytestRequest, type PlaytestResult } from "../shared/playtest.js";
 
 interface ProcessIpc {
   connected?: boolean;
@@ -9,6 +9,7 @@ interface ProcessIpc {
 }
 
 interface PendingRequest {
+  request: PlaytestRequest;
   resolve: (result: PlaytestResult) => void;
   reject: (error: Error) => void;
   signal?: AbortSignal;
@@ -51,7 +52,7 @@ export class ProcessPlaytestDriver implements GameRuntimeAdapter {
         this.#send({ channel: "ohmygame:playtest-cancel", id });
       } : undefined;
       signal?.addEventListener("abort", onAbort!, { once: true });
-      this.#pending.set(id, { resolve, reject, signal, onAbort, timeout });
+      this.#pending.set(id, { request: structuredClone(request), resolve, reject, signal, onAbort, timeout });
       this.#send({ channel: "ohmygame:playtest-request", id, request }, (error) => {
         if (error) this.#settle(id, error);
       });
@@ -76,7 +77,21 @@ export class ProcessPlaytestDriver implements GameRuntimeAdapter {
 
   #handleMessage(message: unknown): void {
     if (!isResponse(message)) return;
-    if (message.error) this.#settle(message.id, new Error(message.error));
+    if (message.error) {
+      const opening = this.#pending.get(message.id)?.request, rejected = message.openFailure;
+      if (opening?.operation === "open" && rejected?.version === 1 && rejected.reason === "session_limit"
+        && Number.isInteger(rejected.limit) && rejected.limit > 0 && rejected.limit <= 100 && rejected.windowCreated === false) {
+        this.#settle(message.id, playtestOpenError(message.error, rejected));
+        return;
+      }
+      const request = this.#pending.get(message.id)?.request, failure = message.actionFailure;
+      const valid = request?.operation === "act" && failure?.version === 1 && failure.sessionId === request.sessionId
+        && Number.isInteger(failure.completedActions) && failure.completedActions >= 0 && failure.completedActions < request.actions.length
+        && failure.failedAction === failure.completedActions + 1 && request.actions[failure.completedActions]?.type === failure.actionType
+        && (failure.phase === "target_lookup" && failure.actionType === "click" && failure.inputDispatched === false
+          || failure.phase === "action" && failure.inputDispatched === "unknown");
+      this.#settle(message.id, valid ? playtestActionError(message.error, failure!) : new Error(message.error));
+    }
     else if (message.result) this.#settle(message.id, undefined, message.result);
     else this.#settle(message.id, new Error("Desktop playtest service returned an empty response"));
   }

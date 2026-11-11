@@ -25,6 +25,21 @@ describe("renderer file transfers", () => {
     expect(batch).toBe(2);
   });
 
+  it("filters private clipboard names and preserves ordinary file transfers", async () => {
+    const secret = new File(["fake-sensitive-content"], ".env"), publicFile = new File(["notes"], "notes.md");
+    expect(clipboardFiles({ files: [secret, publicFile], items: [] } as unknown as DataTransfer)).toEqual([publicFile]);
+    const read = vi.fn();
+    const entries = [
+      { isFile: true, name: ".env.local", file: read },
+      { isFile: true, name: "../outside.txt", file: read },
+      { isDirectory: true, name: ".ssh", createReader: read },
+      { isFile: false, isDirectory: false, name: "unsupported-entry" },
+    ];
+    expect(await transferredFiles({ files: [], items: entries.map((entry) => ({ kind: "file", webkitGetAsEntry: () => entry, getAsFile: () => null })) } as unknown as DataTransfer)).toEqual([]);
+    expect(read).not.toHaveBeenCalled();
+    expect(droppedFolders([{ file: secret }, { file: publicFile, relativePath: "game/notes.md" }, { file: secret, relativePath: "game/.env" }])).toEqual({ folders: [{ name: "game", bytes: publicFile.size, files: [{ file: publicFile, directory: "" }] }], files: [] });
+  });
+
   it("sorts canvas imports into documents, tables, Library media and project files, and leaves system files behind", () => {
     expect(canvasImportKind("Notes.MD")).toEqual({ kind: "document" });
     expect(canvasImportKind("items.csv")).toEqual({ kind: "table", delimiter: "," });
@@ -34,8 +49,8 @@ describe("renderer file transfers", () => {
     expect(canvasImportKind("walk.GIF")).toEqual({ kind: "media", mediaType: "image/gif" });
     expect(canvasImportKind("scene.psd")).toEqual({ kind: "file" });
     expect(canvasImportKind(".png")).toEqual({ kind: "file" });
-    for (const path of [".DS_Store", "pack/Thumbs.db", "pack/._hero.png", "__MACOSX/pack/hero.png", "pack/.cache/hero.png"]) expect(isIgnoredImportPath(path), path).toBe(true);
-    for (const path of [".env", ".pack/hero.png", "pack/hero.png"]) expect(isIgnoredImportPath(path), path).toBe(false);
+    for (const path of [".DS_Store", "pack/Thumbs.db", "pack/._hero.png", "__MACOSX/pack/hero.png", "pack/.cache/hero.png", ".env", "config/.env.local", ".ssh/id_rsa", "config/credentials.json"]) expect(isIgnoredImportPath(path), path).toBe(true);
+    for (const path of [".pack/hero.png", "pack/hero.png", "game/settings.json"]) expect(isIgnoredImportPath(path), path).toBe(false);
     const loose = new File(["x"], "loose.txt"), hero = new File(["hero"], "hero.gltf"), texture = new File(["png"], "skin.png");
     expect(droppedFolders([{ file: loose }, { file: hero, relativePath: "pack/hero.gltf" }, { file: texture, relativePath: "pack/textures/skin.png" }, { file: loose, relativePath: "loose.txt" }])).toEqual({
       folders: [{ name: "pack", bytes: 7, files: [{ file: hero, directory: "" }, { file: texture, directory: "textures" }] }],

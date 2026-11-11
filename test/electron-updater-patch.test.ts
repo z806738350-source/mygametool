@@ -1,37 +1,23 @@
-import { createRequire } from "node:module";
-import { PassThrough } from "node:stream";
-import { expect, it, vi } from "vitest";
+import { readFile } from "node:fs/promises";
+import { expect, it } from "vitest";
+import { parse } from "yaml";
 
-const require = createRequire(import.meta.url);
-const { executeTasksUsingMultipleRangeRequests } = require("electron-updater/out/differentialDownloader/multipleRangeDownloader.js");
-const { OperationKind } = require("electron-updater/out/differentialDownloader/downloadPlanBuilder.js");
+it("does not ship a remote updater, telemetry SDKs or an author update feed", async () => {
+  const metadata = JSON.parse(await readFile("package.json", "utf8"));
+  const dependencies = { ...metadata.dependencies, ...metadata.devDependencies };
+  for (const name of ["electron-updater", "@sentry/electron", "@sentry/vite-plugin", "posthog-js", "@supabase/supabase-js"]) expect(dependencies).not.toHaveProperty(name);
+  expect(metadata.patchedDependencies).not.toHaveProperty("electron-updater@6.8.9");
+  const config = parse(await readFile("electron-builder.yml", "utf8"));
+  expect(config.publish).toBeNull();
+  expect(JSON.stringify(config.extraResources)).not.toMatch(/preinstalled-plugins|examples|desktop-config/);
+  for (const name of ["build:desktop-app", "dev:daemon", "dev:desktop", "start:desktop"]) expect(metadata.scripts[name]).not.toMatch(/prepare:(?:examples|preinstalled-plugins)/);
+});
 
-// patches/electron-updater@6.8.9.patch: a connection that drops during a multi-range
-// differential download must fail the download instead of crashing the main process.
-it("rejects a differential download whose multi-range response fails", () => {
-  const response = Object.assign(new PassThrough(), {
-    statusCode: 206,
-    headers: { "content-type": "multipart/byteranges; boundary=parts" },
-  });
-  const downloader = {
-    options: {},
-    createRequestOptions: () => ({ headers: {} }),
-    httpExecutor: {
-      createRequest: (_options: unknown, callback: (response: unknown) => void) => ({
-        end: () => callback(response),
-        abort: vi.fn(),
-      }),
-      addErrorAndTimeoutHandlers: vi.fn(),
-    },
-  };
-  const tasks = [
-    { kind: OperationKind.DOWNLOAD, start: 0, end: 10 },
-    { kind: OperationKind.DOWNLOAD, start: 20, end: 30 },
-  ];
-  const reject = vi.fn();
-  executeTasksUsingMultipleRangeRequests(downloader, tasks, new PassThrough(), 0, reject)(0);
-
-  const error = new Error("net::ERR_CONNECTION_CLOSED");
-  expect(() => response.emit("error", error)).not.toThrow();
-  expect(reject).toHaveBeenCalledWith(error);
+it("leaves remote resource preparation explicitly unavailable", async () => {
+  for (const name of ["prepare-examples.ts", "prepare-preinstalled-plugins.ts"]) {
+    const source = await readFile(`scripts/${name}`, "utf8");
+    expect(source).toMatch(/^throw new Error/);
+    expect(source).toContain("disabled in this local-only build");
+    expect(source).not.toMatch(/https?:|spawn|fetch|import /);
+  }
 });

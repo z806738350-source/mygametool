@@ -272,6 +272,15 @@ it("recovers the recorded interrupted operation and blocks creative writes until
   });
   expect(blocked.statusCode).toBe(409);
   expect(blocked.json().code).toBe("workspace_recovery");
+  const metadata = await readFile(path.join(project.storagePath!, "project.json"), "utf8");
+  const rename = await app.inject({
+    method: "PATCH",
+    url: `/projects/${project.id}`,
+    payload: { name: "Must wait for recovery" },
+  });
+  expect(rename.statusCode).toBe(409);
+  expect(rename.json().code).toBe("workspace_recovery");
+  expect(await readFile(path.join(project.storagePath!, "project.json"), "utf8")).toBe(metadata);
   for (const route of ["canvas/workspace", "playable"]) {
     const read = await app.inject({
       method: "GET",
@@ -297,7 +306,7 @@ it("recovers the recorded interrupted operation and blocks creative writes until
   ).toEqual({ unfinished: false });
 });
 
-it("preserves the restored workspace version across daemon restart", async () => {
+it.each([false, true])("renames restored project metadata without accepting old file writes (restart: %s)", async (restart) => {
   const { checkpointId, app, directory, project, base } = await fixture();
   const undo = await app.inject({
     method: "POST",
@@ -305,23 +314,60 @@ it("preserves the restored workspace version across daemon restart", async () =>
     payload: {},
   });
   expect(undo.statusCode, undo.body).toBe(200);
-  await app.close();
-  const restarted = createApp({ dataDirectory: directory, createSession });
-  cleanup.push(() => restarted.close());
-  const read = await restarted.inject({
+  let active = app;
+  if (restart) {
+    await app.close();
+    active = createApp({ dataDirectory: directory, createSession });
+    cleanup.push(() => active.close());
+  }
+  const listed = await active.inject({ method: "GET", url: "/projects" });
+  expect(listed.statusCode, listed.body).toBe(200);
+  const store = new CheckpointStore();
+  const creative = await store.snapshot(project);
+  const notice = await readWorkspaceNotice(project);
+  const metadataPath = path.join(project.storagePath!, "project.json");
+  const metadata = JSON.parse(await readFile(metadataPath, "utf8"));
+  for (const headers of [{ "x-workspace-version": "0" }, {}]) {
+    const name = headers["x-workspace-version"] ? "Renamed from list" : "Renamed without a file version";
+    const renamed = await active.inject({
+      method: "PATCH",
+      url: `/projects/${project.id}`,
+      headers,
+      payload: { name },
+    });
+    expect(renamed.statusCode, renamed.body).toBe(200);
+    expect(renamed.json()).toMatchObject({ name, nameSource: "manual" });
+    expect(renamed.headers["x-workspace-version"]).toBe(undo.headers["x-workspace-version"]);
+    const saved = JSON.parse(await readFile(metadataPath, "utf8"));
+    expect(saved).toEqual({ ...metadata, name, nameSource: "manual", updatedAt: saved.updatedAt });
+  }
+  expect(await store.snapshot(project)).toBe(creative);
+  expect(await readWorkspaceNotice(project)).toBe(notice);
+  expect(await readWorkspaceVersion(project)).toBe(undo.headers["x-workspace-version"]);
+  const read = await active.inject({
     method: "GET",
     url: `/projects/${project.id}`,
   });
   expect(read.headers["x-workspace-version"]).toBe(
     undo.headers["x-workspace-version"],
   );
-  const stale = await restarted.inject({
+  for (const request of [
+    { method: "POST" as const, url: `/projects/${project.id}/files`, payload: { name: "stale.txt", kind: "file" } },
+    { method: "PATCH" as const, url: `/projects/${project.id}/files?path=game.txt`, payload: { name: "stale.txt" } },
+    { method: "DELETE" as const, url: `/projects/${project.id}` },
+  ]) {
+    const stale = await active.inject({ ...request, headers: { "x-workspace-version": "0" } });
+    expect(stale.statusCode, stale.body).toBe(409);
+    expect(stale.json().code).toBe("workspace_stale");
+  }
+  expect(await store.snapshot(project)).toBe(creative);
+  const fresh = await active.inject({
     method: "POST",
     url: `/projects/${project.id}/files`,
-    payload: { name: "stale.txt", kind: "file" },
+    headers: { "x-workspace-version": undo.headers["x-workspace-version"] },
+    payload: { name: "fresh.txt", kind: "file" },
   });
-  expect(stale.statusCode).toBe(409);
-  expect(stale.json().code).toBe("workspace_stale");
+  expect(fresh.statusCode, fresh.body).toBe(201);
 });
 
 it("shows binary and oversized files without unbounded text reads", async () => {

@@ -1,7 +1,6 @@
 import { spawnSync } from "node:child_process";
 import {
   mkdtempSync,
-  mkdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -256,142 +255,14 @@ describe("release notes CLI", () => {
   );
 });
 
-describe("desktop release publication", () => {
-  const workflow = parse(
-    readFileSync(".github/workflows/release-desktop.yml", "utf8"),
-  );
-
-  it("requires changelog validation before packaging", () => {
-    const jobs = workflow.jobs;
-    expect(jobs.windows.needs).toBe("release-notes");
-    expect(jobs.macos.needs).toBe("release-notes");
+describe("local desktop release policy", () => {
+  it("has no tag trigger, secrets, build downloads or remote publication steps", () => {
+    const source = readFileSync(".github/workflows/release-desktop.yml", "utf8");
+    const workflow = parse(source);
+    expect(Object.keys(workflow.on)).toEqual(["workflow_dispatch"]);
+    expect(workflow.permissions).toEqual({ contents: "read" });
+    expect(Object.keys(workflow.jobs)).toEqual(["local-only"]);
+    expect(source).not.toMatch(/secrets\.|vars\.|aws s3|gh release|upload-artifact|bun install|PUBLISH_API_URL|SENTRY|POSTHOG/);
+    expect(workflow.jobs["local-only"].steps[0].run).toContain("publishing is disabled");
   });
-
-  it("only publishes from a pushed tag", () => {
-    expect(workflow.on).toHaveProperty("workflow_dispatch");
-    expect(workflow.jobs.release.if).toBe("github.event_name == 'push'");
-  });
-
-  it.each([
-    ["the pushed tag", `v${version}`, 0],
-    ["package.json for a manual build", "", 0],
-    ["a mismatched tag", "v0.0.0-beta.4.8", 1],
-  ])("validates the changelog for %s", (_label, tag, status) => {
-    const directory = fixture();
-    mkdirSync(path.join(directory, "scripts"));
-    writeFileSync(
-      path.join(directory, "scripts", "release-notes.mjs"),
-      readFileSync(script),
-    );
-    mkdirSync(path.join(directory, "src", "shared"), { recursive: true });
-    writeFileSync(
-      path.join(directory, "src", "shared", "changelog.ts"),
-      readFileSync("src/shared/changelog.ts"),
-    );
-    const validate = workflow.jobs["release-notes"].steps.find(
-      (step: any) => step.name === "Validate version and changelog",
-    );
-    const result = spawnSync("bash", ["-e", "-c", validate.run], {
-      cwd: directory,
-      encoding: "utf8",
-      env: { ...process.env, RELEASE_TAG: tag },
-    });
-    expect(result.status, result.stderr).toBe(status);
-  });
-
-  it.each([`v${version}`, "v0.0.0-beta.4.8"])(
-    "prepares notes locally for tag %s",
-    (tag) => {
-      const directory = fixture();
-      const temporary = path.join(directory, "temp");
-      mkdirSync(temporary);
-      mkdirSync(path.join(directory, "scripts"));
-      writeFileSync(
-        path.join(directory, "scripts", "release-notes.mjs"),
-        readFileSync(script),
-      );
-      mkdirSync(path.join(directory, "src", "shared"), { recursive: true });
-      writeFileSync(
-        path.join(directory, "src", "shared", "changelog.ts"),
-        readFileSync("src/shared/changelog.ts"),
-      );
-      const prepare = workflow.jobs.release.steps.find(
-        (step: any) => step.name === "Prepare release notes",
-      );
-      const result = spawnSync("bash", ["-e", "-c", prepare.run], {
-        cwd: directory,
-        encoding: "utf8",
-        env: { ...process.env, RELEASE_TAG: tag, RUNNER_TEMP: temporary },
-      });
-      const notes = readFileSync(
-        path.join(temporary, "release-notes.md"),
-        "utf8",
-      );
-      if (tag === `v${version}`) {
-        expect(result.status, result.stderr).toBe(0);
-        expect(notes).toBe(`${body}\n`);
-      } else {
-        expect(result.status).toBe(1);
-        expect(result.stderr).toContain("does not match package.json");
-        expect(notes).toBe("");
-      }
-    },
-  );
-
-  it.each([false, true])(
-    "publishes changelog text when the release already exists: %s",
-    (exists) => {
-      const directory = fixture();
-      const notesFile = path.join(directory, "release notes.md");
-      writeFileSync(notesFile, `${body}\n`);
-      mkdirSync(path.join(directory, "bin"));
-      mkdirSync(path.join(directory, "release-assets"));
-      for (const extension of ["exe", "dmg", "zip"]) {
-        writeFileSync(
-          path.join(directory, "release-assets", `OhMyGame.${extension}`),
-          "fixture",
-        );
-      }
-      const logFile = path.join(directory, "gh.jsonl");
-      writeFileSync(
-        path.join(directory, "bin", "gh"),
-        `#!/usr/bin/env node
-const fs = require("node:fs");
-const args = process.argv.slice(2);
-const notesIndex = args.indexOf("--notes-file");
-fs.appendFileSync(process.env.GH_TEST_LOG, JSON.stringify({ args, notes: notesIndex < 0 ? null : fs.readFileSync(args[notesIndex + 1], "utf8") }) + "\\n");
-if (args[1] === "view") process.exit(process.env.GH_TEST_EXISTS === "true" ? 0 : 1);
-`,
-        { mode: 0o755 },
-      );
-      const publish = workflow.jobs.release.steps.find(
-        (step: any) => step.name === "Publish GitHub prerelease",
-      );
-      const result = spawnSync("bash", ["-e", "-c", publish.run], {
-        cwd: directory,
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          PATH: `${path.join(directory, "bin")}${path.delimiter}${process.env.PATH}`,
-          GITHUB_REF_NAME: `v${version}`,
-          RELEASE_NOTES_FILE: notesFile,
-          GH_TEST_LOG: logFile,
-          GH_TEST_EXISTS: String(exists),
-        },
-      });
-      expect(result.status, result.stderr).toBe(0);
-      const calls = readFileSync(logFile, "utf8")
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line));
-      expect(calls.map((call) => call.args[1])).toEqual(
-        exists ? ["view", "upload", "edit"] : ["view", "create"],
-      );
-      const publication = calls.at(-1);
-      expect(publication.notes).toBe(`${body}\n`);
-      expect(publication.args).toContain(`v${version}`);
-      expect(publication.args).not.toContain("--generate-notes");
-      if (!exists) expect(publication.args).toContain("--verify-tag");
-    },
-  );
 });

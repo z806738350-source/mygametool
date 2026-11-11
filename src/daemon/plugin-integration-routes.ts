@@ -1,8 +1,6 @@
 import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import type { FastifyInstance } from "fastify";
-import { defineTool } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
 import {
   PLUGIN_INTEGRATION_ACTIONS,
   type PluginIntegrationAction,
@@ -206,43 +204,4 @@ export function registerPluginIntegrationRoutes(
       },
     });
   }
-}
-
-export function projectPreviewTool(
-  project: ProjectState,
-  plugins: PluginCatalogService,
-  host: PluginIntegrationHost,
-) {
-  return defineTool({
-    name: "project_preview",
-    label: "Project preview",
-    description:
-      "Control this project's external native preview. Runtime opens its own window; status alone does not verify gameplay.",
-    parameters: Type.Object({
-      action: Type.Union([
-        Type.Literal("status"),
-        Type.Literal("start"),
-        Type.Literal("refresh"),
-        Type.Literal("stop"),
-        Type.Literal("logs"),
-      ]),
-    }),
-    execute: async (_id, { action }, signal) => {
-      const plugin = await requireIntegrationPlugin(
-        plugins,
-        project.integration!.pluginId,
-        project,
-      );
-      const result = await host.execute(
-        plugin,
-        `preview-${action}`,
-        project,
-        signal,
-      );
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(result) }],
-        details: result,
-      };
-    },
-  });
 }
