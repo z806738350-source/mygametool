@@ -253,7 +253,9 @@ export class CodexAppServer {
     const error = record(message.error);
     if (error)
       pending.reject(
-        cliProbeError("Codex", String(error.message ?? "Codex request failed")),
+        Object.assign(cliProbeError("Codex", String(error.message ?? "Codex request failed")), {
+          rpcCode: typeof error.code === "number" ? error.code : undefined,
+        }),
       );
     else pending.resolve(message.result);
   }

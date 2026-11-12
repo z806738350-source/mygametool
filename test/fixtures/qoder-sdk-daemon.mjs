@@ -318,6 +318,11 @@ async function initialized(frame) {
 }
 
 async function prompt(frame) {
+  if (model.startsWith("fixture-steering") && frame.priority === "next") {
+    user = frame;
+    send({ type: "command_lifecycle", state: "queued", command_uuid: frame.uuid, session_id: session });
+    return;
+  }
   promptCount++;
   user = frame;
   // ThreadSession.runTurn emits another sessionSnapshot before submitting the user message.
@@ -406,6 +411,14 @@ async function prompt(frame) {
       params: { name: "write", arguments: arguments_ },
     });
     record({ toolResult: called });
+    if (model.startsWith("fixture-steering")) {
+      if (user.priority !== "next") throw new Error("Expected queued steering before the tool receipt");
+      send({ type: "command_lifecycle", state: "started", command_uuid: user.uuid, session_id: session });
+      if (!await policy(true)) {
+        send({ type: "result", subtype: "error_during_execution", is_error: true, session_id: session });
+        return;
+      }
+    }
     if (visual && !await policy(true)) return;
     if (workerArgs.includes("fixture-snapshot-after-hook")) {
       await request({

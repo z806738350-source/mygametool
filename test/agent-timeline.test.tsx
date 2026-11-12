@@ -4,6 +4,9 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import type { ComponentProps } from "react";
 import type { ThreadItem, Turn } from "../src/shared/contracts.js";
+import { initialRendererState, rendererReducer } from "../src/renderer/state.js";
+
+const queuedSteerLabel = "Queued — waiting for the agent to receive this message";
 
 // Inspect the expanded contents in presentation tests. Mount behavior is tested separately.
 const lazyDetailsPath = fileURLToPath(new URL("../src/renderer/lazy-details.tsx", import.meta.url));
@@ -1354,8 +1357,37 @@ describe("AgentTimeline", () => {
 
     expect(html.indexOf("Working for")).toBeLessThan(html.indexOf("Change direction"));
     expect(html.indexOf("Working for")).toBeLessThan(html.indexOf("Reading package.json"));
-    expect(html.indexOf("Change direction")).toBeLessThan(html.indexOf("Waiting to steer"));
+    expect(html.indexOf("Change direction")).toBeLessThan(html.indexOf(queuedSteerLabel));
     expect(html.match(/class="work-activity work-activity-active"/g)).toHaveLength(1);
+  });
+
+  it.each([
+    { locale: "en", label: queuedSteerLabel },
+    { locale: "zh-CN", label: "补充已排队，尚未被 Agent 接收" },
+  ])("clears the queued message label only when its turn starts, without duplicating the supplement in $locale", async ({ locale, label }) => {
+    const previous = i18next.language;
+    try {
+      await i18next.changeLanguage(locale);
+      const timestamp = "2026-11-12T00:00:00Z";
+      const scope = { projectId: "project-1", conversationId: "conversation-1", turnId: "turn-2", timestamp };
+      const activeTurn: Turn = { id: "turn-1", conversationId: scope.conversationId, status: "inProgress", items: [user(), { ...tool(), status: "inProgress" }] };
+      const queued = rendererReducer({
+        ...initialRendererState,
+        conversation: { id: scope.conversationId, projectId: scope.projectId, title: "Chat", createdAt: timestamp, updatedAt: timestamp, messageCount: 1 },
+        turns: [activeTurn],
+      }, { type: "runtime-event", event: { ...scope, id: 1, type: "prompt.steered", data: { prompt: "Change direction", references: [] } } });
+      const waiting = renderToStaticMarkup(<ThreadTimeline turns={queued.turns} />);
+      expect(waiting).toContain(label);
+      expect(waiting.match(/Change direction/g)).toHaveLength(1);
+      const toolCompleted = rendererReducer(queued, { type: "runtime-event", event: { ...scope, turnId: "turn-1", id: 2, type: "item.completed", data: { item: tool() } } });
+      expect(renderToStaticMarkup(<ThreadTimeline turns={toolCompleted.turns} />)).toContain(label);
+      const received = rendererReducer(toolCompleted, { type: "runtime-event", event: { ...scope, id: 3, type: "agent.started", data: { prompt: "Change direction" } } });
+      const started = renderToStaticMarkup(<ThreadTimeline turns={received.turns} />);
+      expect(started).not.toContain(label);
+      expect(started.match(/Change direction/g)).toHaveLength(1);
+      expect(received.turns.filter(turn => turn.id === scope.turnId)).toHaveLength(1);
+      expect(received.turns.at(-1)).toMatchObject({ id: scope.turnId, status: "inProgress" });
+    } finally { await i18next.changeLanguage(previous); }
   });
 
   it("shows the pending steer state only after the latest steered message", () => {
@@ -1383,8 +1415,8 @@ describe("AgentTimeline", () => {
     const html = renderToStaticMarkup(<ThreadTimeline turns={[activeTurn, firstSteer, secondSteer]} />);
 
     expect(html.indexOf("Working for")).toBeLessThan(html.indexOf("First change"));
-    expect(html.indexOf("Final change")).toBeLessThan(html.indexOf("Waiting to steer"));
-    expect(html.match(/Waiting to steer/g)).toHaveLength(2);
+    expect(html.indexOf("Final change")).toBeLessThan(html.indexOf(queuedSteerLabel));
+    expect(html.split(queuedSteerLabel)).toHaveLength(3);
     expect(html.match(/class="work-activity work-activity-active"/g)).toHaveLength(1);
   });
   it("keeps failed tool details collapsed by default", () => {

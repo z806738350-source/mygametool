@@ -1931,6 +1931,50 @@ describe("AgentManager", () => {
     await manager.close();
   });
 
+  it("keeps a native prompt consumed before queue admission from becoming pending or being replayed", async () => {
+    const replaceQueue = vi.fn<NonNullable<CodingSession["replaceQueue"]>>(async () => {});
+    const session = Object.assign(new FakeSession(), { emitsInitialUserMessage: true, replaceQueue });
+    const prompt = deferred<void>(), admission = deferred<void>();
+    session.prompt.mockImplementation(() => {
+      session.emit({ type: "message_start", message: { role: "user", content: "First", timestamp: 1 } } as AgentSessionEvent);
+      return prompt.promise;
+    });
+    const events = new RuntimeEventBus();
+    const manager = new AgentManager(events, { createSession: async () => session });
+    const project = createProject(), conversation = createConversation(project);
+    const first = manager.prompt(project, conversation, "First");
+    onTestFinished(async () => { admission.resolve(); prompt.resolve(); await first.result; await manager.close(); });
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledOnce());
+    const second = manager.prompt(project, conversation, "Second");
+    const third = manager.prompt(project, conversation, "Third");
+    await Promise.all([second.result, third.result]);
+    replaceQueue.mockImplementationOnce(async (steering, pending) => {
+      expect(steering).toEqual([{ id: third.turnId, text: "Third", images: [] }]);
+      expect(pending).toEqual([{ id: second.turnId, text: "Second", images: [] }]);
+      session.emit({ type: "message_start", queuedPromptId: third.turnId, message: { role: "user", content: "Expanded Third", timestamp: 2 } } as AgentSessionEvent);
+      await admission.promise;
+    });
+    const steering = manager.steerPending(project.id, conversation.summary.id, third.turnId);
+    await vi.waitFor(() => expect(replaceQueue).toHaveBeenCalledOnce());
+    const started = () => events.since(project.id).filter(event => event.type === "agent.started").map(event => ({ turnId: event.turnId, prompt: event.data.prompt }));
+    expect(started()).toEqual([{ turnId: first.turnId, prompt: "First" }, { turnId: third.turnId, prompt: "Third" }]);
+    expect(manager.pendingPrompts(project.id, conversation.summary.id)).toEqual([expect.objectContaining({ turnId: second.turnId, prompt: "Second" })]);
+    admission.resolve();
+    await expect(steering).resolves.toBe(true);
+    expect(events.since(project.id).filter(event => event.type === "prompt.steered")).toEqual([]);
+    expect(manager.pendingPrompts(project.id, conversation.summary.id)).toEqual([expect.objectContaining({ turnId: second.turnId, prompt: "Second" })]);
+    expect(await manager.removePending(project.id, conversation.summary.id, second.turnId)).toBe(true);
+    expect(replaceQueue).toHaveBeenCalledTimes(2);
+    expect(replaceQueue).toHaveBeenLastCalledWith([], []);
+    expect(session.clearQueue).not.toHaveBeenCalled();
+    expect(session.steer).not.toHaveBeenCalled();
+    expect(session.followUp.mock.calls.map(([message]) => message)).toEqual(["Second", "Third"]);
+    expect(manager.pendingPrompts(project.id, conversation.summary.id)).toEqual([]);
+    expect(started()).toEqual([{ turnId: first.turnId, prompt: "First" }, { turnId: third.turnId, prompt: "Third" }]);
+    prompt.resolve();
+    await first.result;
+  });
+
   it("keeps local queue state unchanged when Pi cannot replay a removal", async () => {
     const session = new FakeSession();
     const prompt = deferred<void>();

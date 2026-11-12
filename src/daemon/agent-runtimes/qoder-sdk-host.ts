@@ -48,6 +48,7 @@ interface HostQuery extends AsyncIterable<unknown> {
   initializationResult(): Promise<unknown>;
   mcpServerStatus(): Promise<unknown>;
   interrupt(): Promise<unknown>;
+  cancelAsyncMessage(uuid: string): Promise<boolean>;
   close(): Promise<void>;
 }
 
@@ -103,6 +104,11 @@ interface HostTurn {
   inputSent: boolean;
   requiresImageInput: boolean;
   failure?: HostError;
+  inputQueue: ObjectValue[];
+  wakeInput?(): void;
+  steering: Map<string, { state: "queued" | "sent" | "started" | "admitted" | "cancelled"; requiresImageInput: boolean }>;
+  admission?: Promise<void>;
+  deferredResult?: ObjectValue;
 }
 
 type InventoryField =
@@ -182,6 +188,12 @@ export class QoderSdkHost {
           break;
         case "turn/interrupt":
           result = await this.#interrupt(params);
+          break;
+        case "turn/steer":
+          result = await this.#steer(params);
+          break;
+        case "turn/cancel-steering":
+          result = await this.#cancelSteering(params);
           break;
         case "models/list":
           result = await this.#requireDaemon().getModels({
@@ -301,6 +313,8 @@ export class QoderSdkHost {
       rejectReady,
       complete: false,
       inputSent: false,
+      inputQueue: [],
+      steering: new Map(),
       requiresImageInput:
         images.length > 0 ||
         params.requiresImageInput === true ||
@@ -325,14 +339,20 @@ export class QoderSdkHost {
     const input = async function* () {
       await inputReady;
       if (!turn.controller.signal.aborted) yield userMessage;
-      await new Promise<void>((resolve) => {
-        if (turn.controller.signal.aborted) resolve();
-        else
-          turn.controller.signal.addEventListener("abort", () => resolve(), {
-            once: true,
-          });
-      });
+      while (!turn.controller.signal.aborted) {
+        const message = turn.inputQueue.shift();
+        if (message) {
+          const command = turn.steering.get(String(message.uuid));
+          if (!command || command.state === "cancelled") continue;
+          command.state = "sent";
+          yield message;
+        } else {
+          await new Promise<void>((resolve) => { turn.wakeInput = resolve; });
+          turn.wakeInput = undefined;
+        }
+      }
     };
+    turn.controller.signal.addEventListener("abort", () => turn.wakeInput?.(), { once: true });
     let phase: NonNullable<HostError["phase"]> = "query-start";
     try {
       await previous?.query?.close();
@@ -347,11 +367,16 @@ export class QoderSdkHost {
           ...(typeof params.resume === "string" && params.resume
             ? { resume: params.resume }
             : {}),
+          // Stable project checkpoints can take longer than the SDK's 500 ms policy default.
+          resolveModelTimeoutMs: 30_000,
           // Native otherwise replaces images with text when its selected model
           // loses vision. Recheck its live catalog before every model request,
           // including requests after controlled tools return new images.
           resolveModel: async (value: unknown) => {
             this.#assertActive(turn);
+            const policy = object(value);
+            if (policy?.purpose === "main" && !policy.agentId)
+              await this.#admitSteering(turn);
             if (turn.requiresImageInput) {
               const context = object(value);
               const models = Array.isArray(context?.availableModels)
@@ -639,6 +664,23 @@ export class QoderSdkHost {
               "Qoder ended while a controlled tool result was still pending",
             );
           if (!turn.controller.signal.aborted)
+            if (message.type === "command_lifecycle") {
+              const command = turn.steering.get(String(message.command_uuid));
+              if (command) {
+                if (message.state === "started" && command.state !== "admitted") {
+                  command.state = "started";
+                  turn.deferredResult = undefined;
+                }
+                if ((message.state === "cancelled" || message.state === "discarded") && command.state !== "admitted") command.state = "cancelled";
+              }
+            }
+          // A late queued user message can start another native turn in this same query.
+          if (message.type === "result" && message.subtype === "success" && !message.is_error &&
+            [...turn.steering.values()].some(command => command.state !== "admitted" && command.state !== "cancelled")) {
+            turn.deferredResult = message;
+            continue;
+          }
+          if (!turn.controller.signal.aborted)
             this.send({
               method: "sdk/message",
               params: { turnId: turn.id, message: message.type === "result" ? safeTerminalResult(message) : message },
@@ -648,6 +690,7 @@ export class QoderSdkHost {
             turn.controller.abort();
             turn.releaseInput?.();
           }
+          this.#finishCancelledSteering(turn);
         } catch (cause) {
           // AsyncIteratorClose can reject initialization before this loop's outer
           // catch runs. Publish and retain our boundary failure before it closes.
@@ -693,6 +736,7 @@ export class QoderSdkHost {
     turn: HostTurn,
     params: ObjectValue,
     signal?: AbortSignal,
+    method = "tool/call",
   ): Promise<unknown> {
     const id = `tool:${randomUUID()}`;
     return new Promise((resolve, reject) => {
@@ -724,10 +768,73 @@ export class QoderSdkHost {
       }
       this.send({
         id,
-        method: "tool/call",
+        method,
         params: { ...params, turnId: turn.id, sessionId: turn.sessionId },
       });
     });
+  }
+
+  async #steer(params: ObjectValue): Promise<unknown> {
+    const turn = this.#turn;
+    if (!turn || turn.complete || turn.controller.signal.aborted || params.turnId !== turn.id) return { queued: false };
+    const id = nonempty(params.commandId);
+    if (turn.steering.has(id)) throw new HostError("Duplicate Qoder steering command");
+    const text = nonempty(params.text), images = parseImages(params.images);
+    turn.steering.set(id, { state: "queued", requiresImageInput: images.length > 0 || params.requiresImageInput === true });
+    turn.inputQueue.push({ type: "user", uuid: id, priority: "next", parent_tool_use_id: null, message: { role: "user", content: [{ type: "text", text }, ...images] } });
+    turn.wakeInput?.();
+    return { queued: true };
+  }
+
+  async #cancelSteering(params: ObjectValue): Promise<unknown> {
+    const turn = this.#turn;
+    if (!turn || params.turnId !== turn.id || !Array.isArray(params.commandIds) || !params.commandIds.every(id => typeof id === "string"))
+      throw new HostError("Invalid Qoder steering cancellation");
+    const cancelled: string[] = [];
+    for (const id of params.commandIds as string[]) {
+      const command = turn.steering.get(id);
+      if (!command || command.state === "admitted" || command.state === "started") continue;
+      if (command.state === "cancelled" || command.state === "queued" || await turn.query?.cancelAsyncMessage(id)) {
+        // A started notification can race the cancellation response; never replay an admitted message.
+        const current = turn.steering.get(id);
+        if (current?.state === "admitted" || current?.state === "started") continue;
+        command.state = "cancelled";
+        cancelled.push(id);
+      }
+    }
+    this.#finishCancelledSteering(turn);
+    return { cancelled };
+  }
+
+  #finishCancelledSteering(turn: HostTurn): void {
+    const result = turn.deferredResult;
+    if (!result || turn.controller.signal.aborted || [...turn.steering.values()].some(command => command.state !== "admitted" && command.state !== "cancelled")) return;
+    turn.deferredResult = undefined;
+    turn.complete = true;
+    turn.controller.abort();
+    turn.releaseInput?.();
+    this.send({ method: "sdk/message", params: { turnId: turn.id, message: safeTerminalResult(result) } });
+  }
+
+  async #admitSteering(turn: HostTurn): Promise<void> {
+    // The pinned SDK dispatches control callbacks separately from its output iterator.
+    // Drain already-arrived lifecycle frames before deciding which commands this request consumes.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    turn.admission = (turn.admission ?? Promise.resolve()).then(async () => {
+      this.#assertActive(turn);
+      await Promise.all([...turn.forwardedCalls.values()].map(call => call.result));
+      for (const [id, command] of turn.steering) {
+        if (command.state !== "started") continue;
+        const receipt = object(await this.#requestTool(turn, { commandId: id }, undefined, "steering/started"));
+        if (receipt?.accepted !== true) throw new HostError("The steering checkpoint was not confirmed");
+        this.#assertActive(turn);
+        command.state = "admitted";
+        turn.requiresImageInput ||= command.requiresImageInput;
+        if (turn.requiresImageInput && turn.sessionId) this.#imageSessions.add(turn.sessionId);
+      }
+    });
+    try { await turn.admission; }
+    catch (cause) { this.#failTurn(turn, cause); throw cause; }
   }
 
   async #interrupt(params: ObjectValue): Promise<unknown> {

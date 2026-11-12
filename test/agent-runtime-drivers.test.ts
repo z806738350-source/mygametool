@@ -4,7 +4,7 @@ import { access, copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFi
 import { existsSync } from "node:fs";
 import { spawn as spawnFixtureProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -2495,7 +2495,143 @@ describe("controlled Codex adapter", () => {
   const tool = (cli: FakeCli, id: number, name: string, args: any, callId = `call-${id}`, namespace = CODEX_TOOL_NAMESPACE) => cli.send({
     id, method: "item/tool/call", params: { threadId: "controlled-thread", turnId: "controlled-turn", callId, namespace, tool: `ohmygame_${name}`, arguments: args },
   });
-  const done = (cli: FakeCli, status = "completed") => cli.send({ method: "turn/completed", params: { threadId: "controlled-thread", turn: { status } } });
+  const done = (cli: FakeCli, status = "completed") => cli.send({ method: "turn/completed", params: { threadId: "controlled-thread", turn: { status, error: null } } });
+  const admitted = (cli: FakeCli, id: string) => {
+    for (const method of ["item/started", "item/completed"]) cli.send({ method, params: { threadId: "controlled-thread", turnId: "controlled-turn", item: { type: "userMessage", id: "native-item", clientId: id, content: [{ type: "text", text: "New instruction" }] } } });
+  };
+
+  it("delivers startup-time steering to the same active Codex turn and waits for its user item", async () => {
+    let cli!: FakeCli;
+    const f = await setup(child => { cli = child; }, (message, child) => {
+      if (message.method !== "turn/steer") return false;
+      child.send({ id: message.id, result: { turnId: "controlled-turn" } });
+      return true;
+    });
+    const driver = new CodexDriver(f.c); cleanup.push(() => driver.dispose());
+    const sink = { ...recordingSink().sink, steeringStarted: vi.fn(async () => {}) };
+    const run = driver.runTurn({ text: "Original", images: [], readOnly: false }, sink, new AbortController().signal);
+    expect(await driver.steer("startup-instruction", { text: "New instruction", images: [], readOnly: false })).toBe(true);
+    expect(f.calls.find(call => call.method === "turn/steer").params).toMatchObject({ threadId: "controlled-thread", expectedTurnId: "controlled-turn", clientUserMessageId: "startup-instruction" });
+    expect(sink.steeringStarted).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(cli).toBeDefined());
+    admitted(cli, "startup-instruction");
+    await vi.waitFor(() => expect(sink.steeringStarted).toHaveBeenCalledOnce());
+    done(cli); expect(await run).toMatchObject({ status: "completed" });
+    expect(f.calls.filter(call => call.method === "turn/start")).toHaveLength(1);
+    expect(f.calls.some(call => call.method === "turn/interrupt")).toBe(false);
+  });
+
+  it("serializes Codex project writes and projected events after old tools and the steering checkpoint", async () => {
+    let cli!: FakeCli;
+    const original = deferred<void>(), checkpoint = deferred<void>();
+    const execute = vi.fn(async (_id: string, args: { value: string }) => {
+      if (args.value === "old") await original.promise;
+      return { content: [{ type: "text" as const, text: args.value }], details: {} };
+    });
+    const f = await setup(child => { cli = child; tool(child, 771, "echo_tool", { value: "old" }, "old-call"); }, (message, child) => {
+      if (message.method !== "turn/steer") return false;
+      admitted(child, message.params.clientUserMessageId);
+      tool(child, 772, "echo_tool", { value: "new" }, "new-call");
+      child.send({ method: "item/agentMessage/delta", params: { threadId: "controlled-thread", turnId: "controlled-turn", itemId: "after-steering", delta: "Received new instructions" } });
+      child.send({ id: message.id, result: { turnId: "controlled-turn" } });
+      return true;
+    });
+    f.c.bridge = new ToolBridge([defineTool({ name: "echo_tool", label: "Echo", description: "Local fixture", parameters: Type.Object({ value: Type.String() }), execute })] as never, true);
+    const driver = new CodexDriver(f.c); cleanup.push(() => driver.dispose());
+    const { sink, results, calls } = recordingSink();
+    sink.steeringStarted = vi.fn(() => checkpoint.promise);
+    const run = driver.runTurn({ text: "Original", images: [], readOnly: false }, sink, new AbortController().signal);
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+    const input = { text: "New instruction", images: [], readOnly: false };
+    expect(await driver.steer("logical-instruction", input)).toBe(true);
+    expect(await driver.steer("logical-instruction", input)).toBe(true);
+    expect(sink.steeringStarted).not.toHaveBeenCalled();
+    expect(execute).toHaveBeenCalledOnce();
+    original.resolve();
+    await vi.waitFor(() => expect(sink.steeringStarted).toHaveBeenCalledOnce());
+    expect(results.has("old-call")).toBe(true);
+    expect(execute).toHaveBeenCalledOnce();
+    expect(calls.some(call => call.includes("Received new instructions"))).toBe(false);
+    checkpoint.resolve();
+    await vi.waitFor(() => expect(results.has("new-call")).toBe(true));
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(calls.some(call => call.includes("Received new instructions"))).toBe(true);
+    done(cli); expect(await run).toMatchObject({ status: "completed" });
+    expect(f.calls.filter(call => call.method === "turn/steer")).toHaveLength(1);
+    expect(f.calls.some(call => call.method === "turn/interrupt")).toBe(false);
+  });
+
+  it("retains Codex's early terminal behind the original tool receipt and steering checkpoint", async () => {
+    let cli!: FakeCli;
+    const original = deferred<void>(), checkpoint = deferred<void>();
+    const execute = vi.fn(async () => { await original.promise; return { content: [{ type: "text" as const, text: "Original effect retained" }], details: {} }; });
+    const f = await setup(child => { cli = child; tool(child, 773, "echo_tool", { value: "old" }, "old-call"); }, (message, child) => {
+      if (message.method !== "turn/steer") return false;
+      admitted(child, message.params.clientUserMessageId);
+      tool(child, 775, "echo_tool", { value: "after-terminal" }, "never-started-call");
+      child.send({ id: message.id, result: { turnId: "controlled-turn" } });
+      done(child);
+      return true;
+    });
+    f.c.bridge = new ToolBridge([defineTool({ name: "echo_tool", label: "Echo", description: "Local fixture", parameters: Type.Object({ value: Type.String() }), execute })] as never, true);
+    const driver = new CodexDriver(f.c); cleanup.push(() => driver.dispose());
+    const { sink, results } = recordingSink();
+    sink.steeringStarted = vi.fn(() => checkpoint.promise);
+    let finished = false;
+    const run = driver.runTurn({ text: "Original", images: [], readOnly: false }, sink, new AbortController().signal).then(outcome => { finished = true; return outcome; });
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+    await driver.steer("terminal-instruction", { text: "New instruction", images: [], readOnly: false });
+    expect(finished).toBe(false);
+    original.resolve();
+    await vi.waitFor(() => expect(sink.steeringStarted).toHaveBeenCalledOnce());
+    expect(results.has("old-call")).toBe(true);
+    expect(finished).toBe(false);
+    checkpoint.resolve();
+    expect(await run).toMatchObject({ status: "completed" });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(cli).toBeDefined();
+  });
+
+  it("interrupts the same Codex turn when the steering checkpoint fails without executing queued writes", async () => {
+    let cli!: FakeCli;
+    const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "Must not run" }], details: {} }));
+    const f = await setup(child => { cli = child; }, (message, child) => {
+      if (message.method !== "turn/steer") return false;
+      admitted(child, message.params.clientUserMessageId);
+      tool(child, 774, "echo_tool", { value: "blocked" });
+      child.send({ id: message.id, result: { turnId: "controlled-turn" } });
+      return true;
+    });
+    f.c.bridge = new ToolBridge([defineTool({ name: "echo_tool", label: "Echo", description: "Local fixture", parameters: Type.Object({ value: Type.String() }), execute })] as never, true);
+    const driver = new CodexDriver(f.c); cleanup.push(() => driver.dispose());
+    const sink = { ...recordingSink().sink, steeringStarted: vi.fn(async () => { throw new Error("Snapshot failed"); }) };
+    const run = driver.runTurn({ text: "Original", images: [], readOnly: false }, sink, new AbortController().signal);
+    await vi.waitFor(() => expect(cli).toBeDefined());
+    await driver.steer("rejected-instruction", { text: "New instruction", images: [], readOnly: false });
+    expect(await run).toMatchObject({ status: "failed", interruption: { code: "codex_steering_checkpoint" } });
+    expect(execute).not.toHaveBeenCalled();
+    expect(f.calls.filter(call => call.method === "turn/start")).toHaveLength(1);
+    expect(f.calls.filter(call => call.method === "turn/interrupt")).toHaveLength(1);
+  });
+
+  it.each([-32600, -32000])("only treats the exact native no-active-turn rejection as not submitted (code %s)", async code => {
+    let cli!: FakeCli;
+    const f = await setup(child => { cli = child; }, (message, child) => {
+      if (message.method !== "turn/steer") return false;
+      child.send({ id: message.id, error: { code, message: "no active turn to steer" } });
+      return true;
+    });
+    const driver = new CodexDriver(f.c); cleanup.push(() => driver.dispose());
+    const sink = { ...recordingSink().sink, steeringStarted: vi.fn(async () => {}) };
+    const run = driver.runTurn({ text: "Original", images: [], readOnly: false }, sink, new AbortController().signal);
+    await vi.waitFor(() => expect(cli).toBeDefined());
+    const submitted = driver.steer("late-instruction", { text: "New instruction", images: [], readOnly: false });
+    if (code === -32600) expect(await submitted).toBe(false);
+    else await expect(submitted).rejects.toThrow("no active turn to steer");
+    expect(sink.steeringStarted).not.toHaveBeenCalled();
+    expect(f.calls.filter(call => call.method === "turn/steer")).toHaveLength(1);
+    done(cli); await run;
+  });
 
   it.each(["interrupted", "completed", "unknown-status"])("classifies a Codex terminal %s without inventing a user cancellation", async status => {
     const f = await setup(cli => done(cli, status));
@@ -2843,6 +2979,12 @@ describe("native capacity context contract", () => {
   });
 });
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 describe("Qoder driver text projection into persisted sessions", () => {
   type Frame = Record<string, unknown>;
   const stream = (event: Frame): Frame => ({ type: "stream_event", event });
@@ -2851,6 +2993,86 @@ describe("Qoder driver text projection into persisted sessions", () => {
   const delta = (index: number, text: string): Frame => stream({ type: "content_block_delta", index, delta: { type: "text_delta", text } });
   const stop = (index: number): Frame => stream({ type: "content_block_stop", index });
   const final = (id: string | undefined, uuid: string, texts: string[]): Frame => ({ type: "assistant", uuid, message: { ...(id ? { id } : {}), role: "assistant", content: texts.map(text => ({ type: "text", text })) } });
+
+  it("acknowledges steering once after the original tool receipt and the stable checkpoint", async () => {
+    const tool = deferred<NativeToolResult & { details: object }>();
+    const execute = vi.fn(() => tool.promise);
+    const echo = defineTool({ name: "echo_tool", label: "Echo", description: "Local fixture", parameters: Type.Object({ value: Type.String() }), execute });
+    const ctx = await context({ model: "gmodel", bridge: new ToolBridge([echo] as never) });
+    const responses: { id: unknown; value: unknown }[] = [], requests: { method: string; params: Frame }[] = [];
+    let receive!: (message: Frame) => void;
+    const driver = new QoderDriver(ctx, handler => {
+      receive = handler;
+      return {
+        start: async () => {}, stop: async () => {},
+        respond: (id, value) => { responses.push({ id, value }); },
+        request: async (method, params = {}) => {
+          requests.push({ method, params });
+          if (method === "turn/start") receive({ method: "sdk/message", params: { turnId: params.turnId, message: { type: "system", subtype: "init", session_id: "steering-session" } } });
+          return method === "turn/steer" ? { queued: true } : {};
+        },
+      };
+    });
+    cleanup.push(() => driver.dispose());
+    const { sink, results } = recordingSink();
+    const checkpoint = deferred<void>();
+    sink.steeringStarted = vi.fn(() => checkpoint.promise);
+    const run = driver.runTurn({ text: "Original", images: [], readOnly: false }, sink, new AbortController().signal);
+    await vi.waitFor(() => expect(requests.some(request => request.method === "turn/start")).toBe(true));
+    const turnId = requests[0].params.turnId;
+    receive({ id: "original-tool", method: "tool/call", params: { turnId, sessionId: "steering-session", name: "echo_tool", callId: "only-call", arguments: { value: "original" } } });
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+    const input = { text: "New instruction", images: [], readOnly: false };
+    expect(await driver.steer("logical-queue-id", input)).toBe(true);
+    expect(await driver.steer("logical-queue-id", input)).toBe(true);
+    expect(requests.filter(request => request.method === "turn/steer")).toHaveLength(1);
+    const commandId = requests.find(request => request.method === "turn/steer")!.params.commandId;
+    const startSteering = (id: string) => receive({ id, method: "steering/started", params: { turnId, sessionId: "steering-session", commandId } });
+    startSteering("admit-1"); startSteering("admit-2");
+    await new Promise(resolve => setImmediate(resolve));
+    expect(sink.steeringStarted).not.toHaveBeenCalled();
+    tool.resolve({ content: [{ type: "text", text: "Original tool result" }], details: {} });
+    await vi.waitFor(() => expect(sink.steeringStarted).toHaveBeenCalledExactlyOnceWith("logical-queue-id", expect.any(AbortSignal)));
+    expect(results.has("only-call")).toBe(true);
+    expect(responses.map(response => response.id)).toEqual(["original-tool"]);
+    expect(await driver.cancelSteering(["logical-queue-id"])).toEqual([]);
+    checkpoint.resolve();
+    await vi.waitFor(() => expect(responses.filter(response => String(response.id).startsWith("admit-"))).toEqual([
+      { id: "admit-1", value: { accepted: true } }, { id: "admit-2", value: { accepted: true } },
+    ]));
+    receive({ method: "sdk/message", params: { turnId, message: { type: "result", subtype: "success", is_error: false } } });
+    expect(await run).toMatchObject({ status: "completed" });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(requests.some(request => request.method === "turn/interrupt")).toBe(false);
+  });
+
+  it("keeps uncertain queued messages and assigns a fresh SDK UUID only after confirmed cancellation", async () => {
+    const ctx = await context({ model: "gmodel" });
+    const submissions: Frame[] = [];
+    let cancel = false;
+    const driver = new QoderDriver(ctx, () => ({
+      start: async () => {}, stop: async () => {}, respond: () => {},
+      request: async (method, params = {}) => {
+        if (method === "turn/steer") { submissions.push(params); return { queued: true }; }
+        if (method === "turn/cancel-steering") return { cancelled: cancel ? params.commandIds : [] };
+        return {};
+      },
+    }));
+    cleanup.push(() => driver.dispose());
+    const run = driver.runTurn({ text: "Original", images: [], readOnly: false }, recordingSink().sink, new AbortController().signal);
+    const input = { text: "Next", images: [], readOnly: false };
+    expect(await driver.steer("queued-id", input)).toBe(true);
+    expect(await driver.cancelSteering(["queued-id"])).toEqual([]);
+    expect(await driver.steer("queued-id", input)).toBe(true);
+    expect(submissions).toHaveLength(1);
+    cancel = true;
+    expect(await driver.cancelSteering(["queued-id"])).toEqual(["queued-id"]);
+    expect(await driver.steer("queued-id", input)).toBe(true);
+    expect(submissions).toHaveLength(2);
+    expect(submissions[0].commandId).not.toBe(submissions[1].commandId);
+    await driver.dispose();
+    await run;
+  });
 
   it.each([
     [{ subtype: "error_max_turns", num_turns: 64 }, "turn_limit", "qoder_max_turns"],
@@ -3192,14 +3414,6 @@ describe("Qoder SDK host controlled bridge", () => {
     },
   };
 
-  function deferred<T>() {
-    let resolve!: (value: T) => void;
-    const promise = new Promise<T>((done) => {
-      resolve = done;
-    });
-    return { promise, resolve };
-  }
-
   function fixture(
     options: {
       tools?: Tool[];
@@ -3219,6 +3433,7 @@ describe("Qoder SDK host controlled bridge", () => {
       emit(message: unknown): void;
       close: ReturnType<typeof vi.fn>;
       interrupt: ReturnType<typeof vi.fn>;
+      cancelAsyncMessage: ReturnType<typeof vi.fn>;
     }> = [];
     const tools = options.tools ?? [readTool];
     const accountInfo = vi.fn(async () => ({ userId: "fixture-user" }));
@@ -3258,6 +3473,7 @@ describe("Qoder SDK host controlled bridge", () => {
             wake?.();
           }),
           interrupt: vi.fn(async () => ({})),
+          cancelAsyncMessage: vi.fn(async (_uuid: string) => false),
           initializationResult: vi.fn(async () =>
             options.handshake
               ? await options.handshake
@@ -3444,6 +3660,89 @@ describe("Qoder SDK host controlled bridge", () => {
     send({ id: "close", method: "session/close" });
     await vi.waitFor(() => expect(frames.find(message => message.id === "close")).toHaveProperty("result"));
     expect(f.stop).toHaveBeenCalledOnce();
+  });
+
+  it("admits next-priority steering only at a main model boundary after old tools and checkpoint acknowledgement", async () => {
+    const f = fixture();
+    await f.initializeHost();
+    await f.start();
+    await f.hook({ tool_name: "mcp__ohmygame__read", tool_input: { path: "game.ts" } }, "old-tool");
+    const tool = f.call("read", { path: "game.ts" });
+    await vi.waitFor(() => expect(f.toolCalls()).toHaveLength(1));
+    await f.host.handle({ id: "steer", method: "turn/steer", params: { turnId: "turn-1", commandId: "command-next", text: "Change the model", images: [] } });
+    await vi.waitFor(() => expect(f.prompts).toHaveLength(2));
+    expect(f.prompts[1]).toMatchObject({ uuid: "command-next", priority: "next" });
+    expect(f.sent.filter(message => message.method === "steering/started")).toEqual([]);
+    f.queries[0].emit({ type: "command_lifecycle", command_uuid: "command-next", state: "started", session_id: "qoder-fixture-session-1" });
+    let released = false;
+    const policy = f.queries[0].options.resolveModel!({ purpose: "main" }).then(() => { released = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(f.sent.filter(message => message.method === "steering/started")).toEqual([]);
+    await f.host.handle({ id: f.toolCalls()[0].id, result: { content: [{ type: "text", text: "Original result" }] } });
+    await tool;
+    await vi.waitFor(() => expect(f.sent.filter(message => message.method === "steering/started")).toHaveLength(1));
+    expect(released).toBe(false);
+    const admission = f.sent.find(message => message.method === "steering/started")!;
+    await f.host.handle({ id: admission.id, result: { accepted: true } });
+    await policy;
+    expect(released).toBe(true);
+    await f.queries[0].options.resolveModel!({ purpose: "main" });
+    expect(f.sent.filter(message => message.method === "steering/started")).toHaveLength(1);
+    expect(f.queries[0].interrupt).not.toHaveBeenCalled();
+  });
+
+  it("keeps unconfirmed cancellation in the SDK and allows reordering only after a confirmed cancellation", async () => {
+    const f = fixture();
+    await f.initializeHost(); await f.start();
+    await f.host.handle({ id: "steer", method: "turn/steer", params: { turnId: "turn-1", commandId: "command-next", text: "Change", images: [] } });
+    await vi.waitFor(() => expect(f.prompts).toHaveLength(2));
+    await f.host.handle({ id: "cancel-unknown", method: "turn/cancel-steering", params: { turnId: "turn-1", commandIds: ["command-next"] } });
+    expect(f.sent.find(message => message.id === "cancel-unknown")).toMatchObject({ result: { cancelled: [] } });
+    f.queries[0].cancelAsyncMessage.mockResolvedValue(true);
+    await f.host.handle({ id: "cancel-confirmed", method: "turn/cancel-steering", params: { turnId: "turn-1", commandIds: ["command-next"] } });
+    expect(f.sent.find(message => message.id === "cancel-confirmed")).toMatchObject({ result: { cancelled: ["command-next"] } });
+    expect(f.queries[0].interrupt).not.toHaveBeenCalled();
+  });
+
+  it.each(["consumed", "cancelled"])("retains a late queued command across the previous success result until %s", async (state) => {
+    const f = fixture();
+    await f.initializeHost(); await f.start();
+    await f.host.handle({ id: "steer", method: "turn/steer", params: { turnId: "turn-1", commandId: "late-command", text: "Next instruction", images: [] } });
+    await vi.waitFor(() => expect(f.prompts).toHaveLength(2));
+    const terminalMessages = () => f.sent.filter(message => message.method === "sdk/message" && (message.params as { message: { type: string } }).message.type === "result");
+    f.queries[0].emit({ type: "result", subtype: "success", is_error: false, result: "Original turn" });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(terminalMessages()).toEqual([]);
+    if (state === "cancelled") {
+      f.queries[0].cancelAsyncMessage.mockResolvedValue(true);
+      await f.host.handle({ id: "cancel", method: "turn/cancel-steering", params: { turnId: "turn-1", commandIds: ["late-command"] } });
+      expect(f.sent.find(message => message.id === "cancel")).toMatchObject({ result: { cancelled: ["late-command"] } });
+    } else {
+      f.queries[0].emit({ type: "command_lifecycle", command_uuid: "late-command", state: "started", session_id: "qoder-fixture-session-1" });
+      const policy = f.queries[0].options.resolveModel!({ purpose: "main" });
+      await vi.waitFor(() => expect(f.sent.some(message => message.method === "steering/started")).toBe(true));
+      await f.host.handle({ id: f.sent.find(message => message.method === "steering/started")!.id, result: { accepted: true } });
+      await policy;
+      expect(terminalMessages()).toEqual([]);
+      f.queries[0].emit({ type: "result", subtype: "success", is_error: false, result: "Steered turn" });
+    }
+    await vi.waitFor(() => expect(terminalMessages()).toHaveLength(1));
+    expect(f.queries[0].interrupt).not.toHaveBeenCalled();
+  });
+
+  it("stops before model dispatch if the steering checkpoint is rejected", async () => {
+    const f = fixture();
+    await f.initializeHost(); await f.start();
+    await f.host.handle({ id: "steer", method: "turn/steer", params: { turnId: "turn-1", commandId: "rejected-command", text: "Next instruction", images: [] } });
+    await vi.waitFor(() => expect(f.prompts).toHaveLength(2));
+    f.queries[0].emit({ type: "command_lifecycle", command_uuid: "rejected-command", state: "started", session_id: "qoder-fixture-session-1" });
+    const policy = f.queries[0].options.resolveModel!({ purpose: "main" });
+    const rejected = expect(policy).rejects.toThrow("checkpoint was not confirmed");
+    await vi.waitFor(() => expect(f.sent.some(message => message.method === "steering/started")).toBe(true));
+    await f.host.handle({ id: f.sent.find(message => message.method === "steering/started")!.id, result: { accepted: false } });
+    await rejected;
+    expect(f.sent.find(message => message.method === "sdk/error")).toBeDefined();
+    expect(await f.call("read")).toMatchObject({ isError: true });
   });
 
   it("withholds the first prompt until the exact inventory and MCP handshake pass", async () => {
@@ -4252,7 +4551,9 @@ describe.skipIf(!existsSync(installedQoderSdk) || !!process.versions.bun || proc
     await expect(access(path.join(env.QODER_CONFIG_DIR!, ".auth", "user"))).rejects.toMatchObject({ code: "ENOENT" });
   }, 15000);
 
-  it.each(["safe", "unsafe-inventory", "ignored-skills", "ignored-meta-deny", "malformed-control", "changed-snapshot-tools", "changed-snapshot-session", "snapshot-after-hook", "vision-initial", "vision-tool", "vision-resume", "vision-false", "vision-missing", "vision-drift", "vision-tool-false", "vision-resume-missing", "vision-tool-gif", "vision-tool-malformed", "result-turn-limit", "result-turn-limit-recover", "edit-preflight-recover"] as const)("checks actual SDK startup, control frames and tools with %s output", async (scenario) => {
+  it.each(["safe", "unsafe-inventory", "ignored-skills", "ignored-meta-deny", "malformed-control", "changed-snapshot-tools", "changed-snapshot-session", "snapshot-after-hook", "vision-initial", "vision-tool", "vision-resume", "vision-false", "vision-missing", "vision-drift", "vision-tool-false", "vision-resume-missing", "vision-tool-gif", "vision-tool-malformed", "result-turn-limit", "result-turn-limit-recover", "edit-preflight-recover", "steering", "steering-timeout"] as const)("checks actual SDK startup, control frames and tools with %s output", async (scenario) => {
+    const steering = scenario.startsWith("steering");
+    const steeringTimeout = scenario === "steering-timeout";
     const preflightRecovery = scenario === "edit-preflight-recover";
     const recovers = scenario === "result-turn-limit-recover" || preflightRecovery;
     const toolName = preflightRecovery ? "edit" : "write";
@@ -4260,7 +4561,7 @@ describe.skipIf(!existsSync(installedQoderSdk) || !!process.versions.bun || proc
     const structuredFailure = scenario === "result-turn-limit";
     const usesSession = scenario === "safe" || scenario === "snapshot-after-hook" || scenario === "vision-initial" || scenario === "vision-tool" || invalidToolImage || structuredFailure || recovers;
     const visual = scenario.startsWith("vision-");
-    const completes = usesSession && !invalidToolImage && !structuredFailure || ["vision-initial", "vision-tool", "vision-resume"].includes(scenario);
+    const completes = steering && !steeringTimeout || usesSession && !invalidToolImage && !structuredFailure || ["vision-initial", "vision-tool", "vision-resume"].includes(scenario);
     const afterToolFailure = scenario === "vision-drift" || scenario === "vision-tool-false" || invalidToolImage;
     const hasToolImage = scenario === "vision-tool" || scenario === "vision-tool-false" || invalidToolImage;
     const images = visual && !scenario.startsWith("vision-tool") && !scenario.startsWith("vision-resume") ? [
@@ -4286,8 +4587,18 @@ describe.skipIf(!existsSync(installedQoderSdk) || !!process.versions.bun || proc
     await writeFile(host, ts.transpileModule(await readFile(fileURLToPath(new URL("../src/daemon/agent-runtimes/qoder-sdk-host.ts", import.meta.url)), "utf8"), {
       compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 },
     }).outputText, { mode: 0o600 });
+    let entrypoint = host;
+    if (steeringTimeout) {
+      // Exercise the fixed SDK's actual deadline through its existing dependency-injection seam.
+      entrypoint = path.join(root, "timeout-host.mjs");
+      await writeFile(entrypoint, `import { runQoderSdkHost, loadQoderSdkHostDependencies } from ${JSON.stringify(pathToFileURL(host).href)};
+await runQoderSdkHost(process.stdin, process.stdout, async () => {
+  const dependencies = await loadQoderSdkHostDependencies(process.argv[2]);
+  return { ...dependencies, sdk: { ...dependencies.sdk, query: input => dependencies.sdk.query({ ...input, options: { ...input.options, resolveModelTimeoutMs: 200 } }) } };
+});`, { mode: 0o600 });
+    }
     // The real SDK may spawn only our local daemon. Networking is denied before SDK import.
-    const child = spawnFixtureProcess(process.execPath, ["--import", fileURLToPath(new URL("./fixtures/qoder-sdk-network-guard.mjs", import.meta.url)), host, installedQoderSdk], {
+    const child = spawnFixtureProcess(process.execPath, ["--import", fileURLToPath(new URL("./fixtures/qoder-sdk-network-guard.mjs", import.meta.url)), entrypoint, installedQoderSdk], {
       cwd: directory, env: { ...privateEnv, OHMYGAME_QODER_FIXTURE_ROOT: root }, stdio: ["pipe", "pipe", "pipe"], detached: true,
     });
     let stderr = "", stdout = "";
@@ -4312,7 +4623,7 @@ describe.skipIf(!existsSync(installedQoderSdk) || !!process.versions.bun || proc
       if (message.method === "tool/call") {
         toolCalls.push(message);
         if (driverReceive) driverReceive(message);
-        else child.stdin.write(JSON.stringify({ id: message.id, result: { content: hasToolImage ? [toolImage] : [{ type: "text", text: "Local controlled tool completed" }], isError: false } }) + "\n");
+        else if (!steering) child.stdin.write(JSON.stringify({ id: message.id, result: { content: hasToolImage ? [toolImage] : [{ type: "text", text: "Local controlled tool completed" }], isError: false } }) + "\n");
       } else if (message.id !== undefined) {
         const request = pending.get(String(message.id));
         pending.delete(String(message.id));
@@ -4421,6 +4732,30 @@ describe.skipIf(!existsSync(installedQoderSdk) || !!process.versions.bun || proc
       started = await request("turn/start", { turnId: "sdk-wire-turn", model: selectedModel, reasoningLevel: "high", contextWindow: 128000, text: "Exercise only the local SDK protocol fixture.", images, ...(scenario.startsWith("vision-resume") ? { resume: "11111111-1111-4111-8111-111111111111", requiresImageInput: true } : {}), instructions: "Use only the provided local fixture tool.",
         tools: [{ name: "write", description: "Controlled local fixture", inputSchema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"], additionalProperties: false } }] });
     }
+    if (steering) {
+      await vi.waitFor(() => expect(toolCalls).toHaveLength(1));
+      expect(await request("turn/steer", { turnId: "sdk-wire-turn", commandId: "22222222-2222-4222-8222-222222222222", text: "Use the new instructions at the next safe boundary.", images: [] })).toMatchObject({ result: { queued: true } });
+      await vi.waitFor(async () => {
+        const frames = (await readFile(path.join(env.QODER_CONFIG_DIR!, "fixture-frames.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line) as Frame);
+        expect(frames.filter(frame => (frame.received as Frame | undefined)?.type === "user")).toHaveLength(2);
+      });
+      child.stdin.write(JSON.stringify({ id: toolCalls[0].id, result: { content: [{ type: "text", text: "Local controlled tool completed" }], isError: false } }) + "\n");
+      await vi.waitFor(() => expect(sent.some(message => message.method === "steering/started"), JSON.stringify(sent)).toBe(true));
+      const beforeAdmission = (await readFile(path.join(env.QODER_CONFIG_DIR!, "fixture-frames.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line) as Frame);
+      expect(beforeAdmission.filter(frame => frame.modelRequest)).toHaveLength(1);
+      expect(beforeAdmission.filter(frame => frame.toolResult)).toHaveLength(1);
+      if (steeringTimeout) {
+        await vi.waitFor(() => expect(sent.some(message => message.method === "sdk/error")).toBe(true));
+      } else {
+        // Exercise the real SDK beyond its default 500 ms model-policy deadline.
+        await new Promise(resolve => setTimeout(resolve, 600));
+        expect(sent.some(message => message.method === "sdk/error")).toBe(false);
+        const admission = sent.find(message => message.method === "steering/started")!;
+        expect(admission.params).toMatchObject({ commandId: "22222222-2222-4222-8222-222222222222", sessionId: "11111111-1111-4111-8111-111111111111" });
+        child.stdin.write(JSON.stringify({ id: admission.id, result: { accepted: true } }) + "\n");
+      }
+      expect(sent.some(message => message.method === "sdk/message" && ((message.params as Frame).message as Frame).type === "result")).toBe(false);
+    }
     if (completes) {
       expect(started, JSON.stringify(sent)).toMatchObject({ result: { sessionId: "11111111-1111-4111-8111-111111111111" } });
       await vi.waitFor(() => expect(sent.some(message => message.method === "sdk/message" && ((message.params as Frame).message as Frame).type === "result"), JSON.stringify(sent)).toBe(true));
@@ -4431,6 +4766,9 @@ describe.skipIf(!existsSync(installedQoderSdk) || !!process.versions.bun || proc
       expect(emitted[completedIndex]!.message).toMatchObject({ id: "fixture-assistant", content: [{ type: "text", text: "Local SDK protocol completed." }] });
       expect(emitted.slice(0, completedIndex).some(message => (message.event as Frame | undefined)?.type === "content_block_start" && (message.event as Frame).index === 1)).toBe(true);
       expect(emitted.slice(completedIndex + 1).some(message => (message.event as Frame | undefined)?.type === "content_block_stop" && (message.event as Frame).index === 1)).toBe(true);
+    } else if (steeringTimeout) {
+      expect(started).toHaveProperty("result.sessionId");
+      expect(toolCalls).toHaveLength(1);
     } else if (structuredFailure) {
       expect(started).toHaveProperty("result.sessionId");
       expect(sent.find(message => message.method === "sdk/message" && ((message.params as Frame).message as Frame).type === "result")).toMatchObject({ params: { message: { subtype: "error_max_turns", num_turns: 64 } } });
@@ -4466,7 +4804,14 @@ describe.skipIf(!existsSync(installedQoderSdk) || !!process.versions.bun || proc
     const received = frames.filter(frame => frame.received).map(frame => frame.received as Frame);
     expect(received.some(frame => String((frame.request as Frame | undefined)?.type).match(/account|authenticate|get_models/))).toBe(false);
     const userFrames = received.filter(frame => frame.type === "user");
-    expect(userFrames).toHaveLength(recovers ? 2 : completes || changesSnapshot || visual || structuredFailure ? 1 : 0);
+    expect(userFrames).toHaveLength(recovers || steering ? 2 : completes || changesSnapshot || visual || structuredFailure ? 1 : 0);
+    if (steering) {
+      expect(userFrames[1]).toMatchObject({ priority: "next", uuid: "22222222-2222-4222-8222-222222222222" });
+      expect(frames.filter(frame => frame.modelRequest)).toHaveLength(steeringTimeout ? 1 : 2);
+      expect(frames.filter(frame => frame.modelPolicyDenied)).toHaveLength(steeringTimeout ? 1 : 0);
+      expect(frames.filter(frame => frame.toolResult)).toHaveLength(1);
+      expect(received.some(frame => (frame.request as Frame | undefined)?.subtype === "interrupt")).toBe(false);
+    }
     if (visual) {
       expect((userFrames[0]!.message as Frame).content).toEqual([{ type: "text", text: "Exercise only the local SDK protocol fixture." }, ...images.map(image => ({ type: "image", source: { type: "base64", media_type: image.mimeType, data: image.data } }))]);
       expect(frames.filter(frame => frame.modelRequest)).toHaveLength(completes ? 2 : afterToolFailure ? 1 : 0);

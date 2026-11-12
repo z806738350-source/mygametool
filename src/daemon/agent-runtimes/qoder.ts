@@ -77,6 +77,7 @@ const QODER_PROTOCOL_DETAILS = new Set([
   "Qoder returned a message for another session",
   "Qoder ended while a controlled tool result was still pending",
   "Qoder ended without a turn result",
+  "The steering checkpoint was not confirmed",
   "Qoder returned an invalid message",
   "Qoder host messages require an ID",
   "Unknown Qoder host method",
@@ -281,6 +282,7 @@ interface Turn {
   frameKeys: Map<string, string[]>;
   text: Map<string, string>;
   calls: Map<string, { input: string; result: Promise<unknown> }>;
+  steering: Map<string, { commandId: string; signature: string; admission?: Promise<void> }>;
   assistantError?: string;
 }
 
@@ -322,6 +324,7 @@ export class QoderDriver implements NativeDriver {
         frameKeys: new Map(),
         text: new Map(),
         calls: new Map(),
+        steering: new Map(),
       };
       this.#turn = turn;
       const abort = () => {
@@ -398,6 +401,51 @@ export class QoderDriver implements NativeDriver {
     }
   }
 
+  async steer(id: string, input: NativeTurnInput): Promise<boolean> {
+    const turn = this.#turn;
+    if (!turn || turn.controller.signal.aborted) return false;
+    const signature = JSON.stringify(input);
+    const existing = turn.steering.get(id);
+    if (existing) {
+      if (existing.signature !== signature) throw new Error("A steering message cannot change after submission");
+      return true;
+    }
+    const command = { commandId: randomUUID(), signature };
+    turn.steering.set(id, command);
+    await this.#starting;
+    if (this.#turn !== turn || !this.#connection) return false;
+    const receipt = record(await this.#connection.request("turn/steer", {
+      turnId: turn.id, commandId: command.commandId, text: input.text,
+      images: input.images, requiresImageInput: input.requiresImageInput === true,
+    }));
+    if (receipt?.queued !== true) {
+      turn.steering.delete(id);
+      return false;
+    }
+    return true;
+  }
+
+  async cancelSteering(ids: readonly string[]): Promise<string[]> {
+    const turn = this.#turn, connection = this.#connection;
+    if (!turn || !connection) return [];
+    const candidates = ids.flatMap(id => {
+      const command = turn.steering.get(id);
+      return command && !command.admission ? [{ id, command }] : [];
+    });
+    if (!candidates.length) return [];
+    const receipt = record(await connection.request("turn/cancel-steering", {
+      turnId: turn.id, commandIds: candidates.map(({ command }) => command.commandId),
+    }));
+    const cancelled: string[] = [];
+    for (const { id, command } of candidates) {
+      if (Array.isArray(receipt?.cancelled) && receipt.cancelled.includes(command.commandId) && !command.admission) {
+        turn.steering.delete(id);
+        cancelled.push(id);
+      }
+    }
+    return cancelled;
+  }
+
   async dispose(): Promise<void> {
     this.#disposed = true;
     this.#turn?.controller.abort();
@@ -421,6 +469,7 @@ export class QoderDriver implements NativeDriver {
     const params = record(message.params);
     const turn = this.#turn;
     if (!turn || turn.controller.signal.aborted || params?.turnId !== turn.id) {
+      if (message.method === "steering/started") this.#connection?.respond(message.id, { accepted: false });
       if (message.method === "tool/call")
         this.#connection?.respond(message.id, {
           isError: true,
@@ -428,6 +477,26 @@ export class QoderDriver implements NativeDriver {
             { type: "text", text: "The Qoder turn is no longer active" },
           ],
         });
+      return;
+    }
+    if (message.method === "steering/started") {
+      const entry = [...turn.steering].find(([, command]) => command.commandId === params.commandId);
+      if (!entry || params.sessionId !== this.#session || !turn.sink.steeringStarted) {
+        this.#connection?.respond(message.id, { accepted: false });
+        return;
+      }
+      const [id, command] = entry;
+      command.admission ??= (async () => {
+        await Promise.all([...turn.calls.values()].map(call => call.result));
+        if (this.#turn !== turn || turn.controller.signal.aborted) throw new Error("The Qoder turn was cancelled");
+        await turn.sink.steeringStarted!(id, turn.controller.signal);
+      })();
+      try {
+        await command.admission;
+        this.#connection?.respond(message.id, { accepted: this.#turn === turn && !turn.controller.signal.aborted });
+      } catch {
+        this.#connection?.respond(message.id, { accepted: false });
+      }
       return;
     }
     if (message.method === "tool/call") {

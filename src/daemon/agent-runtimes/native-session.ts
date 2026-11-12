@@ -13,8 +13,8 @@ import type {
   ApprovalDecision,
   ApprovalRequestDetails,
 } from "../../shared/agent-runtimes.js";
-import { CHECKPOINT_ENTRY, recordCheckpoint } from "../checkpoint-extension.js";
-import type { CodingSession, SkillCatalogItem } from "../agent.js";
+import { CHECKPOINT_ENTRY, recordCheckpoint, type StoredCheckpoint } from "../checkpoint-extension.js";
+import type { CodingQueuedPrompt, CodingSession, SkillCatalogItem } from "../agent.js";
 import { handoffSummary } from "./handoff.js";
 import { NATIVE_API } from "./replay.js";
 import { inside } from "./policy.js";
@@ -88,6 +88,8 @@ export interface NativeUsage {
  * arguments, then started and finished by its call id.
  */
 export interface NativeTurnSink {
+  /** Awaited before subsequent project tools and transcript events, after prior tools settle. */
+  steeringStarted?(id: string, admissionSignal?: AbortSignal): Promise<void>;
   limits?(limits: AgentUsageLimit[]): void;
   text(key: string, delta: string): void;
   textDone(key: string, text?: string): void;
@@ -123,6 +125,8 @@ export interface NativeTurnSink {
 
 /** A protocol adapter: Claude Code stream-json, Codex app-server or OpenCode serve. */
 export interface NativeDriver {
+  steer?(id: string, input: NativeTurnInput): Promise<boolean>;
+  cancelSteering?(ids: readonly string[]): Promise<string[]>;
   /** Runs one user message to the end of the native turn. */
   runTurn(
     input: NativeTurnInput,
@@ -189,6 +193,10 @@ interface NativeContinuation {
   readOnly: boolean;
 }
 
+interface NativeQueuedPrompt extends CodingQueuedPrompt {
+  submitted?: Promise<boolean>;
+}
+
 /**
  * A conversation run by a coding agent CLI. It keeps the conversation in the
  * same Pi session file as OhMyGame's own agent: every user message, answer
@@ -205,7 +213,8 @@ export class NativeCodingSession implements CodingSession {
   #driver: NativeDriver;
   #listeners = new Set<(event: AgentSessionEvent) => void>();
   #followUps: Array<{ text: string; images: PromptImage[] }> = [];
-  #steering: Array<{ text: string; images: PromptImage[] }> = [];
+  #steering: NativeQueuedPrompt[] = [];
+  #deliveredSteering = new Set<string>();
   #running?: { controller: AbortController; done: Promise<void> };
   #readOnly = false;
   #handoff: boolean;
@@ -290,6 +299,7 @@ export class NativeCodingSession implements CodingSession {
       settle = resolve;
     });
     this.#running = { controller, done };
+    this.#deliveredSteering.clear();
     this.#checkpointFailure = undefined;
     try {
       const stopping = this.#takeIdleStop();
@@ -309,7 +319,7 @@ export class NativeCodingSession implements CodingSession {
           this.#steering = [];
           break;
         }
-        next = this.#steering.shift() ?? this.#followUps.shift();
+        next = await this.#nextQueuedPrompt();
       }
     } finally {
       this.#running = undefined;
@@ -322,14 +332,59 @@ export class NativeCodingSession implements CodingSession {
     if (failure) throw failure.cause;
   }
 
+  async #nextQueuedPrompt(): Promise<{ text: string; images: PromptImage[] } | undefined> {
+    const queued = this.#steering.shift();
+    if (queued?.submitted) {
+      // A successful native turn does not prove an in-flight steering request was unused.
+      let notSubmitted = false;
+      try { notSubmitted = await queued.submitted === false; } catch { /* An uncertain input must not be replayed. */ }
+      if (!notSubmitted) {
+        await this.#resetContext();
+        throw new Error("The queued instruction's receipt is unconfirmed; it was not sent again.");
+      }
+    }
+    return queued ?? this.#followUps.shift();
+  }
+
   async followUp(prompt: string, images?: PromptImage[]): Promise<void> {
     this.#followUps.push({ text: prompt, images: images ?? [] });
   }
 
   async steer(prompt: string, images?: PromptImage[]): Promise<void> {
-    // A CLI can write independently of the daemon. Delivering steering while it
-    // runs cannot provide a stable pre-message snapshot, so admit it next turn.
-    this.#steering.push({ text: prompt, images: images ?? [] });
+    const entry = { id: randomUUID(), text: prompt, images: images ?? [] };
+    this.#steering.push(entry);
+    await this.#sendSteering(entry);
+  }
+
+  async replaceQueue(steering: readonly CodingQueuedPrompt[], followUp: readonly CodingQueuedPrompt[]): Promise<void> {
+    const desired = new Set(steering.map((item) => item.id));
+    const removed = this.#steering.filter((item) => !desired.has(item.id));
+    const admitted = removed.filter((item) => item.submitted);
+    if (admitted.length) {
+      const cancelled = new Set(await this.#driver.cancelSteering?.(admitted.map((item) => item.id)) ?? []);
+      if (admitted.some((item) => !cancelled.has(item.id) && !this.#deliveredSteering.has(item.id)))
+        throw new Error("A queued instruction is already being delivered; it was not replayed");
+    }
+    this.#steering = this.#steering.filter((item) => desired.has(item.id));
+    this.#followUps = followUp.map(({ text, images }) => ({ text, images }));
+    for (const entry of steering) {
+      if (this.#deliveredSteering.has(entry.id)) continue;
+      let queued = this.#steering.find((item) => item.id === entry.id);
+      if (!queued) { queued = { ...entry }; this.#steering.push(queued); }
+      await this.#sendSteering(queued);
+    }
+  }
+
+  async #sendSteering(entry: NativeQueuedPrompt): Promise<void> {
+    // Other native adapters retain next-turn delivery until they expose a safe boundary.
+    if (!this.#running || !this.#driver.steer || entry.submitted) return;
+    const requiresImageInput = entry.images.length > 0 || sessionImageReferences(this.sessionManager.getBranch()).length > 0;
+    if (requiresImageInput && this.options.supportsImages === false)
+      throw new Error("This conversation contains images, but the selected connection does not have image input enabled; the instruction was not submitted.");
+    const sending = this.#driver.steer(entry.id, { text: entry.text, images: entry.images, readOnly: this.#readOnly,
+      requiresImageInput });
+    entry.submitted = sending;
+    if (!await sending) entry.submitted = undefined;
   }
 
   clearQueue(): { steering: string[]; followUp: string[] } {
@@ -410,7 +465,7 @@ export class NativeCodingSession implements CodingSession {
       if (stopping) await stopping;
       let failed = await this.#runMessage("Continue the same unfinished user task from the retained conversation and current files. Reuse completed tool results. Never replay completed effects; recover uncertain operations by their original call or job ID. A normal final answer ends this task.", [], controller.signal, true);
       while (!failed && !controller.signal.aborted) {
-        const next = this.#steering.shift() ?? this.#followUps.shift();
+        const next = await this.#nextQueuedPrompt();
         if (!next) break;
         failed = await this.#runMessage(next.text, next.images, controller.signal);
       }
@@ -678,40 +733,72 @@ export class NativeCodingSession implements CodingSession {
     // A crash or interrupted write must never leave an earlier ready marker
     // claiming that this native context still matches the branch.
     this.#storeNativeState("active");
-    const turn = new TurnRecorder(this, this.options.model);
+    let turn = new TurnRecorder(this, this.options.model);
     const sink = turn.sink();
-    const recordToolResult = sink.toolResult;
-    sink.toolResult = (...result) => {
-      // Persist the actual rejection/effect receipt before interrupting the adapter.
-      // Stopping inside Tool.execute races the adapter's result callback and loses it.
-      recordToolResult(...result);
-      if (this.options.continuationTools?.stopRequested && !this.options.continuationTools.repairable)
-        void this.stopForUnconfirmedEffect().catch(() => {});
+    const bindRecorder = () => {
+      Object.assign(sink, turn.sink());
+      const recordToolResult = sink.toolResult;
+      sink.toolResult = (...result) => {
+        // Persist the actual rejection/effect receipt before interrupting the adapter.
+        recordToolResult(...result);
+        if (this.options.continuationTools?.stopRequested && !this.options.continuationTools.repairable)
+          void this.stopForUnconfirmedEffect().catch(() => {});
+      };
+    };
+    bindRecorder();
+    sink.steeringStarted = async (id, admissionSignal) => {
+      const admission = admissionSignal ? AbortSignal.any([signal, admissionSignal]) : signal;
+      if (this.#deliveredSteering.has(id)) return;
+      const entry = this.#steering.find((item) => item.id === id);
+      if (!entry) throw new Error("The queued instruction is no longer available");
+      admission.throwIfAborted();
+      if (turn.hasPendingTools()) throw new Error("A tool result is still pending; the instruction was not admitted");
+      this.options.continuationTools?.assertSafe();
+      if (this.options.continuationTools?.stopRequested || this.options.continuationTools?.repairOnly)
+        throw new Error("Original tool effects still need recovery; the instruction was not admitted");
+      if (entry.images.length && this.options.supportsImages === false)
+        throw new Error("The selected connection does not have image input enabled");
+      turn.closeAssistant("stop");
+      if (!await this.#storeUserMessage(entry.text, entry.images, entry.id, admission)) throw this.#checkpointFailure?.cause ?? new Error("Workspace checkpoint failed");
+      admission.throwIfAborted();
+      this.#deliveredSteering.add(id);
+      this.#steering = this.#steering.filter((item) => item.id !== id);
+      const user = this.sessionManager.getBranch().findLast((item) => item.type === "message" && item.message.role === "user");
+      if (!user) throw new Error("The queued instruction was not retained");
+      this.#continuation = { text: entry.text, images: entry.images, userEntryId: user.id, model: this.options.model, reasoningLevel: this.options.nativeReasoningLevel, readOnly: this.#readOnly };
+      this.#segment = 0;
+      this.options.continuationTools?.reset(user.id);
+      await this.options.beginTask?.(user.id);
+      turn = new TurnRecorder(this, this.options.model);
+      bindRecorder();
+    };
+    const runNative = async (input: NativeTurnInput): Promise<NativeTurnOutcome> => {
+      const running = this.#driver.runTurn(input, sink, signal);
+      // Inputs arriving during a checkpoint or expired-context rebuild join this live turn.
+      try { for (const entry of this.#steering) await this.#sendSteering(entry); }
+      catch (cause) { await this.#driver.interrupt(); await running; throw cause; }
+      return running;
     };
     let outcome: NativeTurnOutcome;
     try {
       try {
         if (requiresImageInput && this.options.supportsImages === false)
           throw new Error("This conversation contains retained images, but the selected connection does not have image input enabled. Choose an image-enabled connection before continuing; original images are retained and no model task was sent.");
-        outcome = await this.#driver.runTurn(
+        outcome = await runNative(
           { text: wire, images, readOnly: this.#readOnly, ...(requiresImageInput ? { requiresImageInput: true } : {}) },
-          sink,
-          signal,
         );
       } catch (cause) {
         if (!(cause instanceof NativeSessionExpiredError) || signal.aborted)
           throw cause;
         await this.#resetContext();
         const summary = handoffSummary(history);
-        outcome = await this.#driver.runTurn(
+        outcome = await runNative(
           {
             text: `${imageContext ? `${imageContext}\n\n` : ""}${summary ? `${summary}\n\n${currentPrompt}` : currentPrompt}`,
             images,
             readOnly: this.#readOnly,
             ...(requiresImageInput ? { requiresImageInput: true } : {}),
           },
-          sink,
-          signal,
         );
         this.#handoff = false;
       }
@@ -729,6 +816,12 @@ export class NativeCodingSession implements CodingSession {
       outcome = { status: "failed", error: this.#toolStopMessage(), interruption: this.#forcedInterruption };
     if (outcome.status === "completed" && this.options.continuationTools?.stopRequested)
       outcome = { status: "failed", error: this.#toolStopMessage(), interruption: { kind: "blocked", source: this.runtime === "qoder-cli" ? "qoder" : "codex", code: "unconfirmed_tool_effect", phase: "tools" } };
+    if (outcome.status === "failed" && !signal.aborted) {
+      const receipts = await Promise.allSettled(this.#steering.flatMap(({ submitted }) => submitted ? [submitted] : []));
+      if (receipts.some(receipt => receipt.status === "rejected" || receipt.value))
+        outcome = { ...outcome, error: `${outcome.error} The queued instruction's receipt is unconfirmed; it was not sent again.`,
+          interruption: { kind: "blocked", source: outcome.interruption?.source ?? (this.runtime === "qoder-cli" ? "qoder" : "codex"), code: "native_steering_unconfirmed", phase: "result" } };
+    }
     this.#interruption = outcome.status === "failed" && !signal.aborted ? outcome.interruption : undefined;
     this.sessionManager.appendCustomEntry("ohmygame-native-outcome", { version: 1, taskId: this.#continuation?.userEntryId, status: outcome.status,
       segment: ++this.#segment,
@@ -809,6 +902,8 @@ export class NativeCodingSession implements CodingSession {
   async #storeUserMessage(
     text: string,
     images: PromptImage[],
+    queuedPromptId?: string,
+    signal?: AbortSignal,
   ): Promise<boolean> {
     const message = {
       role: "user" as const,
@@ -817,19 +912,30 @@ export class NativeCodingSession implements CodingSession {
         : text,
       timestamp: Date.now(),
     };
-    this.#emit({ type: "message_start", message } as AgentSessionEvent);
+    const start = () => this.#emit({ type: "message_start", message, ...(queuedPromptId ? { queuedPromptId } : {}) } as AgentSessionEvent);
+    if (!queuedPromptId) start();
     const snapshot = this.options.snapshotBeforeMessage;
+    let checkpoint: StoredCheckpoint | { version: 1 } | undefined;
     if (snapshot) {
       try {
         await recordCheckpoint(
-          (data) =>
-            this.sessionManager.appendCustomEntry(CHECKPOINT_ENTRY, data),
+          (data) => {
+            if (queuedPromptId) checkpoint = data;
+            else this.sessionManager.appendCustomEntry(CHECKPOINT_ENTRY, data);
+          },
           snapshot,
         );
       } catch (cause) {
         this.#checkpointFailure ??= { cause };
         return false;
       }
+    }
+    if (queuedPromptId) {
+      // Queue consumption is announced only after the snapshot succeeds. Keep start before
+      // checkpoint insertion so AgentManager can associate that checkpoint with this message.
+      signal?.throwIfAborted();
+      start();
+      if (checkpoint) this.sessionManager.appendCustomEntry(CHECKPOINT_ENTRY, checkpoint);
     }
     // As in Pi, the message ends before it is stored: OhMyGame finds the message's checkpoint among the entries before it.
     this.#emit({ type: "message_end", message } as AgentSessionEvent);
@@ -873,6 +979,10 @@ class TurnRecorder {
     private readonly model: string,
   ) {
     this.#userEntryId = session.sessionManager.getBranch().findLast(entry => entry.type === "message" && entry.message.role === "user")?.id;
+  }
+
+  hasPendingTools(): boolean {
+    return [...this.#tools.values()].some((tool) => !tool.finished);
   }
 
   sink(): NativeTurnSink {

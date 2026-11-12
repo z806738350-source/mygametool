@@ -1872,7 +1872,7 @@ const en = {
     duration: "Could not read the duration of {{name}}",
   },
   timeline: {
-    waitingToSteer: "Waiting to steer",
+    waitingToSteer: "Queued — waiting for the agent to receive this message",
     branchChat: "Branch in new chat",
     branchConfirm: "Create a new chat with all messages through this response?",
     copyResponse: "Copy response",

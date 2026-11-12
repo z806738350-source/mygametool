@@ -6,12 +6,12 @@ import type { AgentProcessOptions } from "./process.js";
 import { AgentRuntimeCompatibilityError } from "./compatibility.js";
 
 // The native tool inventory is version-specific. Re-audit against a mock model before widening this.
-export const CONTROLLED_CODEX_VERSION = "0.167.0-alpha.3.2";
+export const CONTROLLED_CODEX_VERSION = "0.167.0-alpha.4.1";
 export const CODEX_TOOL_NAMESPACE = "ohmygame";
 const CONTROLLED_CODEX_SHA256 =
-  "a636331ed87605efc4cf84028ac2884a75363f9d10ead63cffb57ea0016d486e";
+  "7cb8700a47be3c81bb3c5efbf2d2adc716ce3db4806e9dc992f2925f78b2b194";
 const CONTROLLED_CODEX_HOST_SHA256 =
-  "c0285b76616ed906bfcbb353fe46f64dcbc577113fc8836f9ab6da530438dbdc";
+  "1cf6ad4fa020d5d7165a62d18b0e1673204a5985b693f22c2b890ac02a6822ba";
 export const CODEX_CONTROLLED_CONFIG: Record<string, unknown> = {
   model_provider: "openai",
   cli_auth_credentials_store: "file",

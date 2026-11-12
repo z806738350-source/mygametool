@@ -313,8 +313,8 @@ OhMyGame stops its owned CLI processes. Recheck after completing the browser flo
 no automated login or paid model request is needed to inspect this page.
 
 This initial connection is pinned to the audited macOS native executable
-`0.167.0-alpha.3.2`, SHA-256
-`a636331ed87605efc4cf84028ac2884a75363f9d10ead63cffb57ea0016d486e`, bundled
+`0.167.0-alpha.4.1`, SHA-256
+`7cb8700a47be3c81bb3c5efbf2d2adc716ce3db4806e9dc992f2925f78b2b194`, bundled
 inside the installed ChatGPT app. Discovery never executes a login shell. An
 unrecognized binary is rejected before version or authentication probes run.
 An app update or a different CLI build needs another isolation check before
@@ -324,7 +324,13 @@ which is a shell launcher; use `CodexCLI.app/Contents/MacOS/codex`.
 This CLI uses Code Mode's separate V8 runner to dispatch project tools through
 `functions.exec`. The controlled connection enables that runner with in-process
 fallback disabled and verifies its SHA-256
-`c0285b76616ed906bfcbb353fe46f64dcbc577113fc8836f9ab6da530438dbdc`.
+`1cf6ad4fa020d5d7165a62d18b0e1673204a5985b693f22c2b890ac02a6822ba`.
+The November 12 compatibility check used the real CLI with a local mock model
+and an OS network restriction to one loopback proxy port. API and ChatGPT routing,
+controlled tools, planning restrictions and cancellation passed; native project,
+private-directory and protected-path writes were denied, as was native shell
+execution. The fixture's exact eight-tool inventory and the V8 runtime's lack of Node and
+network access were rechecked. No real credentials or inference were used.
 Only the `ohmygame` namespace is registered for project tools; native `functions`,
 `collaboration`, `web` and `clock` namespaces are excluded from nested dispatch.
 This JavaScript runtime has no Node, filesystem, subprocess or network APIs.
@@ -666,10 +672,31 @@ permission grants. No second conversation manager or event database is needed.
 | Codex       | `codex app-server` JSON-RPC; one thread per conversation         | The thread's dynamic tools, answered over the same pipe | App server approval requests                         |
 | OpenCode    | `opencode serve` on loopback with its own password               | Remote MCP on the daemon with a turn token              | `permission.asked` events, answered on the server    |
 
-Each stdin stays open for the session. A CLI that no message has used for ten minutes is stopped; the next message starts a new process that resumes the same native session. Codex conversations with the same executable, environment and staged Skills share one app server, routed by thread; it stops with its last conversation. OpenCode keeps a server per conversation because its MCP servers, and so OhMyGame's tools, are registered for the whole instance. Native queue prioritization means
-**Next**: after the current turn, before ordinary follow-ups. Mid-turn native
-injection is excluded because concurrent file writes cannot provide an
-independent checkpoint before delivery. Processes run in their
+Each stdin stays open for the session. A CLI that no message has used for ten minutes is stopped; the next message starts a new process that resumes the same native session. Codex conversations with the same executable, environment and staged Skills share one app server, routed by thread; it stops with its last conversation. OpenCode keeps a server per conversation because its MCP servers, and so OhMyGame's tools, are registered for the whole instance.
+
+Controlled Qoder accepts **Steer** during the current task using SDK `priority: "next"`.
+It waits for the current tools to settle, then pauses the next model request while
+OhMyGame saves the workspace checkpoint and records that exact queued message.
+It does not interrupt a Blender job or restart a paid request. Stable queue IDs
+prevent duplicate delivery when another message is queued or removed. Cancellation
+requires confirmation from the native runtime; an ambiguous cancellation is not
+replayed. The timeline keeps the waiting label until this admission succeeds.
+Checkpoint failure, cancellation or unresolved original tool effects stop admission.
+Offline tests exercise this handshake with the installed SDK and a local protocol
+fixture, including a delayed checkpoint and policy timeout without model fallback.
+
+Controlled Codex uses [`turn/steer`](https://learn.chatgpt.com/docs/app-server#steer-an-active-turn)
+on the existing native turn. Its user-message event must match the queued input's
+`clientUserMessageId` through `item.clientId`; the RPC acceptance alone does not
+clear the waiting label. Codex can receive guidance while an earlier tool is
+still running. OhMyGame waits for those original host tools, saves the checkpoint,
+and records the user message before releasing subsequent project tools and
+transcript events. Unlike Qoder's model-policy pause, this does not pause native
+inference. Native project writes remain disabled, and a failed checkpoint stops
+the native turn without replaying the instruction or original operations.
+
+Other native adapters retain **Next** semantics: after the current turn, before
+ordinary follow-ups, until they provide a controlled admission boundary. Processes run in their
 own process group, are registered with the desktop app for crash cleanup, and
 are stopped when the daemon closes.
 

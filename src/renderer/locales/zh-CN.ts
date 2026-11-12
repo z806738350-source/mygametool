@@ -1839,7 +1839,7 @@ const zhCN: typeof en = {
     duration: "无法读取 {{name}} 的时长",
   },
   timeline: {
-    waitingToSteer: "等待引导",
+    waitingToSteer: "补充已排队，尚未被 Agent 接收",
     branchChat: "在新聊天中创建分支",
     branchConfirm: "将截至此回复（包含此回复）的消息复制到新聊天？",
     copyResponse: "复制回复",

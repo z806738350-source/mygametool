@@ -48,6 +48,12 @@ import { getToolConfirmedFailure } from "./agent-tool-errors.js";
 
 const CONTINUATION_SUPERSEDED = Symbol("newer user message");
 
+export interface CodingQueuedPrompt {
+  id: string;
+  text: string;
+  images: PiPromptImage[];
+}
+
 export interface CodingSession {
   readonly messages: readonly unknown[];
   readonly model?: RuntimeModel;
@@ -70,6 +76,8 @@ export interface CodingSession {
   abortCompaction?(origin?: "user" | "host"): void;
   getContextUsage?(): AgentContextUsage | undefined;
   clearQueue?(): { steering: string[]; followUp: string[] };
+  /** Native adapters retain stable IDs instead of cancelling and replaying admitted inputs. */
+  replaceQueue?(steering: readonly CodingQueuedPrompt[], followUp: readonly CodingQueuedPrompt[]): Promise<void>;
   navigateTree?(targetId: string, options?: { summarize?: boolean }): Promise<{ editorText?: string; cancelled: boolean }>;
   abort(origin?: "user" | "host"): Promise<void>;
   dispose(): void;
@@ -1365,7 +1373,7 @@ export class AgentManager {
       const pending = current.filter((item) => item.turnId !== turnId);
       const steering = this.#steeringPrompts.get(key) ?? [];
       await this.#rebuildQueue(projectId, conversationId, steering, pending);
-      this.#pendingPrompts.set(key, pending);
+      this.#pendingPrompts.set(key, (this.#pendingPrompts.get(key) ?? []).filter((item) => item.turnId !== turnId));
       if (removed.images.length) this.events.expireThrough(projectId, removed.queuedEventId);
       this.events.publish(projectId, "prompt.removed", {}, { conversationId, turnId });
       return true;
@@ -1384,8 +1392,10 @@ export class AgentManager {
       ];
       const pending = current.filter((item) => item.turnId !== turnId);
       await this.#rebuildQueue(projectId, conversationId, steering, pending);
-      this.#steeringPrompts.set(key, steering);
-      this.#pendingPrompts.set(key, pending);
+      // A native boundary can acknowledge this exact input before queue admission returns.
+      if (!(this.#pendingPrompts.get(key) ?? []).some((item) => item.turnId === turnId)) return true;
+      this.#steeringPrompts.set(key, [...(this.#steeringPrompts.get(key) ?? []), current[index]]);
+      this.#pendingPrompts.set(key, (this.#pendingPrompts.get(key) ?? []).filter((item) => item.turnId !== turnId));
       const steered = current[index];
       this.events.publish(projectId, "prompt.steered", {
         prompt: steered.prompt,
@@ -1411,7 +1421,7 @@ export class AgentManager {
     }
     const managed = this.#sessions.get(key);
     if (!managed) throw new Error("Agent session is not active");
-    if (!managed.session.clearQueue || !managed.session.followUp || !managed.session.steer) {
+    if (!managed.session.replaceQueue && (!managed.session.clearQueue || !managed.session.followUp || !managed.session.steer)) {
       throw new Error("The current agent session cannot modify its message queue");
     }
     try {
@@ -1952,11 +1962,14 @@ export class AgentManager {
       if (initialMessage && this.#sessions.get(key)?.session.emitsInitialUserMessage) return;
       const steering = this.#steeringPrompts.get(key) ?? [];
       const pending = this.#pendingPrompts.get(key) ?? [];
-      const started = steering[0] ?? pending[0];
+      const queuedPromptId = (event as AgentSessionEvent & { queuedPromptId?: string }).queuedPromptId;
+      const started = queuedPromptId
+        ? [...steering, ...pending].find((item) => item.turnId === queuedPromptId)
+        : steering[0] ?? pending[0];
       if (!started) return;
       appendPromptDetails(this.#sessions.get(key)?.session.sessionManager, started, started.wirePrompt);
-      if (steering.length > 0) this.#steeringPrompts.set(key, steering.slice(1));
-      else this.#pendingPrompts.set(key, pending.slice(1));
+      this.#steeringPrompts.set(key, steering.filter((item) => item.turnId !== started.turnId));
+      this.#pendingPrompts.set(key, pending.filter((item) => item.turnId !== started.turnId));
       this.#finishContinuation(projectId, active, active.lastError ? "failed" : "completed", active.lastError);
       active.autoContinuationItem = undefined;
       if (active.images.length && active.startedEventId !== undefined) this.events.expireThrough(projectId, active.startedEventId);
@@ -2803,6 +2816,11 @@ async function replayQueue(
   steering: readonly QueuedPrompt[],
   pending: readonly QueuedPrompt[],
 ): Promise<void> {
+  if (session.replaceQueue) {
+    const entry = (item: QueuedPrompt): CodingQueuedPrompt => ({ id: item.turnId, text: item.wirePrompt, images: item.images.map(toPiImage) });
+    await session.replaceQueue(steering.map(entry), pending.map(entry));
+    return;
+  }
   session.clearQueue!();
   for (const item of steering) {
     await session.steer!(item.wirePrompt, item.images.length ? item.images.map(toPiImage) : undefined);

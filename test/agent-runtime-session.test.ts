@@ -559,6 +559,318 @@ function items(sessionManager: SessionManager): ThreadItem[] {
 }
 
 // Legacy execution is retained for future OS-isolated support; agent-local-files.test.ts covers current refusal.
+function fixture(
+  scripts: Script[],
+  sessionManager = SessionManager.inMemory("/tmp/project-1"),
+  extra: Record<string, unknown> = {},
+) {
+  const drivers: ScriptedDriver[] = [];
+  const session = new NativeCodingSession({
+    runtime: "claude-code-cli",
+    model: "sonnet",
+    sessionManager,
+    toolNames: [],
+    requestApproval: async () => "deny",
+    createDriver: (resume) => {
+      const driver = new ScriptedDriver(scripts, resume);
+      drivers.push(driver);
+      return driver;
+    },
+    ...extra,
+  });
+  return { session, sessionManager, drivers };
+}
+
+describe("native live steering", () => {
+  it("delivers startup steering to the replacement live turn after an explicitly expired context", async () => {
+    let expire!: () => void, finish!: () => void, created = 0;
+    const inputs: NativeTurnInput[] = [], delivered: string[] = [];
+    const store = SessionManager.inMemory("/tmp/native-expired-steering");
+    const session = new NativeCodingSession({ runtime: "qoder-cli", model: "fixture", sessionManager: store, toolNames: [],
+      requestApproval: async () => "deny", createDriver: () => {
+        const expired = ++created === 1;
+        let sink: NativeTurnSink;
+        return {
+          runTurn: async (input, current) => {
+            inputs.push(input); sink = current;
+            if (expired) {
+              await new Promise<void>(resolve => { expire = resolve; });
+              throw new NativeSessionExpiredError("Expired fixture context");
+            }
+            await new Promise<void>(resolve => { finish = resolve; });
+            return { status: "completed" };
+          },
+          steer: async id => {
+            if (expired) return false;
+            await sink!.steeringStarted!(id); delivered.push(id); return true;
+          },
+          interrupt: async () => { finish?.(); }, dispose() {},
+        };
+      } });
+    try {
+      const run = session.prompt("Original task");
+      await vi.waitFor(() => expect(expire).toBeDefined());
+      await session.replaceQueue([{ id: "startup-guidance", text: "Keep the feet separate", images: [] }], []);
+      expire();
+      await vi.waitFor(() => expect(delivered).toEqual(["startup-guidance"]));
+      expect(store.getBranch().filter(item => item.type === "message" && item.message.role === "user")).toHaveLength(2);
+      finish(); await run;
+      expect(inputs).toHaveLength(2);
+    } finally { finish?.(); await session.dispose(); }
+  });
+
+  it.each(["accepted", "unknown", "unsent"])("preserves %s steering evidence when a failed native turn could otherwise auto-continue", async delivery => {
+    let finish!: () => void;
+    const manager = SessionManager.inMemory("/tmp/native-failed-steering-receipt");
+    const { session, drivers } = fixture([async () => {
+      await new Promise<void>(resolve => { finish = resolve; });
+      return { status: "failed", error: "Original transport failure", interruption: { kind: "transient", source: "codex", code: "fixture_connection" } };
+    }], manager, { runtime: "codex-cli", continuationTools: new AutoContinueTools([], { sessionManager: manager }) });
+    Object.assign(drivers[0]!, { steer: vi.fn(async () => {
+      if (delivery === "unknown") throw new Error("Steering response lost");
+      return delivery === "accepted";
+    }) });
+    const run = session.prompt("Original task");
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    const queued = session.replaceQueue([{ id: "unconfirmed", text: "Updated instruction", images: [] }], []);
+    if (delivery === "unknown") await expect(queued).rejects.toThrow("Steering response lost");
+    else await queued;
+    finish(); await run;
+    if (delivery === "unsent") expect(session.interruption?.kind).toBe("transient");
+    else {
+      expect(session.interruption).toMatchObject({ kind: "blocked", code: "native_steering_unconfirmed" });
+      await expect(session.prepareContinuation(new AbortController().signal)).rejects.toThrow("no longer eligible");
+      expect(JSON.stringify(manager.getBranch())).toContain("Original transport failure The queued instruction's receipt is unconfirmed");
+    }
+    expect(drivers.flatMap(driver => driver.inputs)).toHaveLength(1);
+    await session.dispose();
+  });
+
+  it.each([
+    { delivery: "accepted", resumed: false }, { delivery: "unknown", resumed: false },
+    { delivery: "accepted", resumed: true }, { delivery: "unknown", resumed: true },
+  ])("does not replay $delivery steering without a consumption receipt (resumed=$resumed)", async ({ delivery, resumed }) => {
+    let finish!: () => void;
+    const manager = SessionManager.inMemory("/tmp/native-steering-receipt");
+    const scripts: Script[] = resumed ? [async () => ({ status: "failed", error: "Segment limit", interruption: { kind: "turn_limit", source: "codex", code: "fixture_max_turns" } })] : [];
+    scripts.push(async () => {
+      await new Promise<void>(resolve => { finish = resolve; });
+      return { status: "completed" };
+    });
+    const { session, drivers } = fixture(scripts, manager, { runtime: "codex-cli", continuationTools: new AutoContinueTools([], { sessionManager: manager }) });
+    if (resumed) {
+      await session.prompt("Original task");
+      await session.prepareContinuation(new AbortController().signal);
+    }
+    Object.assign(drivers.at(-1)!, { steer: vi.fn(async () => {
+      if (delivery === "unknown") throw new Error("Transport response lost");
+      return true;
+    }) });
+    const run = resumed ? session.resumeAfterInterruption() : session.prompt("Original task");
+    const failure = expect(run).rejects.toThrow("unconfirmed; it was not sent again");
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    const queued = session.replaceQueue([{ id: "unconfirmed", text: "Updated instruction", images: [] }], []);
+    if (delivery === "unknown") await expect(queued).rejects.toThrow("Transport response lost");
+    else await queued;
+    finish(); await failure;
+    expect(drivers.flatMap(driver => driver.inputs)).toHaveLength(resumed ? 2 : 1);
+    expect(drivers).toHaveLength(resumed ? 3 : 2); // A future message rebuilds from the retained transcript.
+    await session.dispose();
+  });
+
+  it.each([false, true])("rejects unsupported live image input before driver submission (retained=%s)", async retained => {
+    let finish!: () => void;
+    const { session, drivers, sessionManager } = fixture([async () => {
+      await new Promise<void>(resolve => { finish = resolve; });
+      return { status: "completed" };
+    }], undefined, { supportsImages: false });
+    const steer = vi.fn(async () => true);
+    Object.assign(drivers[0]!, { steer });
+    const run = session.prompt("Original task");
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    const image = { type: "image" as const, mimeType: "image/png", data: "aW1hZ2U=" };
+    if (retained) sessionManager.appendMessage({ role: "toolResult", toolCallId: "image", toolName: "read", content: [image], isError: false, timestamp: 2 });
+    await expect(session.replaceQueue([{ id: "image-steer", text: "Use this reference", images: retained ? [] : [image] }], []))
+      .rejects.toThrow("does not have image input enabled");
+    expect(steer).not.toHaveBeenCalled();
+    session.clearQueue(); finish(); await run; await session.dispose();
+  });
+
+  it("admits live steering once at a settled boundary without starting a replacement native turn", async () => {
+    let sink!: NativeTurnSink, finish!: () => void;
+    const snapshot = vi.fn(async () => "commit");
+    const { session, sessionManager, drivers } = fixture([
+      async (_input, current) => {
+        sink = current;
+        sink.toolCall("original-job", "run_blender", { stage: "clean" });
+        sink.toolStarted("original-job");
+        await new Promise<void>((resolve) => { finish = resolve; });
+        sink.textDone("response", "Both feet will remain separate.");
+        return { status: "completed" };
+      },
+    ], undefined, { runtime: "qoder-cli", snapshotBeforeMessage: snapshot });
+    const steer = vi.fn(async () => true);
+    Object.assign(drivers[0]!, { steer });
+    const received: unknown[] = [];
+    session.subscribe((event) => received.push(event));
+    const run = session.prompt("Clean this character");
+    await vi.waitFor(() => expect(sink).toBeDefined());
+    const entry = { id: "feet-instruction", text: "Do not join the feet", images: [] };
+    await session.replaceQueue([entry], []);
+    await session.replaceQueue([entry], []);
+    expect(steer).toHaveBeenCalledTimes(1);
+    expect(snapshot).toHaveBeenCalledTimes(1);
+    await expect(sink.steeringStarted!(entry.id)).rejects.toThrow("tool result is still pending");
+    sink.toolResult("original-job", { content: [{ type: "text", text: "Saved original clean scene" }] }, false);
+    await sink.steeringStarted!(entry.id);
+    await sink.steeringStarted!(entry.id);
+    await session.replaceQueue([entry], []); // A stale queue snapshot cannot resend an acknowledged instruction.
+    expect(snapshot).toHaveBeenCalledTimes(2);
+    expect(steer).toHaveBeenCalledTimes(1);
+    expect(received).toContainEqual(expect.objectContaining({ type: "message_start", queuedPromptId: entry.id }));
+    finish();
+    await run;
+    expect(drivers[0]!.inputs).toHaveLength(1);
+    const messages = sessionManager.getBranch().flatMap((item) => item.type === "message" ? [item.message] : []);
+    expect(messages.filter((item) => item.role === "user")).toHaveLength(2);
+    expect(messages.findIndex((item) => item.role === "toolResult")).toBeLessThan(messages.findIndex((item) => item.role === "user" && item.content === entry.text));
+    expect(messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+    session.dispose();
+  });
+
+  it("keeps an admitted instruction when the runtime cannot confirm cancellation", async () => {
+    let finish!: () => void;
+    const { session, drivers } = fixture([async () => {
+      await new Promise<void>((resolve) => { finish = resolve; });
+      return { status: "completed" };
+    }]);
+    const steer = vi.fn(async () => true), cancelSteering = vi.fn(async (_ids: readonly string[]): Promise<string[]> => []);
+    Object.assign(drivers[0]!, { steer, cancelSteering });
+    const run = session.prompt("Original task");
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    const entry = { id: "queued-instruction", text: "Keep the feet separate", images: [] };
+    await session.replaceQueue([entry], []);
+    await expect(session.replaceQueue([], [])).rejects.toThrow("already being delivered");
+    await session.replaceQueue([entry], []);
+    expect(steer).toHaveBeenCalledTimes(1);
+    cancelSteering.mockResolvedValue([entry.id]);
+    await session.replaceQueue([], []);
+    finish();
+    await run;
+    expect(drivers[0]!.inputs).toHaveLength(1);
+    session.dispose();
+  });
+
+  it("does not archive or release a live instruction when its checkpoint fails", async () => {
+    let sink!: NativeTurnSink, finish!: () => void;
+    const snapshot = vi.fn(async () => "commit").mockImplementationOnce(async () => "commit").mockImplementationOnce(async () => { throw new Error("snapshot failed"); });
+    const { session, drivers, sessionManager } = fixture([async (_input, current) => {
+      sink = current;
+      await new Promise<void>((resolve) => { finish = resolve; });
+      return { status: "failed", error: "steering checkpoint failed" };
+    }], undefined, { snapshotBeforeMessage: snapshot });
+    Object.assign(drivers[0]!, { steer: vi.fn(async () => true) });
+    const received: unknown[] = [];
+    session.subscribe(event => received.push(event));
+    const run = session.prompt("Original task"), failure = expect(run).rejects.toThrow("snapshot failed");
+    await vi.waitFor(() => expect(sink).toBeDefined());
+    await session.replaceQueue([{ id: "queued", text: "Updated instruction", images: [] }], []);
+    await expect(sink.steeringStarted!("queued")).rejects.toThrow("snapshot failed");
+    expect(received).not.toContainEqual(expect.objectContaining({ type: "message_start", queuedPromptId: "queued" }));
+    expect(sessionManager.getBranch().filter(item => item.type === "custom" && item.customType === CHECKPOINT_ENTRY)).toHaveLength(1);
+    finish();
+    await failure;
+    expect(sessionManager.getBranch().filter((item) => item.type === "message" && item.message.role === "user")).toHaveLength(1);
+    session.dispose();
+  });
+
+  it("does not consume or archive a live instruction cancelled while its snapshot is pending", async () => {
+    let sink!: NativeTurnSink, finish!: () => void, releaseSnapshot!: (commit: string) => void;
+    const snapshot = vi.fn(async () => "commit").mockImplementationOnce(async () => "commit")
+      .mockImplementationOnce(() => new Promise<string>(resolve => { releaseSnapshot = resolve; }));
+    const beginTask = vi.fn();
+    const { session, drivers, sessionManager } = fixture([async (_input, current) => {
+      sink = current;
+      await new Promise<void>(resolve => { finish = resolve; });
+      return { status: "completed" };
+    }], undefined, { snapshotBeforeMessage: snapshot, beginTask });
+    Object.assign(drivers[0]!, { steer: vi.fn(async () => true), interrupt: async () => { finish(); } });
+    const received: unknown[] = [];
+    session.subscribe(event => received.push(event));
+    const run = session.prompt("Original task");
+    await vi.waitFor(() => expect(sink).toBeDefined());
+    await session.replaceQueue([{ id: "queued", text: "Updated instruction", images: [] }], []);
+    const admitting = sink.steeringStarted!("queued");
+    const cancelled = expect(admitting).rejects.toMatchObject({ name: "AbortError" });
+    await vi.waitFor(() => expect(snapshot).toHaveBeenCalledTimes(2));
+    await session.abort();
+    releaseSnapshot("later-checkpoint");
+    await cancelled;
+    await run;
+    expect(received).not.toContainEqual(expect.objectContaining({ type: "message_start", queuedPromptId: "queued" }));
+    expect(sessionManager.getBranch().filter(item => item.type === "custom" && item.customType === CHECKPOINT_ENTRY)).toHaveLength(1);
+    expect(sessionManager.getBranch().filter(item => item.type === "message" && item.message.role === "user")).toHaveLength(1);
+    expect(beginTask).toHaveBeenCalledOnce();
+    await session.dispose();
+  });
+
+  it("rejects a late snapshot when only the driver's admission signal was cancelled", async () => {
+    let sink!: NativeTurnSink, finish!: () => void, releaseSnapshot!: (commit: string) => void, sessionSignal!: AbortSignal;
+    const snapshot = vi.fn(async () => "commit").mockImplementationOnce(async () => "commit")
+      .mockImplementationOnce(() => new Promise<string>(resolve => { releaseSnapshot = resolve; }));
+    const { session, drivers, sessionManager } = fixture([async (_input, current, signal) => {
+      sink = current; sessionSignal = signal;
+      await new Promise<void>(resolve => { finish = resolve; });
+      return { status: "failed", error: "Native request ended" };
+    }], undefined, { snapshotBeforeMessage: snapshot });
+    Object.assign(drivers[0]!, { steer: vi.fn(async () => true) });
+    const received: unknown[] = [];
+    session.subscribe(event => received.push(event));
+    const run = session.prompt("Original task");
+    await vi.waitFor(() => expect(sink).toBeDefined());
+    await session.replaceQueue([{ id: "queued", text: "Updated instruction", images: [] }], []);
+    const admission = new AbortController();
+    const admitting = sink.steeringStarted!("queued", admission.signal);
+    const cancelled = expect(admitting).rejects.toMatchObject({ name: "AbortError" });
+    await vi.waitFor(() => expect(snapshot).toHaveBeenCalledTimes(2));
+    admission.abort(); finish(); await run;
+    expect(sessionSignal.aborted).toBe(false);
+    releaseSnapshot("late-checkpoint");
+    await cancelled;
+    expect(received).not.toContainEqual(expect.objectContaining({ type: "message_start", queuedPromptId: "queued" }));
+    expect(sessionManager.getBranch().filter(item => item.type === "custom" && item.customType === CHECKPOINT_ENTRY)).toHaveLength(1);
+    expect(sessionManager.getBranch().filter(item => item.type === "message" && item.message.role === "user")).toHaveLength(1);
+    await session.dispose();
+  });
+
+  it("preserves repair-only restrictions when a live instruction arrives", async () => {
+    let sink!: NativeTurnSink, finish!: () => void;
+    const guard = new AutoContinueTools([]), beginTask = vi.fn();
+    const { session, drivers, sessionManager } = fixture([async (_input, current) => {
+      sink = current;
+      await new Promise<void>((resolve) => { finish = resolve; });
+      return { status: "completed" };
+    }], undefined, { continuationTools: guard, beginTask });
+    Object.assign(drivers[0]!, { steer: vi.fn(async () => true) });
+    const run = session.prompt("Recover the original operation");
+    await vi.waitFor(() => expect(sink).toBeDefined());
+    // assertSafe intentionally permits recovery; it must not permit a fresh task reset.
+    const safe = vi.spyOn(guard, "assertSafe").mockImplementation(() => {});
+    const repair = vi.spyOn(guard, "repairOnly", "get").mockReturnValue(true);
+    const reset = vi.spyOn(guard, "reset");
+    await session.replaceQueue([{ id: "correction", text: "Keep the feet separate", images: [] }], []);
+    await expect(sink.steeringStarted!("correction")).rejects.toThrow("effects still need recovery");
+    expect(safe).toHaveBeenCalledOnce();
+    expect(reset).not.toHaveBeenCalled();
+    expect(beginTask).toHaveBeenCalledOnce();
+    expect(sessionManager.getBranch().filter((item) => item.type === "message" && item.message.role === "user")).toHaveLength(1);
+    session.clearQueue();
+    repair.mockRestore(); safe.mockRestore(); reset.mockRestore();
+    finish(); await run; await session.dispose();
+  });
+
+});
+
 describe.skip("coding agent sessions", () => {
   it("releases changed runtime settings after a busy run and resumes on the next one", async () => {
     let finish!: () => void;
@@ -623,27 +935,6 @@ describe.skip("coding agent sessions", () => {
     }
   });
 
-  function fixture(
-    scripts: Script[],
-    sessionManager = SessionManager.inMemory("/tmp/project-1"),
-    extra: Record<string, unknown> = {},
-  ) {
-    const drivers: ScriptedDriver[] = [];
-    const session = new NativeCodingSession({
-      runtime: "claude-code-cli",
-      model: "sonnet",
-      sessionManager,
-      toolNames: [],
-      requestApproval: async () => "deny",
-      createDriver: (resume) => {
-        const driver = new ScriptedDriver(scripts, resume);
-        drivers.push(driver);
-        return driver;
-      },
-      ...extra,
-    });
-    return { session, sessionManager, drivers };
-  }
 
   it("stops an idle CLI and resumes the same native session with the next message", async () => {
     const { session, drivers } = fixture(

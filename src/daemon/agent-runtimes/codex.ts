@@ -47,6 +47,10 @@ interface CodexTurn {
   imageError?: string;
   finishing?: boolean;
   interruption?: AgentInterruption;
+  controller: AbortController;
+  starting?: Promise<void>;
+  steering: Map<string, { signature: string; submission?: Promise<boolean>; admission?: Promise<void> }>;
+  admission?: Promise<void>;
 }
 
 /**
@@ -74,65 +78,78 @@ export class CodexDriver implements NativeDriver {
     this.#writeProfile = this.#profile;
   }
 
-  async runTurn(
+  runTurn(
     input: NativeTurnInput,
     sink: NativeTurnSink,
     signal: AbortSignal,
   ): Promise<NativeTurnOutcome> {
     if (this.#turn) throw new Error("A Codex turn is already running");
-    if (signal.aborted) return { status: "aborted" };
-    let server: CodexAppServer;
-    let threadId: string;
-    try {
-      server = await this.#start();
-      if (signal.aborted) return { status: "aborted" };
-      threadId = await this.#thread(server, sink);
-      if (this.#limits.length) sink.limits?.(this.#limits);
-      if (signal.aborted) return { status: "aborted" };
-    } catch (cause) {
-      if (cause instanceof NativeSessionExpiredError) throw cause;
-      if (signal.aborted) return { status: "aborted" };
-      return {
-        status: "failed",
-        error: runtimeStartupError(cause).message,
-      };
-    }
+    if (signal.aborted) return Promise.resolve({ status: "aborted" });
     this.#toolCalls.clear();
-    return new Promise<NativeTurnOutcome>((resolve) => {
-      const turn: CodexTurn = {
-        sink,
-        signal,
-        resolve,
-      };
+    return new Promise<NativeTurnOutcome>((resolve, reject) => {
+      // Keep startup-time steering attached to this same native turn.
+      const turn: CodexTurn = { sink, signal, resolve, controller: new AbortController(), steering: new Map() };
       this.#turn = turn;
-      server
-        .request<{ turn?: { id?: string } }>("turn/start", {
-          threadId,
-          input: codexInput(input),
-          ...(this.context.reasoningLevel
-            ? { effort: this.context.reasoningLevel }
-            : {}),
-          model: this.context.model,
-          permissions: input.readOnly ? this.#readProfile : this.#writeProfile,
-        })
-        .then(
-          (response) => {
-            turn.turnId ??= response.turn?.id;
-          },
-          (cause) => {
-            if (this.#turn !== turn) return;
-            this.#turn = undefined;
-            resolve({
-              status: "failed",
-              error: cause instanceof Error ? cause.message : String(cause),
-            });
-          },
-        );
+      turn.starting = (async () => {
+        try {
+          const server = await this.#start();
+          if (signal.aborted || turn.controller.signal.aborted) throw new Error("The Codex turn was cancelled");
+          const threadId = await this.#thread(server, sink);
+          if (this.#limits.length) sink.limits?.(this.#limits);
+          if (signal.aborted || turn.controller.signal.aborted) throw new Error("The Codex turn was cancelled");
+          const response = await server.request<{ turn?: { id?: string } }>("turn/start", {
+            threadId,
+            input: codexInput(input),
+            ...(this.context.reasoningLevel ? { effort: this.context.reasoningLevel } : {}),
+            model: this.context.model,
+            permissions: input.readOnly ? this.#readProfile : this.#writeProfile,
+          });
+          turn.turnId ??= response.turn?.id;
+        } catch (cause) {
+          if (this.#turn !== turn) return;
+          this.#turn = undefined;
+          turn.controller.abort();
+          if (cause instanceof NativeSessionExpiredError) reject(cause);
+          else resolve(signal.aborted ? { status: "aborted" } : { status: "failed", error: runtimeStartupError(cause).message });
+        }
+      })();
     });
+  }
+
+  async steer(id: string, input: NativeTurnInput): Promise<boolean> {
+    const turn = this.#turn;
+    if (!turn?.starting || turn.finishing || turn.signal.aborted || turn.controller.signal.aborted) return false;
+    const signature = JSON.stringify(input);
+    const existing = turn.steering.get(id);
+    if (existing) {
+      if (existing.signature !== signature) throw new Error("A steering message cannot change after submission");
+      return existing.submission!;
+    }
+    const command: { signature: string; submission?: Promise<boolean>; admission?: Promise<void> } = { signature };
+    turn.steering.set(id, command);
+    command.submission = (async () => {
+      await turn.starting;
+      if (this.#turn !== turn || turn.finishing || turn.controller.signal.aborted || !turn.turnId || !this.#lease || !this.#threadId) return false;
+      let response: { turnId?: string };
+      try {
+        response = await this.#lease.server.request<{ turnId?: string }>("turn/steer", {
+          threadId: this.#threadId, expectedTurnId: turn.turnId,
+          clientUserMessageId: id, input: codexInput(input),
+        });
+      } catch (cause) {
+        // Only the native precondition rejection proves that no message was submitted.
+        if (!command.admission && record(cause)?.rpcCode === -32600 && cause instanceof Error && cause.message === "no active turn to steer") return false;
+        throw cause;
+      }
+      if (response.turnId !== turn.turnId) throw new Error("Codex did not confirm the steering turn identity");
+      return true;
+    })();
+    return command.submission;
   }
 
   async interrupt(): Promise<void> {
     const turn = this.#turn;
+    turn?.controller.abort();
     if (!turn?.turnId || !this.#lease || !this.#threadId) return;
     await this.#lease.server
       .request(
@@ -148,7 +165,7 @@ export class CodexDriver implements NativeDriver {
     const threadId = await this.#thread(server, sink);
     sink.compaction("start");
     const outcome = await new Promise<NativeTurnOutcome>((resolve) => {
-      const turn: CodexTurn = { sink, signal, resolve };
+      const turn: CodexTurn = { sink, signal, resolve, controller: new AbortController(), steering: new Map() };
       this.#turn = turn;
       server.request("thread/compact/start", { threadId }).catch((cause) => {
         if (this.#turn !== turn) return;
@@ -206,6 +223,7 @@ export class CodexDriver implements NativeDriver {
             exit: (failure) => {
               this.#lease = undefined;
               const turn = this.#turn;
+              turn?.controller.abort();
               this.#turn = undefined;
               turn?.resolve(
                 turn.signal.aborted
@@ -356,6 +374,46 @@ export class CodexDriver implements NativeDriver {
     )
       return;
     if (typeof params.turnId === "string") turn.turnId ??= params.turnId;
+    const item = record(params.item);
+    if ((method === "item/started" || method === "item/completed") && item?.type === "userMessage" && typeof item.clientId === "string") {
+      const command = turn.steering.get(item.clientId);
+      if (command && !command.admission) {
+        const id = item.clientId;
+        const previous = turn.admission;
+        const oldTools = [...this.#toolCalls.values()].map(call => call.result);
+        command.admission = turn.admission = (async () => {
+          await previous;
+          await Promise.all(oldTools);
+          if (this.#turn !== turn || turn.controller.signal.aborted || !turn.sink.steeringStarted) throw new Error("The Codex steering checkpoint was cancelled");
+          await turn.sink.steeringStarted(id, turn.controller.signal);
+        })();
+        void command.admission.catch(async () => {
+          if (this.#turn !== turn) return;
+          turn.admission = undefined;
+          turn.error = "Codex could not confirm the steering checkpoint. Existing tool results are retained.";
+          turn.interruption = { kind: "blocked", source: "codex", code: "codex_steering_checkpoint", phase: "tools" };
+          await this.interrupt();
+          if (this.#turn === turn) await this.#completeTurn(turn, { status: "failed" });
+        });
+      }
+      if (command) return;
+    }
+    if (method === "turn/completed") {
+      if (turn.finishing) return;
+      turn.finishing = true;
+    }
+    // Codex can already be reasoning here. Its native tools cannot write the project;
+    // serialize project tools and displayed events behind the stable host checkpoint.
+    if (turn.admission) {
+      void turn.admission.then(() => {
+        if (this.#turn === turn) this.#projectNotification(turn, method, params);
+      }).catch(() => {});
+      return;
+    }
+    this.#projectNotification(turn, method, params);
+  }
+
+  #projectNotification(turn: CodexTurn, method: string, params: Record<string, unknown>): void {
     const sink = turn.sink;
     switch (method) {
       case "turn/started":
@@ -419,10 +477,7 @@ export class CodexDriver implements NativeDriver {
         return;
       }
       case "turn/completed": {
-        if (!turn.finishing) {
-          turn.finishing = true;
-          void this.#completeTurn(turn, record(params.turn) ?? {});
-        }
+        void this.#completeTurn(turn, record(params.turn) ?? {});
         return;
       }
       default:
@@ -435,6 +490,7 @@ export class CodexDriver implements NativeDriver {
     completed: Record<string, unknown>,
   ): Promise<void> {
     if (this.#turn !== turn) return;
+    turn.controller.abort();
     this.#turn = undefined;
     if (turn.turnId) {
       this.#completedTurns.add(turn.turnId);
@@ -446,7 +502,7 @@ export class CodexDriver implements NativeDriver {
     const terminalInterruption = turn.interruption ?? codexInterruption(record(completed.error));
     if (turn.signal.aborted)
       turn.resolve({ status: "aborted" });
-    else if (turn.imageError || terminalInterruption.kind === "blocked" || completed.error !== undefined && terminalInterruption.kind === "unknown")
+    else if (turn.imageError || terminalInterruption.kind === "blocked" || completed.error != null && terminalInterruption.kind === "unknown")
       turn.resolve({ status: "failed", error: turn.imageError || "Codex stopped because the request could not safely continue.", interruption: turn.imageError ? { kind: "blocked", source: "codex", code: "codex_image_delivery", phase: "result" } : terminalInterruption });
     else if ([...this.#toolCalls.values()].some(call => !call.settled))
       turn.resolve({ status: "failed", error: "Codex ended before a controlled tool result was confirmed. Recover or review the original operation.", interruption: { kind: "runtime_interrupted", source: "codex", code: "codex_pending_tool_result", phase: "tools", terminalReason: "runtime_interrupted" } });
@@ -619,7 +675,12 @@ export class CodexDriver implements NativeDriver {
   ): Promise<unknown> {
     const turn = this.#turn;
     if (method === "item/tool/call") {
-      if (!turn || turn.signal.aborted) throw new Error("No turn is running");
+      let admitted: Promise<void> | undefined;
+      while (turn?.admission && turn.admission !== admitted) {
+        admitted = turn.admission;
+        await admitted;
+      }
+      if (!turn || this.#turn !== turn || turn.signal.aborted || turn.controller.signal.aborted) throw new Error("No turn is running");
       if (
         params.threadId !== this.#threadId ||
         typeof params.turnId !== "string" ||
@@ -642,6 +703,7 @@ export class CodexDriver implements NativeDriver {
           );
         return previous.result;
       }
+      if (turn.finishing) throw new Error("The Codex turn has already ended");
       const call = { input, result: undefined as unknown as Promise<unknown>, settled: false };
       const result = (async () => {
         const name = this.#bridgeToolName(params.tool);
