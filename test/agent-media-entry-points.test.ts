@@ -8,6 +8,25 @@ import { createAgentTools } from "../src/daemon/agent-tools.js";
 import { ProjectManager } from "../src/daemon/projects.js";
 import { model3DJournal } from "../src/daemon/model3d-journal.js";
 import { ToolRunner } from "../src/daemon/tools.js";
+import { AssetLibrary } from "../src/daemon/asset-library.js";
+import { CanvasStore } from "../src/daemon/canvas-workspace.js";
+import { saveAgentCanvasMedia } from "../src/daemon/agent-canvas-media.js";
+import { referencePng } from "./video-reference-png-fixture.js";
+
+it("keeps a chat attachment's Canvas copy owned by the project without saving it globally", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-canvas-attachment-owner-"));
+  const library = new AssetLibrary(directory), projects = new ProjectManager(directory, library);
+  await Promise.all([library.load(), projects.load()]);
+  const project = await projects.create("References"), tools = new ToolRunner(directory, { generate: vi.fn() }, undefined, undefined, library);
+  const store = new CanvasStore(projects, library, tools), image = { mediaType: "image/png" as const, data: referencePng().toString("base64") };
+  try {
+    for (const node of ["first", "second"]) await saveAgentCanvasMedia(project.id, store, projects, tools, "generate-image",
+      { prompt: "Reference", imagePaths: ["attachment:fixture/image"], resolution: "1K", aspectRatio: "1:1" }, node, undefined, async () => image);
+    expect(library.list()).toHaveLength(1); expect(library.list()[0]).toMatchObject({ origin: "uploaded", saved: false, purpose: "reference" });
+    await library.removeProjectCopies(project.id, async () => []);
+    expect(library.list()).toEqual([]);
+  } finally { await store.close(); await tools.close(); await library.close(); await rm(directory, { recursive: true, force: true }); }
+});
 
 it("keeps direct generation inputs separate from recovery through Pi and direct dispatch", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-media-entry-"));

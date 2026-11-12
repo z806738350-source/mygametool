@@ -28,7 +28,7 @@ import { CheckedMediaSnapshotError, CheckedMediaSnapshotStore, type CheckedMedia
 import { mediaPreviewReadLimit, mediaSnapshotResponse } from "./media-snapshot-response.js";
 import { KUNPO_BASE_URL, KUNPO_DEFAULT_MODEL_REFS, KUNPO_MODEL_ROLES, kunpoModelOption, validateKunpoSelection, type KunpoModelRole } from "../shared/kunpo-models.js";
 import { imageModelsForProvider } from "./image-models.js";
-import { readFile, rm, lstat } from "node:fs/promises";
+import { readFile, rm, lstat, realpath } from "node:fs/promises";
 import { OnboardingStore } from "./onboarding.js";
 import type { UpdateOnboardingRequest } from "../shared/onboarding.js";
 import path from "node:path";
@@ -1335,8 +1335,9 @@ export function createApp(options: AppOptions = {}) {
     const effort = nativeEffort(model, reasoningLevel);
     const sessionManager = conversations.open(project, conversation);
     const authorizeAttachment = (reference: Parameters<typeof authorizeConversationAttachment>[1]) => authorizeConversationAttachment(sessionManager, reference);
-    const sessionImages = new SessionImages(sessionManager, path.join(piAgentDirectory, "request-image-previews"));
+    const sessionImages = new SessionImages(sessionManager, path.join(project.storagePath ?? path.dirname(project.workspacePath), "request-image-previews"));
     return agentRuntimes.createSession({
+      projectId: project.id,
       runtime,
       model: modelId,
       ...(effort ? { reasoningLevel: effort } : {}),
@@ -1573,7 +1574,7 @@ export function createApp(options: AppOptions = {}) {
       catch (cause) { if ((cause as NodeJS.ErrnoException).code === "ENOENT") continue; }
       reservationWorkspaces.push(path.join(directory, "workspace"));
     }
-    await restoreRecoverySpaceReservations(reservationWorkspaces).catch(err => app.log.warn({ err }, "Recovery space reservations require review; new recovery allocations are blocked"));
+    await restoreRecoverySpaceReservations(reservationWorkspaces, projects.list().filter(project => project.workspaceLocation === "external").map(project => project.workspacePath)).catch(err => app.log.warn({ err }, "Recovery space reservations require review; new recovery allocations are blocked"));
     await restoreLocalImageRecoverySpaces(() => projects.localImageRecoveryAnchors()).catch(err => app.log.warn({ err }, "Local image reservations require review; new recovery allocations are blocked"));
     await projectLifecycle.load();
     await Promise.all(projects.list().map(async (project) => { projectWrites.initialize(project.id, await readWorkspaceVersion(project)); }));
@@ -2381,16 +2382,39 @@ export function createApp(options: AppOptions = {}) {
           await stage("volume-retired");
           if (project.integration) await pluginIntegrations.forget(project.integration.pluginId, project.id);
           await stage("deleting-host");
-          const imageAnchor = await projects.getLocalImageRecoveryAnchor(project.id);
+          const imageAnchor = await projects.getLocalImageRecoveryAnchor(project.id, true);
           await releaseRetiredProjectRecoverySpace(project.workspacePath, {
             namespace: options.projectExecution?.namespace ?? "manual",
             projectId: project.id,
             sourceRetired: retirement?.deleted === true,
+            allowMissingWorkspace: project.workspaceLocation === "external",
             ...(imageAnchor ? { imageStorage: imageAnchor.storage } : {}),
           });
+          await agents.forgetProject(project.id);
+          await agentRuntimes.removeProjectHistory(project);
+          await tools.removeProject(project.id, {
+            workspacePath: project.workspacePath,
+            generationScopes: (await conversations.list(project)).map(conversation => conversation.id),
+          });
+          await mediaSnapshots.evictScope(`project:${project.id}`);
+          const privateRoots: string[] = [];
+          for (const name of ["blender-jobs", "image-recovery"]) {
+            const root = path.join(await realpath(dataDirectory), name);
+            const directory = await lstat(root).catch((cause: NodeJS.ErrnoException) => {
+              if (cause.code !== "ENOENT") throw cause;
+            });
+            if (!directory) continue;
+            if (!directory.isDirectory() || directory.isSymbolicLink())
+              throw new ProjectLifecycleError("Linked project recovery storage cannot be deleted with a project.");
+            privateRoots.push(root);
+          }
+          for (const root of privateRoots) await rm(path.join(root, project.id), { recursive: true, force: true });
+          for (const key of blenderWorkflows.keys()) if (key.startsWith(`${project.id}:`)) blenderWorkflows.delete(key);
           await conversationImages.removeProject(project.id);
+          await library.removeProjectCopies(project.id, async assetId =>
+            (await projects.referencesLibraryAsset(assetId, project.id)).map(owner => owner.id));
           await projects.delete(project.id);
-          agents.forgetProject(project.id); conversations.forget(project);
+          conversations.forget(project);
         });
       });
       return reply.code(204).send();
@@ -2480,7 +2504,7 @@ export function createApp(options: AppOptions = {}) {
     }
   });
 
-  app.post<{ Body: CreateLibraryImageRequest }>("/library/assets", {
+  for (const url of ["/library/assets", "/projects/:projectId/library-assets"]) app.post<{ Params: { projectId?: string }; Body: CreateLibraryImageRequest }>(url, {
     bodyLimit: 15 * 1024 * 1024,
     schema: {
       body: {
@@ -2503,6 +2527,8 @@ export function createApp(options: AppOptions = {}) {
       },
     },
   }, async (request, reply) => {
+    const projectId = request.params.projectId;
+    if (projectId && !projects.get(projectId)) return reply.code(404).send({ error: "Project not found" });
     if (!validBase64(request.body.image.data)) return reply.code(400).send({ error: "Image data is invalid" });
     const contents = Buffer.from(request.body.image.data, "base64");
     if (contents.length === 0 || contents.length > MAX_LIBRARY_IMAGE_BYTES) {
@@ -2516,14 +2542,15 @@ export function createApp(options: AppOptions = {}) {
         : request.body.image.mediaType === "image/jpeg" ? ".jpg"
           : ".webp";
       const name = `${path.parse(path.basename(request.body.name)).name || "image"}${extension}`;
-      return reply.code(201).send(await library.add(name, contents, { origin: "uploaded", purpose: request.body.purpose }));
+      return reply.code(201).send(await library.add(name, contents, { origin: "uploaded", purpose: request.body.purpose,
+        ...(projectId ? { saved: false, sourceKey: `project:${projectId}:upload:${randomUUID()}` } : {}) }));
     } catch (cause) {
       const error = cause instanceof Error ? cause.message : String(cause);
       return reply.code(cause instanceof AssetLibraryError ? cause.statusCode : 500).send({ error });
     }
   });
 
-  app.post<{ Querystring: { name: string; mediaType: string; duration?: string; purpose?: "asset" | "reference"; trimSource?: string; trimStart?: string; trimEnd?: string }; Body: Buffer }>("/library/assets/upload", {
+  for (const url of ["/library/assets/upload", "/projects/:projectId/library-assets/upload"]) app.post<{ Params: { projectId?: string }; Querystring: { name: string; mediaType: string; duration?: string; purpose?: "asset" | "reference"; trimSource?: string; trimStart?: string; trimEnd?: string }; Body: Buffer }>(url, {
     schema: {
       querystring: {
         type: "object",
@@ -2541,6 +2568,8 @@ export function createApp(options: AppOptions = {}) {
       },
     },
   }, async (request, reply) => {
+    const projectId = request.params.projectId;
+    if (projectId && !projects.get(projectId)) return reply.code(404).send({ error: "Project not found" });
     const mediaType = request.query.mediaType as LibraryUploadMediaType;
     const contents = request.body;
     if (!Buffer.isBuffer(contents) || contents.length === 0) return reply.code(400).send({ error: "File is empty" });
@@ -2564,7 +2593,8 @@ export function createApp(options: AppOptions = {}) {
       return reply.code(400).send({ error: "Invalid trim source" });
     }
     try {
-      return reply.code(201).send(await library.add(name, contents, { origin: "uploaded", purpose: request.query.purpose, ...(duration !== undefined ? { duration } : {}), ...(derivedFrom ? { derivedFrom } : {}) }));
+      return reply.code(201).send(await library.add(name, contents, { origin: "uploaded", purpose: request.query.purpose, ...(duration !== undefined ? { duration } : {}), ...(derivedFrom ? { derivedFrom } : {}),
+        ...(projectId ? { saved: false, sourceKey: `project:${projectId}:upload:${randomUUID()}` } : {}) }));
     } catch (cause) {
       const error = cause instanceof Error ? cause.message : String(cause);
       return reply.code(cause instanceof AssetLibraryError ? cause.statusCode : 500).send({ error });

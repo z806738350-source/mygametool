@@ -224,6 +224,7 @@ export class NativeCodingSession implements CodingSession {
   #readFolders: string[] = [];
   #checkpointFailure?: { cause: unknown };
   #disposed = false;
+  #disposal?: Promise<void>;
   #idleTimer?: ReturnType<typeof setTimeout>;
   /** An idle CLI still stopping; the next run waits so two processes never share a native session. */
   #idleStop?: Promise<void>;
@@ -594,17 +595,23 @@ export class NativeCodingSession implements CodingSession {
     return this.options.skills?.() ?? [];
   }
 
-  dispose(): void {
-    if (this.#disposed) return;
+  dispose(): Promise<void> {
+    if (this.#disposal) return this.#disposal;
     this.#disposed = true;
     this.#cancelOrigin ??= "host";
     clearTimeout(this.#idleTimer);
     this.#running?.controller.abort();
     // Keep generated config/Skills until the process has actually stopped.
-    void Promise.resolve(this.#driver.dispose())
-      .finally(() => this.options.dispose?.())
-      .catch(() => {});
+    const disposal = this.#disposal = (async () => {
+      await this.#driver.dispose();
+      await this.#idleStop;
+      await this.options.dispose?.();
+    })();
+    // Existing callers may only initiate disposal; project deletion awaits it.
+    // A failed cleanup remains retryable and never grants a successful deletion.
+    void disposal.catch(() => { if (this.#disposal === disposal) this.#disposal = undefined; });
     this.#listeners.clear();
+    return disposal;
   }
 
   /** Records the usage the agent reported for its context. */
@@ -861,7 +868,8 @@ export class NativeCodingSession implements CodingSession {
       model: this.options.model,
       reasoningLevel: this.options.nativeReasoningLevel,
     });
-    this.#idleStop = Promise.resolve(idle.dispose()).catch(() => {});
+    this.#idleStop = (async () => { await idle.dispose(); })();
+    void this.#idleStop.catch(() => {});
   }
 
   /** Cancels the idle stop and returns a stop still in progress, if any; awaiting nothing keeps the snapshot synchronous. */

@@ -647,8 +647,8 @@ const en = {
     noMatch: "No projects match your search",
     rename: "Rename project",
     confirmRemove:
-      "Remove “{{name}}” from OhMyGame? Project records and its managed execution copy will be permanently removed. Files in “{{path}}” and browser drafts are kept. Unreturned execution changes must be recovered first. Before deletion, the local isolated environment may start to verify execution volumes.",
-    confirmDelete: "Permanently delete “{{name}}”, including project files and its execution copy? Unreturned changes must be recovered first. Browser drafts remain. This cannot be undone. Before deletion, the local isolated environment may start to verify execution volumes.",
+      "Remove “{{name}}” from OhMyGame? Project records, recovery files, browser drafts and its managed execution copy will be permanently removed. Files in “{{path}}” are kept. Unreturned execution changes must be recovered first. Before deletion, the local isolated environment may start to verify execution volumes.",
+    confirmDelete: "Permanently delete “{{name}}”, including project files, recovery files, browser drafts and its execution copy? Unreturned changes must be recovered first. This cannot be undone. Before deletion, the local isolated environment may start to verify execution volumes.",
     drafts: {
       pending: "Save this project's canvas, document and table changes, and keep or clear its unsent message drafts before deleting it.",
       unknown: "This project's drafts could not be checked. Open the project and check saved changes before deleting it.",

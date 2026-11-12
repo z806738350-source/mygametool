@@ -194,6 +194,8 @@ export interface LocalImageRecoveryAnchor {
   workspace: string;
   storage: string;
   projectId: string;
+  /** Read-only inspection/deletion of a registered external workspace that no longer exists. */
+  allowMissingWorkspace?: boolean;
 }
 const capacityRoots = [
   "isolated-changes",
@@ -1200,7 +1202,7 @@ async function privateRoot(
   create: boolean,
 ): Promise<string> {
   const root = path.join(
-    path.dirname(await realpath(workspace)),
+    path.dirname(workspace),
     "isolated-space-reservations",
   );
   if (create) {
@@ -1221,6 +1223,28 @@ async function privateRoot(
   )
     throw refusal("reservation storage is not private");
   return root;
+}
+/** Missing external folders may be inspected, but must not resolve through a replacement link. */
+export async function recoveryWorkspacePath(workspace: string, allowMissing = false): Promise<string> {
+  try { return await realpath(workspace); }
+  catch (cause) {
+    if (!allowMissing || (cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
+    const canonical = path.resolve(workspace);
+    let parent = canonical;
+    while (true) {
+      try {
+        const info = await lstat(parent);
+        if (!info.isDirectory() || info.isSymbolicLink() || await realpath(parent) !== parent)
+          throw refusal("missing workspace ancestry changed; its recovery data needs inspection");
+        return canonical;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        const next = path.dirname(parent);
+        if (next === parent) throw error;
+        parent = next;
+      }
+    }
+  }
 }
 async function sync(directory: string): Promise<void> {
   const handle = await open(
@@ -1276,16 +1300,16 @@ function sameOwner(a: RecoverySpaceOwner, b: RecoverySpaceOwner): boolean {
     sameSourceIdentity(a, b)
   );
 }
-async function loadWorkspace(workspace: string): Promise<void> {
+async function loadWorkspace(workspace: string, allowMissing = false): Promise<void> {
   try {
-    await loadWorkspaceIntents(workspace);
+    await loadWorkspaceIntents(workspace, allowMissing);
   } catch (cause) {
     uncertainLedger = true;
     throw cause;
   }
 }
-async function loadWorkspaceIntents(workspace: string): Promise<void> {
-  const canonical = await realpath(workspace);
+async function loadWorkspaceIntents(workspace: string, allowMissing: boolean): Promise<void> {
+  const canonical = await recoveryWorkspacePath(workspace, allowMissing);
   let root: string;
   try {
     root = await privateRoot(canonical, false);
@@ -1305,6 +1329,8 @@ async function loadWorkspaceIntents(workspace: string): Promise<void> {
     throw cause;
   }
   const entries = await readdir(root);
+  // Device-bound promises cannot be verified against a missing source. Keep them protected.
+  if (entries.length && allowMissing) await realpath(canonical);
   if (entries.length > 16)
     throw refusal("unresolved reservation history is full");
   if (
@@ -1394,10 +1420,11 @@ async function loadWorkspaceIntents(workspace: string): Promise<void> {
 /** Startup reconciliation only: no operation or publication is replayed and no timeout releases an unknown intent. */
 export function restoreRecoverySpaceReservations(
   workspaces: readonly string[],
+  missingExternalWorkspaces: readonly string[] = [],
 ): Promise<void> {
   return serial(async () => {
     try {
-      for (const workspace of workspaces) await loadWorkspace(workspace);
+      for (const workspace of workspaces) await loadWorkspace(workspace, missingExternalWorkspaces.includes(workspace));
     } catch (cause) {
       uncertainLedger = true;
       throw cause;
@@ -2351,7 +2378,7 @@ async function validateLocalAnchor(
 ): Promise<LocalImageRecoveryAnchor> {
   if (!uuid.test(anchor.projectId))
     throw refusal("invalid local image project identity");
-  const workspace = await realpath(anchor.workspace),
+  const workspace = await recoveryWorkspacePath(anchor.workspace, !sameFilesystem && anchor.allowMissingWorkspace),
     storage = path.resolve(anchor.storage);
   if (
     path.basename(storage) !== anchor.projectId ||
@@ -2383,7 +2410,7 @@ async function validateLocalAnchor(
       parent = next;
     }
   }
-  return { workspace, storage, projectId: anchor.projectId };
+  return { workspace, storage, projectId: anchor.projectId, ...(anchor.allowMissingWorkspace ? { allowMissingWorkspace: true } : {}) };
 }
 
 async function localIntentRoot(
@@ -2621,20 +2648,22 @@ export function releaseRetiredProjectRecoverySpace(
     projectId: string;
     imageStorage?: string;
     sourceRetired: boolean;
+    allowMissingWorkspace?: boolean;
   },
 ): Promise<void> {
   return serial(async () => {
-    const canonical = await realpath(workspace);
+    const canonical = await recoveryWorkspacePath(workspace, context.allowMissingWorkspace);
     const { assertSourcePublicationSettled } =
       await import("./isolated-publication-journal.js");
     await assertSourcePublicationSettled(canonical);
-    await loadWorkspace(canonical);
+    await loadWorkspace(canonical, context.allowMissingWorkspace);
     if (context.imageStorage) {
       const anchor = await validateLocalAnchor(
         {
           workspace: canonical,
           storage: context.imageStorage,
           projectId: context.projectId,
+          allowMissingWorkspace: context.allowMissingWorkspace,
         },
         false,
       );

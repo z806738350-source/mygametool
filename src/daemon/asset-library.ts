@@ -21,6 +21,8 @@ interface StoredLibrary {
 }
 
 interface AddAssetOptions {
+  /** Project-only caches are not an explicit request to keep an independent Library asset. */
+  saved?: boolean;
   modelPreview?: Buffer;
   prompt?: string;
   model3d?: LibraryAsset["model3d"];
@@ -369,17 +371,61 @@ export class AssetLibrary {
   }
 
   async delete(id: string): Promise<void> {
+    await this.#mutate(() => this.#delete(id));
+  }
+
+  /** Associate before copying, so project deletion cannot remove a shared source mid-import. */
+  async associateProject(id: string, projectId: string): Promise<void> {
+    if (!/^[a-zA-Z0-9_-]{1,120}$/.test(projectId)) throw new AssetLibraryError("Invalid project asset owner", 400);
     await this.#mutate(async () => {
-      const asset = this.get(id);
-      if (!asset) throw new AssetLibraryError("Library asset not found", 404);
-      const sources = Object.fromEntries(Object.entries(this.#state.sources).filter(([, assetId]) => assetId !== id));
-      const state = { ...this.#state, assets: this.#state.assets.filter((candidate) => candidate.id !== id), sources };
-      await this.#write(state);
-      this.#state = state;
-      await rm(this.#contentPath(asset.id, asset.name), { force: true });
-      await rm(this.#previewPath(id), { force: true });
-      await this.#imageSources.delete(id);
+      if (!this.get(id)) throw new AssetLibraryError("Library asset not found", 404);
+      const key = `project:${projectId}:shared:${id}`;
+      if (this.#state.sources[key] === id) return;
+      const sources = { ...this.#state.sources, [key]: id };
+      await this.#write({ ...this.#state, sources }); this.#state.sources = sources;
     });
+  }
+
+  /** Drop only unsaved project copies; references in another project inherit the existing source association. */
+  async removeProjectCopies(projectId: string, referencedProjects: (assetId: string) => Promise<readonly string[]>): Promise<void> {
+    if (!/^[a-zA-Z0-9_-]{1,120}$/.test(projectId)) throw new AssetLibraryError("Invalid project asset owner", 400);
+    await this.#mutate(async () => {
+      const owned = (key: string) => key.startsWith(`project:${projectId}:`) || key.startsWith(`canvas:${projectId}:`);
+      const ids = new Set(Object.entries(this.#state.sources).filter(([key]) => owned(key)).map(([, id]) => id));
+      const releases: Array<{ id: string; references: readonly string[] }> = [];
+      // Finish every reference check before deleting; an unreadable project preserves all copies.
+      // ponytail: very large libraries scan project references per asset; batch those reads if deletion becomes slow.
+      for (const id of ids) if (this.get(id)?.saved === false) {
+        const owners = Object.entries(this.#state.sources).flatMap(([key, assetId]) => {
+          const match = /^(?:project|canvas):([^:]+):/.exec(key);
+          return assetId === id && match ? [match[1]!] : [];
+        });
+        const references = [...new Set([...owners, ...await referencedProjects(id)])].filter(id => id !== projectId);
+        if (references.some(id => !/^[a-zA-Z0-9_-]{1,120}$/.test(id))) throw new AssetLibraryError("Invalid project asset reference", 409);
+        releases.push({ id, references });
+      }
+      const sources = { ...this.#state.sources };
+      for (const { id, references } of releases) for (const owner of references) sources[`project:${owner}:shared:${id}`] = id;
+      await this.#write({ ...this.#state, sources }); this.#state.sources = sources;
+      for (const { id, references } of releases) if (!references.length) await this.#delete(id);
+      const retainedSources = Object.fromEntries(Object.entries(this.#state.sources).filter(([key]) => !owned(key)));
+      await this.#write({ ...this.#state, sources: retainedSources }); this.#state.sources = retainedSources;
+    });
+  }
+
+  async #delete(id: string): Promise<void> {
+    const asset = this.get(id);
+    if (!asset) throw new AssetLibraryError("Library asset not found", 404);
+    // Keep ownership metadata until file cleanup finishes, so an IO failure remains retryable.
+    await rm(this.#contentPath(asset.id, asset.name), { force: true });
+    await rm(this.#previewPath(id), { force: true });
+    await this.#imageSources.delete(id);
+    await this.#snapshots.evictScope(`library:${id}:original`);
+    await this.#snapshots.evictScope(`library:${id}:preview`);
+    const sources = Object.fromEntries(Object.entries(this.#state.sources).filter(([, assetId]) => assetId !== id));
+    const state = { ...this.#state, assets: this.#state.assets.filter((candidate) => candidate.id !== id), sources };
+    await this.#write(state);
+    this.#state = state;
   }
 
   #existing(sourceKey?: string): LibraryAsset | undefined {
@@ -433,7 +479,7 @@ export class AssetLibrary {
       createdAt: new Date().toISOString(),
       origin,
       purpose: options.purpose ?? "asset",
-      saved: origin !== "workspace",
+      saved: options.saved ?? origin !== "workspace",
       ...(media.contentType === FBX_MEDIA_TYPE ? { model3d: { triangles: 0, textured: false, rigged: false, animations: [], ...options.model3d, originalSha256,
         preview: { status: options.modelPreview ? "ready" as const : "unavailable" as const, materialApproximation: true as const,
           ...(options.modelPreview ? { sha256: createHash("sha256").update(options.modelPreview).digest("hex") } : {}) } } } : options.model3d ? { model3d: options.model3d } : {}),

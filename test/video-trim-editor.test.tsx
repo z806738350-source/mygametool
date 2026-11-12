@@ -321,5 +321,11 @@ it("uploads a new asset with derivation, leaving the original untouched", async 
     3.2,
     undefined,
     { assetId: "original", trim: { start: 2.2, end: 5.4 } },
+    undefined,
   );
+});
+
+it("keeps a Canvas video trim owned by its project", async () => {
+  await saveTrimmedVideo(new Blob(["trimmed"], { type: "video/mp4" }), { start: 1, end: 2 }, { name: "clip.mp4", projectId: "project-1" });
+  expect(uploadLibraryAsset).toHaveBeenCalledWith(expect.any(File), "video/mp4", 1, undefined, undefined, "project-1");
 });

@@ -7,7 +7,7 @@ import { readPluginIconImage, updatePluginDraftIcon, cancelToolJob, getCanvasMod
 import { exportProject } from "../src/renderer/api.js";
 import { answerApproval, getExecutionStorageOverview, getProjectExecutionStorage, recoverProjectExecutionStorage } from "../src/renderer/api.js";
 import { volumeMigrationReview, volumeMigrationConfirmation } from "./volume-migration-fixture.js";
-import { confirmProjectDeletion, projectDeletionConfirmation } from "../src/renderer/project-deletion.js";
+import { clearProjectBrowserData, confirmProjectDeletion, projectDeletionConfirmation } from "../src/renderer/project-deletion.js";
 import i18next from "i18next";
 import { t } from "../src/renderer/i18n.js";
 import { getNativeMediaUrl } from "../src/renderer/api.js";
@@ -155,6 +155,16 @@ describe("renderer event stream", () => {
       "/api/library/assets/upload?name=opening.mp4&mediaType=video%2Fmp4&duration=6.5",
       expect.objectContaining({ method: "POST", body: file, headers: expect.objectContaining({ "content-type": "application/octet-stream" }) }),
     );
+  });
+
+  it("routes project uploads and image references through project admission", async () => {
+    installWindow();
+    const fetchMock = vi.fn(async (_url: string, _options?: RequestInit) => Response.json({ id: "asset-1" }, { status: 201 })); vi.stubGlobal("fetch", fetchMock);
+    const file = new File(["video"], "clip.mp4", { type: "video/mp4" });
+    await uploadLibraryAsset(file, "video/mp4", undefined, "reference", undefined, "project-1");
+    await createLibraryImage({ name: "reference.png", image: { mediaType: "image/png", data: "aW1hZ2U=" } }, "project-1");
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/projects/project-1/library-assets/upload?name=clip.mp4&mediaType=video%2Fmp4&purpose=reference");
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/api/projects/project-1/library-assets");
   });
 
   it("sends the Library video a trimmed upload was cut from", async () => {
@@ -399,6 +409,28 @@ describe("renderer project API", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/projects/project-1", expect.objectContaining({ method: "DELETE" }));
   });
 
+  it("clears all browser data of a confirmed deleted project without touching another project or global preferences", () => {
+    installWindow();
+    const storage = emptyDraftStorage();
+    const removed = ["canvas-board:removed:board:version", "canvas-documents:removed", "canvas-tables:removed", "canvas-document-generations:removed", "canvas-table-generations:removed", "canvas-active:removed", "ohmygame:composer-draft:v1:removed:chat", "ohmygame:playable:project:removed", "ohmygame:playable:project:removed:seen", "ohmygame:playtest:request:removed", "ohmygame:playtest:ask:removed"];
+    for (const key of removed) storage.values.set(key, "old project data");
+    storage.values.set("canvas-board:kept:board", "keep");
+    storage.values.set("ohmygame:appearance", "dark");
+    clearProjectBrowserData("removed");
+    expect(removed.some(key => storage.values.has(key))).toBe(false);
+    expect([...storage.values.keys()].sort()).toEqual(["canvas-board:kept:board", "ohmygame:appearance"]);
+  });
+
+  it.each([200, 503])("preserves recovery drafts of projects missing from a listing (status=%s)", async status => {
+    installWindow();
+    const storage = emptyDraftStorage();
+    storage.values.set("canvas-active:kept", "board");
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json(status === 200 ? [] : { error: "Unavailable" }, { status })));
+    if (status === 200) expect(await listProjects()).toEqual([]);
+    else await expect(listProjects()).rejects.toThrow();
+    expect(storage.removeItem).not.toHaveBeenCalled();
+  });
+
   it.each(["en", "zh-CN"] as const)("localizes execution retirement preflight failures in %s without retrying deletion or requesting VM actions", async (language) => {
     installWindow();
     const storage = emptyDraftStorage();
@@ -449,8 +481,8 @@ describe("renderer project API", () => {
         await i18next.changeLanguage(language);
         const managed = projectDeletionConfirmation(project);
         for (const promise of language === "en"
-          ? ["Unreturned changes must be recovered first.", "Browser drafts remain.", "This cannot be undone.", "Before deletion, the local isolated environment may start to verify execution volumes."]
-          : ["尚未回传的修改必须先恢复", "浏览器草稿会保留", "此操作无法撤销", "删除前可能启动本地隔离环境，以核对执行卷。"])
+          ? ["Unreturned changes must be recovered first.", "browser drafts", "This cannot be undone.", "Before deletion, the local isolated environment may start to verify execution volumes."]
+          : ["尚未回传的修改必须先恢复", "浏览器草稿", "此操作无法撤销", "删除前可能启动本地隔离环境，以核对执行卷。"])
           expect(managed).toContain(promise);
         expect(confirmProjectDeletion(project)).toBe(false);
         expect(confirm).toHaveBeenLastCalledWith(managed);
@@ -458,8 +490,8 @@ describe("renderer project API", () => {
         const removal = projectDeletionConfirmation(external);
         expect(removal).toContain(project.workspacePath);
         for (const promise of language === "en"
-          ? ["will be permanently removed.", "browser drafts are kept.", "Unreturned execution changes must be recovered first.", "Before deletion, the local isolated environment may start to verify execution volumes."]
-          : ["将被永久移除", "中的文件和浏览器草稿会保留", "尚未回传的执行修改必须先恢复", "删除前可能启动本地隔离环境，以核对执行卷。"])
+          ? ["will be permanently removed.", "browser drafts", "Unreturned execution changes must be recovered first.", "Before deletion, the local isolated environment may start to verify execution volumes."]
+          : ["将被永久移除", "中的文件会保留", "尚未回传的执行修改必须先恢复", "删除前可能启动本地隔离环境，以核对执行卷。"])
           expect(removal).toContain(promise);
         expect(confirmProjectDeletion(external)).toBe(false);
         expect(confirm).toHaveBeenLastCalledWith(removal);
@@ -470,7 +502,7 @@ describe("renderer project API", () => {
     }
   });
 
-  it("rechecks only the deleted project's drafts after confirmation and keeps late drafts", async () => {
+  it("rechecks drafts before deletion and clears late drafts only after confirmed deletion", async () => {
     installWindow();
     const storage = emptyDraftStorage();
     storage.values.set("canvas-board:another-project:board", "unreadable");
@@ -487,8 +519,8 @@ describe("renderer project API", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     storage.values.delete("canvas-board:safe-delete:board");
     await deleteProject(project.id);
-    expect(storage.values.get("ohmygame:composer-draft:v1:safe-delete:late")).toContain("late draft");
-    expect(storage.removeItem).not.toHaveBeenCalled();
+    expect(storage.values.has("ohmygame:composer-draft:v1:safe-delete:late")).toBe(false);
+    expect(storage.values.has("canvas-board:another-project:board")).toBe(true);
   });
 
   it("blocks deletion before confirmation when this project's state is unknown or pending", () => {

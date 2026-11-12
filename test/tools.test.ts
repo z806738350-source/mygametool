@@ -1,7 +1,8 @@
 import { referenceWav } from "./audio-reference-fixture.js";
 import { TEST_GLB } from "./model3d-fixture.js";
 import { referencePng } from "./video-reference-png-fixture.js";
-import { access, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { temporaryTestDirectory } from "./temporary-test-directory.js";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -21,6 +22,136 @@ const apps: ReturnType<typeof createApp>[] = [];
 afterEach(async () => { await Promise.all(apps.splice(0).map((app) => app.close())); });
 
 describe("tool runner", () => {
+  it("removes project media after reopening while preserving other owners, shared results and Library assets", async () => {
+    const directory = await temporaryData(), runner = new ToolRunner(directory, fakeGenerator()); await runner.load();
+    const ownedId = "a".repeat(64), scope = "b".repeat(64), sharedId = "c".repeat(64);
+    const owned = await runner.run("generate-image", { prompt: "Owned" }, undefined, "project-a", { recoveryId: ownedId, agentCall: { scope, callId: "owned-call" } });
+    expect(owned).not.toHaveProperty("recoveryId");
+    const shared = await runner.run("generate-image", { prompt: "Shared" }, undefined, "project-a", { recoveryId: sharedId });
+    await runner.agentMedia.trackProject("project-b", sharedId);
+    const foreign = await runner.run("generate-image", { prompt: "Other" }, undefined, "project-b", { recoveryId: "other" });
+    const global = await runner.run("generate-image", { prompt: "Global" });
+    for (const kind of ["image-requests", "video-tasks", "model3d-tasks", "audio-attempts"]) {
+      const folder = path.join(directory, "tools", kind); await mkdir(folder, { recursive: true });
+      for (const id of [ownedId, sharedId, "other", "unattributed"]) await writeFile(path.join(folder, `${id}${kind === "image-requests" ? "-0" : ""}.json`), "retained");
+    }
+    const modelCache = path.join(directory, "tools/model3d-tasks", `${ownedId}.json.generate.result`); await writeFile(modelCache, "local-model");
+    const library = new AssetLibrary(directory); await library.load(); const asset = await library.add("keep.png", referencePng());
+    await runner.close();
+    const reopened = new ToolRunner(directory, fakeGenerator()); await reopened.load();
+    await reopened.removeProject("project-a");
+    await expect(access(path.join(directory, "tools/runs", owned.id))).rejects.toMatchObject({ code: "ENOENT" });
+    for (const run of [shared, foreign, global]) await expect(access(path.join(directory, "tools/runs", run.id))).resolves.toBeUndefined();
+    for (const kind of ["image-requests", "video-tasks", "model3d-tasks", "audio-attempts"]) {
+      const names = await readdir(path.join(directory, "tools", kind));
+      expect(names.some(name => name.startsWith(ownedId))).toBe(false);
+      expect(names.some(name => name.startsWith(sharedId))).toBe(true);
+      expect(names.some(name => name.startsWith("other"))).toBe(true);
+      expect(names.some(name => name.startsWith("unattributed"))).toBe(true);
+    }
+    await expect(access(path.join(directory, "tools/agent-media", scope))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(access(path.join(directory, "tools/agent-media/projects/project-a"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await library.content(asset.id)).asset.id).toBe(asset.id);
+    await reopened.removeProject("project-a"); await reopened.close();
+  });
+
+  it.each([
+    { toolId: "generate-image", input: { prompt: "Fixture" } },
+    { toolId: "image-to-3d", input: { operation: "text" as const, prompt: "Fixture", images: [] } },
+    { toolId: "generate-video", input: { prompt: "Fixture", model: TEST_VIDEO_MODEL } },
+    { toolId: "generate-speech", input: { text: "Fixture" } },
+  ])("finds the retained $toolId output after its final ownership update was interrupted", async ({ toolId, input }) => {
+    const directory = await temporaryData();
+    const runner = new ToolRunner(directory, fakeGenerator(),
+      { generate: async () => ({ bytes: TEST_GLB, mediaType: "model/gltf-binary", requestId: "fixture" }) },
+      { generate: async () => ({ bytes: Buffer.from("video"), mediaType: "video/mp4", requestId: "fixture" }) }, undefined, undefined,
+      { catalog: () => ({ models: [], providers: [] }), generate: async () => ({ bytes: referenceWav(), mediaType: "audio/wav", model: { provider: "fixture", id: "audio" } }) });
+    await runner.load();
+    const track = runner.agentMedia.trackProject.bind(runner.agentMedia);
+    vi.spyOn(runner.agentMedia, "trackProject").mockImplementation(async (projectId, recoveryId, update) => {
+      if (update?.runId) throw new Error("Ownership write interrupted");
+      await track(projectId, recoveryId, update);
+    });
+    await expect(runner.run(toolId, input, undefined, "interrupted-project", { recoveryId: "original-request" })).rejects.toThrow("Ownership write interrupted");
+    const runs = await readdir(path.join(directory, "tools/runs"));
+    expect(runs).toHaveLength(1);
+    const retained = JSON.parse(await readFile(path.join(directory, "tools/runs", runs[0]!, "run.json"), "utf8"));
+    await expect(access(path.join(directory, "tools/runs", runs[0]!, retained.files[0].name))).resolves.toBeUndefined();
+    expect((await runner.agentMedia.projectRecords("interrupted-project"))[0]?.runIds).toEqual([]);
+    await runner.close();
+    const reopened = new ToolRunner(directory, fakeGenerator()); await reopened.load();
+    await reopened.removeProject("interrupted-project");
+    expect(await readdir(path.join(directory, "tools/runs"))).toEqual([]);
+    await expect(access(path.join(directory, "tools/agent-media/projects/interrupted-project"))).rejects.toMatchObject({ code: "ENOENT" });
+    await reopened.close();
+  });
+
+  it("cleans legacy scopes and canvas ownership but retains journals referenced by another copied project", async () => {
+    const directory = await temporaryData(), runner = new ToolRunner(directory, fakeGenerator()); await runner.load();
+    const projectId = "legacy", generationScope = "chat", toolId = "generate-image";
+    const scope = createHash("sha256").update(JSON.stringify([projectId, generationScope, toolId])).digest("hex");
+    const recoveryId = "d".repeat(64);
+    await runner.agentMedia.adopt({ scope, callId: "old-call" }, recoveryId);
+    const folder = path.join(directory, "tools/image-requests"); await mkdir(folder, { recursive: true });
+    await writeFile(path.join(folder, `${recoveryId}-0.json`), "retained");
+    await writeFile(path.join(folder, "canvas-only-0.json"), "retained");
+    for (const id of [projectId, "copy"]) {
+      const canvas = path.join(directory, "projects", id, "workspace/canvas"); await mkdir(canvas, { recursive: true });
+      await writeFile(path.join(canvas, "jobs.json"), JSON.stringify([{ id: "job", recoveryId: "canvas-only" }]));
+    }
+    await runner.removeProject(projectId, { workspacePath: path.join(directory, "projects", projectId, "workspace"), generationScopes: [generationScope] });
+    await expect(access(path.join(folder, `${recoveryId}-0.json`))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(access(path.join(folder, "canvas-only-0.json"))).resolves.toBeUndefined();
+    await expect(access(path.join(directory, "tools/agent-media", scope))).rejects.toMatchObject({ code: "ENOENT" });
+    await runner.close();
+  });
+
+  it("deletes old project runs even after their jobs fall out of recent history", async () => {
+    const directory = await temporaryData(), runner = new ToolRunner(directory, fakeGenerator()); await runner.load();
+    for (let index = 0; index < 21; index++) runner.start("generate-image", { prompt: `Fixture ${index}` }, { context: { projectId: "history-project", nodeId: `node-${index}` } });
+    await vi.waitFor(() => expect(runner.isProjectBusy("history-project")).toBe(false));
+    expect(runner.jobs()).toHaveLength(20);
+    expect(await readdir(path.join(directory, "tools/runs"))).toHaveLength(21);
+    await runner.removeProject("history-project");
+    expect(await readdir(path.join(directory, "tools/runs"))).toEqual([]);
+    expect(runner.jobs()).toEqual([]); await runner.close();
+  });
+
+  it("preserves media if another owner's retained identity cannot be read safely", async () => {
+    const directory = await temporaryData(), runner = new ToolRunner(directory, fakeGenerator()); await runner.load();
+    const run = await runner.run("generate-image", { prompt: "Keep until ownership is known" }, undefined, "owner");
+    const foreign = path.join(directory, "tools/agent-media/projects/other"); await mkdir(foreign, { recursive: true });
+    await writeFile(path.join(foreign, "receipt.json"), "invalid");
+    await expect(runner.removeProject("owner")).rejects.toThrow();
+    await expect(access(path.join(directory, "tools/runs", run.id))).resolves.toBeUndefined();
+    await expect(runner.removeProject("../other")).rejects.toThrow("Invalid project");
+    await runner.close();
+  });
+
+  it("waits for a cancelled image submission's late journal write before removing project records", async () => {
+    const directory = await temporaryData(); let finish!: () => void, started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    const generator: ImageGenerator = { generate: async (input, signal) => {
+      await input.execution!.submitted("fixture", {}, async () => {
+        started(); await new Promise<void>(resolve => { finish = resolve; });
+        return { url: "https://example.com/retained.png", generation: { model: "fixture", protocol: "openai-images", parameters: {} } };
+      }, signal);
+      return { bytes: referencePng(), mediaType: "image/png" };
+    } };
+    const runner = new ToolRunner(directory, generator); await runner.load();
+    runner.start("generate-image", { prompt: "Fixture" }, { context: { projectId: "late-project", nodeId: "node" } }, false, "late-submission");
+    await ready;
+    let removed = false; const deletion = runner.removeProject("late-project").then(() => { removed = true; });
+    await vi.waitFor(() => expect(runner.jobs()[0]?.status).toBe("cancelled"));
+    expect(removed).toBe(false);
+    finish(); await deletion;
+    expect(runner.jobs()).toEqual([]);
+    expect(await readdir(path.join(directory, "tools/image-requests"))).toEqual([]);
+    await new Promise(resolve => setImmediate(resolve));
+    expect(await readdir(path.join(directory, "tools/image-requests"))).toEqual([]);
+    await runner.close();
+  });
+
   it.each([
     { toolId: "image-to-3d", operation: "text", options: { pose: "t-pose" }, key: "pose" },
     { toolId: "image-to-3d", operation: "image", options: { rigType: "quadruped" }, key: "rigType" },

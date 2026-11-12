@@ -1113,7 +1113,7 @@ export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled
     if (file.size > MAX_UPLOAD_BYTES) throw new Error(t("assetCanvas.uploadSize"));
     const kind = mediaType.startsWith("video/") ? "video" : mediaType.startsWith("audio/") ? "audio" : undefined;
     const duration = kind ? await readMediaFileDuration(file, kind) : undefined;
-    const uploaded = await uploadLibraryAsset(file, mediaType, duration);
+    const uploaded = await uploadLibraryAsset(file, mediaType, duration, undefined, undefined, projectId);
     const asset: LibraryAsset = { ...uploaded, assetId: uploaded.id, path: uploaded.name };
     setLibraryAssets((current) => [asset, ...current]);
     return asset;
@@ -1358,7 +1358,7 @@ export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled
   async function saveTrimmedVideoNode(viewed: ViewableCanvasAsset, name: string, video: Blob, trim: VideoTrim): Promise<void> {
     // A canvas copy of a Library video records the Library original.
     const libraryAssetId = localAssets.find((asset) => asset.id === viewed.assetId)?.libraryAssetId ?? viewed.assetId;
-    const saved = await saveTrimmedVideo(video, trim, { name, ...(globalAssets.some((asset) => asset.id === libraryAssetId) ? { libraryAssetId } : {}) });
+    const saved = await saveTrimmedVideo(video, trim, { name, ...(globalAssets.some((asset) => asset.id === libraryAssetId) ? { libraryAssetId } : {}), projectId });
     setLibraryAssets((current) => [{ ...saved, assetId: saved.id, path: saved.name }, ...current]);
     const source = nodesRef.current.find((node) => node.id === viewed.nodeId);
     const position = { x: (source?.position.x ?? 0) + (source?.measured?.width ?? 440) + 60, y: source?.position.y ?? 0 };
@@ -1468,7 +1468,7 @@ export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled
     setGenerationError(undefined);
     try {
       const images = await Promise.all(files.map(readUploadImage));
-      const assets = await Promise.all(images.map(({ name, image }) => createLibraryImage({ name, image, purpose: "reference" })));
+      const assets = await Promise.all(images.map(({ name, image }) => createLibraryImage({ name, image, purpose: "reference" }, projectId)));
       attachImageReferences(node, assets, replaceAt);
       setLibraryAssets(await loadLibraryAssets());
     } catch (error) {
@@ -1502,7 +1502,7 @@ export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled
     try {
       const uploads = await Promise.all(files.map(prepareVideoReferenceFile));
       for (const upload of uploads) {
-        const asset = await uploadLibraryAsset(upload.file, upload.mediaType, undefined, "reference");
+        const asset = await uploadLibraryAsset(upload.file, upload.mediaType, undefined, "reference", undefined, projectId);
         setLibraryAssets((current) => [{ ...asset, assetId: asset.id, path: asset.name }, ...current.filter((candidate) => candidate.id !== asset.id)]);
         setNodes((current) => current.map((candidate) => candidate.id === node.id && candidate.type === "video"
           ? { ...candidate, data: compatibleVideoDraft({ ...candidate.data, references: [...(candidate.data.references ?? []), { type: "library", assetId: asset.id }] }, videoModels) }
@@ -1527,7 +1527,7 @@ export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled
       const bytes = new Uint8Array(await blob.arrayBuffer());
       const inspected = await inspectAudioReference(bytes, source instanceof File ? undefined : mediaType);
       const digest = await audioReferenceDigest(bytes);
-      const asset = source instanceof File ? await uploadLibraryAsset(new File([source], source.name.replace(/\.(mp3|wav)$/i, inspected.mediaType === "audio/wav" ? ".wav" : ".mp3"), { type: inspected.mediaType, lastModified: source.lastModified }), inspected.mediaType, inspected.duration, "reference") : source;
+      const asset = source instanceof File ? await uploadLibraryAsset(new File([source], source.name.replace(/\.(mp3|wav)$/i, inspected.mediaType === "audio/wav" ? ".wav" : ".mp3"), { type: inspected.mediaType, lastModified: source.lastModified }), inspected.mediaType, inspected.duration, "reference", undefined, projectId) : source;
       setLibraryAssets((current) => [{ ...asset, assetId: asset.id, path: asset.name }, ...current.filter((candidate) => candidate.id !== asset.id)]);
       setNodes((current) => current.map((candidate) => candidate.id === node.id && candidate.type === "speech"
         ? { ...candidate, data: { ...candidate.data, referenceAssetId: asset.id, referenceSha256: digest, voiceSourceNodeId: sourceNodeId, voiceId: undefined } } : candidate));

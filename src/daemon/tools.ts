@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readFile, rename, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, rename, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import {
   IMAGE_ASPECT_RATIOS,
@@ -39,9 +39,9 @@ import { isMeshyModelReference, MESHY_DISABLED_MESSAGE } from "../shared/disable
 import { sniffImageType } from "./image-format.js";
 import { decodedReferenceIdentity } from "./image-working-assets.js";
 import { Model3DGenerationError, type Generated3DModel, type Model3DAnimationAction, type Model3DGenerator } from "./model3d.js";
-import { hasAttempted3DTask, hasSaved3DTask, model3DJournal } from "./model3d-journal.js";
-import { hasAttemptedVideoTask, hasSavedVideoTask, videoTaskJournal } from "./video-task-journal.js";
-import { hasSavedImageResult, hasSavedImageSlot, imageRequestJournal } from "./image-request-journal.js";
+import { hasAttempted3DTask, hasSaved3DTask, model3DJournal, waitFor3DTasks } from "./model3d-journal.js";
+import { hasAttemptedVideoTask, hasSavedVideoTask, videoTaskJournal, waitForVideoTasks } from "./video-task-journal.js";
+import { hasSavedImageResult, hasSavedImageSlot, imageRequestJournal, waitForImageRequests } from "./image-request-journal.js";
 import { inspectModel3D } from "./model3d-inspect.js";
 import { FBX_MEDIA_TYPE, createFbxPreview } from "./fbx-preview.js";
 import type { Model3DExecution } from "./model3d.js";
@@ -104,6 +104,7 @@ interface ToolJobRecord extends ToolJob {
 }
 
 interface StoredToolRun extends ToolRun {
+  recoveryId?: string;
   batchRecoveryId?: string;
   version: 1;
   canvasContext?: ToolJobContext;
@@ -144,7 +145,7 @@ export class ToolRunner {
   readonly #directRuns = new Map<string, number>();
 
   constructor(
-    dataDirectory: string,
+    private readonly dataDirectory: string,
     private readonly imageGenerator: ImageGenerator,
     private readonly model3DGenerator?: Model3DGenerator,
     private readonly videoGenerator?: VideoGenerator,
@@ -326,6 +327,7 @@ export class ToolRunner {
         job.controller.abort();
       }
     }
+    await Promise.allSettled([...this.#pending.values()]);
     if (changed) await this.#saveJobsSafely();
     else await this.#jobWrites.catch((cause) => console.error("Could not save generation history", cause));
   }
@@ -340,7 +342,7 @@ export class ToolRunner {
         }
         await this.#saveJobs();
         job.model = selectedModel(job.toolId, job.input!);
-        return this.#runPrepared(job.toolId, job.input!, job.controller.signal, job.recoveryId, job.imageRecoveryOnly, job.videoRecoveryOnly, job.model3DRecoveryOnly, async (summary) => {
+        return this.#projectGeneration(job.context?.projectId, job.recoveryId, () => this.#runPrepared(job.toolId, job.input!, job.controller.signal, job.recoveryId, job.imageRecoveryOnly, job.videoRecoveryOnly, job.model3DRecoveryOnly, async (summary) => {
           if (!validVideoReferencePreparation(summary)) throw new ToolRunError("Invalid video reference preparation summary", 400);
           job.videoReferencePreparation = summary;
           await this.#saveJobsSafely();
@@ -348,7 +350,7 @@ export class ToolRunner {
           job.controller.signal.throwIfAborted();
           job.videoSubmission = "attempted";
           await this.#saveJobs();
-        }, undefined, job.run?.id);
+        }, job.context, job.run?.id));
       });
       if (job.run.files.length && job.run.files.every((file) => file.assetId)) {
         await this.removeRun(job.run.id).catch(() => {});
@@ -421,11 +423,11 @@ export class ToolRunner {
           if (options.model3DRecoveryOnly && !await this.hasSavedModel3DTask(recoveryId)) throw new ToolRunError("No saved 3D task is available. Recovery never submits a new generation.", 409);
           if (options.audioRecoveryOnly) throw new ToolRunError("No completed local audio is available. Check the provider before authorizing a new paid request.", 409, "unknown");
           executing = true;
-          return this.#runPrepared(toolId, prepared, signal, recoveryId, options.imageRecoveryOnly, options.videoRecoveryOnly, options.model3DRecoveryOnly);
+          return this.#projectGeneration(projectId, recoveryId, () => this.#runPrepared(toolId, prepared!, signal, recoveryId, options.imageRecoveryOnly, options.videoRecoveryOnly, options.model3DRecoveryOnly));
         };
         if (!options.agentCall) return execute();
         const recovering = Boolean(options.imageRecoveryOnly || options.videoRecoveryOnly || options.model3DRecoveryOnly || options.audioRecoveryOnly);
-        return this.agentMedia.use(options.agentCall, recoveryId, recovering, confirmNew, async (receipt, save) => {
+        return this.agentMedia.use({ ...options.agentCall, ...(projectId ? { projectId } : {}) }, recoveryId, recovering, confirmNew, async (receipt, save) => {
           if (receipt.runId) {
             const stored = await this.#readRun(receipt.runId);
             if (!stored || stored.toolId !== toolId) throw new ToolRunError("The retained media is unavailable. Check the original result before authorizing another generation.", 409, "unknown");
@@ -530,12 +532,25 @@ export class ToolRunner {
     const { recoveryId = randomUUID(), projectId } = options;
     if (projectId) this.#directRuns.set(projectId, (this.#directRuns.get(projectId) ?? 0) + 1);
     try {
-      return await this.#withGenerationLog(toolId, () => input, signal, projectId, () => this.#runPrepared(toolId, input, signal, recoveryId, options.imageRecoveryOnly, options.videoRecoveryOnly, options.model3DRecoveryOnly, referencePrepared, submissionStarted, options.canvasContext));
+      return await this.#withGenerationLog(toolId, () => input, signal, projectId, () => this.#projectGeneration(projectId, recoveryId, () => this.#runPrepared(toolId, input, signal, recoveryId, options.imageRecoveryOnly, options.videoRecoveryOnly, options.model3DRecoveryOnly, referencePrepared, submissionStarted, options.canvasContext)));
     } finally {
       if (projectId) {
         const remaining = (this.#directRuns.get(projectId) ?? 1) - 1;
         if (remaining) this.#directRuns.set(projectId, remaining); else this.#directRuns.delete(projectId);
       }
+    }
+  }
+
+  async #projectGeneration(projectId: string | undefined, recoveryId: string, execute: () => Promise<ToolRun>): Promise<ToolRun> {
+    if (!projectId) return execute();
+    await this.agentMedia.trackProject(projectId, recoveryId);
+    try {
+      const run = await execute();
+      await this.agentMedia.trackProject(projectId, recoveryId, { runId: run.id });
+      return run;
+    } catch (cause) {
+      if (cause instanceof PartialImageRunError) await this.agentMedia.trackProject(projectId, recoveryId, { runId: cause.run.id });
+      throw cause;
     }
   }
 
@@ -583,15 +598,15 @@ export class ToolRunner {
     if (!model3DRecoveryOnly) await this.assertMediaInputOptions(toolId, input);
     if (toolId === "image-to-3d") {
       assertOnlyKeys(input, ["images", "model", "targetPolycount", "texture", "pbr", "operation", "prompt", "sourceAssetId", "options"]);
-      return this.#run3D(input as Run3DToolRequest, signal, await model3DJournal(path.join(this.#runsDirectory, "../model3d-tasks"), recoveryId, model3DRecoveryOnly), canvasContext).catch(model3DToolError);
+      return this.#run3D(input as Run3DToolRequest, signal, recoveryId, await model3DJournal(path.join(this.#runsDirectory, "../model3d-tasks"), recoveryId, model3DRecoveryOnly), canvasContext).catch(model3DToolError);
     }
     if (toolId === "animate-3d") {
       assertOnlyKeys(input, ["assetId", "actionIds", "heightMeters", "model", "options"]);
-      return this.#runAnimate3D(input as RunAnimate3DToolRequest, signal, await model3DJournal(path.join(this.#runsDirectory, "../model3d-tasks"), recoveryId, model3DRecoveryOnly), canvasContext).catch(model3DToolError);
+      return this.#runAnimate3D(input as RunAnimate3DToolRequest, signal, recoveryId, await model3DJournal(path.join(this.#runsDirectory, "../model3d-tasks"), recoveryId, model3DRecoveryOnly), canvasContext).catch(model3DToolError);
     }
     if (toolId === "generate-video") {
       assertOnlyKeys(input, ["prompt", "model", "references", "duration", "aspectRatio", "resolution", "referenceMode"]);
-      return this.#runVideo(input as RunVideoToolRequest, signal, await videoTaskJournal(path.join(this.#runsDirectory, "../video-tasks"), recoveryId, videoRecoveryOnly, referencePrepared, submissionStarted), canvasContext);
+      return this.#runVideo(input as RunVideoToolRequest, signal, recoveryId, await videoTaskJournal(path.join(this.#runsDirectory, "../video-tasks"), recoveryId, videoRecoveryOnly, referencePrepared, submissionStarted), canvasContext);
     }
     if (toolId === "generate-speech") {
       assertOnlyKeys(input, ["text", "model", "referenceAssetId", "referenceSha256", "voiceDesign", "voiceDescription", "language", "style", "speed", "output"]);
@@ -688,6 +703,7 @@ export class ToolRunner {
       const generation = retained.find(slot => slot.image?.generation)?.image?.generation;
       const run: StoredToolRun = {
         version: 1,
+        recoveryId,
         canvasContext,
         ...(outputs > 1 ? { batchRecoveryId: recoveryId } : {}),
         id,
@@ -725,7 +741,7 @@ export class ToolRunner {
       : generator?.resolveModel ? generator.resolveModel(model) : resolveModel3D(model);
   }
 
-  async #run3D(input: Run3DToolRequest, signal: AbortSignal | undefined, execution: Model3DExecution, canvasContext?: ToolJobContext): Promise<ToolRun> {
+  async #run3D(input: Run3DToolRequest, signal: AbortSignal | undefined, recoveryId: string, execution: Model3DExecution, canvasContext?: ToolJobContext): Promise<ToolRun> {
     const operation = input.operation ?? "image", images = input.images;
     if (!["image", "text", "retexture", "remesh"].includes(operation)) throw new ToolRunError("Unknown 3D operation", 400);
     if (input.prompt !== undefined && typeof input.prompt !== "string") throw new ToolRunError("3D prompt must be a string", 400);
@@ -760,7 +776,7 @@ export class ToolRunner {
       source = content.bytes; sourceMetadata = content.metadata;
     } else if (input.sourceAssetId !== undefined) throw new ToolRunError("Generation does not accept a source model", 400);
     const primaryImage = images[0];
-    return this.#storeModelRun("image-to-3d", signal, async () => {
+    return this.#storeModelRun("image-to-3d", signal, recoveryId, async () => {
       const { sourceAssetId: _, ...generationInput } = input;
       const result = await generator.generate({ ...generationInput, options, model: { provider: model.provider, id: model.id }, source, execution }, signal);
       return { ...result, metadata: { ...(sourceMetadata?.forwardAxis ? { forwardAxis: sourceMetadata.forwardAxis } : {}), ...result.metadata, provider: model.provider, operation } };
@@ -785,7 +801,7 @@ export class ToolRunner {
     return { bytes, metadata };
   }
 
-  async #runAnimate3D(input: RunAnimate3DToolRequest, signal: AbortSignal | undefined, execution: Model3DExecution, canvasContext?: ToolJobContext): Promise<ToolRun> {
+  async #runAnimate3D(input: RunAnimate3DToolRequest, signal: AbortSignal | undefined, recoveryId: string, execution: Model3DExecution, canvasContext?: ToolJobContext): Promise<ToolRun> {
     const { actionIds, heightMeters } = input;
     if (typeof input.assetId !== "string" || !input.assetId) throw new ToolRunError("Choose a 3D model to animate", 400);
     if (!Array.isArray(actionIds) || actionIds.length < 1 || actionIds.length > MAX_ANIMATION_ACTIONS
@@ -803,7 +819,7 @@ export class ToolRunner {
     if (!connection) throw new ToolRunError("Choose an available animation provider", 400);
     if (isMeshyModelReference(connection)) throw new ToolRunError(MESHY_DISABLED_MESSAGE, 410, undefined, undefined, undefined, true);
     validateOperationOptions(input.options, "animate", connection.protocol ?? "tripo");
-    return this.#storeModelRun("animate-3d", signal, async () => {
+    return this.#storeModelRun("animate-3d", signal, recoveryId, async () => {
       const result = await generator.animate!({ model: source.bytes, actionIds, providerModel: input.model, options: input.options, forwardAxis: source.metadata.forwardAxis, execution, ...(heightMeters !== undefined ? { heightMeters } : {}) }, signal);
       return { ...result, metadata: { ...(source.metadata.forwardAxis ? { forwardAxis: source.metadata.forwardAxis } : {}), ...result.metadata, provider: connection.provider, operation: "animate" } };
     }, undefined, input.model, canvasContext);
@@ -814,6 +830,7 @@ export class ToolRunner {
   async #storeModelRun(
     toolId: "image-to-3d" | "animate-3d",
     signal: AbortSignal | undefined,
+    recoveryId: string,
     produce: () => Promise<Generated3DModel>,
     preview?: { fileName: string; mediaType: "image/png" | "image/jpeg"; bytes: Buffer },
     model?: ModelRef,
@@ -848,6 +865,7 @@ export class ToolRunner {
       }
       const run: StoredToolRun = {
         version: 1,
+        recoveryId,
         canvasContext,
         id,
         toolId,
@@ -877,7 +895,7 @@ export class ToolRunner {
     }
   }
 
-  async #runVideo(input: RunVideoToolRequest, signal: AbortSignal | undefined, execution?: VideoExecution, canvasContext?: ToolJobContext): Promise<ToolRun> {
+  async #runVideo(input: RunVideoToolRequest, signal: AbortSignal | undefined, recoveryId: string, execution?: VideoExecution, canvasContext?: ToolJobContext): Promise<ToolRun> {
     if (!this.videoGenerator) throw new ToolRunError("Video generation is not configured", 503);
     const prompt = input.prompt?.trim();
     if (!prompt) throw new ToolRunError("Prompt must not be empty", 400);
@@ -912,6 +930,7 @@ export class ToolRunner {
       }
       const run: StoredToolRun = {
         version: 1,
+        recoveryId,
         canvasContext,
         id,
         toolId: "generate-video",
@@ -993,6 +1012,7 @@ export class ToolRunner {
       }
       const run: StoredToolRun = {
         version: 1,
+        recoveryId,
         canvasContext,
         id,
         toolId,
@@ -1095,6 +1115,72 @@ export class ToolRunner {
     await rm(path.join(this.#runsDirectory, runId), { recursive: true, force: true });
   }
 
+  /** Called after project admission is closed and Agent/Canvas work has settled. */
+  async removeProject(projectId: string, options: { workspacePath?: string; generationScopes?: readonly string[] } = {}): Promise<void> {
+    if (!/^[a-zA-Z0-9_-]{1,120}$/.test(projectId)) throw new ToolRunError("Invalid project media owner", 400);
+    for (const job of this.#jobs.values()) if (job.context?.projectId === projectId && job.status === "running") this.cancelJob(job.id);
+    await Promise.allSettled([...this.#pending].filter(([id]) => this.#jobs.get(id)?.context?.projectId === projectId).map(([, pending]) => pending));
+    if (this.isProjectBusy(projectId)) throw new ToolRunError("Wait for project media work to finish before deleting its records", 409);
+    const recoveryIds = new Set<string>(), runIds = new Set<string>();
+    const collect = (job: { recoveryId?: string; id?: string; run?: { id?: string } }) => {
+      const recoveryId = job.recoveryId ?? job.id;
+      if (recoveryId && /^[a-zA-Z0-9_-]{1,120}$/.test(recoveryId)) recoveryIds.add(recoveryId);
+      if (job.run?.id && isRunId(job.run.id)) runIds.add(job.run.id);
+    };
+    for (const job of this.#jobs.values()) if (job.context?.projectId === projectId) collect(job);
+    if (options.workspacePath) for (const job of await projectCanvasJobs(options.workspacePath)) collect(job);
+    const records = await this.agentMedia.projectRecords(projectId);
+    const scopes = new Set(records.flatMap(record => record.scopes));
+    for (const generationScope of [projectId, ...options.generationScopes ?? []]) for (const toolId of TOOL_IDS)
+      scopes.add(createHash("sha256").update(JSON.stringify([projectId, generationScope, toolId])).digest("hex"));
+    for (const scope of scopes) records.push(...await this.agentMedia.scopeRecords(scope));
+    this.agentMedia.assertScopesIdle([...scopes]);
+    for (const record of records) { recoveryIds.add(record.recoveryId); for (const runId of record.runIds) runIds.add(runId); }
+    const runRecoveries = new Map<string, string>();
+    for (const name of await ordinaryDirectoryNames(this.#runsDirectory)) {
+      if (!isRunId(name)) continue;
+      const run = await this.#readRun(name);
+      const recoveryId = run?.recoveryId ?? run?.batchRecoveryId;
+      if (recoveryId) runRecoveries.set(name, recoveryId);
+      // The output and its original request identity commit together, even if the later owner update was interrupted.
+      if (run?.canvasContext?.projectId === projectId || recoveryId && recoveryIds.has(recoveryId)) {
+        runIds.add(name); if (recoveryId) recoveryIds.add(recoveryId);
+      }
+    }
+    // Persist legacy ownership before removing anything so a failed cleanup can be retried.
+    for (const recoveryId of recoveryIds) await this.agentMedia.trackProject(projectId, recoveryId);
+    for (const runId of runIds) await this.agentMedia.trackProject(projectId, runId, { runId });
+    const sharedRecovery = new Set<string>(), sharedRuns = new Set<string>();
+    for (const record of await this.agentMedia.otherProjectRecords(projectId)) {
+      sharedRecovery.add(record.recoveryId); for (const runId of record.runIds) sharedRuns.add(runId);
+      for (const scope of record.scopes) scopes.delete(scope);
+    }
+    const shared = (job: { recoveryId?: string; id?: string; run?: { id?: string } }) => {
+      if (job.recoveryId ?? job.id) sharedRecovery.add((job.recoveryId ?? job.id)!);
+      if (job.run?.id) sharedRuns.add(job.run.id);
+    };
+    for (const job of this.#jobs.values()) if (job.context?.projectId !== projectId) shared(job);
+    const projects = path.join(this.dataDirectory, "projects");
+    for (const id of await ordinaryDirectoryNames(projects)) if (id !== projectId && /^[a-zA-Z0-9_-]{1,120}$/.test(id))
+      for (const job of await projectCanvasJobs(path.join(projects, id, "workspace"))) shared(job);
+    for (const [runId, recoveryId] of runRecoveries) if (sharedRecovery.has(recoveryId)) sharedRuns.add(runId);
+    for (const id of sharedRecovery) recoveryIds.delete(id);
+    for (const id of sharedRuns) runIds.delete(id);
+    const root = path.dirname(this.#runsDirectory);
+    await Promise.all([waitForImageRequests(path.join(root, "image-requests"), recoveryIds), waitForVideoTasks(path.join(root, "video-tasks"), recoveryIds), waitFor3DTasks(path.join(root, "model3d-tasks"), recoveryIds)]);
+    for (const runId of runIds) await this.removeRun(runId);
+    for (const kind of ["image-requests", "video-tasks", "model3d-tasks", "audio-attempts"]) {
+      const directory = path.join(root, kind);
+      for (const name of await ordinaryDirectoryNames(directory)) {
+        const match = (kind === "image-requests" ? /^([a-zA-Z0-9_-]{1,120})-[0-7]\.json(?:\.|$)/ : /^([a-zA-Z0-9_-]{1,120})\.json(?:\.|$)/).exec(name);
+        if (match && recoveryIds.has(match[1]!)) await rm(path.join(directory, name), { recursive: true, force: true });
+      }
+    }
+    for (const [id, job] of this.#jobs) if (job.context?.projectId === projectId) this.#jobs.delete(id);
+    await this.#saveJobs();
+    await this.agentMedia.removeProject(projectId, [...scopes]);
+  }
+
   async #readRun(runId: string): Promise<StoredToolRun | undefined> {
     try {
       const value = JSON.parse(await readFile(path.join(this.#runsDirectory, runId, "run.json"), "utf8")) as Partial<StoredToolRun>;
@@ -1107,6 +1193,28 @@ export class ToolRunner {
       throw error;
     }
   }
+}
+
+async function ordinaryDirectoryNames(directory: string): Promise<string[]> {
+  try {
+    if (!(await lstat(directory)).isDirectory()) throw new Error("Project media storage must be an ordinary directory");
+    return await readdir(directory);
+  } catch (cause) { if ((cause as NodeJS.ErrnoException).code === "ENOENT") return []; throw cause; }
+}
+
+async function projectCanvasJobs(workspace: string): Promise<Array<{ id?: string; recoveryId?: string; run?: { id?: string } }>> {
+  try { if (!(await lstat(workspace)).isDirectory()) throw new Error("Canvas media ownership requires an ordinary workspace"); }
+  catch (cause) { if ((cause as NodeJS.ErrnoException).code === "ENOENT") return []; throw cause; }
+  const directory = path.join(workspace, "canvas");
+  if (!(await ordinaryDirectoryNames(directory)).includes("jobs.json")) return [];
+  const handle = await open(path.join(directory, "jobs.json"), constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.nlink !== 1 || info.size > 64 * 1024 * 1024) throw new Error("Canvas media ownership could not be read safely");
+    const value = JSON.parse(await handle.readFile("utf8"));
+    if (!Array.isArray(value)) throw new Error("Invalid Canvas media ownership");
+    return value;
+  } finally { await handle.close(); }
 }
 
 function isPromptImage(value: unknown, allowWebP = false): value is PromptImage {
@@ -1127,7 +1235,7 @@ function supportedVideoReferenceType(type: VideoGenerationReference["type"], con
   return contentType === "audio/mpeg" || contentType === "audio/wav";
 }
 
-function publicRun({ version: _, preview: __, canvasContext: ___, batchRecoveryId: ____, ...run }: StoredToolRun): ToolRun {
+function publicRun({ version: _, preview: __, canvasContext: ___, batchRecoveryId: ____, recoveryId: _____, ...run }: StoredToolRun): ToolRun {
   return { ...run, files: run.files.map((file) => ({ ...file })) };
 }
 

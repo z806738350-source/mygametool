@@ -700,6 +700,10 @@ describe("local working image preparation", () => {
     await expect(assertLocalImagePublicationsSettled(anchor)).rejects.toThrow("unconfirmed"); expect(await readdir(path.join(anchor.storage, "space-reservations"))).toHaveLength(1);
     await expect(releaseRetiredProjectRecoverySpace(project.workspacePath, { namespace: "manual", projectId: project.id, imageStorage: anchor.storage, sourceRetired: true })).rejects.toThrow("unconfirmed");
     expect(await readdir(path.join(anchor.storage, "space-reservations"))).toHaveLength(1);
+    await rm(project.workspacePath, { recursive: true });
+    await expect(assertLocalImagePublicationsSettled({ ...anchor, allowMissingWorkspace: true })).rejects.toThrow("unconfirmed");
+    await expect(releaseRetiredProjectRecoverySpace(project.workspacePath, { namespace: "manual", projectId: project.id, imageStorage: anchor.storage, sourceRetired: true, allowMissingWorkspace: true })).rejects.toThrow("unconfirmed");
+    expect(await readdir(path.join(anchor.storage, "space-reservations"))).toHaveLength(1);
   }));
 
   it.each(["optimize", "import"] as const)("rejects a cross-filesystem %s before any project or recovery directory change", async action => fixture(async (_directory, manager, project) => {

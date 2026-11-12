@@ -476,6 +476,7 @@ function setup(
     sessionManager?: SessionManager;
     accountLimits?: () => AgentUsageLimit[];
     beforeCreate?: () => Promise<void>;
+    dispose?: () => Promise<void>;
     runtime?: AgentRuntimeId;
     toolNames?: readonly string[];
   } = {},
@@ -530,6 +531,7 @@ function setup(
         ),
       toolNames: options.toolNames ?? ["canvas_check"],
       setActiveTools: (names) => activeTools.push([...names]),
+      ...(options.dispose ? { dispose: options.dispose } : {}),
     });
   };
   manager = new AgentManager(events, {
@@ -580,6 +582,84 @@ function fixture(
   });
   return { session, sessionManager, drivers };
 }
+
+describe("project session disposal", () => {
+  it.each([false, true])("waits for native disposal when closing, including invalidated sessions (invalidated=%s)", async invalidated => {
+    let release!: () => void;
+    const cleanup = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+    const state = setup([async () => ({ status: "completed" })], { runtime: "qoder-cli", dispose: cleanup });
+    await state.manager.prompt(state.project, state.conversation, "read").result;
+    if (invalidated) state.manager.invalidateProjectSessions(state.project.id);
+    let closed = false;
+    const closing = state.manager.close().then(() => { closed = true; });
+    await vi.waitFor(() => expect(cleanup).toHaveBeenCalledOnce());
+    expect(closed).toBe(false);
+    release(); await closing; expect(closed).toBe(true);
+  });
+
+  it.each([false, true])("waits for a session created during closing and reports its cleanup failure (failure=%s)", async fail => {
+    let created = false, releaseCreate!: () => void, releaseCleanup!: () => void;
+    const cleanup = vi.fn().mockImplementationOnce(() => new Promise<void>((resolve, reject) => {
+      releaseCleanup = () => fail ? reject(new Error("Closing cleanup failed")) : resolve();
+    })).mockResolvedValue(undefined);
+    const state = setup([], { runtime: "qoder-cli", dispose: cleanup, beforeCreate: () => new Promise<void>(resolve => { created = true; releaseCreate = resolve; }) });
+    const turn = state.manager.prompt(state.project, state.conversation, "read");
+    await vi.waitFor(() => expect(created).toBe(true));
+    let closed = false;
+    const closing = state.manager.close().then(() => { closed = true; return undefined; }, cause => { closed = true; return cause; });
+    await Promise.resolve(); expect(closed).toBe(false);
+    releaseCreate(); await vi.waitFor(() => expect(cleanup).toHaveBeenCalledOnce());
+    expect(closed).toBe(false); expect(state.drivers[0]!.inputs).toEqual([]);
+    releaseCleanup(); const failure = await closing; await turn.result;
+    if (fail) {
+      expect(failure).toEqual(new Error("Closing cleanup failed"));
+      expect(cleanup).toHaveBeenCalledOnce();
+      await state.manager.forgetProject(state.project.id); expect(cleanup).toHaveBeenCalledTimes(2);
+    } else expect(failure).toBeUndefined();
+  });
+
+  it.each([false, true])("waits for native private storage cleanup including previously invalidated sessions (invalidated=%s)", async invalidated => {
+    let release!: () => void;
+    const cleanup = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+    const state = setup([async () => ({ status: "completed" })], { runtime: "qoder-cli", dispose: cleanup });
+    await state.manager.prompt(state.project, state.conversation, "read").result;
+    if (invalidated) state.manager.invalidateProjectSessions(state.project.id);
+    let removed = false;
+    const pending = state.manager.forgetProject(state.project.id).then(() => { removed = true; });
+    await vi.waitFor(() => expect(cleanup).toHaveBeenCalledOnce());
+    expect(removed).toBe(false); expect(state.drivers[0]!.disposed).toBe(true);
+    release(); await pending; expect(removed).toBe(true);
+    await state.manager.close();
+  });
+
+  it("reports a cleanup failure and retries it on the next explicit project deletion", async () => {
+    const cleanup = vi.fn().mockRejectedValueOnce(new Error("Private storage busy")).mockResolvedValue(undefined);
+    const state = setup([async () => ({ status: "completed" })], { runtime: "qoder-cli", dispose: cleanup });
+    await state.manager.prompt(state.project, state.conversation, "read").result;
+    await expect(state.manager.forgetProject(state.project.id)).rejects.toThrow("Private storage busy");
+    await expect(state.manager.forgetProject(state.project.id)).resolves.toBeUndefined();
+    expect(cleanup).toHaveBeenCalledTimes(2); await state.manager.close();
+  });
+
+  it("retains native files when stopping the driver fails", async () => {
+    const cleanup = vi.fn(async () => {}), { session, drivers } = fixture([], undefined, { dispose: cleanup });
+    drivers[0]!.dispose = vi.fn().mockRejectedValueOnce(new Error("Process stop unconfirmed")).mockResolvedValue(undefined);
+    await expect(session.dispose()).rejects.toThrow("Process stop unconfirmed");
+    expect(cleanup).not.toHaveBeenCalled();
+    await session.dispose(); expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("waits for an earlier idle process stop before removing its shared private directory", async () => {
+    let release!: () => void;
+    const cleanup = vi.fn(async () => {}), { session, drivers } = fixture([async () => ({ status: "completed" })], undefined, { dispose: cleanup, idleTimeoutMs: 1 });
+    drivers[0]!.dispose = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+    await session.prompt("read");
+    await vi.waitFor(() => expect(release).toBeDefined());
+    const pending = session.dispose();
+    await Promise.resolve(); expect(cleanup).not.toHaveBeenCalled();
+    release(); await pending; expect(cleanup).toHaveBeenCalledOnce();
+  });
+});
 
 describe("native live steering", () => {
   it("delivers startup steering to the replacement live turn after an explicitly expired context", async () => {

@@ -7,7 +7,9 @@ import { containsKnownSensitiveValue } from "../shared/sensitive-values.js";
 export interface AgentMediaCall {
   scope: string;
   callId: string;
+  projectId?: string;
 }
+export interface ProjectMediaRecord { recoveryId: string; runIds: string[]; scopes: string[] }
 interface Receipt {
   callId: string;
   runId?: string;
@@ -26,11 +28,89 @@ export class AgentMediaRecovery {
   private readonly active = new Set<string>();
   private readonly creating = new Set<string>();
   private readonly runReceipts = new Map<string, string>();
+  private readonly projectWrites = new Map<string, Promise<void>>();
 
   constructor(private readonly root: string) {}
 
+  /** Keep ownership beyond the bounded job history, including failed requests. */
+  async trackProject(projectId: string, recoveryId: string, update: { runId?: string; scope?: string } = {}): Promise<void> {
+    if (!/^[a-zA-Z0-9_-]{1,120}$/.test(projectId) || !/^[a-zA-Z0-9_-]{1,120}$/.test(recoveryId) ||
+      update.runId !== undefined && !validUuid(update.runId) || update.scope !== undefined && !/^[a-f0-9]{64}$/.test(update.scope)) throw new Error("Invalid project media ownership");
+    const directory = path.join(this.root, "projects", projectId), file = path.join(directory, recoveryId + ".json");
+    const pending = (this.projectWrites.get(file) ?? Promise.resolve()).then(async () => {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      for (const folder of [this.root, path.join(this.root, "projects"), directory]) if (!(await lstat(folder)).isDirectory()) throw new Error("Invalid project media ownership directory");
+      const previous = await this.projectRecord(file, recoveryId);
+      const record = { recoveryId, runIds: [...new Set([...previous.runIds, ...(update.runId ? [update.runId] : [])])], scopes: [...new Set([...previous.scopes, ...(update.scope ? [update.scope] : [])])] };
+      const temporary = file + "." + randomUUID() + ".tmp";
+      try { await writeFile(temporary, JSON.stringify(record), { mode: 0o600, flag: "wx" }); await rename(temporary, file); }
+      finally { await rm(temporary, { force: true }); }
+    });
+    this.projectWrites.set(file, pending);
+    try { await pending; } finally { if (this.projectWrites.get(file) === pending) this.projectWrites.delete(file); }
+  }
+
+  private async projectRecord(file: string, recoveryId: string): Promise<ProjectMediaRecord> {
+    let handle;
+    try {
+      handle = await open(file, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+      const info = await handle.stat();
+      if (!info.isFile() || info.nlink !== 1 || info.size > 1024 * 1024) throw new Error("Invalid project media ownership");
+      const value = JSON.parse(await handle.readFile("utf8")) as ProjectMediaRecord;
+      if (value.recoveryId !== recoveryId || !Array.isArray(value.runIds) || value.runIds.some(id => !validUuid(id)) ||
+        !Array.isArray(value.scopes) || value.scopes.some(scope => !/^[a-f0-9]{64}$/.test(scope))) throw new Error("Invalid project media ownership");
+      return value;
+    } catch (cause) { if ((cause as NodeJS.ErrnoException).code === "ENOENT") return { recoveryId, runIds: [], scopes: [] }; throw cause; }
+    finally { await handle?.close(); }
+  }
+
+  async projectRecords(projectId: string): Promise<ProjectMediaRecord[]> {
+    if (!/^[a-zA-Z0-9_-]{1,120}$/.test(projectId)) throw new Error("Invalid project media ownership");
+    const directory = path.join(this.root, "projects", projectId);
+    await Promise.all([...this.projectWrites].filter(([file]) => path.dirname(file) === directory).map(([, pending]) => pending));
+    const names = await ordinaryNames(directory);
+    return Promise.all(names.filter(name => /^[a-zA-Z0-9_-]{1,120}\.json$/.test(name)).map(name => this.projectRecord(path.join(directory, name), name.slice(0, -5))));
+  }
+
+  async otherProjectRecords(projectId: string): Promise<ProjectMediaRecord[]> {
+    const names = await ordinaryNames(path.join(this.root, "projects"));
+    return (await Promise.all(names.filter(name => name !== projectId && /^[a-zA-Z0-9_-]{1,120}$/.test(name)).map(name => this.projectRecords(name)))).flat();
+  }
+
+  async scopeRecords(scope: string): Promise<ProjectMediaRecord[]> {
+    if (!/^[a-f0-9]{64}$/.test(scope)) throw new Error("Invalid media recovery scope");
+    const directory = path.join(this.root, scope), records: ProjectMediaRecord[] = [];
+    for (const child of ["", "completed", "canvas-observations"]) {
+      const folder = path.join(directory, child);
+      const names = await ordinaryNames(folder);
+      for (const name of names) {
+        const recoveryId = child ? name : name.replace(/\.(json|reviewed)$/, "");
+        if (!/^[a-f0-9]{64}$/.test(recoveryId)) continue;
+        const receipt = await this.read(path.join(folder, name));
+        records.push({ recoveryId, runIds: receipt.runId ? [receipt.runId] : [], scopes: [scope] });
+      }
+    }
+    return records;
+  }
+
+  assertScopesIdle(scopes: readonly string[]): void {
+    if (scopes.some(scope => !/^[a-f0-9]{64}$/.test(scope))) throw new Error("Invalid media recovery scope");
+    const folders = scopes.map(scope => path.join(this.root, scope));
+    if ([...this.active].some(file => folders.includes(path.dirname(file)))) throw new Error("Project media is still running");
+  }
+
+  async removeProject(projectId: string, scopes: readonly string[]): Promise<void> {
+    if (!/^[a-zA-Z0-9_-]{1,120}$/.test(projectId)) throw new Error("Invalid project media ownership");
+    this.assertScopesIdle(scopes);
+    const folders = scopes.map(scope => path.join(this.root, scope));
+    for (const [runId, receipt] of this.runReceipts) if (folders.includes(path.dirname(receipt))) this.runReceipts.delete(runId);
+    for (const folder of folders) await rm(folder, { recursive: true, force: true });
+    await rm(path.join(this.root, "projects", projectId), { recursive: true, force: true });
+  }
+
   private async directory(call: AgentMediaCall, recoveryId: string): Promise<string> {
     if (!/^[a-f0-9]{64}$/.test(call.scope) || !/^[a-f0-9]{64}$/.test(recoveryId) || !validCallId(call.callId)) throw new Error("Invalid media recovery identity");
+    if (call.projectId) await this.trackProject(call.projectId, recoveryId, { scope: call.scope });
     await mkdir(this.root, { recursive: true, mode: 0o700 });
     if (!(await lstat(this.root)).isDirectory()) throw new Error("Invalid media recovery directory");
     const directory = path.join(this.root, call.scope);
@@ -207,6 +287,13 @@ export class AgentMediaRecovery {
       this.runReceipts.delete(runId);
     }
   }
+}
+
+async function ordinaryNames(directory: string): Promise<string[]> {
+  try {
+    if (!(await lstat(directory)).isDirectory()) throw new Error("Invalid media recovery directory");
+    return await readdir(directory);
+  } catch (cause) { if ((cause as NodeJS.ErrnoException).code === "ENOENT") return []; throw cause; }
 }
 
 function validCallId(value: unknown): value is string {

@@ -194,8 +194,11 @@ automatically bills a replacement.
 
 Originals, preparation receipts and transaction recovery live in private
 `<dataDirectory>/image-recovery/<projectId>/`, independently of the project and
-its VM volume. Deleting a project does not delete this store. It has no automatic
-expiry or cleanup UI; retain it until the user explicitly reviews disposal.
+its VM volume. Normal cancellation, failure and recovery retain this store.
+Explicitly deleting the project removes its recovery originals and preparation
+receipts after active work and recovery transactions have settled, together with
+its Blender jobs, conversation data and checkpoints. Independent Library assets
+and account settings remain available.
 Legacy project-scoped image recovery blocks project deletion until it is
 preserved independently. Publication stages both versions and a manifest before
 moving any source, and uses no-replace links. Interrupted transactions require

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readdir, realpath, rename } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
 
 const PHASES = ["requested", "retiring-volume", "volume-retired", "deleting-host", "complete"] as const;
@@ -56,6 +56,7 @@ export class ProjectLifecycle {
         if (value.version === 1 && value.projectId === id && [...PHASES, "aborted"].includes(value.phase as typeof PHASES[number])) record = value;
       } catch { /* A damaged record blocks this project, without deleting anything. */ }
       finally { await handle.close(); }
+      if (record.phase === "complete") { await this.#removeComplete(id); continue; }
       this.#records.set(id, record);
     }
   }
@@ -87,12 +88,22 @@ export class ProjectLifecycle {
         await this.#write(id, next); phase = next;
       });
       await this.#write(id, "complete");
+      await this.#removeComplete(id);
       return result;
     } catch (error) {
       // Before requesting retirement, the project and its guest data are unchanged.
       if (phase === "requested") await this.#write(id, "aborted");
       throw error;
     } finally { this.#active.delete(id); }
+  }
+  async #removeComplete(id: string): Promise<void> {
+    const directory = await this.#directory(false);
+    await rm(path.join(directory, id + ".json"), { force: true });
+    if (process.platform !== "win32") {
+      const folder = await open(directory, constants.O_RDONLY);
+      try { await folder.sync(); } finally { await folder.close(); }
+    }
+    this.#records.delete(id);
   }
   async recovered(id: string): Promise<void> {
     if (this.#active.has(id)) throw new ProjectLifecycleError("Project deletion is still running.");

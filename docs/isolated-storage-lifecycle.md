@@ -48,9 +48,31 @@ metadata requires separate inspection rather than a claim that deletion or
 recovery completed. The guest volume must have been confirmed retired before
 this host phase can begin.
 
+Explicit project deletion also waits for native Agent disposal, removes that
+project's private Blender jobs and image-recovery originals, and drops its
+conversation image and request-preview caches. Session files and checkpoints
+are removed with project storage. Project-owned generation receipts/results and
+native Codex/Qoder histories are removed as well, including attributable content
+logs; shared results owned by another project are preserved. Cleanup errors leave
+deletion pending and may be retried explicitly; normal cancellation or an uncertain tool result never
+triggers this disposal. Completed deletion journals are removed, including
+completed journals left by earlier app versions. Unsaved Library copies with
+an explicit project source are removed unless another project owns or uses them;
+shared copies retain that other project's association for its eventual deletion.
+Unreadable project references block this cleanup. Explicitly saved Library assets,
+independent uploads, unattributed assets and account settings remain intact.
+Canvas and Playable uploads and project chat attachment references are unsaved
+project copies; uploading directly to the Library still creates an independent
+saved asset.
+
 Legacy image recovery directories block deletion before guest retirement or
 conversation cleanup. Removing an external workspace registration cleans its
 ordinary chat-attachment directory only when the directory belongs to that workspace.
+If the registered external folder is confirmed missing, startup and deletion can
+still inspect its application-owned recovery data without recreating the folder.
+Unconfirmed publications and source reservations whose device identity can no
+longer be verified continue to block deletion; permission errors and replacement
+links are not treated as missing folders.
 
 Quick-start canvas initialization failures retain the new host project for user
 inspection instead of invoking an unconfirmed automatic deletion. No settings
@@ -58,9 +80,12 @@ query or failed quick start acquires VM ownership as a cleanup side effect.
 
 All four renderer deletion entry points inspect this project's canvas, document,
 table, Playable and composer drafts; the DELETE client checks again immediately
-before sending. Browser drafts are retained even after deletion. This does not
-atomically lock another window's unpersisted memory: browser protection covers
-mounted editor readers and persisted drafts.
+before sending. After confirmed deletion, the browser removes that project's
+drafts and saved canvas, document, table and playtest state. A project missing
+from a listing is not evidence of deletion: loading damaged metadata can fail,
+so listing never discards browser recovery drafts. This does not atomically lock
+another window's unpersisted memory: browser protection covers mounted editor
+readers and persisted drafts.
 
 Every writable guest operation is dirty before writing. Capture alone does not
 mark source saved: the host checks its unchanged baseline, publishes through the

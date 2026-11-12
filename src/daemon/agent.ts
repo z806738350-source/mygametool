@@ -80,7 +80,7 @@ export interface CodingSession {
   replaceQueue?(steering: readonly CodingQueuedPrompt[], followUp: readonly CodingQueuedPrompt[]): Promise<void>;
   navigateTree?(targetId: string, options?: { summarize?: boolean }): Promise<{ editorText?: string; cancelled: boolean }>;
   abort(origin?: "user" | "host"): Promise<void>;
-  dispose(): void;
+  dispose(): void | Promise<void>;
   subscribe(listener: (event: AgentSessionEvent) => void): () => void;
   setModel?(model: RuntimeModel): Promise<void>;
   readonly thinkingLevel?: AgentReasoningLevel;
@@ -528,6 +528,7 @@ interface PendingQuestionnaire {
 
 export class AgentManager {
   readonly #sessions = new Map<string, ManagedSession>();
+  readonly #sessionDisposals = new Map<CodingSession, { key: string; pending?: Promise<void>; failed?: boolean }>();
   readonly #sessionLoads = new Map<string, Promise<ManagedSession>>();
   readonly #activeTurns = new Map<string, ActiveTurn>();
   readonly #agentStates = new Map<string, ConversationAgentState>();
@@ -1728,11 +1729,11 @@ export class AgentManager {
     await Promise.allSettled(sessions.map(({ session }) => session.abort("host")));
     await Promise.allSettled([...this.#runs]);
     await Promise.allSettled([...this.#queueMutations.values()]);
-    for (const managed of sessions) {
-      managed.unsubscribe();
-      managed.session.dispose();
-    }
-    this.#sessions.clear();
+    await Promise.allSettled([...this.#sessionLoads.values()]);
+    for (const key of this.#sessions.keys()) this.#forgetConversation(key);
+    const disposed = await Promise.allSettled([...this.#sessionDisposals].map(([session, item]) => this.#disposeSession(item.key, session)));
+    const failed = disposed.find(result => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
   }
 
   async #finishRun(project: ProjectState, active: ActiveTurn, run: Promise<AgentRunResult>, result?: AgentRunResult): Promise<void> {
@@ -1930,7 +1931,7 @@ export class AgentManager {
       [],
     )))(project, conversation);
     if (this.#closing) {
-      session.dispose();
+      await this.#disposeSession(key, session);
       throw new Error("Agent manager is closing");
     }
     const unsubscribe = session.subscribe((event) => this.#forwardEvent(project.id, conversation.summary.id, event));
@@ -2424,12 +2425,14 @@ export class AgentManager {
     this.#flushInvalidatedProject(projectId);
   }
 
-  forgetProject(projectId: string): void {
+  async forgetProject(projectId: string): Promise<void> {
     this.#invalidatedProjects.delete(projectId);
     const prefix = `${projectId}:`;
     for (const key of this.#sessions.keys()) {
       if (key.startsWith(prefix)) this.#forgetConversation(key);
     }
+    await Promise.all([...this.#sessionDisposals].filter(([, item]) => item.key.startsWith(prefix))
+      .map(([session, item]) => this.#disposeSession(item.key, session, true)));
     for (const key of this.#agentStates.keys()) {
       if (key.startsWith(prefix)) this.#agentStates.delete(key);
     }
@@ -2459,8 +2462,18 @@ export class AgentManager {
     const managed = this.#sessions.get(key);
     if (!managed) return;
     managed.unsubscribe();
-    managed.session.dispose();
+    void this.#disposeSession(key, managed.session);
     this.#sessions.delete(key);
+  }
+
+  #disposeSession(key: string, session: CodingSession, retry = false): Promise<void> {
+    let entry = this.#sessionDisposals.get(session);
+    if (entry?.pending && !(retry && entry.failed)) return entry.pending;
+    if (!entry) { entry = { key }; this.#sessionDisposals.set(session, entry); }
+    entry.failed = false;
+    const pending = entry.pending = (async () => { await session.dispose(); })();
+    void pending.then(() => this.#sessionDisposals.delete(session), () => { entry.failed = true; });
+    return pending;
   }
 }
 
@@ -3218,7 +3231,7 @@ export async function createPiSession(
       ? ["This connection does not have image input enabled. Image attachments and image history are rejected. game_use and recall_image are unavailable for this connection; choose an image-enabled connection for screenshot-based playtesting or visual verification."] : [])],
     checkpointFactory: guardedCheckpoints,
   });
-  const images = new SessionImages(sessionManager, path.join(agentDir, "request-image-previews"));
+  const images = new SessionImages(sessionManager, path.join(project.storagePath ?? path.dirname(project.workspacePath), "request-image-previews"));
   const authorizeAttachment = (reference: AttachmentReference) => authorizeConversationAttachment(sessionManager, reference);
   const localTools = [...createLocalAgentFileTools(project.workspacePath, mutateWorkspace, model?.input.includes("image") === true, authorizeAttachment),
     createAgentAttachmentReadTool(project.workspacePath, model?.input.includes("image") === true, authorizeAttachment), ...(textOnly ? [] : [images.recallTool as ToolDefinition]),

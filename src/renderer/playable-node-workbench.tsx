@@ -363,7 +363,7 @@ export function PlayableNodeWorkbench({
   const ready = Boolean(runtime.definition && (runtime.assets || runtime.page));
   const canSetBackdrop = Boolean(backdrop && onSetBackdrop);
   const canRemoveBackdrop = Boolean(backdrop === "set" && onRemoveBackdrop);
-  const chooser = useMediaChooser((asset, target) => void addMedia(asset, target), (text) => showToast({ tone: "error", text }));
+  const chooser = useMediaChooser(projectId, (asset, target) => void addMedia(asset, target), (text) => showToast({ tone: "error", text }));
   let videoBackground: PlayableBackdropDetails | undefined;
   try { videoBackground = playableBackdropDetails(runtime.definition?.compiled.nodes[node.id]?.html ?? ""); } catch { /* Compiler reports invalid ranges. */ }
   const webTrim = webTrimSource && webTrimSource.definition === runtime.definition && webTrimSource.nodeId === node.id ? webTrimSource.value : undefined;
@@ -576,7 +576,7 @@ type MediaTarget = "backdrop" | "chat";
  * Chooses an image or a video from the Library, or uploads a new one.
  * `elements` holds the picker and the file input, and must be rendered.
  */
-function useMediaChooser(onAsset: (asset: PlayableAssetRequest, target: MediaTarget) => void, onError: (text: string) => void) {
+function useMediaChooser(projectId: string, onAsset: (asset: PlayableAssetRequest, target: MediaTarget) => void, onError: (text: string) => void) {
   const [library, setLibrary] = useState<LibraryAsset[]>();
   const [uploading, setUploading] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -594,7 +594,7 @@ function useMediaChooser(onAsset: (asset: PlayableAssetRequest, target: MediaTar
       event.target.value = "";
       if (!file) return;
       setUploading(true);
-      void uploadLibraryFile(file).then((asset) => { setLibrary(undefined); use(asset); }, (cause) => onError(t("sceneWorkbench.uploadFailed", { error: errorMessage(cause) }))).finally(() => setUploading(false));
+      void uploadLibraryFile(file, projectId).then((asset) => { setLibrary(undefined); use(asset); }, (cause) => onError(t("sceneWorkbench.uploadFailed", { error: errorMessage(cause) }))).finally(() => setUploading(false));
     }} />
     {library ? <LibraryAssetPicker
       title={target.current === "backdrop" ? t("sceneWorkbench.chooseBackground") : t("sceneWorkbench.addToChat")}

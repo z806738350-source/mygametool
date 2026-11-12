@@ -4,6 +4,8 @@ import path from "node:path";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/daemon/app.js";
+import { AssetLibrary } from "../src/daemon/asset-library.js";
+import { ProjectManager } from "../src/daemon/projects.js";
 import { AgentAttachmentStore, resolveAgentAttachment } from "../src/daemon/agent-attachments.js";
 import { createLocalAgentFileTools } from "../src/daemon/agent-local-files.js";
 import type { CodingSession } from "../src/daemon/agent.js";
@@ -433,6 +435,90 @@ describe("daemon", () => {
     expect((await app.inject({ method: "GET", url: `/projects/${project.id}` })).statusCode).toBe(404);
   });
 
+  it("deletes only the selected project's Blender jobs and image recovery alongside its project storage", async () => {
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "ohmygame-project-disposal-"));
+    const app = createApp({ dataDirectory }); apps.push(app);
+    const first = (await app.inject({ method: "POST", url: "/projects", payload: { name: "Remove" } })).json();
+    const second = (await app.inject({ method: "POST", url: "/projects", payload: { name: "Keep" } })).json();
+    for (const name of ["blender-jobs", "image-recovery"]) for (const project of [first, second]) {
+      const directory = path.join(dataDirectory, name, project.id);
+      await mkdir(directory, { recursive: true, mode: 0o700 }); await writeFile(path.join(directory, "retained.bin"), "original");
+    }
+    const account = path.join(dataDirectory, "account-preservation-fixture.json"); await writeFile(account, "keep settings");
+    const response = await app.inject({ method: "DELETE", url: `/projects/${first.id}` });
+    expect(response.statusCode, response.body).toBe(204);
+    for (const name of ["blender-jobs", "image-recovery", "projects"]) {
+      await expect(stat(path.join(dataDirectory, name, first.id))).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await stat(path.join(dataDirectory, name, second.id))).isDirectory()).toBe(true);
+    }
+    expect(await readFile(account, "utf8")).toBe("keep settings");
+    await expect(stat(path.join(dataDirectory, "project-lifecycle", first.id + ".json"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("deletes project Library copies only after the last owning project is removed", async () => {
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "ohmygame-project-library-disposal-"));
+    const library = new AssetLibrary(dataDirectory); await library.load();
+    const projects = new ProjectManager(dataDirectory, library); await projects.load();
+    const first = await projects.create("First"), second = await projects.create("Second");
+    const owned = await library.add("owned.mp4", Buffer.from("owned"), { origin: "workspace", sourceKey: `project:${first.id}:owned` });
+    const shared = await library.add("shared.mp4", Buffer.from("shared"), { origin: "workspace", sourceKey: `canvas:${first.id}:shared` });
+    const saved = await library.add("saved.mp4", Buffer.from("saved"), { origin: "workspace", sourceKey: `project:${first.id}:saved` }); await library.save(saved.id);
+    await projects.materializeLibraryAsset(second.id, shared.id);
+    await library.close();
+    const app = createApp({ dataDirectory }); apps.push(app);
+    const removed = await app.inject({ method: "DELETE", url: `/projects/${first.id}` });
+    expect(removed.statusCode, removed.body).toBe(204);
+    let assets = (await app.inject({ method: "GET", url: "/library/assets" })).json();
+    expect(assets.map((asset: { id: string }) => asset.id).sort()).toEqual([shared.id, saved.id].sort());
+    await expect(stat(path.join(dataDirectory, "library/files", `${owned.id}.mp4`))).rejects.toMatchObject({ code: "ENOENT" });
+    const last = await app.inject({ method: "DELETE", url: `/projects/${second.id}` });
+    expect(last.statusCode, last.body).toBe(204);
+    assets = (await app.inject({ method: "GET", url: "/library/assets" })).json();
+    expect(assets.map((asset: { id: string }) => asset.id)).toEqual([saved.id]);
+    await expect(stat(path.join(dataDirectory, "library/files", `${shared.id}.mp4`))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("refuses linked Blender storage without removing external files or the project", async () => {
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "ohmygame-linked-disposal-"));
+    const outside = await mkdtemp(path.join(tmpdir(), "ohmygame-outside-disposal-"));
+    const app = createApp({ dataDirectory }); apps.push(app);
+    const project = (await app.inject({ method: "POST", url: "/projects", payload: {} })).json();
+    await mkdir(path.join(outside, project.id)); await writeFile(path.join(outside, project.id, "keep.txt"), "keep");
+    await symlink(outside, path.join(dataDirectory, "blender-jobs"), "dir");
+    const response = await app.inject({ method: "DELETE", url: `/projects/${project.id}` });
+    expect(response.statusCode).toBe(409); expect(response.json().error).toContain("Linked project recovery storage");
+    expect(await readFile(path.join(outside, project.id, "keep.txt"), "utf8")).toBe("keep");
+    expect((await app.inject({ method: "GET", url: `/projects/${project.id}` })).statusCode).toBe(200);
+    await rm(outside, { recursive: true, force: true });
+  });
+
+  it.each([false, true])("waits for session disposal and preserves a retryable project when cleanup fails (failure=%s)", async fail => {
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "ohmygame-delete-session-"));
+    let release!: () => void;
+    const dispose = vi.fn().mockImplementationOnce(() => new Promise<void>((resolve, reject) => {
+      release = () => fail ? reject(new Error("Private session cleanup unavailable")) : resolve();
+    })).mockResolvedValue(undefined);
+    const app = createApp({ dataDirectory, createSession: async () => ({ messages: [], prompt: async () => {}, abort: async () => {}, dispose, subscribe: () => () => {} }) });
+    apps.push(app);
+    const project = (await app.inject({ method: "POST", url: "/projects", payload: {} })).json();
+    const conversation = (await app.inject({ method: "POST", url: `/projects/${project.id}/conversations` })).json();
+    expect((await app.inject({ method: "POST", url: `/projects/${project.id}/conversations/${conversation.id}/turns`, payload: { prompt: "Read only" } })).statusCode).toBe(202);
+    await vi.waitFor(async () => expect((await app.inject({ method: "GET", url: "/projects/activity" })).json().activity).toEqual([]));
+    let done = false;
+    const pending = app.inject({ method: "DELETE", url: `/projects/${project.id}` }).then(response => { done = true; return response; });
+    await vi.waitFor(() => expect(dispose).toHaveBeenCalledOnce());
+    expect(done).toBe(false); expect((await stat(path.join(dataDirectory, "projects", project.id))).isDirectory()).toBe(true);
+    release(); const response = await pending;
+    expect(response.statusCode, response.body).toBe(fail ? 409 : 204);
+    if (fail) {
+      expect(response.json().error).toContain("Private session cleanup unavailable");
+      expect((await stat(path.join(dataDirectory, "projects", project.id))).isDirectory()).toBe(true);
+      const retry = await app.inject({ method: "DELETE", url: `/projects/${project.id}` });
+      expect(retry.statusCode, retry.body).toBe(204); expect(dispose).toHaveBeenCalledTimes(2);
+    }
+    await expect(stat(path.join(dataDirectory, "projects", project.id))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("exposes workspace code and media with project provenance", async () => {
     const app = createApp({ dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-workspace-api-")) });
     apps.push(app);
@@ -645,7 +731,7 @@ describe("daemon", () => {
     });
 
     expect(response.statusCode, response.body).toBe(201);
-    expect(response.json()).toMatchObject({ name: "opening.mp4", mediaType: "video", contentType: "video/mp4", duration: 6.5 });
+    expect(response.json()).toMatchObject({ name: "opening.mp4", mediaType: "video", contentType: "video/mp4", duration: 6.5, saved: true });
     const content = await app.inject({ method: "GET", url: `/library/assets/${response.json().id}/content` });
     expect(content.rawPayload).toEqual(mp4);
 
@@ -656,6 +742,48 @@ describe("daemon", () => {
     const updated = (await app.inject({ method: "GET", url: `/projects/${project.id}/playable/codebase` })).json();
     expect(updated.graph.assets.clip).toBeUndefined();
     expect(updated.graph.nodes[0].assets).not.toContain("clip");
+  });
+
+  it.each(["image", "binary"] as const)("removes a project's %s upload while retaining independent Library uploads", async kind => {
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "ohmygame-project-upload-"));
+    const app = createApp({ dataDirectory }); apps.push(app);
+    const project = (await app.inject({ method: "POST", url: "/projects", payload: {} })).json();
+    const upload = (projectId?: string) => app.inject(kind === "image" ? {
+      method: "POST", url: projectId ? `/projects/${projectId}/library-assets` : "/library/assets",
+      payload: { name: "reference.png", image: { mediaType: "image/png", data: REFERENCE_PNG } },
+    } : {
+      method: "POST", url: `${projectId ? `/projects/${projectId}/library-assets` : "/library/assets"}/upload?name=clip.mp4&mediaType=video%2Fmp4`,
+      headers: { "content-type": "application/octet-stream" }, payload: Buffer.from([0, 0, 0, 24, 102, 116, 121, 112]),
+    });
+    const global = await upload(), owned = await upload(project.id);
+    expect(global.statusCode, global.body).toBe(201); expect(global.json().saved).toBe(true);
+    expect(owned.statusCode, owned.body).toBe(201); expect(owned.json().saved).toBe(false);
+    expect((await app.inject({ method: "DELETE", url: `/projects/${project.id}` })).statusCode).toBe(204);
+    expect((await app.inject({ method: "GET", url: "/library/assets" })).json().map((asset: { id: string }) => asset.id)).toEqual([global.json().id]);
+    expect((await upload(project.id)).statusCode).toBe(404);
+    expect((await app.inject({ method: "GET", url: "/library/assets" })).json()).toHaveLength(1);
+  });
+
+  it("drains an admitted project upload and rejects new uploads during deletion without late Library writes", async () => {
+    const app = createApp({ dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-upload-delete-race-")) }); apps.push(app);
+    const project = (await app.inject({ method: "POST", url: "/projects", payload: {} })).json();
+    let release!: () => void, entered = false, deleted = false;
+    const gate = new Promise<void>(resolve => { release = resolve; }), original = AssetLibrary.prototype.add;
+    const add = vi.spyOn(AssetLibrary.prototype, "add").mockImplementation(async function (this: AssetLibrary, ...args) {
+      entered = true; await gate; return original.apply(this, args);
+    });
+    const upload = () => app.inject({ method: "POST", url: `/projects/${project.id}/library-assets/upload?name=clip.mp4&mediaType=video%2Fmp4`,
+      headers: { "content-type": "application/octet-stream" }, payload: Buffer.from([0, 0, 0, 24, 102, 116, 121, 112]) });
+    const uploading = upload().then(result => result);
+    await vi.waitFor(() => expect(entered).toBe(true));
+    const deleting = app.inject({ method: "DELETE", url: `/projects/${project.id}` }).then(result => { deleted = true; return result; });
+    try {
+      await vi.waitFor(async () => expect((await app.inject({ method: "PATCH", url: `/projects/${project.id}`, payload: { name: "Blocked" } })).statusCode).toBe(409));
+      expect((await upload()).statusCode).toBe(409); expect(add).toHaveBeenCalledOnce(); expect(deleted).toBe(false);
+    } finally { release(); }
+    expect((await uploading).statusCode).toBe(201); expect((await deleting).statusCode).toBe(204); add.mockRestore();
+    expect((await app.inject({ method: "GET", url: "/library/assets" })).json()).toEqual([]);
+    expect((await upload()).statusCode).toBe(404);
   });
 
   it("records the Library video a trimmed upload was cut from, and rejects an unknown or partial source", async () => {
@@ -1920,6 +2048,10 @@ describe("daemon", () => {
     });
     await second.close();
     apps.splice(apps.indexOf(second), 1);
+    for (const name of ["blender-jobs", "image-recovery"]) {
+      await mkdir(path.join(dataDirectory, name, project.id), { recursive: true });
+      await writeFile(path.join(dataDirectory, name, project.id, "retained.bin"), "project-owned data");
+    }
     await rm(workspacePath, { recursive: true, force: true });
 
     const third = createApp({ dataDirectory });
@@ -1933,6 +2065,9 @@ describe("daemon", () => {
       workspaceAvailable: false,
     });
     expect((await third.inject({ method: "DELETE", url: `/projects/${project.id}` })).statusCode).toBe(204);
+    for (const name of ["projects", "blender-jobs", "image-recovery"])
+      await expect(stat(path.join(dataDirectory, name, project.id))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(workspacePath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("restores conversation history from the project's Pi session", async () => {

@@ -361,7 +361,7 @@ export function createAgentTools(
     const scope = [project.id, generationScope ?? project.id, toolId];
     return {
       recoveryId: createHash("sha256").update(JSON.stringify([...scope, callId])).digest("hex"),
-      agentCall: { callId, scope: createHash("sha256").update(JSON.stringify(scope)).digest("hex") },
+      agentCall: { callId, projectId: project.id, scope: createHash("sha256").update(JSON.stringify(scope)).digest("hex") },
       ...(askQuestionnaire ? { confirmNew: async (previousIds: readonly string[]) => {
         const answer = await askQuestionnaire(callId, { previousPaidCount: previousIds.length, questions: [{
           id: "new-paid-media", prompt: `Previous ${toolId} requests that may already have been billed: ${previousIds.length}. Authorize one new paid generation?`,

@@ -537,8 +537,8 @@ export class CanvasStore {
           if (!["image/png", "image/jpeg"].includes(source.image.mediaType)) throw new CanvasError("Attachment references require PNG or JPEG");
           const extension = source.image.mediaType === "image/png" ? "png" : "jpg";
           assetId = (await this.library.add(`attachment-${digest}.${extension}`, bytes, {
-            origin: "uploaded", purpose: "reference", signal: source.signal,
-            sourceKey: `attachment:${createHash("sha256").update(JSON.stringify([id, source.attachmentReference, digest])).digest("hex")}`,
+            origin: "uploaded", purpose: "reference", signal: source.signal, saved: false,
+            sourceKey: `project:${id}:attachment:${createHash("sha256").update(JSON.stringify([id, source.attachmentReference, digest])).digest("hex")}`,
           })).id;
         } else assetId = source.assetId;
         await ensureCanvasAssets(project, this.projects, this.library, [assetId]);

@@ -16,6 +16,15 @@ interface ImageJournalEntry {
 
 const submissions = new Map<string, Promise<unknown>>();
 
+export async function waitForImageRequests(directory: string, ids: ReadonlySet<string>): Promise<void> {
+  const files = new Set([...ids].flatMap(id => Array.from({ length: 8 }, (_, index) => path.resolve(directory, `${id}-${index}.json`))));
+  for (;;) {
+    const pending = [...submissions].filter(([file]) => files.has(file)).map(([, promise]) => promise);
+    if (!pending.length) return;
+    await Promise.allSettled(pending);
+  }
+}
+
 async function readImageEntry(file: string): Promise<ImageJournalEntry | undefined> {
   try {
     const handle = await open(file, constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW ?? 0));

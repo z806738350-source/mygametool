@@ -8,6 +8,15 @@ import { parseVideoReferencePreparation, type VideoReferencePreparation } from "
 type Entry = { fingerprint: string; task?: Record<string, string> };
 const submissions = new Map<string, Promise<unknown>>();
 
+export async function waitForVideoTasks(directory: string, ids: ReadonlySet<string>): Promise<void> {
+  const files = new Set([...ids].map(id => path.resolve(directory, `${id}.json`)));
+  for (;;) {
+    const pending = [...submissions].filter(([file]) => files.has(file)).map(([, promise]) => promise);
+    if (!pending.length) return;
+    await Promise.allSettled(pending);
+  }
+}
+
 async function readEntries(file: string): Promise<Record<string, Entry>> {
   let handle;
   try {

@@ -6,7 +6,7 @@ import type {
   SessionManager,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import type { AgentModel, AgentUsageLimit } from "../../shared/contracts.js";
+import type { AgentModel, AgentUsageLimit, ProjectState } from "../../shared/contracts.js";
 import {
   AGENT_RUNTIME_IDS,
   isAgentRuntimeId,
@@ -56,6 +56,7 @@ import { controlledCodexEnvironment, requireControlledCodexVersion, verifyContro
 import { OpenCodeDriver } from "./opencode.js";
 import { QoderConnection, QoderDriver } from "./qoder.js";
 import { controlledQoderEnvironment, resolveControlledQoder, CONTROLLED_QODER_VERSION } from "./controlled-qoder.js";
+import { NATIVE_PRIVATE_SESSION_ENTRY, removeProjectNativeHistory } from "./project-history.js";
 
 const STATUS_TTL_MS = 60_000;
 
@@ -86,6 +87,7 @@ interface QoderAccountProbe {
 }
 
 export interface NativeSessionRequest {
+  projectId?: string;
   runtime: AgentRuntimeId;
   model: string;
   reasoningLevel?: string;
@@ -563,6 +565,29 @@ export class AgentRuntimeService {
     return { command: definition.loginCommand };
   }
 
+  /** Delete only this project's native history, without an account probe or model turn. */
+  async removeProjectHistory(project: ProjectState): Promise<void> {
+    await removeProjectNativeHistory(this.#root, project, async (ids) => {
+      const binary = await resolveBinary("codex-cli", this.settings.get("codex-cli").binaryPath);
+      if (!binary) throw new Error("The controlled Codex runtime is required to finish deleting this project's history");
+      await verifyControlledCodexBinary(binary.path);
+      const server = new CodexAppServer(binary.path, this.#root, await this.#environment("codex-cli", binary.path), {
+        processDirectory: path.join(this.#root, "processes"),
+      });
+      try {
+        await server.initialize();
+        for (const id of ids) {
+          try { await server.request("thread/delete", { threadId: id }); }
+          catch (cause) {
+            // A prior deletion may have completed before the project cleanup was interrupted.
+            if (!(cause instanceof Error) || (cause as Error & { rpcCode?: number }).rpcCode !== -32600 ||
+              cause.message !== `no rollout found for thread id ${id}`) throw cause;
+          }
+        }
+      } finally { await server.stop(); }
+    });
+  }
+
   async createSession(
     request: NativeSessionRequest,
   ): Promise<NativeCodingSession> {
@@ -607,6 +632,13 @@ export class AgentRuntimeService {
       path.join(this.#root, "sessions"),
       request.runtime,
     );
+    if (request.projectId && (request.runtime === "codex-cli" || request.runtime === "qoder-cli")) {
+      try {
+        request.sessionManager.appendCustomEntry(NATIVE_PRIVATE_SESSION_ENTRY, {
+          version: 1, projectId: request.projectId, runtime: request.runtime, privateDirectory: folder.path,
+        });
+      } catch (cause) { await folder.remove(); throw cause; }
+    }
     let pluginTool:
       { tool: ToolDefinition; close: () => Promise<void> } | undefined;
     try {

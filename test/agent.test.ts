@@ -3000,7 +3000,7 @@ describe("AgentManager", () => {
       plan: { steps: [{ step: "Inspect files", status: "pending" }] },
     });
 
-    manager.forgetProject(project.id);
+    await manager.forgetProject(project.id);
 
     expect(manager.planState(conversation)).toEqual({ mode: "normal" });
     await manager.close();

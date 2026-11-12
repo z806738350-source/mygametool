@@ -24,6 +24,15 @@ type Entry = { fingerprint: string; credentials?: Record<string, string> };
 const submissions = new Map<string, Promise<unknown>>();
 const results = new Map<string, Promise<unknown>>();
 
+export async function waitFor3DTasks(directory: string, ids: ReadonlySet<string>): Promise<void> {
+  const files = new Set([...ids].map(id => path.resolve(directory, `${id}.json`)));
+  for (;;) {
+    const pending = [...submissions, ...results].filter(([file]) => files.has(file) || [...files].some(prefix => file.startsWith(prefix + "."))).map(([, promise]) => promise);
+    if (!pending.length) return;
+    await Promise.allSettled(pending);
+  }
+}
+
 const storageUncertain = () =>
   new Model3DGenerationError(
     "Local 3D task storage could not be confirmed. Existing receipts and results are retained; this attempt did not submit a subsequent stage. Inspect the original operation before retrying.",

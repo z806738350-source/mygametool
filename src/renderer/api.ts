@@ -94,7 +94,7 @@ import type { ExternalAgentClientId, ExternalAgentSettings, UpdateExternalAgentS
 import type { DesktopClipboardFile } from "../shared/file-transfer.js";
 import type { WebGamePlayerBridge } from "../shared/web-game-player.js";
 import type { NetworkConnectionTest, NetworkSettings, NetworkSettingsState } from "../shared/network-settings.js";
-import { assertProjectCanvasDraftsSaved, assertProjectDraftsSaved } from "./project-deletion.js";
+import { assertProjectCanvasDraftsSaved, assertProjectDraftsSaved, clearProjectBrowserData } from "./project-deletion.js";
 import type { OnboardingState, UpdateOnboardingRequest } from "../shared/onboarding.js";
 import type { ExecutionStorageOverview } from "../shared/execution-storage.js";
 import type { IsolatedSourceConfirmation } from "../shared/execution-storage.js";
@@ -298,6 +298,7 @@ export async function importProject(file: File): Promise<ProjectState> {
 export async function deleteProject(projectId: string): Promise<void> {
   assertProjectDraftsSaved(projectId);
   await request(`/projects/${projectId}`, { method: "DELETE" });
+  clearProjectBrowserData(projectId);
 }
 
 export function getExecutionStorageOverview(signal?: AbortSignal): Promise<ExecutionStorageOverview> {
@@ -902,12 +903,12 @@ export async function listLibraryAssets(): Promise<LibraryAssetSummary[]> {
   return request("/library/assets");
 }
 
-export async function createLibraryImage(input: CreateLibraryImageRequest): Promise<LibraryAsset> {
-  return request("/library/assets", { method: "POST", body: JSON.stringify(input) });
+export async function createLibraryImage(input: CreateLibraryImageRequest, projectId?: string): Promise<LibraryAsset> {
+  return request(projectId ? `/projects/${encodeURIComponent(projectId)}/library-assets` : "/library/assets", { method: "POST", body: JSON.stringify(input) });
 }
 
 /** `derivedFrom` records the Library video an upload was cut from. */
-export async function uploadLibraryAsset(file: File, mediaType: LibraryUploadMediaType, duration?: number, purpose?: LibraryAssetPurpose, derivedFrom?: LibraryAssetDerivation): Promise<LibraryAsset> {
+export async function uploadLibraryAsset(file: File, mediaType: LibraryUploadMediaType, duration?: number, purpose?: LibraryAssetPurpose, derivedFrom?: LibraryAssetDerivation, projectId?: string): Promise<LibraryAsset> {
   const query = new URLSearchParams({ name: file.name, mediaType });
   if (duration !== undefined) query.set("duration", String(duration));
   if (purpose !== undefined) query.set("purpose", purpose);
@@ -916,7 +917,7 @@ export async function uploadLibraryAsset(file: File, mediaType: LibraryUploadMed
     query.set("trimStart", String(derivedFrom.trim.start));
     query.set("trimEnd", String(derivedFrom.trim.end));
   }
-  return request(`/library/assets/upload?${query}`, {
+  return request(`${projectId ? `/projects/${encodeURIComponent(projectId)}/library-assets` : "/library/assets"}/upload?${query}`, {
     method: "POST",
     headers: { "content-type": "application/octet-stream" },
     body: file,

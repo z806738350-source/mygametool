@@ -45,7 +45,17 @@ it("keeps a host deletion failure blocked across crashes and never clears it as 
   expect(() => restarted.assertAvailable(id)).toThrow();
   // An explicit new deletion request may finish the same pending operation.
   await restarted.delete(id, async (stage) => { await stage("retiring-volume"); });
-  expect(JSON.parse(await readFile(path.join(directory, "project-lifecycle", id + ".json"), "utf8")).phase).toBe("complete");
+  await expect(readFile(path.join(directory, "project-lifecycle", id + ".json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+});
+it("removes only a previously completed deletion record on startup", async () => {
+  const { lifecycle, directory } = await fixture();
+  await mkdir(path.join(directory, "project-lifecycle"), { mode: 0o700 });
+  for (const [projectId, phase] of [[id, "complete"], [other, "deleting-host"]])
+    await writeFile(path.join(directory, "project-lifecycle", projectId + ".json"), JSON.stringify({ version: 1, projectId, phase, updatedAt: "now" }), { mode: 0o600 });
+  await lifecycle.load();
+  await expect(readFile(path.join(directory, "project-lifecycle", id + ".json"))).rejects.toMatchObject({ code: "ENOENT" });
+  expect(lifecycle.pending(id)).toBe(false); expect(lifecycle.pending(other)).toBe(true);
+  expect(JSON.parse(await readFile(path.join(directory, "project-lifecycle", other + ".json"), "utf8")).phase).toBe("deleting-host");
 });
 it("blocks a damaged journal instead of treating uncertain cleanup as complete", async () => {
   const { lifecycle, directory } = await fixture();

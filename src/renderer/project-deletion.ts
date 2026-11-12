@@ -3,6 +3,18 @@ import { t } from "./i18n.js";
 import { readCanvasDraftStatus, type CanvasDraftStatus } from "./canvas-draft-safety.js";
 import { composerDrafts } from "./composer-drafts.js";
 
+function storedProjectId(key: string): string | undefined {
+  const match = /^(?:canvas-(?:board|documents|tables|document-generations|table-generations|active):|ohmygame:(?:composer-draft:v1:|playable:project:|playtest:(?:request|ask):))([^:]+)(?::|$)/.exec(key);
+  if (!match) return;
+  try { return decodeURIComponent(match[1]!); } catch { return; }
+}
+
+export function clearProjectBrowserData(projectId: string): void {
+  composerDrafts.deleteProject(projectId);
+  const keys = Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i));
+  for (const key of keys) if (key && storedProjectId(key) === projectId) localStorage.removeItem(key);
+}
+
 /** A missing/corrupt recovery cannot authorize removing its project. */
 export function projectDraftStatus(projectId: string): CanvasDraftStatus {
   const canvas = readCanvasDraftStatus(undefined, projectId);

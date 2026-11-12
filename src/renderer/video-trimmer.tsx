@@ -179,7 +179,7 @@ export function VideoTrimmer({
 export async function saveTrimmedVideo(
   video: Blob,
   trim: VideoTrim,
-  original: { name: string; libraryAssetId?: string },
+  original: { name: string; libraryAssetId?: string; projectId?: string },
 ): Promise<LibraryAsset> {
   const type = trimmedVideoType(video.type);
   const stem = original.name.replace(/\.[^./]+$/, "") || "video";
@@ -196,6 +196,7 @@ export async function saveTrimmedVideo(
     original.libraryAssetId
       ? { assetId: original.libraryAssetId, trim: kept }
       : undefined,
+    original.projectId,
   );
 }
 

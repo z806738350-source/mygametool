@@ -426,7 +426,7 @@ it("records retirement only after preparation, before allowing any host deletion
     return { deleted: true };
   });
   expect((await app.inject({ method: "DELETE", url: `/projects/${project.id}` })).statusCode).toBe(204);
-  expect(JSON.parse(await readFile(record, "utf8")).phase).toBe("complete");
+  await expect(readFile(record)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 it.each(["start failed", "inventory could not be verified"])("does not strand a new deletion when preparation fails: %s", async (message) => {
@@ -503,7 +503,7 @@ it("finishes a pending deletion only after a new explicit request receives fresh
   });
   expect((await app.inject({ method: "DELETE", url: `/projects/${project.id}` })).statusCode).toBe(204);
   expect(execution.retireProject).toHaveBeenCalledTimes(2);
-  expect(JSON.parse(await readFile(path.join(directory, "project-lifecycle", project.id + ".json"), "utf8")).phase).toBe("complete");
+  await expect(readFile(path.join(directory, "project-lifecycle", project.id + ".json"))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 it("preserves the host-deletion stage on a host failure and completes only on an explicit retry", async () => {
@@ -522,7 +522,7 @@ it("preserves the host-deletion stage on a host failure and completes only on an
   } finally { remove.mockRestore(); }
   expect((await app.inject({ method: "DELETE", url: `/projects/${project.id}` })).statusCode).toBe(204);
   expect(execution.retireProject).toHaveBeenCalledTimes(2);
-  expect(JSON.parse(await readFile(path.join(directory, "project-lifecycle", project.id + ".json"), "utf8")).phase).toBe("complete");
+  await expect(readFile(path.join(directory, "project-lifecycle", project.id + ".json"))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 it("reloads a partial host deletion as pending and preserves remaining files until an explicit retry", async () => {
@@ -556,7 +556,7 @@ it("reloads a partial host deletion as pending and preserves remaining files unt
   expect(execution.retireProject).toHaveBeenCalledOnce();
   expect((await restarted.inject({ method: "DELETE", url: `/projects/${project.id}` })).statusCode).toBe(204);
   expect(execution.retireProject).toHaveBeenCalledTimes(2);
-  expect(JSON.parse(await readFile(path.join(directory, "project-lifecycle", project.id + ".json"), "utf8")).phase).toBe("complete");
+  await expect(readFile(path.join(directory, "project-lifecycle", project.id + ".json"))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 it("rejects malformed recovery generations before invoking the execution backend", async () => {
@@ -828,7 +828,7 @@ it.each(["valid", "unknown-entry", "damaged-intent"] as const)("restores reserva
   const app = coldCreateApp({ dataDirectory: directory, piAgentDirectory: agentDirectory, createModelRuntime: async () => runtime });
   cleanups.push(() => app.close());
   await expect(app.ready()).resolves.toBe(app);
-  expect(restore).toHaveBeenCalledExactlyOnceWith([workspace]);
+  expect(restore).toHaveBeenCalledExactlyOnceWith([workspace], []);
   const listed = await app.inject({ method: "GET", url: "/projects" });
   expect(listed.statusCode, listed.body).toBe(200); expect(listed.body).not.toContain(projectId);
   expect(await readFile(path.join(projectDirectory, "project.json"), "utf8")).toBe(brokenMetadata);

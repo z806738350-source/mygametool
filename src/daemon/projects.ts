@@ -23,7 +23,7 @@ import { isPrivateProjectPath } from "../shared/private-project-paths.js";
 import { KUNPO_DEFAULT_MODEL_REFS, KUNPO_MODEL_OPTIONS } from "../shared/kunpo-models.js";
 import { inspectSafeProjectMedia, readSafeProjectFile } from "./safe-project-file.js";
 import { imageDigest, prepareWorkingImage, retainImageOriginal, retainImagePreparation, replaceWorkingImages, serializeWorkingImages, withLocalImageRecovery } from "./image-working-assets.js";
-import { assertLocalImagePublicationsSettled, reserveDerivedMediaSpace, type DerivedMediaSpaceReservation, type LocalImageRecoveryAnchor } from "./recovery-space.js";
+import { assertLocalImagePublicationsSettled, recoveryWorkspacePath, reserveDerivedMediaSpace, type DerivedMediaSpaceReservation, type LocalImageRecoveryAnchor } from "./recovery-space.js";
 import { localAgentPath } from "./agent-local-files.js";
 import { blenderAuthoringPath, inspectProjectSourceBudget, mediaHeaderMatches, withCheckedFileStream, type ProjectSourceProfile } from "./isolated-project-files.js";
 import { runtimeMediaFileLimit } from "../shared/execution-capacity-profiles.js";
@@ -449,7 +449,7 @@ export class ProjectManager {
       catch (cause) { if ((cause as NodeJS.ErrnoException).code === "ENOENT") continue; throw cause; }
       throw new Error("Legacy image recovery must be preserved outside the project before deletion; no project files were removed");
     }
-    await assertLocalImagePublicationsSettled(await this.getLocalImageRecoveryAnchor(id));
+    await assertLocalImagePublicationsSettled(await this.getLocalImageRecoveryAnchor(id, true));
   }
 
   async delete(id: string): Promise<ProjectState> {
@@ -572,10 +572,12 @@ export class ProjectManager {
   }
 
   /** These are real, existing application storage anchors; discovery never creates a workspace or directory. */
-  async getLocalImageRecoveryAnchor(id: string): Promise<LocalImageRecoveryAnchor> {
+  async getLocalImageRecoveryAnchor(id: string, inspectMissingExternal = false): Promise<LocalImageRecoveryAnchor> {
     const project = this.#projects.get(id); if (!project) throw new Error(`Project not found: ${id}`);
     const data = await realpath(path.join(this.#projectsDirectory, ".."));
-    return { workspace: await realpath(project.workspacePath), storage: path.join(data, "image-recovery", id), projectId: id };
+    const allowMissingWorkspace = inspectMissingExternal && project.workspaceLocation === "external";
+    return { workspace: await recoveryWorkspacePath(project.workspacePath, allowMissingWorkspace), storage: path.join(data, "image-recovery", id), projectId: id,
+      ...(allowMissingWorkspace ? { allowMissingWorkspace: true } : {}) };
   }
 
   async localImageRecoveryAnchors(): Promise<readonly LocalImageRecoveryAnchor[]> {
@@ -587,7 +589,7 @@ export class ProjectManager {
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.isSymbolicLink() || !isProjectId(entry.name)) throw new Error("Unknown local image recovery index entry");
       const storage = path.join(root, entry.name), project = this.#projects.get(entry.name);
-      if (project) result.push(await this.getLocalImageRecoveryAnchor(project.id));
+      if (project) result.push(await this.getLocalImageRecoveryAnchor(project.id, true));
       else {
         let promises: string[]; try { promises = await readdir(path.join(storage, "space-reservations")); } catch (cause) { if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause; promises = []; }
         if (promises.length) throw new Error("A local image recovery promise belongs to an unavailable project; inspect storage before allocating again");
@@ -704,6 +706,7 @@ export class ProjectManager {
     const project = this.#projects.get(id);
     if (!project) throw new Error(`Project not found: ${id}`);
     if (!this.assetLibrary) throw new ProjectAssetError("Asset Library is not configured", 503);
+    await this.assetLibrary.associateProject(assetId, id);
     const { asset, absolutePath } = await this.assetLibrary.content(assetId);
     const candidate = canvasCandidate && isCanvasMediaPath(`assets/canvas/${asset.name}`);
     const folder = [candidate ? "canvas" : "imported"];
@@ -1076,7 +1079,7 @@ export class ProjectManager {
     return associations;
   }
 
-  async referencesLibraryAsset(assetId: string): Promise<ProjectState[]> {
+  async referencesLibraryAsset(assetId: string, excludingProjectId?: string): Promise<ProjectState[]> {
     try {
       const storage = await lstat(this.#projectsDirectory);
       if (!storage.isDirectory() || storage.isSymbolicLink()) throw new Error("Project storage is not a regular directory");
@@ -1097,6 +1100,7 @@ export class ProjectManager {
     }
     const references: ProjectState[] = [];
     for (const project of this.#projects.values()) {
+      if (project.id === excludingProjectId) continue;
       let referenced = false;
       try {
         if (project.workspaceAvailable === false) throw new Error("Project workspace is unavailable");

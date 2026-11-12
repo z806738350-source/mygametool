@@ -15,6 +15,67 @@ import { matchingKunpoImageUrl, rememberKunpoImageSource, copyProviderImageSourc
 import { isPrivateProjectPath } from "../src/shared/private-project-paths.js";
 
 describe("AssetLibrary", () => {
+  it("removes unsaved project copies, transfers shared ownership, and preserves saved or independent assets", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-library-project-delete-"));
+    const library = new AssetLibrary(directory);
+    try {
+      await library.load();
+      const owned = await library.add("owned.mp4", Buffer.from("owned"), { origin: "workspace", sourceKey: "project:first:owned" });
+      const shared = await library.add("shared.mp4", Buffer.from("shared"), { origin: "workspace", sourceKey: "canvas:first:shared" });
+      const attachment = await library.add("attachment.mp4", Buffer.from("attachment"), { origin: "uploaded", saved: false, sourceKey: "project:first:attachment:fixture" });
+      const saved = await library.add("saved.mp4", Buffer.from("saved"), { origin: "workspace", sourceKey: "project:first:saved" }); await library.save(saved.id);
+      const independent = await library.add("upload.mp4", Buffer.from("independent"));
+      const unattributed = await library.add("unknown.mp4", Buffer.from("unknown"), { origin: "workspace" });
+      await library.associateProject(shared.id, "second");
+      // The second import has claimed the source but has not written its workspace manifest yet.
+      await library.removeProjectCopies("first", async () => ["first"]);
+      for (const asset of [owned, attachment]) {
+        expect(library.get(asset.id)).toBeUndefined();
+        await expect(stat(path.join(directory, "library/files", `${asset.id}.mp4`))).rejects.toMatchObject({ code: "ENOENT" });
+      }
+      const state = JSON.parse(await readFile(path.join(directory, "library/assets.json"), "utf8"));
+      expect(Object.keys(state.sources).some(key => key.startsWith("project:first:") || key.startsWith("canvas:first:"))).toBe(false);
+      expect(state.sources[`project:second:shared:${shared.id}`]).toBe(shared.id);
+      const reopened = new AssetLibrary(directory);
+      try {
+        await reopened.load(); await reopened.removeProjectCopies("second", async () => []);
+        expect(reopened.get(shared.id)).toBeUndefined();
+        for (const asset of [saved, independent, unattributed]) expect((await reopened.content(asset.id)).asset.id).toBe(asset.id);
+      } finally { await reopened.close(); }
+    } finally { await library.close(); await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it("preserves every project copy when another physical project cannot be checked", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-library-project-unknown-"));
+    const library = new AssetLibrary(directory);
+    try {
+      await library.load(); const projects = new ProjectManager(directory, library); await projects.load();
+      const owner = await projects.create(), unknown = await projects.create();
+      const assets = await Promise.all(["a", "b"].map(name => library.add(`${name}.mp4`, Buffer.from(name), { origin: "workspace", sourceKey: `project:${owner.id}:${name}` })));
+      await writeFile(path.join(directory, "projects", unknown.id, "project.json"), "invalid");
+      const reopenedProjects = new ProjectManager(directory, library); await reopenedProjects.load();
+      expect(reopenedProjects.list()).toHaveLength(1);
+      await expect(library.removeProjectCopies(owner.id, async id => (await reopenedProjects.referencesLibraryAsset(id, owner.id)).map(project => project.id))).rejects.toThrow("Cannot verify registered projects");
+      for (const asset of assets) expect((await library.content(asset.id)).asset.id).toBe(asset.id);
+    } finally { await library.close(); await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it("retains ownership for a retry if deleting a project copy fails", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-library-project-retry-"));
+    const library = new AssetLibrary(directory);
+    try {
+      await library.load();
+      const asset = await library.add("owned.mp4", Buffer.from("owned"), { origin: "workspace", sourceKey: "project:owner:fixture" });
+      const file = (await library.content(asset.id)).absolutePath;
+      await rm(file); await mkdir(file);
+      await expect(library.removeProjectCopies("owner", async () => [])).rejects.toThrow();
+      expect(library.get(asset.id)).toBeDefined();
+      await rm(file, { recursive: true });
+      await library.removeProjectCopies("owner", async () => []);
+      expect(library.get(asset.id)).toBeUndefined();
+    } finally { await library.close(); await rm(directory, { recursive: true, force: true }); }
+  });
+
   it("persists new content hashes, checks them on read, and keeps legacy records unbound", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-library-digest-"));
     const library = new AssetLibrary(directory);

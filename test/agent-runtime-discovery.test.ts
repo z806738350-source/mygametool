@@ -1,5 +1,5 @@
 // Legacy execution is retained for future OS-isolated support; agent-local-files.test.ts covers current refusal.
-import { lstat, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
@@ -12,6 +12,9 @@ import * as environment from "../src/daemon/agent-runtimes/environment.js";
 import * as controlledQoder from "../src/daemon/agent-runtimes/controlled-qoder.js";
 import { QoderConnection } from "../src/daemon/agent-runtimes/qoder.js";
 import * as codexProtocol from "../src/daemon/agent-runtimes/codex-app-server.js";
+import * as controlledCodex from "../src/daemon/agent-runtimes/controlled-codex.js";
+import type { ProjectState } from "../src/shared/contracts.js";
+import { NATIVE_PRIVATE_SESSION_ENTRY } from "../src/daemon/agent-runtimes/project-history.js";
 
 const cleanup: Array<() => unknown | Promise<unknown>> = [];
 
@@ -69,6 +72,43 @@ function deferred<T>() {
   const promise = new Promise<T>((done) => { resolve = done; });
   return { promise, resolve };
 }
+
+it("deletes native Codex history without sign-in, model discovery or turns and retries a confirmed prior deletion", async () => {
+  const { root, service } = await fixture();
+  const project = { id: "history-project", storagePath: path.join(root, "project"), workspacePath: path.join(root, "project/workspace") } as ProjectState;
+  const session = path.join(project.storagePath!, "session", "conversation.jsonl"), id = "11111111-1111-4111-8111-111111111111";
+  await mkdir(path.dirname(session), { recursive: true });
+  await writeFile(session, JSON.stringify({ type: "custom", customType: "ohmygame-native-session", data: { runtime: "codex-cli", sessionId: id } }) + "\n");
+  vi.spyOn(discovery, "resolveBinary").mockResolvedValue({ path: "/audited/codex", signature: "fixture", source: "manual" });
+  const verify = vi.spyOn(controlledCodex, "verifyControlledCodexBinary").mockResolvedValue();
+  const probe = vi.spyOn(discovery, "probeAuth").mockRejectedValue(new Error("No account check"));
+  const models = vi.spyOn(discovery, "probeModels").mockRejectedValue(new Error("No model discovery"));
+  const initialize = vi.fn(async () => {}), stop = vi.fn(async () => {});
+  const request = vi.fn(async () => { throw new Error("temporary native deletion failure"); });
+  vi.spyOn(codexProtocol, "CodexAppServer").mockImplementation(function () { return { initialize, stop, request } as never; });
+  await expect(service.removeProjectHistory(project)).rejects.toThrow("temporary native deletion failure");
+  expect(await readFile(session, "utf8")).toContain(id);
+  request.mockRejectedValue(Object.assign(new Error(`no rollout found for thread id ${id}`), { rpcCode: -32600 }));
+  await service.removeProjectHistory(project);
+  expect(request.mock.calls).toEqual([["thread/delete", { threadId: id }], ["thread/delete", { threadId: id }]]);
+  expect(initialize).toHaveBeenCalledTimes(2); expect(stop).toHaveBeenCalledTimes(2); expect(verify).toHaveBeenCalledTimes(2);
+  expect(probe).not.toHaveBeenCalled(); expect(models).not.toHaveBeenCalled();
+});
+
+it("records project ownership before creating a disposable native session", async () => {
+  qoderInstallation();
+  vi.spyOn(QoderConnection.prototype, "start").mockResolvedValue();
+  vi.spyOn(QoderConnection.prototype, "stop").mockResolvedValue();
+  vi.spyOn(QoderConnection.prototype, "request").mockImplementation(async method => method === "account/read" ? { userId: "offline" } : [{ value: "auto", source: "system" }]);
+  const { root, service } = await fixture();
+  await service.status("qoder-cli", true); await service.update("qoder-cli", { enabled: true });
+  const request = { ...qoderSessionRequest(root), projectId: "owning-project" };
+  const session = await service.createSession(request);
+  try {
+    const entry = request.sessionManager.getEntries().find(entry => entry.type === "custom" && entry.customType === NATIVE_PRIVATE_SESSION_ENTRY);
+    expect(entry).toMatchObject({ data: { version: 1, projectId: request.projectId, runtime: "qoder-cli", privateDirectory: expect.stringContaining(path.join(root, "agent-runtimes/sessions/qoder-cli-")) } });
+  } finally { await session.dispose(); }
+});
 
 it("keeps disabled passive Qoder discovery and manual sign-in preparation free of CLI, shell and SDK execution", async () => {
   qoderInstallation();

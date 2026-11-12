@@ -752,6 +752,29 @@ it("restores unknown intents without expiring, changing owner or silently upgrad
   await restored.release(); expect(await readdir(path.dirname(file))).toEqual([]);
 });
 
+it.each([false, true])("inspects a missing external workspace without discarding an existing promise: %s", async retained => {
+  let space = await freshSpace(); const missing = await fixture(), other = await fixture();
+  const lease = retained ? await space.reserveRecoverySpace(missing.workspace, smallPlan, owner) : undefined;
+  await rm(missing.workspace, { recursive: true });
+  space = await freshSpace();
+  const restore = space.restoreRecoverySpaceReservations([missing.workspace], [missing.workspace]);
+  if (retained) {
+    await expect(restore).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(space.reserveRecoverySpace(other.workspace, smallPlan, owner)).rejects.toThrow("startup");
+    expect(await readFile(path.join(missing.directory, "isolated-space-reservations", lease!.id + ".json"), "utf8")).toContain(lease!.id);
+  } else {
+    await restore;
+    const next = await space.reserveRecoverySpace(other.workspace, smallPlan, owner); await next.release();
+    await space.releaseRetiredProjectRecoverySpace(missing.workspace, { namespace: "manual", projectId: owner.projectId, sourceRetired: false, allowMissingWorkspace: true });
+  }
+});
+
+it("refuses a replacement link when inspecting a missing registered workspace", async () => {
+  const space = await freshSpace(), { workspace, directory } = await fixture();
+  await rm(workspace, { recursive: true }); await symlink(path.join(directory, "gone"), workspace);
+  await expect(space.recoveryWorkspacePath(workspace, true)).rejects.toThrow("ancestry changed");
+});
+
 it("does not reuse a reservation after removing a verified artifact deduction", async () => {
   const space = await freshSpace(), { workspace, directory } = await fixture(), bytes = Buffer.alloc(1024, 65), sha256 = createHash("sha256").update(bytes).digest("hex"), raw = path.join(directory, "isolated-review-artifacts/raw");
   await mkdir(raw, { recursive: true, mode: 0o700 }); await writeFile(path.join(raw, sha256), bytes, { mode: 0o600 });
