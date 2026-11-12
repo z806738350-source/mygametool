@@ -645,6 +645,12 @@ plan mode, cancellation, errors and events are the same code.
   Pi messages/model changes, cancellation, failure, legacy metadata and
   interrupted writes also invalidate it. An expired native session triggers
   one fresh-context retry with handoff rather than silently losing history.
+  Qoder stores native history under its private working directory. After an app
+  restart that directory changes; an exact `CHAT_SESSION_HISTORY_MISSING` error
+  while opening a resumed session, before prompt release, uses this same one-time
+  handoff. Both the initialization reply and an earlier SDK error notification
+  preserve that classification. Other initialization failures and any error after
+  input release remain failures; they never authorize replaying a model task.
   Classified safe interruptions also use the shared [bounded continuation](agent-errors.md#automatic-continuation-after-an-interruption)
   protocol after original tool outcomes and task ownership are verified. Failed
   contexts rebuild; continuation does not resend the user message or checkpoint.

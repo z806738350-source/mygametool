@@ -20,6 +20,7 @@ import type {
   NativeResultMetadata,
 } from "./native-session.js";
 import type { AgentInterruption } from "../agent-auto-continue.js";
+import { NativeSessionExpiredError } from "./native-session.js";
 
 const CONTROL_TIMEOUT = 30_000;
 type Message = Record<string, unknown>;
@@ -90,6 +91,10 @@ export function qoderHelperError(value: unknown): Error {
   const code = failure?.code;
   const phase = failure?.phase;
   const boundary = failure?.boundary;
+  if (code === "QODER_SESSION_HISTORY_MISSING" && phase === "session-initialize")
+    return new NativeSessionExpiredError(
+      "Qoder's saved context is unavailable; no user input was sent.",
+    );
   const stage =
     typeof phase === "string" && Object.hasOwn(QODER_FAILURE_PHASES, phase)
       ? ` Stage: ${QODER_FAILURE_PHASES[phase]}.`
@@ -276,6 +281,7 @@ interface Turn {
   sink: NativeTurnSink;
   controller: AbortController;
   resolve(outcome: NativeTurnOutcome): void;
+  reject(error: Error): void;
   textSequence: number;
   stream?: StreamMessage;
   streams: StreamMessage[];
@@ -313,12 +319,13 @@ export class QoderDriver implements NativeDriver {
     if (this.#disposed) throw new Error("The Qoder session was closed");
     if (this.#turn) throw new Error("A Qoder turn is already running");
     if (signal.aborted) return { status: "aborted" };
-    return new Promise<NativeTurnOutcome>((resolve) => {
+    return new Promise<NativeTurnOutcome>((resolve, reject) => {
       const turn: Turn = {
         id: randomUUID(),
         sink,
         controller: new AbortController(),
         resolve,
+        reject,
         textSequence: 0,
         streams: [],
         frameKeys: new Map(),
@@ -334,6 +341,10 @@ export class QoderDriver implements NativeDriver {
       turn.resolve = (outcome) => {
         signal.removeEventListener("abort", abort);
         resolve(outcome);
+      };
+      turn.reject = (error) => {
+        signal.removeEventListener("abort", abort);
+        reject(error);
       };
       void (async () => {
         try {
@@ -368,7 +379,7 @@ export class QoderDriver implements NativeDriver {
             const failed = this.#connection;
             this.#connection = undefined;
             this.#starting = undefined;
-            this.#finish({
+            this.#finish(cause instanceof NativeSessionExpiredError && !signal.aborted ? cause : {
               status: signal.aborted ? "aborted" : "failed",
               error:
                 cause instanceof AgentRuntimeCompatibilityError ||
@@ -553,9 +564,10 @@ export class QoderDriver implements NativeDriver {
       return;
     }
     if (message.method === "sdk/error") {
-      this.#finish({
+      const cause = qoderHelperError(params);
+      this.#finish(cause instanceof NativeSessionExpiredError ? cause : {
         status: "failed",
-        error: qoderHelperError(params).message,
+        error: cause.message,
         interruption: qoderHostInterruption(params),
       });
       return;
@@ -730,14 +742,19 @@ export class QoderDriver implements NativeDriver {
       turn.sink.textDone(block.key, text);
   }
 
-  #finish(outcome: NativeTurnOutcome): void {
+  #finish(outcome: NativeTurnOutcome | NativeSessionExpiredError): void {
     const turn = this.#turn;
     if (!turn) return;
     this.#turn = undefined;
-    if (outcome.status !== "completed") this.#session = undefined;
+    if (
+      outcome instanceof NativeSessionExpiredError ||
+      outcome.status !== "completed"
+    )
+      this.#session = undefined;
     turn.controller.abort();
     for (const [key, value] of turn.text) turn.sink.textDone(key, value);
-    turn.resolve(outcome);
+    if (outcome instanceof NativeSessionExpiredError) turn.reject(outcome);
+    else turn.resolve(outcome);
   }
 }
 

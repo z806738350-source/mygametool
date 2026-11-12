@@ -22,7 +22,7 @@ import { CodexDriver } from "../src/daemon/agent-runtimes/codex.js";
 import * as discovery from "../src/daemon/agent-runtimes/discovery.js";
 import { AgentRuntimeService } from "../src/daemon/agent-runtimes/service.js";
 import { OpenCodeDriver } from "../src/daemon/agent-runtimes/opencode.js";
-import { QoderDriver, type QoderHostConnection } from "../src/daemon/agent-runtimes/qoder.js";
+import { QoderDriver, qoderHelperError, type QoderHostConnection } from "../src/daemon/agent-runtimes/qoder.js";
 import {
   QoderSdkHost,
   runQoderSdkHost,
@@ -2994,6 +2994,58 @@ describe("Qoder driver text projection into persisted sessions", () => {
   const stop = (index: number): Frame => stream({ type: "content_block_stop", index });
   const final = (id: string | undefined, uuid: string, texts: string[]): Frame => ({ type: "assistant", uuid, message: { ...(id ? { id } : {}), role: "assistant", content: texts.map(text => ({ type: "text", text })) } });
 
+  it.each(["stream-first", "request-first", "fresh-fails"])("rebuilds a missing Qoder context once through the actual driver without replaying retained work (%s)", async order => {
+    const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "Must not replay" }], details: {} }));
+    const ctx = await context({ model: "gmodel", bridge: new ToolBridge([defineTool({ name: "echo_tool", label: "Echo", description: "Retained fixture tool", parameters: Type.Object({}), execute })] as never) });
+    const manager = SessionManager.create(ctx.privateDirectory, path.join(ctx.privateDirectory, "sessions"));
+    manager.appendMessage({ role: "user", content: "Keep the approved character and original workflow", timestamp: 1 });
+    manager.appendMessage({ role: "toolResult", toolCallId: "retained-blender-call", toolName: "run_blender", isError: false, content: [{ type: "text", text: "Existing model normalized; model.glb retained" }], timestamp: 2 });
+    manager.appendCustomEntry("ohmygame-native-session", { version: 2, runtime: "qoder-cli", state: "ready", sessionId: "expired-qoder-context" });
+    const inputs: Frame[] = [], resumes: Array<string | undefined> = [];
+    const snapshot = vi.fn(async () => "1".repeat(40));
+    const session = new NativeCodingSession({ runtime: "qoder-cli", model: "gmodel", sessionManager: manager, toolNames: ["echo_tool"], snapshotBeforeMessage: snapshot, requestApproval: async () => "deny", createDriver: resume => {
+      resumes.push(resume);
+      return new QoderDriver({ ...ctx, resume }, receive => ({
+        start: async () => {}, stop: async () => {}, respond: () => {},
+        request: async (method, params = {}) => {
+          expect(method).toBe("turn/start"); inputs.push(params);
+          if (resume || order === "fresh-fails") {
+            const failure = { code: "QODER_SESSION_HISTORY_MISSING", phase: "session-initialize", message: "PRIVATE_TRANSCRIPT_PATH" };
+            if (order !== "request-first") receive({ method: "sdk/error", params: { turnId: params.turnId, ...failure } });
+            throw qoderHelperError(failure);
+          }
+          queueMicrotask(() => {
+            receive({ method: "sdk/message", params: { turnId: params.turnId, message: { type: "system", subtype: "init", session_id: "replacement-qoder-context" } } });
+            receive({ method: "sdk/message", params: { turnId: params.turnId, message: final("fresh-response", "fresh-block", ["Continuing the retained work."]) } });
+            receive({ method: "sdk/message", params: { turnId: params.turnId, message: { type: "result", subtype: "success", is_error: false } } });
+          });
+          return { sessionId: "replacement-qoder-context" };
+        },
+      }));
+    } });
+    cleanup.push(() => session.dispose());
+    await session.prompt("Accept and continue");
+    expect(resumes.slice(0, 2)).toEqual(["expired-qoder-context", undefined]);
+    expect(inputs).toHaveLength(2);
+    expect(inputs[0].resume).toBe("expired-qoder-context");
+    expect(inputs[1]).not.toHaveProperty("resume");
+    expect(inputs[1].text).toContain("<conversation-handoff>");
+    expect(inputs[1].text).toContain("Keep the approved character");
+    expect(inputs[1].text).toContain('"originalCallId":"retained-blender-call","tool":"run_blender","state":"completed"');
+    expect(snapshot).toHaveBeenCalledOnce();
+    expect(execute).not.toHaveBeenCalled();
+    const entries = manager.getBranch();
+    expect(entries.filter(entry => entry.type === "message" && entry.message.role === "user")).toHaveLength(2);
+    expect(entries.filter(entry => entry.type === "message" && entry.message.role === "toolResult")).toHaveLength(1);
+    expect(entries.filter(entry => entry.type === "custom" && entry.customType === "ohmygame-native-outcome").at(-1)).toMatchObject({ data: { status: order === "fresh-fails" ? "failed" : "completed" } });
+    expect(JSON.stringify(entries)).not.toContain("PRIVATE_TRANSCRIPT_PATH");
+  });
+
+  it.each(["response-stream", "query-start"])("does not classify a saved-context message as expired after an unverified boundary (%s)", phase => {
+    expect(qoderHelperError({ code: "QODER_SESSION_HISTORY_MISSING", phase })).not.toBeInstanceOf(NativeSessionExpiredError);
+    expect(qoderHelperError({ code: "QODER_SDK", phase: "session-initialize", message: "CHAT_SESSION_HISTORY_MISSING" })).not.toBeInstanceOf(NativeSessionExpiredError);
+  });
+
   it("acknowledges steering once after the original tool receipt and the stable checkpoint", async () => {
     const tool = deferred<NativeToolResult & { details: object }>();
     const execute = vi.fn(() => tool.promise);
@@ -4026,6 +4078,49 @@ describe("Qoder SDK host controlled bridge", () => {
     expect(await f.start()).toMatchObject({ error: { code: "QODER_SDK_DAEMON_PROTOCOL", phase: "query-start" } });
     expect(f.prompts).toEqual([]);
     expect(JSON.stringify(f.sent)).not.toContain("PRIVATE_SDK_CANARY");
+  });
+
+  it.each([
+    { resume: true, source: "stream", code: "CHAT_SESSION_HISTORY_MISSING", expected: "QODER_SESSION_HISTORY_MISSING" },
+    { resume: true, source: "request", code: "CHAT_SESSION_HISTORY_MISSING", expected: "QODER_SESSION_HISTORY_MISSING" },
+    { resume: true, source: "query", code: "CHAT_SESSION_HISTORY_MISSING", expected: "QODER_SDK" },
+    { resume: false, source: "request", code: "CHAT_SESSION_HISTORY_MISSING", expected: "QODER_SDK" },
+    { resume: true, source: "request", code: "DAEMON_REQUEST_FAILED", expected: "QODER_SDK" },
+  ])("only exposes a known pre-input resume failure ($source, resume=$resume, code=$code)", async ({ resume, source, code, expected }) => {
+    const f = fixture();
+    const failure = Object.assign(new Error("PRIVATE_TRANSCRIPT_PATH"), { name: "DaemonRpcError", code });
+    const query = f.sdkQuery.getMockImplementation()!;
+    f.sdkQuery.mockImplementationOnce(input => {
+      if (source === "query") throw failure;
+      const runtime = query(input);
+      return { ...runtime,
+        initializationResult: vi.fn(async () => { throw failure; }),
+        ...(source === "stream" ? { async *[Symbol.asyncIterator]() { throw failure; yield {}; } } : {}),
+      };
+    });
+    await f.initializeHost();
+    expect(await f.start(resume ? { resume: "retained-context" } : {})).toMatchObject({ error: { code: expected, phase: source === "query" ? "query-start" : "session-initialize" } });
+    if (source === "stream") expect(f.sent.find(entry => entry.method === "sdk/error")).toMatchObject({ params: { code: expected, phase: "session-initialize" } });
+    expect(f.prompts).toEqual([]);
+    expect(JSON.stringify(f.sent)).not.toContain("PRIVATE_TRANSCRIPT_PATH");
+  });
+
+  it("does not treat missing history after input dispatch as a safe context rebuild", async () => {
+    const f = fixture(), fail = deferred<void>();
+    const query = f.sdkQuery.getMockImplementation()!;
+    f.sdkQuery.mockImplementationOnce(input => {
+      const runtime = query(input);
+      return { ...runtime, async *[Symbol.asyncIterator]() {
+        yield (await runtime[Symbol.asyncIterator]().next()).value;
+        await fail.promise;
+        throw Object.assign(new Error("PRIVATE_TRANSCRIPT_PATH"), { name: "DaemonRpcError", code: "CHAT_SESSION_HISTORY_MISSING" });
+      } };
+    });
+    await f.initializeHost(); await f.start({ resume: "retained-context" });
+    await vi.waitFor(() => expect(f.prompts).toHaveLength(1));
+    fail.resolve();
+    await vi.waitFor(() => expect(f.sent.find(entry => entry.method === "sdk/error")).toMatchObject({ params: { code: "QODER_SDK", phase: "response-stream" } }));
+    expect(JSON.stringify(f.sent)).not.toContain("PRIVATE_TRANSCRIPT_PATH");
   });
 
   it("keeps the primary boundary failure when SDK query cleanup also fails", async () => {

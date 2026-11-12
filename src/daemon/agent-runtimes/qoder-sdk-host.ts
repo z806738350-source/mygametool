@@ -102,6 +102,7 @@ interface HostTurn {
   pump?: Promise<void>;
   complete: boolean;
   inputSent: boolean;
+  resuming: boolean;
   requiresImageInput: boolean;
   failure?: HostError;
   inputQueue: ObjectValue[];
@@ -313,6 +314,7 @@ export class QoderSdkHost {
       rejectReady,
       complete: false,
       inputSent: false,
+      resuming: typeof params.resume === "string" && params.resume.length > 0,
       inputQueue: [],
       steering: new Map(),
       requiresImageInput:
@@ -535,7 +537,7 @@ export class QoderSdkHost {
       releaseInput();
       return { sessionId: turn.sessionId };
     } catch (cause) {
-      const error = turn.failure ?? sdkFailure(cause, phase);
+      const error = turn.failure ?? sdkFailure(cause, phase, turn);
       turn.rejectReady(error);
       // Keep the primary startup failure if SDK cleanup also rejects.
       await this.#stopTurn(turn).catch(() => {});
@@ -710,6 +712,7 @@ export class QoderSdkHost {
     const error = (turn.failure = sdkFailure(
       cause,
       turn.inputSent ? "response-stream" : "session-initialize",
+      turn,
     ));
     turn.rejectReady(error);
     if (!turn.controller.signal.aborted)
@@ -970,7 +973,19 @@ function errorCode(cause: unknown): string {
 function sdkFailure(
   cause: unknown,
   phase: NonNullable<HostError["phase"]>,
+  turn?: HostTurn,
 ): HostError {
+  if (
+    turn?.resuming &&
+    !turn.inputSent &&
+    phase === "session-initialize" &&
+    object(cause)?.code === "CHAT_SESSION_HISTORY_MISSING"
+  )
+    return new HostError(
+      "Qoder's saved context is unavailable; no user input was sent.",
+      "QODER_SESSION_HISTORY_MISSING",
+      phase,
+    );
   return cause instanceof HostError
     ? cause.phase
       ? cause
