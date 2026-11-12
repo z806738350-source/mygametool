@@ -7,6 +7,75 @@ import { startDaemon } from "../src/desktop/daemon-process.js";
 import { playtestActionError, playtestOpenError } from "../src/shared/playtest.js";
 import { localDesktopLaunch } from "../src/desktop/local-launch.js";
 import { bindDesktopDaemonOwner } from "../src/daemon/desktop-owner.js";
+import { resolveBlenderWindowBounds } from "../src/daemon/blender-window-bounds.js";
+import { blenderWindowGeometry, placeBlenderWindow } from "../src/shared/blender-window-bounds.js";
+
+describe("Blender observer window placement", () => {
+  const content = { x: 100, y: 100, width: 1200, height: 800 };
+  const workArea = { x: 0, y: 25, width: 1920, height: 1055 };
+  it.each(["left", "right"])("fits the visible canvas when chat is on the %s", (chatSide) => {
+    const canvas = { x: chatSide === "left" ? 431 : 0, y: 0, width: 769, height: 800 };
+    const bounds = placeBlenderWindow(content, workArea, { canvas, chatSide });
+    expect(bounds).toEqual({ x: chatSide === "left" ? 543 : 112, y: 185, width: 745, height: 650 });
+  });
+  it("converts page zoom to DIP without applying a second Retina scale", () => {
+    const canvas = { x: 344.8, y: 0, width: 615.2, height: 640 };
+    expect(placeBlenderWindow(content, workArea, { canvas, devicePixelRatio: 2 }, 1.25))
+      .toEqual({ x: 543, y: 185, width: 745, height: 650 });
+  });
+  it("retains negative secondary-display coordinates and uses the primary display for Blender's bottom origin", () => {
+    const bounds = placeBlenderWindow({ x: -1800, y: -900, width: 1400, height: 800 }, { x: -1920, y: -1080, width: 1920, height: 1080 }, { canvas: { x: 431, y: 0, width: 969, height: 800 } });
+    expect(bounds).toEqual({ x: -1334, y: -815, width: 900, height: 650 });
+    expect(blenderWindowGeometry({ bounds, screenHeight: 1080 })).toEqual({ x: -1334, y: 1245, width: 900, height: 650 });
+  });
+  it("uses free screen space beside a widened chat when the canvas is narrower than Blender's minimum", () => {
+    const bounds = placeBlenderWindow(content, workArea, { canvas: { x: 1001, y: 0, width: 199, height: 800 }, chat: { x: 0, y: 0, width: 1000, height: 800 } })!;
+    expect(bounds.x).toBeGreaterThanOrEqual(1100);
+    expect(bounds.width).toBeGreaterThanOrEqual(500);
+    expect(bounds.x + bounds.width).toBeLessThanOrEqual(1920);
+  });
+  it("defaults to the opposite side and keeps a collapsed-canvas fallback small", () => {
+    expect(placeBlenderWindow(content, workArea, undefined)!.x).toBeGreaterThanOrEqual(530);
+    const bounds = placeBlenderWindow(workArea, workArea, { chat: { x: 0, y: 0, width: 1920, height: 1055 }, chatSide: "right" });
+    expect(bounds).toEqual({ x: 12, y: 57, width: 500, height: 360 });
+    expect(placeBlenderWindow(content, { ...workArea, width: 450 }, undefined)).toBeUndefined();
+  });
+  it.each([undefined, {}, { bounds: { x: 0, y: 0, width: 901, height: 650 }, screenHeight: 1080 }, { bounds: { x: NaN, y: 0, width: 500, height: 360 }, screenHeight: 1080 }])("ignores invalid desktop geometry (%j)", (value) => {
+    expect(blenderWindowGeometry(value)).toBeUndefined();
+  });
+  it.each(["en", "zh-CN", "zh-TW", "__proto__"])("carries only supported observer languages (%s)", (language) => {
+    const placement = { bounds: { x: 600, y: 100, width: 700, height: 650 }, screenHeight: 1080, language };
+    expect(blenderWindowGeometry(placement)).toEqual({
+      x: 600, y: 330, width: 700, height: 650,
+      ...(language === "en" || language === "zh-CN" ? { language } : {}),
+    });
+  });
+  it.each(["result", "malformed", "disconnect", "timeout", "send-error", "send-throw"])("cleans optional placement IPC after %s", async (mode) => {
+    vi.useFakeTimers();
+    const send = vi.fn((_message: unknown, callback: (error?: Error) => void) => {
+      if (mode === "send-throw") throw new Error("disconnected");
+      callback(mode === "send-error" ? new Error("disconnected") : undefined);
+    });
+    const ipc = Object.assign(new EventEmitter(), { platform: "darwin", env: { OHMYGAME_BLENDER_WINDOW_IPC: "1" }, connected: true, send });
+    vi.stubGlobal("process", ipc);
+    try {
+      const promise = resolveBlenderWindowBounds();
+      const request = send.mock.calls[0]![0] as { id: string };
+      const result = { bounds: { x: 600, y: 100, width: 700, height: 650 }, screenHeight: 1080 };
+      ipc.emit("message", { channel: "ohmygame:blender-window:result", id: "another-call", result });
+      if (mode === "result" || mode === "malformed") ipc.emit("message", { channel: "ohmygame:blender-window:result", id: request.id, result: mode === "result" ? result : {} });
+      if (mode === "disconnect") ipc.emit("disconnect");
+      if (mode === "timeout") await vi.advanceTimersByTimeAsync(1500);
+      expect(await promise).toEqual(mode === "result" ? { x: 600, y: 330, width: 700, height: 650 } : undefined);
+      expect(ipc.listenerCount("message")).toBe(0);
+      expect(ipc.listenerCount("disconnect")).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe("source desktop launcher arguments and ownership", () => {
   const envFile = path.resolve(tmpdir(), "fake.env"), profile = path.resolve(tmpdir(), "fake-profile");
@@ -80,10 +149,11 @@ describe("desktop daemon process", () => {
       timers.mockRestore(); await rm(directory, { recursive: true, force: true });
     }
   });
-  it("resolves the system proxy over private child IPC", async () => {
+  it("resolves system proxy and Blender placement over private child IPC", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-proxy-ipc-"));
     const entry = path.join(directory, "daemon.mjs");
     const resultFile = path.join(directory, "result.json");
+    const windowFile = path.join(directory, "window.json");
     const shutdownFile = path.join(directory, "shutdown");
     await writeFile(
       entry,
@@ -93,17 +163,20 @@ describe("desktop daemon process", () => {
       const server = createServer((_request, response) => response.end());
       process.on("message", (message) => {
         if (message.channel === "ohmygame:system-proxy:result") writeFileSync(${JSON.stringify(resultFile)}, JSON.stringify(message));
+        if (message.channel === "ohmygame:blender-window:result") writeFileSync(${JSON.stringify(windowFile)}, JSON.stringify({ ...message, enabled: process.env.OHMYGAME_BLENDER_WINDOW_IPC }));
         if (message.channel === "ohmygame:shutdown") server.close(() => {
           writeFileSync(${JSON.stringify(shutdownFile)}, "closed");
           process.exit(0);
         });
       });
       process.send({ channel: "ohmygame:system-proxy:resolve", id: "test-proxy" });
+      process.send({ channel: "ohmygame:blender-window:resolve", id: "test-window" });
       server.listen(Number(process.env.DAEMON_PORT), "127.0.0.1");
       // This fixture can only close gracefully through IPC, as on Windows.
       process.once("SIGTERM", () => {});
     `);
-    const daemon = await startDaemon({ daemonEntry: entry, dataDirectory: directory, token: "test-token", allowedOrigins: [], executable: process.execPath, environment: {}, resolveSystemProxy: async () => "PROXY 127.0.0.1:7890" });
+    const placement = { bounds: { x: 600, y: 100, width: 700, height: 650 }, screenHeight: 1080, language: "zh-CN" as const };
+    const daemon = await startDaemon({ daemonEntry: entry, dataDirectory: directory, token: "test-token", allowedOrigins: [], executable: process.execPath, environment: {}, resolveSystemProxy: async () => "PROXY 127.0.0.1:7890", resolveBlenderWindowBounds: async () => placement });
     try {
       await vi.waitFor(async () =>
         expect(JSON.parse(await readFile(resultFile, "utf8"))).toEqual({
@@ -112,6 +185,7 @@ describe("desktop daemon process", () => {
           result: "PROXY 127.0.0.1:7890",
         }),
       );
+      await vi.waitFor(async () => expect(JSON.parse(await readFile(windowFile, "utf8"))).toEqual({ channel: "ohmygame:blender-window:result", id: "test-window", result: placement, enabled: "1" }));
     } finally {
       await Promise.all([daemon.stop(), daemon.stop()]);
       expect(await readFile(shutdownFile, "utf8")).toBe("closed");

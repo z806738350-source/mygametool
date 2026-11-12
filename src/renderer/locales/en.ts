@@ -1,5 +1,8 @@
 // English is the source language. Add every UI string here first.
+import { blenderLiveViewLabels } from "../../shared/blender-live-view-labels.js";
+
 const en = {
+  blenderLiveView: blenderLiveViewLabels.en,
   localEdition: {
     title: "Local edition",
     cloudUnavailable: "This local edition does not provide accounts, Community, cloud publishing, or hosted model quotas. Local projects work without signing in.",

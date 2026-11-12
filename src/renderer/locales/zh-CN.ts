@@ -1,6 +1,8 @@
 import type en from "./en.js";
+import { blenderLiveViewLabels } from "../../shared/blender-live-view-labels.js";
 
 const zhCN: typeof en = {
+  blenderLiveView: blenderLiveViewLabels["zh-CN"],
   localEdition: {
     title: "本地版",
     cloudUnavailable: "本地版不提供账号、社区、云发布或托管模型额度。本地项目无需登录即可使用。",

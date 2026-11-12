@@ -47,6 +47,17 @@ Keep joint/region overlays and stress-pose images alongside it. Recovery reuses
 the same nodes and preserves their edited titles and layout. Preview publication
 does not mark the asset approved or add it to the running game.
 
+When `blender_status.liveWorkWindow` is true, the desktop opens a movable,
+resizable Blender work window for each running task and closes it automatically
+on completion or cancellation. A separate observer loads copies of the worker's
+current scene at checkpoints. These are intermediate production scenes, not
+commands executed through that window or a recording played after completion.
+Native operations such as remeshing, weight solving or baking can leave the last
+scene visible until control returns to the script and it reaches a checkpoint.
+Observation warnings do not change the production outcome: retain the run and
+its outputs rather than rerunning or buying a replacement. Canvas model playback
+and the user's milestone review remain the acceptance step.
+
 The shipped baseline has been exercised with Blender 5.3. Its ordinary Python
 uses Blender's `bpy`, `bmesh` and `mathutils`, with no external Python packages.
 Preview rendering uses CPU Cycles. Custom scripts must follow the tool's same
@@ -65,6 +76,7 @@ import argparse
 import sys
 from pathlib import Path
 import bpy
+from live_preview import checkpoint
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--input-dir", required=True)
@@ -76,8 +88,20 @@ inputs = Path(args.input_dir)
 output = Path(args.output_dir)
 if args.input:
     bpy.ops.wm.open_mainfile(filepath=str(inputs / args.input))  # .blend input
+    checkpoint("Loaded source", force=True)
 # Read only declared inputs. Write results only below output.
 ```
+
+Call `checkpoint("Describe the completed operation")` after meaningful scene
+changes such as creating a part, cleaning a mesh, adjusting weights, posing a
+stress test or baking a clip. Use `checkpoint("Finished scene", force=True)`
+after saving the final result. Ordinary calls are limited to once per second;
+`force=True` is for initial and final scenes. Do not sleep to make work look
+longer, start another Blender process, or write observer files yourself. The
+helper does nothing when the host has not enabled observation. It saves a packed
+copy without changing the source filepath; a snapshot error disables further
+updates and reports a warning without stopping production. Live copies are
+temporary observation data, not additional deliverables in `report.outputs`.
 
 A confirmed script failure returns its retained run ID, failure status and log;
 it does not approve or publish partial files. Fix the script/configuration and

@@ -14,6 +14,101 @@ const pipeline = path.resolve(
 
 // Real Blender is opt-in: ordinary unit tests must not launch host applications.
 describe.skipIf(!blender)("Blender production stages", () => {
+  it("publishes throttled live scene copies without modifying sources and keeps preview failures independent", async () => {
+    const root = await temporaryTestDirectory("ohmygame-blender-live-");
+    const script = path.join(root, "live-check.py");
+    await writeFile(
+      script,
+      `import json, os, sys
+from pathlib import Path
+import bpy
+sys.path.insert(0, ${JSON.stringify(path.dirname(pipeline))})
+import live_preview
+root = Path(${JSON.stringify(root)})
+bpy.ops.wm.read_factory_settings(use_empty=True)
+bpy.ops.mesh.primitive_cube_add()
+bpy.context.object.name = "Original"
+image = bpy.data.images.new("Texture", width=2, height=2)
+image.filepath_raw = str(root / "texture.png")
+image.file_format = "PNG"
+image.save()
+image.source = "FILE"
+material = bpy.data.materials.new("Textured")
+material.use_nodes = True
+material.node_tree.nodes.new("ShaderNodeTexImage").image = image
+bpy.context.object.data.materials.append(material)
+bpy.ops.wm.save_as_mainfile(filepath=str(root / "source.blend"), compress=False)
+source_bytes = (root / "source.blend").read_bytes()
+source_path = bpy.data.filepath
+save_version = bpy.context.preferences.filepaths.save_version
+os.environ.pop("OHMYGAME_BLENDER_LIVE_DIR", None)
+assert live_preview.checkpoint("Disabled", force=True) is False
+assert not (root / "live").exists()
+os.environ["OHMYGAME_BLENDER_LIVE_DIR"] = str(root / "live")
+live_preview.monotonic = lambda: 0
+assert live_preview.checkpoint("Initial shape", force=True) is True
+assert bpy.data.filepath == source_path
+assert bpy.context.preferences.filepaths.save_version == save_version
+first = json.loads((root / "live/status.json").read_text())
+bpy.ops.mesh.primitive_cube_add(location=(3, 0, 0))
+bpy.context.object.name = "Second"
+assert live_preview.checkpoint("Throttled") is False
+assert json.loads((root / "live/status.json").read_text()) == first
+live_preview.monotonic = lambda: 1.1
+assert live_preview.checkpoint("Second part") is True
+second = json.loads((root / "live/status.json").read_text())
+assert second["sequence"] == first["sequence"] + 1
+assert second["label"] == "Second part"
+assert bpy.data.filepath == source_path
+bpy.ops.mesh.primitive_cube_add(location=(6, 0, 0))
+bpy.context.object.name = "Unsaved third"
+replace = live_preview.os.replace
+def broken_replace(source, destination):
+    if Path(destination).name == "scene.blend":
+        raise OSError("Synthetic observer snapshot failure")
+    return replace(source, destination)
+live_preview.os.replace = broken_replace
+assert live_preview.checkpoint("Failed preview", force=True) is False
+live_preview.os.replace = replace
+assert live_preview.checkpoint("Disabled after failure", force=True) is False
+failed = json.loads((root / "live/status.json").read_text())
+assert all(failed[key] == value for key, value in second.items())
+assert "Synthetic observer snapshot failure" in failed["error"]
+assert bpy.data.filepath == source_path
+assert len(bpy.context.scene.objects) == 3
+assert (root / "source.blend").read_bytes() == source_bytes
+assert sorted(p.name for p in (root / "live").iterdir()) == ["scene.blend", "status.json"]
+bpy.ops.wm.open_mainfile(filepath=str(root / "live/scene.blend"), load_ui=False, use_scripts=False)
+assert sorted(obj.name for obj in bpy.context.scene.objects) == ["Original", "Second"]
+assert bpy.data.images["Texture"].packed_file is not None
+(root / "verified.json").write_text(json.dumps({"first": first, "second": second, "failed": failed, "sourcePreserved": True}))
+`,
+    );
+    const result = await execute(
+      blender!,
+      [
+        "--background",
+        "--factory-startup",
+        "--disable-autoexec",
+        "--python-exit-code",
+        "1",
+        "--python",
+        script,
+      ],
+      { timeout: 60000 },
+    );
+    expect(result.stderr.match(/LIVE_PREVIEW_ERROR/g)).toHaveLength(1);
+    const verified = JSON.parse(
+      await readFile(path.join(root, "verified.json"), "utf8"),
+    );
+    expect(verified).toMatchObject({
+      first: { sequence: 1 },
+      second: { sequence: 2, label: "Second part" },
+      sourcePreserved: true,
+    });
+    expect(Number.isFinite(Date.parse(verified.second.updatedAt))).toBe(true);
+  }, 75000);
+
   it("normalizes shared mesh instances without applying one instance transform to another", async () => {
     const root = await temporaryTestDirectory("ohmygame-blender-instances-");
     const document = new Document();
@@ -210,6 +305,7 @@ describe.skipIf(!blender)("Blender production stages", () => {
       settingsPath = configPath,
     ) => {
       const output = path.join(root, outputName);
+      const liveDirectory = path.join(root, "live-" + outputName);
       await execute(
         blender!,
         [
@@ -231,11 +327,27 @@ describe.skipIf(!blender)("Blender production stages", () => {
           output,
           ...(input ? ["--input", input] : []),
         ],
-        { timeout: 120000, maxBuffer: 8 * 1024 * 1024 },
+        {
+          timeout: 120000,
+          maxBuffer: 8 * 1024 * 1024,
+          env: { ...process.env, OHMYGAME_BLENDER_LIVE_DIR: liveDirectory },
+        },
       );
-      return JSON.parse(
+      const status = JSON.parse(
+        await readFile(path.join(liveDirectory, "status.json"), "utf8"),
+      );
+      expect(status).toMatchObject({ label: "Finished stage: " + stage });
+      expect(status.error).toBeUndefined();
+      expect(status.sequence).toBeGreaterThanOrEqual(2);
+      expect(
+        (await stat(path.join(liveDirectory, "scene.blend"))).size,
+      ).toBeGreaterThan(0);
+      const report = JSON.parse(
         await readFile(path.join(output, "report.json"), "utf8"),
       );
+      expect(report.outputs).not.toContain("status.json");
+      expect(report.outputs).not.toContain("scene.pending.blend");
+      return report;
     };
     expect((await run("parts")).technicalChecksPassed).toBe(true);
     const source = path.join(root, "parts", "scene.blend");

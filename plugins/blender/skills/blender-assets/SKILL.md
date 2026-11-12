@@ -45,6 +45,15 @@ script and result paths in the project's asset production document. If delivery 
 interrupted, call `recover_blender_run` with that runId; it recovers saved work and
 never starts Blender or submits a provider request.
 
+Check `blender_status.liveWorkWindow` before promising a live window. When available
+on desktop, each task automatically opens a movable, resizable Blender observer
+and closes it when work finishes or is cancelled. It shows copies of the worker's
+actual intermediate scenes at checkpoints; the Agent is not performing each
+operation through the GUI. Long native operations may hold the previous scene
+until the next checkpoint. Report any observation warning separately from the
+production result. Keep saved work; do not rerun a completed task or use paid
+generation to repair a missing window.
+
 Use the current Canvas `boardId` when known. Bundled modeling stages produce
 `review.glb`; export produces `model.glb`. The host adds each run's model and
 auxiliary PNGs to that board and returns `canvas.boardId` / `canvas.nodeIds`.
@@ -59,6 +68,12 @@ network or access to other host files. Parse `--input-dir` and `--output-dir` af
 `--` in `sys.argv`; read only declared inputs and save results under output-dir.
 Use `import pipeline` or `import export_glb` to reuse the bundled helpers. The
 executed script and helpers are preserved together in the result's `recipe/`.
+For live observation, use `from live_preview import checkpoint` and call
+`checkpoint("Describe the completed operation")` after meaningful scene changes.
+Use `force=True` for the loaded source and final scene. Updates are otherwise
+limited to once per second; do not add sleeps or launch a GUI yourself. When
+live observation is not enabled, the helper does nothing. The window does not replace Canvas
+model playback or the user's milestone acceptance.
 Do not install packages, launch helpers, or depend on user Blender preferences.
 Save the editable `.blend` explicitly with `bpy.ops.wm.save_as_mainfile(..., compress=False)`; pack textures. Name datablocks explicitly and
 select shader nodes by type rather than translated labels. Bake procedural materials

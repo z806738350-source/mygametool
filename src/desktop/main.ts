@@ -4,7 +4,7 @@ import { mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, session, shell } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, screen, session, shell } from "electron";
 import { clipboardFilePaths, loadClipboardFiles } from "./file-clipboard.js";
 import { DaemonSupervisor } from "./daemon-supervisor.js";
 import { isLoopbackHostHeader } from "../shared/local-security.js";
@@ -32,6 +32,7 @@ import type { PlayableThumbnailSnapshot } from "../shared/playable-player-protoc
 import { PROJECT_FILE_OPEN_MODES, type ProjectFileOpenMode } from "../shared/contracts.js";
 import type { PlaytestWatchState } from "../shared/playtest.js";
 import type { WebGamePlayerRequest, WebGamePreviewLayout } from "../shared/web-game-player.js";
+import { placeBlenderWindow, type BlenderWindowPlacement } from "../shared/blender-window-bounds.js";
 
 ignoreBrokenStdio();
 
@@ -572,6 +573,7 @@ try {
       await systemProxySession.forceReloadProxyConfig();
       return systemProxySession.resolveProxy(SYSTEM_PROXY_TARGET);
     },
+    resolveBlenderWindowBounds: readBlenderWindowPlacement,
     development: !useBuiltRenderer,
     healthTimeoutMs: 60_000,
     log: daemonLog,
@@ -666,6 +668,43 @@ function desktopEnvironment(): NodeJS.ProcessEnv {
     if (/^(?:CLOUD_API_URL|PUBLISH_API_URL|DESKTOP_UPDATE_URL|SENTRY_.+|VITE_(?:POSTHOG|SUPABASE)_.+)$/i.test(name)) delete environment[name];
   }
   return environment;
+}
+
+async function readBlenderWindowPlacement(): Promise<BlenderWindowPlacement | undefined> {
+  const window = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+  const content = window?.getContentBounds() ?? screen.getPrimaryDisplay().workArea;
+  const workArea = screen.getDisplayMatching(content).workArea;
+  const zoom = window?.webContents.getZoomFactor() ?? 1;
+  let layout: unknown;
+  if (window && !window.isMinimized()) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      layout = await Promise.race([
+        // Fixed app-owned query; no Agent input or project iframe script is executed.
+        window.webContents.executeJavaScript(`(() => {
+          const rect = (selector) => {
+            const element = document.querySelector(selector);
+            if (!element || getComputedStyle(element).visibility === "hidden") return;
+            const { x, y, width, height } = element.getBoundingClientRect();
+            if (width > 0 && height > 0) return { x, y, width, height };
+          };
+          return {
+            canvas: rect(".viewer-pane:not([hidden])"), chat: rect(".agent-pane"),
+            chatSide: document.querySelector(".workspace-shell-chat-right") ? "right" : "left",
+            language: document.documentElement.lang
+          };
+        })()`),
+        new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), 750); }),
+      ]);
+    } catch { /* An unready renderer only affects the initial window position. */ }
+    finally { clearTimeout(timer); }
+  }
+  const bounds = placeBlenderWindow(content, workArea, layout, zoom);
+  const language = (layout as { language?: unknown } | undefined)?.language;
+  return bounds ? {
+    bounds, screenHeight: screen.getPrimaryDisplay().bounds.height,
+    ...(language === "en" || language === "zh-CN" ? { language } : {}),
+  } : undefined;
 }
 
 function captureBounds(value: unknown, content: Electron.Rectangle): Electron.Rectangle {

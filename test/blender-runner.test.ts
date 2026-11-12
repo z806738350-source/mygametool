@@ -17,7 +17,29 @@ import {
   BlenderRunner,
 } from "../src/daemon/blender-runner.js";
 
-const monitor = vi.hoisted(() => ({ rss: undefined as string | undefined }));
+const monitor = vi.hoisted(() => ({ rss: undefined as string | undefined, transientStats: 0, transientDirectories: 0, missingCompletedOutput: false }));
+vi.mock("node:fs/promises", async (original) => {
+  const actual = await original<typeof import("node:fs/promises")>();
+  const missing = () => Object.assign(new Error("ENOENT: snapshot was atomically replaced"), { code: "ENOENT" });
+  return {
+    ...actual,
+    lstat: async (...args: Parameters<typeof actual.lstat>) => {
+      if (String(args[0]).endsWith("/tmp/atomic.json") && monitor.transientStats > 0) {
+        monitor.transientStats--;
+        throw missing();
+      }
+      if (String(args[0]).endsWith("/output/report.json") && monitor.missingCompletedOutput) throw missing();
+      return actual.lstat(...args);
+    },
+    readdir: async (...args: Parameters<typeof actual.readdir>) => {
+      if (String(args[0]).endsWith("/tmp/atomic-directory") && monitor.transientDirectories > 0) {
+        monitor.transientDirectories--;
+        throw missing();
+      }
+      return actual.readdir(...args);
+    },
+  };
+});
 vi.mock("node:child_process", async (original) => {
   const actual = await original<typeof import("node:child_process")>();
   return {
@@ -41,6 +63,9 @@ const supported =
 let directory: string, workspace: string, runner: BlenderRunner;
 beforeEach(async () => {
   monitor.rss = undefined;
+  monitor.transientStats = 0;
+  monitor.transientDirectories = 0;
+  monitor.missingCompletedOutput = false;
   directory = await realpath(
     await mkdtemp(path.join(tmpdir(), "ohmygame-blender-runner-")),
   );
@@ -53,6 +78,26 @@ afterEach(async () => {
 });
 
 describe.skipIf(!supported)("controlled local Blender", () => {
+  it("tolerates disappearing temporary snapshot entries but keeps completed-output inspection strict", async () => {
+    await writeFile(path.join(workspace, "model.py"), `import sys, time
+from pathlib import Path
+root = Path(__file__).parent.parent
+(root / "tmp" / "atomic.json").write_text("{}")
+(root / "tmp" / "atomic-directory").mkdir()
+time.sleep(1)
+output = Path(sys.argv[sys.argv.index("--output-dir") + 1])
+(output / "report.json").write_text("{}")
+`);
+    monitor.transientStats = 1;
+    monitor.transientDirectories = 1;
+    const result = await runner.run({ workspace, scriptPath: "model.py", inputs: [], liveView: false, timeoutMs: 30_000 });
+    expect(monitor.transientStats).toBe(0);
+    expect(monitor.transientDirectories).toBe(0);
+    expect(result.files).toEqual([{ path: "report.json", size: 2 }]);
+    monitor.missingCompletedOutput = true;
+    await expect(runner.run({ workspace, scriptPath: "model.py", inputs: [], liveView: false, timeoutMs: 30_000 })).rejects.toThrow("ENOENT");
+  }, 40_000);
+
   it("rejects traversal, credentials, links and invalid limits before starting a job", async () => {
     await writeFile(
       path.join(workspace, "script.py"),

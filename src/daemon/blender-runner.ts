@@ -18,6 +18,11 @@ import {
   registerProjectProcess,
   terminateProjectProcess,
 } from "./process-lifecycle.js";
+import {
+  startBlenderLiveView,
+  type BlenderLiveView,
+  type BlenderLiveViewResult,
+} from "./blender-live-view.js";
 
 const EXECUTABLE = "/Applications/Blender.app/Contents/MacOS/Blender";
 const SANDBOX = "/usr/bin/sandbox-exec";
@@ -55,6 +60,8 @@ export interface BlenderRunInput {
   inputs: string[];
   args?: string[];
   timeoutMs?: number;
+  /** Host-owned desktop display; never changes the worker's execution policy. */
+  liveView?: boolean;
   /** Host-owned call identity, retained before execution for recovery without replay. */
   invocation?: { callId: string; sessionFile: string; request: unknown };
 }
@@ -64,6 +71,7 @@ export interface BlenderRunResult {
   outputDirectory: string;
   files: Array<{ path: string; size: number }>;
   log: string;
+  liveView?: BlenderLiveViewResult;
 }
 
 export class BlenderRunError extends Error {
@@ -132,6 +140,8 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
 resource.setrlimit(resource.RLIMIT_CPU, (config["cpu"], config["cpu"]))
 os.chdir(root / "inputs")
 sys.path.insert(0, str(root / "scripts"))
+if config.get("liveView"):
+    os.environ["OHMYGAME_BLENDER_LIVE_DIR"] = str(root / "tmp" / "live")
 entry = str(root / "scripts" / config["entry"])
 sys.argv = [entry, "--", *config["args"], "--input-dir", str(root / "inputs"), "--output-dir", str(root / "output")]
 runpy.run_path(entry, run_name="__main__")
@@ -176,11 +186,24 @@ async function inventory(root: string, limit: number, validate: boolean) {
   let entries = 0,
     bytes = 0;
   const walk = async (directory: string) => {
-    for (const item of await readdir(directory, { withFileTypes: true })) {
+    const children = await readdir(directory, { withFileTypes: true }).catch(
+      (error: NodeJS.ErrnoException) => {
+        if (!validate && error.code === "ENOENT") return [];
+        throw error;
+      },
+    );
+    for (const item of children) {
       if (++entries > 512)
         throw new Error("Blender job exceeds its 512-entry limit");
-      const filename = path.join(directory, item.name),
-        info = await lstat(filename);
+      const filename = path.join(directory, item.name);
+      // Running Blender atomically replaces temporary snapshots; completed outputs stay strict.
+      const info = await lstat(filename).catch(
+        (error: NodeJS.ErrnoException) => {
+          if (!validate && error.code === "ENOENT") return undefined;
+          throw error;
+        },
+      );
+      if (!info) continue;
       if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory()))
         throw new Error(
           "Blender outputs cannot contain links or special files",
@@ -330,6 +353,8 @@ export class BlenderRunner {
     let id: string | undefined,
       directory: string | undefined,
       log = "";
+    let liveView: BlenderLiveView | undefined;
+    let liveResult: BlenderLiveViewResult | undefined;
     try {
       const status = await this.status();
       if (!status.available) throw new Error(status.reason);
@@ -442,6 +467,7 @@ export class BlenderRunner {
           entry: scripts.entry,
           args,
           cpu: Math.ceil(timeout / 1000),
+          liveView: input.liveView === true,
         }),
         { flag: "wx", mode: 0o400 },
       );
@@ -453,6 +479,16 @@ export class BlenderRunner {
             flag: "wx",
             mode: 0o400,
           },
+        );
+      signal?.throwIfAborted();
+      if (input.liveView)
+        liveView = await startBlenderLiveView(
+          directory,
+          async (viewer, viewerDirectory) => {
+            await checkMemory(viewer);
+            await inventory(viewerDirectory, 192 * MiB, false);
+          },
+          signal,
         );
       signal?.throwIfAborted();
       const child = spawn(
@@ -549,6 +585,7 @@ export class BlenderRunner {
         signal?.removeEventListener("abort", abort);
         await scanning;
         await (stopping ?? terminateProjectProcess(child));
+        liveResult = await liveView?.finish();
       }
       log = redact(log, { maxLength: LOG_LIMIT });
       await writeFile(path.join(directory, "run.log"), log, {
@@ -570,7 +607,14 @@ export class BlenderRunner {
         JSON.stringify({ id, status: "completed" }),
         { flag: "wx", mode: 0o600 },
       );
-      return { id, directory, outputDirectory, files, log };
+      return {
+        id,
+        directory,
+        outputDirectory,
+        files,
+        log,
+        ...(liveResult ? { liveView: liveResult } : {}),
+      };
     } catch (error) {
       const message = redact(
         error instanceof Error ? error.message : "Blender job failed",
@@ -589,6 +633,7 @@ export class BlenderRunner {
       }
       throw new BlenderRunError(message, id, log);
     } finally {
+      await liveView?.finish();
       busy = false;
     }
   }

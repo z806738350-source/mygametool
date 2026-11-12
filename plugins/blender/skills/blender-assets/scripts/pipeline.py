@@ -17,6 +17,9 @@ import bmesh
 import bpy
 from mathutils import Matrix, Vector
 
+sys.path.insert(0, str(Path(__file__).parent))
+from live_preview import checkpoint
+
 
 def vector(value, label):
     if not isinstance(value, list) or len(value) != 3 or any(
@@ -120,6 +123,7 @@ def build_parts(config):
             modifier.width = bevel
             modifier.segments = 2
             bpy.ops.object.modifier_apply(modifier=modifier.name)
+        checkpoint("Built part: " + name)
     bpy.context.view_layer.update()
 
 
@@ -158,6 +162,7 @@ def clean(config):
     angle = math.radians(number(config.get("yawDegrees", 0), "yawDegrees", -360, 360))
     for obj in objects:
         obj.data.transform(Matrix.Rotation(angle, 4, "Z"))
+    checkpoint("Applied source orientation")
     low, high = bounds(objects)
     height = number(config.get("height", high.z - low.z), "height", .001, 10000)
     if high.z - low.z < 1e-8:
@@ -174,6 +179,7 @@ def clean(config):
         bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
         bm.to_mesh(obj.data)
         bm.free()
+        checkpoint("Normalized and cleaned mesh: " + obj.name)
     triangles = geometry_report()["triangles"]
     target = int(number(config.get("triangleBudget", triangles), "triangleBudget", 4, 2000000))
     if config.get("decimate", False) and triangles > target:
@@ -183,6 +189,7 @@ def clean(config):
             modifier.ratio = target / triangles
             modifier.use_collapse_triangulate = True
             bpy.ops.object.modifier_apply(modifier=modifier.name)
+            checkpoint("Reduced mesh: " + obj.name)
     for obj in list(bpy.context.scene.objects):
         if obj.type == "EMPTY":
             bpy.data.objects.remove(obj, do_unlink=True)
@@ -278,6 +285,7 @@ def stress_check(arm, config, output):
             bone.rotation_mode = "XYZ"
             bone.rotation_euler = [math.radians(value) for value in vector(degrees, "stress rotation")]
         bpy.context.view_layer.update()
+        checkpoint("Stress pose: " + pose["name"])
         worst = {"ratio": 1.0, "mesh": None, "vertices": None}
         graph = bpy.context.evaluated_depsgraph_get()
         for obj in meshes():
@@ -316,6 +324,7 @@ def rig(config, output):
     bpy.ops.object.mode_set(mode="OBJECT")
     for definition in definitions:
         arm.data.bones[definition["name"]].use_deform = definition.get("deform", True)
+    checkpoint("Created armature")
     objects = meshes()
     mode = config.get("weighting", "regions")
     if mode not in ("regions", "automatic"):
@@ -326,6 +335,7 @@ def rig(config, output):
     arm.select_set(True)
     bpy.context.view_layer.objects.active = arm
     bpy.ops.object.parent_set(type="ARMATURE_AUTO" if mode == "automatic" else "ARMATURE_NAME")
+    checkpoint("Applied " + mode + " bone weights")
     deform = {bone.name for bone in arm.data.bones if bone.use_deform}
     region_counts = []
     for rule in config.get("regions", []):
@@ -365,6 +375,7 @@ def rig(config, output):
             if weights:
                 assign_weights(obj, vertex.index, dict(weights))
     report = weight_report(arm)
+    checkpoint("Corrected and normalized bone weights")
     report["regions"] = region_counts
     report["stressPoses"] = stress_check(arm, config, output)
     report["passed"] = bool(report["stressPoses"]) and report["unweightedVertices"] == 0 and report["nonNormalizedVertices"] == 0 and all(pose["worstEdgeStretch"]["ratio"] <= config.get("maximumEdgeStretch", 2) for pose in report["stressPoses"])
@@ -487,6 +498,7 @@ def animate(config, output):
         arm.select_set(True)
         bpy.ops.nla.bake(frame_start=1, frame_end=frames + 1, step=1, only_selected=False, visual_keying=True, clear_constraints=False, clear_parents=False, use_current_action=True, bake_types={"POSE", "OBJECT"})
         actions.append(action)
+        checkpoint("Baked animation: " + clip_name)
         slip = 0.0
         for samples in contact_samples.values():
             anchor = None
@@ -713,6 +725,7 @@ def main():
             if not source.is_relative_to(input_root) or source.is_relative_to(output):
                 raise ValueError("Source must be a separate file inside the task inputs")
             load_source(source, input_root)
+            checkpoint("Loaded source", force=True)
         if args.stage == "parts":
             build_parts(config)
         elif args.stage == "clean":
@@ -736,6 +749,7 @@ def main():
         bpy.ops.wm.save_as_mainfile(filepath=str(output / "scene.blend"), compress=False)
         if args.stage == "joints":
             joint_markers(config)
+            checkpoint("Joint placement")
         if config.get("previews", True) and args.stage in ("parts", "clean", "joints", "rig"):
             report["previews"] = render_reviews(output, config)
         if args.stage == "export":
@@ -746,6 +760,7 @@ def main():
             report["checks"]["previewRoundtrip"] = export_roundtrip(output, "review.glb")
             report["previewModel"] = "review.glb"
         report["technicalChecksPassed"] = all(check.get("passed", True) for check in report["checks"].values())
+        checkpoint("Finished stage: " + args.stage, force=True)
         report["outputs"] = ["report.json"] + [file.name for file in output.iterdir() if file.is_file() and file.name != "report.json"]
     except Exception as error:
         report["error"] = str(error)

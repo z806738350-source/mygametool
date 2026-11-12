@@ -58,6 +58,22 @@ and the optional controlled coding-agent connections.
 | `run_blender` | Run a bundled stage or a project Python script against explicitly listed input snapshots. |
 | `recover_blender_run` | Recover a saved local run by `runId`; never rerun Blender or a paid provider. |
 
+On desktop, `blender_status.liveWorkWindow` reports whether live observation is
+available. A Blender work window opens automatically when a task starts. It can
+be moved and resized, and closes automatically when the task finishes or is
+cancelled. This separate observer displays copies of the worker's actual current
+scene at script checkpoints while production continues. It does not execute the
+Agent's instructions through the Blender interface. Long native operations may
+leave the last scene visible until the next checkpoint.
+
+Bundled stages publish these updates automatically. Custom scripts import
+`checkpoint` from `live_preview` and call it after meaningful operations, without
+adding sleeps to prolong the display. If the window or scene updates are
+unavailable, the run reports a warning and preserves its production result; do
+not rerun a completed task or submit a paid replacement to repair observation.
+The work window shows progress. Final model and animation acceptance still takes
+place in the interactive Canvas, with images as supporting evidence.
+
 Use a stable `workflow` slug and a new run for every revision. The stages are
 `parts`, `clean`, `joints`, `rig`, `animate`, `export`, and `custom`. The bundled
 [Blender guide](../plugins/blender/skills/blender-assets/SKILL.md) and its

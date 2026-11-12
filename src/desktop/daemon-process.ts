@@ -5,6 +5,7 @@ import { getPlaytestActionFailure, getPlaytestOpenFailure, type PlaytestIpcMessa
 import { signalProcessTree } from "../daemon/process-lifecycle.js";
 import type { DaemonRuntime } from "../shared/desktop-runtime.js";
 import type { ExternalMcpLauncher } from "../shared/external-mcp.js";
+import type { BlenderWindowPlacement } from "../shared/blender-window-bounds.js";
 import type { LogWriter } from "./log-file.js";
 export type { DaemonRuntime } from "../shared/desktop-runtime.js";
 
@@ -42,6 +43,7 @@ export interface StartDaemonOptions {
   healthTimeoutMs?: number;
   handlePlaytestRequest?: (request: PlaytestRequest, signal: AbortSignal) => Promise<PlaytestResult>;
   resolveSystemProxy?: () => Promise<string>;
+  resolveBlenderWindowBounds?: () => Promise<BlenderWindowPlacement | undefined>;
   onUnexpectedExit?: (error: Error) => void;
   /** Keeps the daemon's output after the app closes. */
   log?: LogWriter;
@@ -87,6 +89,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<ManagedD
       ...(options.externalMcpLauncher ? { OHMYGAME_EXTERNAL_MCP_LAUNCHER: JSON.stringify(options.externalMcpLauncher) } : {}),
       ...(options.externalSkillDirectory ? { OHMYGAME_EXTERNAL_SKILL_DIR: path.resolve(options.externalSkillDirectory) } : {}),
       ...(options.handlePlaytestRequest ? { OHMYGAME_PLAYTEST_IPC: "1" } : {}),
+      ...(options.resolveBlenderWindowBounds ? { OHMYGAME_BLENDER_WINDOW_IPC: "1" } : {}),
     },
     stdio: ["pipe", "pipe", "pipe", "ipc"],
   });
@@ -112,6 +115,16 @@ export async function startDaemon(options: StartDaemonOptions): Promise<ManagedD
         if (child.connected) child.send({ channel: "ohmygame:system-proxy:result", id: message.id, ...result }, () => {});
       };
       void options.resolveSystemProxy!().then((result) => send({ result }), () => send({ error: "Could not detect the system proxy" }));
+    });
+  }
+  if (options.resolveBlenderWindowBounds) {
+    child.on("message", (value: unknown) => {
+      const message = value as { channel?: unknown; id?: unknown } | null;
+      if (message?.channel !== "ohmygame:blender-window:resolve" || typeof message.id !== "string" || !message.id || message.id.length > 100) return;
+      const send = (result?: BlenderWindowPlacement) => {
+        if (child.connected) child.send({ channel: "ohmygame:blender-window:result", id: message.id, result }, () => {});
+      };
+      void Promise.resolve().then(options.resolveBlenderWindowBounds).then(send, () => send());
     });
   }
   const playtestRequests = options.handlePlaytestRequest

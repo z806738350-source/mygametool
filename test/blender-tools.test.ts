@@ -9,7 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { BlenderWorkflow } from "../src/daemon/blender-tools.js";
 import {
   BlenderRunError,
@@ -37,6 +37,8 @@ import {
   type RecoverableTool,
 } from "../src/daemon/agent-auto-continue.js";
 
+afterEach(() => vi.unstubAllEnvs());
+
 async function fixture(blendHeader = "BLENDER17-01v0503") {
   const root = await realpath(
     await temporaryTestDirectory("ohmygame-blender-tools-"),
@@ -63,7 +65,7 @@ async function fixture(blendHeader = "BLENDER17-01v0503") {
   );
   const bundle = path.join(root, "bundle");
   await mkdir(bundle);
-  for (const name of ["pipeline.py", "export_glb.py"])
+  for (const name of ["pipeline.py", "export_glb.py", "live_preview.py"])
     await writeFile(path.join(bundle, name), "# bundled\n");
   const buffers = new Map([
     [
@@ -326,8 +328,11 @@ describe("controlled Blender project tools", () => {
     ).toHaveLength(0);
     expect(f.runner.run).toHaveBeenCalledOnce();
   });
-  it("publishes exact outputs, executed sources and a recoverable project model binding", async () => {
+  it.each([false, true])("publishes exact outputs, executed sources and a recoverable project model binding (desktop=%s)", async desktop => {
+    vi.stubEnv("OHMYGAME_BLENDER_WINDOW_IPC", desktop ? "1" : undefined);
     const f = await fixture();
+    if (desktop) f.retained.liveView = { shown: true, updates: 3 };
+    expect((await f.call("blender_status", {})).details!.blender).toMatchObject({ liveWorkWindow: desktop });
     const input = {
       workflow: "hero",
       stage: "parts",
@@ -346,8 +351,11 @@ describe("controlled Blender project tools", () => {
       technicalChecksPassed: false,
       review: "pending-human-review",
     });
+    if (desktop) expect(data).toMatchObject({ liveView: { shown: true, updates: 3 } });
+    else expect(data).not.toHaveProperty("liveView");
     expect(f.runner.run).toHaveBeenCalledWith(
       expect.objectContaining({
+        liveView: desktop,
         inputs: ["parts.json"],
         args: ["--stage", "parts", "--config", "parts.json"],
         bundledScripts: {
@@ -355,6 +363,7 @@ describe("controlled Blender project tools", () => {
           files: {
             "pipeline.py": "# bundled\n",
             "export_glb.py": "# bundled\n",
+            "live_preview.py": "# bundled\n",
           },
         },
       }),
@@ -441,7 +450,7 @@ describe("controlled Blender project tools", () => {
 
   it("stages custom Python with fixed bundled helpers and preserves each executed source", async () => {
     const f = await fixture();
-    const custom = "import pipeline\nimport export_glb\n# project refinement\n";
+    const custom = "import pipeline\nimport export_glb\nimport live_preview\n# project refinement\n";
     await writeFile(path.join(f.project.workspacePath, "pipeline.py"), custom);
     f.runner.run.mockImplementationOnce(async (input) => {
       expect(input).not.toHaveProperty("scriptPath");
@@ -450,6 +459,7 @@ describe("controlled Blender project tools", () => {
         files: {
           "pipeline.py": "# bundled\n",
           "export_glb.py": "# bundled\n",
+          "live_preview.py": "# bundled\n",
           "script.py": custom,
         },
       });
@@ -468,6 +478,7 @@ describe("controlled Blender project tools", () => {
       ["script.py", custom],
       ["pipeline.py", "# bundled\n"],
       ["export_glb.py", "# bundled\n"],
+      ["live_preview.py", "# bundled\n"],
     ])
       expect(
         await readFile(

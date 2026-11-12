@@ -146,6 +146,7 @@ export class BlenderWorkflow {
           return result({
             ...status,
             workflowEnabled,
+            liveWorkWindow: process.env.OHMYGAME_BLENDER_WINDOW_IPC === "1",
             available: status.available && workflowEnabled,
             ...(!workflowEnabled
               ? {
@@ -360,7 +361,7 @@ export class BlenderWorkflow {
       ...(input.configPath ? ["--config", input.configPath] : []),
       ...(input.sourcePath ? ["--input", input.sourcePath] : []),
     ];
-    for (const name of ["pipeline.py", "export_glb.py"])
+    for (const name of ["pipeline.py", "export_glb.py", "live_preview.py"])
       files[name] = (
         await readSafeProjectFile(
           this.options.bundledScriptsDirectory,
@@ -380,6 +381,7 @@ export class BlenderWorkflow {
           inputs,
           args,
           bundledScripts,
+          liveView: process.env.OHMYGAME_BLENDER_WINDOW_IPC === "1",
           ...(invocation ? { invocation } : {}),
           ...(input.timeoutSeconds
             ? { timeoutMs: input.timeoutSeconds * 1000 }
@@ -584,6 +586,7 @@ export class BlenderWorkflow {
       directory,
       files: [...files.keys()].map((file) => `${directory}/${file}`),
       models: bindings,
+      ...(run.liveView ? { liveView: run.liveView } : {}),
       ...(canvas ? { canvas } : {}),
       review: "pending-human-review",
       technicalChecksPassed,
