@@ -45,6 +45,15 @@ script and result paths in the project's asset production document. If delivery 
 interrupted, call `recover_blender_run` with that runId; it recovers saved work and
 never starts Blender or submits a provider request.
 
+Authoring runs under `assets/blender/<workflow>/runs/<runId>/` stay on the host;
+the isolated Linux command copy excludes that entire directory, including JSON
+and Python files. Use the project `read` tool to inspect `report.json`, `rig.json`
+and recipes. For computed checks, use a diagnostic `run_blender` custom script
+with those files explicitly declared in `inputs`. A missing path in
+`isolated_shell` does not mean the original was lost. Do not regenerate it or
+copy the whole authoring run into the game; use `get_model_asset` and its returned
+`runtimePath` for game integration.
+
 Check `blender_status.liveWorkWindow` before promising a live window. When available
 on desktop, each task automatically opens a movable, resizable Blender observer
 and closes it when work finishes or is cancelled. It shows copies of the worker's

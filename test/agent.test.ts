@@ -16,10 +16,11 @@ import { AGENT_ERROR_ENTRY } from "../src/daemon/agent-errors.js";
 import { CHECKPOINT_ENTRY, CHECKPOINT_UNDONE_ENTRY, TURN_END_ENTRY, turnRange } from "../src/daemon/checkpoint-extension.js";
 import { AssistantTextStreamNormalizer, normalizeAssistantText } from "../src/daemon/assistant-thinking.js";
 import { AUTO_CONTINUE_DELAYS, AUTO_CONTINUE_ENTRY, AUTO_CONTINUE_TOOL_ENTRY, AutoContinueTools, isRecoverableInterruption } from "../src/daemon/agent-auto-continue.js";
-import { confirmBlenderRunFailure, getToolConfirmedFailure, getToolPreflightFailure, inheritToolPreflightFailure, toolPreflightError } from "../src/daemon/agent-tool-errors.js";
+import { confirmBlenderRunFailure, confirmIsolatedCommandFailure, getToolConfirmedFailure, getToolPreflightFailure, inheritToolPreflightFailure, toolPreflightError } from "../src/daemon/agent-tool-errors.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createIsolatedRepairPending, createIsolatedRepairProof, getIsolatedRepairPending, getIsolatedRepairResolutions, getRepairTargets, inheritIsolatedRepairPending, inheritIsolatedRepairProof, settleIsolatedRepair, getIsolatedOperationReceipts, isolatedInputBudgetError, reportIsolatedOperation, type IsolatedOperationReceipt, type IsolatedRepairProof } from "../src/daemon/isolated-tool-receipts.js";
 import { handoffSummary } from "../src/daemon/agent-runtimes/handoff.js";
+import { ToolBridge } from "../src/daemon/agent-runtimes/tool-bridge.js";
 
 describe("continuation tool safety", () => {
   const result = { content: [{ type: "text" as const, text: "Existing result" }], details: {} };
@@ -44,6 +45,46 @@ describe("continuation tool safety", () => {
   });
   const isolated = { scope: "project_command" as const, namespace: "test" as const, projectId: "11111111-1111-4111-8111-111111111111", operationId: "a".repeat(32) };
   const report = (phase: IsolatedOperationReceipt["phase"], extra: Partial<IsolatedOperationReceipt> = {}, cause?: unknown) => reportIsolatedOperation({ ...isolated, phase, ...extra }, cause);
+  it.each(["pi-live", "pi-reloaded", "native-live", "native-reloaded"])("permits a corrected command after a confirmed unchanged failure without replaying its original call (%s)", async scenario => {
+    const manager = SessionManager.inMemory("/tmp/confirmed-command-failure"), user = manager.appendMessage({ role: "user", content: "Inspect the existing rig", timestamp: 1 });
+    const execute = vi.fn<ToolDefinition["execute"]>().mockImplementationOnce(async () => {
+      for (const phase of ["input_preflight", "prepare_submitting", "prepared", "run_submitting", "running", "captured", "acknowledged", "released"] as const)
+        await report(phase, { mode: "shell", generation: 1, ...(["captured", "acknowledged", "released"].includes(phase) ? { snapshotId: "b".repeat(64) } : {}) });
+      throw confirmIsolatedCommandFailure(new Error("Isolated command failed (1). ENOENT: rig.json"), isolated.operationId, 1);
+    }).mockResolvedValue(result);
+    const tools = [tool("isolated_shell", execute)];
+    let guard = new AutoContinueTools(tools, { sessionManager: manager }); guard.reset(user);
+    await guard.prepare(new AbortController().signal);
+    const input = { command: "read missing rig.json" };
+    manager.appendMessage({ role: "assistant", ...(scenario.startsWith("native") ? { api: "ohmygame-native" } : {}), content: [{ type: "toolCall", id: "original", name: "isolated_shell", arguments: input }], timestamp: 2 } as never);
+    const bridged = scenario.startsWith("native") ? await new ToolBridge(guard.wrap() as never).call("isolated_shell", input, "original") : undefined;
+    const failure = bridged ? { message: bridged.result.content.filter(part => part.type === "text").map(part => part.text).join("\n") } : await run(guard.wrap()[0]!, "original", input).catch(cause => cause);
+    if (bridged) expect(bridged.isError).toBe(true);
+    expect(failure.message).toContain("ENOENT: rig.json");
+    manager.appendMessage({ role: "toolResult", toolName: "isolated_shell", toolCallId: "original", content: [{ type: "text", text: failure.message }], isError: true, timestamp: 3, ...(bridged ? { isolatedOperations: getIsolatedOperationReceipts(bridged.result) } : {}) } as never);
+    if (scenario.endsWith("reloaded")) { guard = new AutoContinueTools(tools, { sessionManager: manager }); guard.reset(user); }
+    await guard.prepare(new AbortController().signal);
+    expect(guard.repairOnly).toBe(false); expect(guard.stopRequested).toBe(false);
+    expect(guard.recoverySummary).toContain("failed_confirmed"); expect(guard.recoverySummary).toContain("source was unchanged");
+    await run(guard.wrap()[0]!, "original", input).catch(cause => cause);
+    expect(execute).toHaveBeenCalledOnce();
+    await expect(run(guard.wrap()[0]!, "original", { command: "different input" })).rejects.toThrow("different arguments");
+    await run(guard.wrap()[0]!, "corrected", { command: "read actual rig path" });
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["plain-error", "missing-ack", "retained", "other-tool"])("does not treat %s as a settled unchanged command failure", async variant => {
+    const execute = vi.fn<ToolDefinition["execute"]>(async () => {
+      for (const phase of ["input_preflight", "prepare_submitting", "prepared", "run_submitting", "running", "captured", ...(variant === "missing-ack" ? [] : ["acknowledged"]), ...(variant === "retained" ? ["retained"] : []), "released"] as IsolatedOperationReceipt["phase"][])
+        await report(phase, { mode: "shell", generation: 1, ...(["captured", "acknowledged", "retained", "released"].includes(phase) ? { snapshotId: "b".repeat(64) } : {}) });
+      const failure = new Error("Isolated command failed (1); source unchanged");
+      throw variant === "plain-error" ? Object.assign(failure, { confirmedFailure: { reason: "isolated_command_failed", operationId: isolated.operationId, exitCode: 1 } }) : confirmIsolatedCommandFailure(failure, isolated.operationId, 1);
+    });
+    const guard = new AutoContinueTools([tool(variant === "other-tool" ? "write" : "isolated_shell", execute)]); guard.reset();
+    await run(guard.wrap()[0]!, "original").catch(() => {});
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("unconfirmed");
+    expect(guard.recoverySummary).not.toContain("failed_confirmed"); expect(execute).toHaveBeenCalledOnce();
+  });
   async function budgetRejected(extra: Partial<IsolatedOperationReceipt> = {}): Promise<never> {
     await report("input_preflight", extra);
     const cause = isolatedInputBudgetError("Project command source exceeds its input budget");

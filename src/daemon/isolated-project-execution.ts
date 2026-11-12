@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { confirmIsolatedCommandFailure, getToolConfirmedFailure } from "./agent-tool-errors.js";
 import { isDeepStrictEqual } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
@@ -3621,7 +3622,7 @@ export class IsolatedProjectExecution {
       (timeout + 5) * 1000,
     );
     combined.addEventListener("abort", cancel, { once: true });
-    let failed = false;
+    let failed = false, commandFailure: Error | undefined;
     try {
       const completed = state.closed
         ? Promise.resolve(state.transportCode ?? null)
@@ -3637,14 +3638,28 @@ export class IsolatedProjectExecution {
         throw new Error(
           "Isolated connection closed without confirmed task cleanup; its data is retained",
         );
-      if (code === 0 && state.terminalCode !== 0)
+      if (code !== state.terminalCode)
         throw new Error("Isolated terminal status did not match the transport");
-      if (timedOut || code !== 0 || state.terminalCode !== 0)
+      if (timedOut)
         throw new Error(
-          `Isolated command failed (${timedOut ? "timeout" : state.terminalCode || code}). ${output}`,
+          `Isolated command failed (timeout). ${output}`,
         );
+      if (code !== 0) commandFailure = new Error(`Isolated command failed (${code}). ${output}`);
       const value = await this.#capture(state, project, combined);
       combined.throwIfAborted();
+      if (code !== 0) {
+        // A terminated command may still have edited files. Only an unchanged
+        // original source snapshot can be settled without publishing failed work.
+        if (typeof code !== "number" || !Number.isSafeInteger(code) || code < 1 || code > 255 ||
+          sourceManifest(value.files) !== sourceManifest(value.baselineFiles) ||
+          sourceManifest(value.baselineFiles) !== sourceManifest([...baseline, ...media]))
+          throw commandFailure;
+        await this.#acknowledge(state, value.snapshotId);
+        combined.throwIfAborted();
+        await this.#finish(state);
+        combined.throwIfAborted();
+        throw confirmIsolatedCommandFailure(commandFailure!, state.id, code);
+      }
       const result = await guard(() =>
         this.#withSpace(state, () =>
           applySourceChanges(
@@ -3673,7 +3688,10 @@ export class IsolatedProjectExecution {
       return { output, ...result };
     } catch (cause) {
       failed = true;
-      await this.#report(state, "retained").catch(() => {});
+      if (!getToolConfirmedFailure(cause))
+        await this.#report(state, "retained").catch(() => {});
+      if (commandFailure && cause !== commandFailure)
+        throw new Error(`${commandFailure.message}\nThe original isolated result remains unconfirmed: ${cause instanceof Error ? cause.message : "result verification failed"}`, { cause });
       throw cause;
     } finally {
       clearTimeout(timer);

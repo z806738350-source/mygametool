@@ -107,8 +107,8 @@ Isolated project commands also keep host-owned operation phases in the original
 tool attempt. The task and call ID are bound to the project, namespace, operation
 ID and, once established, generation and captured snapshot. No lease token,
 command arguments or file payload enters this receipt. The host persists a phase
-before submitting preparation or a command. Only a privately identified input
-budget rejection before submission permits a new corrected call; the failed call
+before submitting preparation or a command. Before submission, only a privately
+identified input budget rejection permits a new corrected call; the failed call
 ID still returns its original failure. This says the project command was not
 submitted, not that a preview could not have paused or the VM could not have woken.
 An executed command with retained output, an interrupted publication, missing
@@ -137,6 +137,19 @@ requires an explicit `maxEdge`; it does not automatically choose a smaller size,
 raise quality, or guarantee atlas layout, frame mappings or transparent edges.
 It does not request another generation and is
 not a universal solution for a specification that needs the full original.
+
+An `isolated_shell` command that exits nonzero is a confirmed, correctable
+failure only when the terminal and transport statuses match, its captured source
+matches the original preparation baseline, and both acknowledgement and release
+are confirmed. The Agent receives the exit status and command output and may
+issue a corrected command with a new call ID. The original call reuses its error
+and never executes again, including after a conversation reload. This shared
+behavior applies to Pi, Qoder and Codex. Partial source edits, missing or
+inconsistent terminal results, cancellation, and failed capture, acknowledgement
+or release remain retained or unconfirmed. No failed command's partial changes
+are automatically published, and older unknown records are never upgraded from
+their error text.
+
 For retained guest results, the main Agent uses `recover_isolated_changes`:
 
 1. `inspect` reads current passive status. A stopped volume is not a missing result.

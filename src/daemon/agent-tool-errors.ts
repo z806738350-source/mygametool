@@ -58,10 +58,14 @@ export function parseToolPreflightFailure(value: unknown): ToolPreflightFailure 
   return Object.freeze({ effect: "none", reason, disposition: dispositions[reason] });
 }
 
-export interface ToolConfirmedFailure {
+export type ToolConfirmedFailure = {
   readonly reason: "blender_run_failed";
   readonly runId: string;
-}
+} | {
+  readonly reason: "isolated_command_failed";
+  readonly operationId: string;
+  readonly exitCode: number;
+};
 
 const confirmed = new WeakMap<object, ToolConfirmedFailure>();
 
@@ -69,6 +73,14 @@ const confirmed = new WeakMap<object, ToolConfirmedFailure>();
 export function confirmBlenderRunFailure<T extends object>(target: T, runId: string): T {
   const failure = parseToolConfirmedFailure({ reason: "blender_run_failed", runId });
   if (!failure) throw new TypeError("Invalid retained Blender run ID");
+  confirmed.set(target, failure);
+  return target;
+}
+
+/** Only after a matching terminal status, unchanged source capture, ACK and release. */
+export function confirmIsolatedCommandFailure<T extends object>(target: T, operationId: string, exitCode: number): T {
+  const failure = parseToolConfirmedFailure({ reason: "isolated_command_failed", operationId, exitCode });
+  if (!failure) throw new TypeError("Invalid confirmed isolated command failure");
   confirmed.set(target, failure);
   return target;
 }
@@ -88,6 +100,10 @@ export function inheritToolConfirmedFailure<T extends object>(target: T, origina
 export function parseToolConfirmedFailure(value: unknown): ToolConfirmedFailure | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return;
   const input = value as Record<string, unknown>;
+  if (input.reason === "isolated_command_failed" && typeof input.operationId === "string" &&
+    /^[a-f\d]{32}$/.test(input.operationId) && Number.isSafeInteger(input.exitCode) &&
+    Number(input.exitCode) > 0 && Number(input.exitCode) <= 255)
+    return Object.freeze({ reason: "isolated_command_failed", operationId: input.operationId, exitCode: Number(input.exitCode) });
   if (input.reason !== "blender_run_failed" || typeof input.runId !== "string" ||
     !/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(input.runId)) return;
   return Object.freeze({ reason: "blender_run_failed", runId: input.runId });

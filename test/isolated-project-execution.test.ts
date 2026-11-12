@@ -1,4 +1,5 @@
 import { ChildProcess } from "node:child_process";
+import { getToolConfirmedFailure } from "../src/daemon/agent-tool-errors.js";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { createConnection, type AddressInfo } from "node:net";
@@ -1427,7 +1428,7 @@ it("cancels private image preparation without saving or approving a review", asy
   } finally { resume(); spy.mockRestore(); }
 });
 
-it.each(["failure", "cancel"] as const)("does not capture or publish a %s original operation", async outcome => {
+it.each(["failure", "cancel"] as const)("never publishes a %s original operation with retained media", async outcome => {
   const f = await captureMediaFixture(), controller = new AbortController();
   const task = f.execution.shell(f.project, "fixture-only", 5, operation => operation(), controller.signal);
   const failure = task.catch(cause => cause);
@@ -1435,7 +1436,8 @@ it.each(["failure", "cancel"] as const)("does not capture or publish a %s origin
   if (outcome === "cancel") controller.abort();
   else f.completeRun([...f.runs.keys()][0]!, 1);
   expect(await failure).toBeInstanceOf(Error);
-  expect(f.requests.some(request => ["capture-media", "capture", "acknowledge"].includes(request.operation))).toBe(false);
+  expect(f.requests.some(request => request.operation === "acknowledge")).toBe(false);
+  if (outcome === "cancel") expect(f.requests.some(request => ["capture-media", "capture"].includes(request.operation))).toBe(false);
   await expect(stat(path.join(f.workspacePath, f.image.path))).rejects.toMatchObject({ code: "ENOENT" });
   expect(f.runs.size).toBe(1);
 });
@@ -3713,6 +3715,54 @@ it("rejects a mismatched reservation binding and cancels only its original scope
   });
 });
 
+it.each([1, 127])("confirms a nonzero command only after unchanged capture, ACK and release (exit %s)", async exitCode => {
+  const f = await fixture(), receipts: IsolatedOperationReceipt[] = [];
+  await writeFile(path.join(f.workspacePath, "existing.txt"), "retained");
+  const files = [sourceFile("existing.txt", "retained")];
+  f.handlers.set("capture", input => ({ files, baselineFiles: files, snapshotId: "b".repeat(64), generation: input.generation }));
+  const pending = withIsolatedOperationScope(async history => { receipts.splice(0, receipts.length, ...history); }, () => f.execution.shell(f.project, "fixture-only", 5, async operation => operation())).catch(cause => cause);
+  await vi.waitFor(() => expect(f.runs.size).toBe(1)); const operationId = [...f.runs.keys()][0]!;
+  f.runOutputs.get(operationId)!.write(JSON.stringify({ kind: "stdout", data: Buffer.from("ENOENT: rig.json").toString("base64") }) + "\n");
+  f.completeRun(operationId, exitCode);
+  const failure = await pending;
+  expect(failure.message).toContain(`Isolated command failed (${exitCode})`);
+  expect(failure.message).toContain("ENOENT: rig.json");
+  expect(getToolConfirmedFailure(failure)).toEqual({ reason: "isolated_command_failed", operationId, exitCode });
+  expect(receipts.map(receipt => receipt.phase)).toEqual(["input_preflight", "prepare_submitting", "prepared", "run_submitting", "running", "captured", "acknowledged", "released"]);
+  expect(await readFile(path.join(f.workspacePath, "existing.txt"), "utf8")).toBe("retained");
+  expect(f.requests.filter(request => request.operation === "acknowledge")).toHaveLength(1);
+  expect(f.runs.size).toBe(1);
+});
+
+it.each(["edited", "added", "deleted", "permissions", "wrong-baseline"])("retains failed command changes without ACK or confirmed-failure classification: %s", async variant => {
+  const f = await fixture();
+  await writeFile(path.join(f.workspacePath, "existing.txt"), "retained");
+  const original = sourceFile("existing.txt", "retained");
+  const files = variant === "deleted" ? [] : variant === "added" ? [original, sourceFile("new.txt", "partial")] :
+    variant === "permissions" ? [{ ...original, executable: true }] : [sourceFile("existing.txt", "partial")];
+  f.handlers.set("capture", input => ({ files, baselineFiles: variant === "wrong-baseline" ? files : [original], snapshotId: "b".repeat(64), generation: input.generation }));
+  const pending = f.execution.shell(f.project, "fixture-only", 5, async operation => operation()).catch(cause => cause);
+  await vi.waitFor(() => expect(f.runs.size).toBe(1)); f.completeRun([...f.runs.keys()][0]!, 1);
+  const failure = await pending;
+  expect(failure.message).toContain("Isolated command failed (1)"); expect(getToolConfirmedFailure(failure)).toBeUndefined();
+  expect(f.requests.some(request => request.operation === "acknowledge")).toBe(false);
+  expect(await readFile(path.join(f.workspacePath, "existing.txt"), "utf8")).toBe("retained");
+  await expect(stat(path.join(f.workspacePath, "new.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+it.each(["capture", "acknowledge", "release", "cancel"])("does not confirm an unchanged failure when %s is unconfirmed or cancelled", async boundary => {
+  const f = await fixture(), controller = new AbortController();
+  f.handlers.set(boundary === "cancel" ? "capture" : boundary, async (input, child, args) => {
+    if (boundary !== "cancel") throw new Error("Fixture receipt unavailable");
+    controller.abort(); return f.defaultResponse(input, child, args);
+  });
+  const pending = f.execution.shell(f.project, "fixture-only", 5, async operation => operation(), controller.signal).catch(cause => cause);
+  await vi.waitFor(() => expect(f.runs.size).toBe(1)); f.completeRun([...f.runs.keys()][0]!, 1);
+  expect(getToolConfirmedFailure(await pending)).toBeUndefined();
+  if (["capture", "cancel"].includes(boundary)) expect(f.requests.some(request => request.operation === "acknowledge")).toBe(false);
+  expect(f.runs.size).toBe(1);
+});
+
 it("does not capture or acknowledge after unconfirmed terminal cleanup", async () => {
   const f = await fixture();
   const task = f.execution.shell(
@@ -3749,7 +3799,7 @@ it("distinguishes a drained transport from a successful build when the terminal 
   expect(f.requests.some(request => request.operation === "export")).toBe(false);
 });
 
-it("never imports a failed command when the transport incorrectly reports success", async () => {
+it.each([0, 2, null])("never imports a failed command when the transport reports a mismatched status (%s)", async transportCode => {
   const f = await fixture();
   await writeFile(path.join(f.workspacePath, "counter.txt"), "before");
   f.handlers.set("capture", (input) => ({
@@ -3772,7 +3822,7 @@ it("never imports a failed command when the transport incorrectly reports succes
   f.runOutputs
     .get(op)!
     .write(JSON.stringify({ kind: "exit", id: op, code: 1 }) + "\n");
-  f.runs.get(op)!.emit("close", 0);
+  f.runs.get(op)!.emit("close", transportCode);
   await rejected;
   expect(
     f.requests.filter((r) => ["capture", "acknowledge"].includes(r.operation)),

@@ -9,6 +9,7 @@ import type {
 import {
   getToolPreflightFailure,
   confirmBlenderRunFailure,
+  confirmIsolatedCommandFailure,
   getToolConfirmedFailure,
   inheritToolConfirmedFailure,
   inheritToolPreflightFailure,
@@ -163,6 +164,15 @@ const REPAIR_ACTIONS = new Set(["inspect", "capacity", "plan_capacity", "plan_fi
 const OBSERVATION_ACTIONS = new Set(["inspect", "capacity", "plan_capacity", "plan_first_allocation", "inspect_capacity_migration", "read_image"]);
 const BLENDER_TOOLS = new Set(["run_blender", "recover_blender_run"]);
 
+function confirmedToolFailure(tool: string, failure: ToolConfirmedFailure | undefined, receipts?: readonly IsolatedOperationReceipt[]): ToolConfirmedFailure | undefined {
+  if (failure?.reason === "blender_run_failed") return BLENDER_TOOLS.has(tool) ? failure : undefined;
+  if (failure?.reason !== "isolated_command_failed" || tool !== "isolated_shell") return;
+  const history = parseIsolatedOperationReceipts(receipts);
+  if (history && history.every(receipt => receipt.operationId === failure.operationId && receipt.mode === "shell" && receipt.phase !== "retained") &&
+    ["captured", "acknowledged", "released"].every(phase => history.some(receipt => receipt.phase === phase && receipt.snapshotId && receipt.generation)))
+    return failure;
+}
+
 // Request identities stay in memory. Neither arguments nor their fingerprints enter diagnostics.
 function identity(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(identity).join(",")}]`;
@@ -279,7 +289,7 @@ export class AutoContinueTools {
             item.state +
             (item.preflightFailure
               ? " (" + item.preflightFailure.reason + ")"
-              : "") + (item.confirmedFailure ? " — retained Blender run " + item.confirmedFailure.runId + "; process failed, no result published. Inspect its diagnostic and correct the script before a new call; the original call must not be replayed." : "") + (item.isolatedOperations ? " — project-command receipts " + JSON.stringify(item.isolatedOperations) + ". Command submission scope only; VM startup or preview pauses may already have occurred." : "") +
+              : "") + (item.confirmedFailure?.reason === "blender_run_failed" ? " — retained Blender run " + item.confirmedFailure.runId + "; process failed, no result published. Inspect its diagnostic and correct the script before a new call; the original call must not be replayed." : item.confirmedFailure?.reason === "isolated_command_failed" ? " — command exited " + item.confirmedFailure.exitCode + "; source was unchanged and cleanup confirmed. Inspect the diagnostic and correct the command under a new call; the original call must not be replayed." : "") + (item.isolatedOperations ? " — project-command receipts " + JSON.stringify(item.isolatedOperations) + ". Command submission scope only; VM startup or preview pauses may already have occurred." : "") +
             (item.pendingVerification ? " — pending publication verification " + JSON.stringify({ reviewId: item.pendingVerification.reviewId, recoveryOperationId: item.pendingVerification.recoveryOperationId, rawSnapshotId: item.pendingVerification.rawSnapshotId, preparedSnapshotId: item.pendingVerification.preparedSnapshotId, publicationId: item.pendingVerification.publicationId }) : ""),
         )
         .join("\n") +
@@ -412,7 +422,7 @@ export class AutoContinueTools {
           : undefined;
       const confirmedFailure = parseToolConfirmedFailure(item.confirmedFailure);
       if (item.state === "failed_confirmed" && BLENDER_TOOLS.has(attempt.tool) &&
-        original && !changedCall && message?.isError && confirmedFailure) {
+        original && !changedCall && message?.isError && confirmedFailure?.reason === "blender_run_failed") {
         attempt.confirmedFailure = confirmedFailure;
         attempt.unconfirmed = false;
         attempt.retainedResult = confirmBlenderRunFailure({
@@ -471,6 +481,12 @@ export class AutoContinueTools {
         }
         if (history && attempt.result) attempt.result = inheritIsolatedOperationReceipts(attempt.result, history);
         if (history && message?.isError) attempt.retainedResult = inheritIsolatedOperationReceipts({ content: message.content, details: message.details, isError: true } as Result, history);
+        if (!wasUnknown && !changedCall && item.state === "failed_confirmed" && original && message?.isError &&
+          confirmedFailure?.reason === "isolated_command_failed" && confirmedToolFailure(attempt.tool, confirmedFailure, attempt.isolatedOperations)) {
+          attempt.confirmedFailure = confirmedFailure;
+          attempt.unconfirmed = false;
+          attempt.retainedResult = confirmIsolatedCommandFailure(attempt.retainedResult!, confirmedFailure.operationId, confirmedFailure.exitCode);
+        }
         // A parser cannot authorize retry: the evidence loader requires the host journal and canonical failure.
         const evidence = retainedIsolatedOperationEvidence(branch, id, item.callId, item.tool!);
         const receipts = getIsolatedOperationReceipts(evidence);
@@ -710,12 +726,15 @@ export class AutoContinueTools {
       failure = cause;
     }
     attempt.failure = failure;
-    attempt.confirmedFailure = BLENDER_TOOLS.has(attempt.tool) &&
-      (result as (Result & { isError?: boolean }) | undefined)?.isError
-      ? getToolConfirmedFailure(result) : undefined;
     attempt.pendingVerification = getIsolatedRepairPending(failure) ?? getIsolatedRepairPending(result);
     const isolated = getIsolatedOperationReceipts(failure) ?? getIsolatedOperationReceipts(result);
     if (isolated) attempt.isolatedOperations = isolated;
+    attempt.confirmedFailure = confirmedToolFailure(attempt.tool,
+      failure !== undefined ? getToolConfirmedFailure(failure) :
+        (result as (Result & { isError?: boolean }) | undefined)?.isError ? getToolConfirmedFailure(result) : undefined,
+      attempt.isolatedOperations);
+    if (attempt.confirmedFailure && failure !== undefined)
+      attempt.retainedResult = inheritToolConfirmedFailure(inheritIsolatedOperationReceipts({ content: [{ type: "text", text: failure instanceof Error ? failure.message : "The original command failed without source changes" }], details: {}, isError: true } as Result, failure), failure);
     attempt.repairMapped = !!isolated;
     attempt.repairResolutions = getIsolatedRepairResolutions(result) ?? getIsolatedRepairResolutions(failure);
     attempt.commandNotSubmitted = isIsolatedInputBudgetError(failure) && isolatedCommandsNotSubmitted(isolated);
