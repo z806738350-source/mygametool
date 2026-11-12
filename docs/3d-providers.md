@@ -103,8 +103,10 @@ bundled modeling stage produces `review.glb`; export produces `model.glb`.
 Successful runs automatically add the model and supporting images to the selected
 `boardId` (or the first board). Drag inside the model to rotate, zoom over it,
 and use play/pause and the clip selector for animations. Drag the node header to
-move the card. Views do not rotate automatically. Off-screen and hidden-page
-playback pauses; returning to a released Canvas model restores its selected clip
+move the card. Canvas models rotate slowly at 10 degrees per second, independently
+of animation playback, so both moving and paused poses can be reviewed from all
+sides. Off-screen and hidden-page rotation and playback pause; returning to a
+released Canvas model restores its selected clip
 and playback position, including a manual pause. Joint/region overlays
 and stress-pose images remain supporting evidence; static images do not validate
 motion. Custom modeling scripts must also export a review GLB. Diagnostic-only

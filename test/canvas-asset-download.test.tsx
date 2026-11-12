@@ -254,7 +254,7 @@ it.each(["asset", "model-3d", "animate-3d"])("enables camera interaction and mot
   await act(async () => root.render(<ReactFlowProvider><CanvasAssetProvider assets={canvasAssetSources("download", assets)}><View data={data} selected /></CanvasAssetProvider></ReactFlowProvider>));
   const preview = container.querySelector<HTMLImageElement>('img[data-interactive="true"]')!;
   expect(preview).not.toBeNull(); expect(preview.getAttribute("data-animate")).toBe("true");
-  expect(preview.hasAttribute("data-auto-rotate")).toBe(false);
+  expect(preview.hasAttribute("data-auto-rotate")).toBe(true);
   expect(preview.getAttribute("data-interactive")).toBe("true");
 });
 
@@ -298,6 +298,9 @@ it.each(["asset", "model-3d", "animate-3d"])("restores %s playback after releasi
   const first = await load();
   expect(first.src).toBe("blob:canvas-test");
   expect(first.getAttribute("src")).toBeNull();
+  expect(first.paused).toBe(false);
+  expect(first.hasAttribute("auto-rotate")).toBe(true);
+  expect(first.getAttribute("rotation-per-second")).toBe("10deg");
   const select = container.querySelector<HTMLSelectElement>(".model-preview-clips")!;
   await act(async () => { select.value = "Walk"; select.dispatchEvent(new Event("change", { bubbles: true })); });
   first.currentTime = 0.75;
@@ -312,7 +315,7 @@ it.each(["asset", "model-3d", "animate-3d"])("restores %s playback after releasi
   expect(restored.animationName).toBe("Walk");
   expect(restored.paused).toBe(true);
   expect(restored.currentTime).toBe(0.75);
-  expect(restored.hasAttribute("auto-rotate")).toBe(false);
+  expect(restored.hasAttribute("auto-rotate")).toBe(true);
   expect(container.querySelector<HTMLButtonElement>(".model-preview-controls button")!.getAttribute("aria-label")).toBe(t("modelPreview.play"));
   await renderNode("fbx-output");
   const replacement = await load();

@@ -2679,7 +2679,7 @@ function AssetNode({ data, selected }: Pick<NodeProps<AssetCanvasFlowNode>, "dat
         {preview.url && kind !== "audio" ? <MediaViewButton /> : null}
         {preview.url && kind === "image" ? <img ref={image} src={preview.url} alt={data.name || t("assetCanvas.libraryImage")} onLoad={mediaLayout.onImageLoad} /> : null}
         {preview.url && kind === "video" ? <CanvasVideo src={preview.url} onLoadedMetadata={mediaLayout.onVideoMetadata} onPlayingChange={setPlaying} /> : null}
-        {preview.url && kind === "model" ? <ModelPreview source={preview.url} label={data.name || "3D model"} minHeight={220} interactive autoRotate={false} animate playback={modelPlayback} onPlaybackChange={setModelPlayback} /> : null}
+        {preview.url && kind === "model" ? <ModelPreview source={preview.url} label={data.name || "3D model"} minHeight={220} interactive autoRotate rotationPerSecond="10deg" animate playback={modelPlayback} onPlaybackChange={setModelPlayback} /> : null}
         {preview.url && kind === "audio" ? <CanvasAudio src={preview.url} onPlayingChange={setPlaying} /> : null}
         {!preview.url ? <div className="story-media-empty"><Icon size={34} /><strong>{data.assetError || preview.error ? t("assetCanvas.assetUnavailable") : t("assetCanvas.loadingAsset")}</strong>{data.assetError ? <span>{data.assetError}</span> : <CanvasAssetRecovery preview={preview} />}</div> : null}
       </div>
@@ -3055,7 +3055,7 @@ function MediaNodeShell({ kind, textKind, label: labelOverride, selected, panelO
         {preview.url && kind === "image" ? <img ref={image} src={preview.url} alt={t("timeline.generatedImage")} onLoad={mediaLayout.onImageLoad} /> : null}
         {preview.url && kind === "video" ? <CanvasVideo src={preview.url} onLoadedMetadata={mediaLayout.onVideoMetadata} onPlayingChange={setPlaying} /> : null}
         {preview.url && audio ? <CanvasAudio src={preview.url} onPlayingChange={setPlaying} /> : null}
-        {preview.url && threeD ? <ModelPreview source={preview.url} label={kind === "animation" ? t("assetCanvas.animated3d") : t("timeline.generated3d")} minHeight={220} interactive autoRotate={false} animate playback={modelPlayback} onPlaybackChange={setModelPlayback} onError={() => setModelFailed(true)} /> : null}
+        {preview.url && threeD ? <ModelPreview source={preview.url} label={kind === "animation" ? t("assetCanvas.animated3d") : t("timeline.generated3d")} minHeight={220} interactive autoRotate rotationPerSecond="10deg" animate playback={modelPlayback} onPlaybackChange={setModelPlayback} onError={() => setModelFailed(true)} /> : null}
         {!preview.url && !runtime?.generating ? (
           <div className="story-media-empty">
             <Icon size={34} />
