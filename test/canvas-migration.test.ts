@@ -20,15 +20,21 @@ describe("offline canvas migration", () => {
     await ensureCanvasContract(directory);
     const file = path.join(directory, "canvas/AGENTS.md");
     const current = await readFile(file, "utf8");
-    const previous = current.replace(/Before submitting new project media,[^\n]+?outside the board\./, "After each media result is saved, register its path in assets.json and add or update its board node before the next long-running step. Do not defer board writes until the final response.");
-    expect(previous).not.toBe(current);
-    await writeFile(file, previous);
-    await ensureCanvasContract(directory);
-    expect(await readFile(file, "utf8")).toBe(current);
-    const custom = previous + "\nUse the team's original art.";
-    await writeFile(file, custom);
-    await ensureCanvasContract(directory);
-    expect(await readFile(file, "utf8")).toBe(custom);
+    expect(current).toContain("Keep internal Blender runs off the board");
+    for (const previous of [
+      "Before submitting new project media, save its generation node on the board, then call generate_canvas_media. It records history, assets and results on that node. Only register a result manually when it already exists outside the board.",
+      "After each media result is saved, register its path in assets.json and add or update its board node before the next long-running step. Do not defer board writes until the final response.",
+    ]) {
+      const oldGuide = current.replace(/For provider-generated media,[^\n]+?outside the board\./, previous);
+      expect(oldGuide).not.toBe(current);
+      await writeFile(file, oldGuide);
+      await ensureCanvasContract(directory);
+      expect(await readFile(file, "utf8")).toBe(current);
+      const custom = oldGuide + "\nUse the team's original art.";
+      await writeFile(file, custom);
+      await ensureCanvasContract(directory);
+      expect(await readFile(file, "utf8")).toBe(custom);
+    }
   });
 
   it("backs up old files, preserves IDs/content/media/layout and is repeatable", async () => {

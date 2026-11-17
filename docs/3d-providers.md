@@ -40,9 +40,9 @@ not the local enabled-service list. Its Meshy column is historical only.
 ## Controlled local Blender workflow
 
 The main Agent can orchestrate local Blender without buying Tripo rigging or
-animation. Tripo remains an optional initial-mesh provider; the Agent writes and
-revises scripts and parameters, Blender executes them, and the user reviews shape,
-joints, deformation and motion. Existing paid-task recovery is unchanged.
+animation. Tripo supplies an initial mesh when needed. The Agent writes and
+revises Blender scripts, checks the intermediate results, and brings the finished
+candidate to the user for a decision on its appearance and motion.
 
 Enable the bundled **Blender** workflow for the project, then ask the main Agent to
 use the Blender workflow for the desired asset. The Agent reads `blender-assets`
@@ -56,7 +56,7 @@ and the optional controlled coding-agent connections.
 | --- | --- |
 | `blender_status` | Inspect local executable and controlled execution availability; no model submission. |
 | `run_blender` | Run a bundled stage or a project Python script against explicitly listed input snapshots. |
-| `recover_blender_run` | Recover a saved local run by `runId`; never rerun Blender or a paid provider. |
+| `recover_blender_run` | Recover a saved local run by `runId`, or present that exact result for review after inspection. |
 
 On desktop, `blender_status.liveWorkWindow` reports whether live observation is
 available. A Blender work window opens automatically when a task starts. It can
@@ -82,10 +82,10 @@ Use a stable `workflow` slug and a new run for every revision. The stages are
 define configuration examples, coordinates, joint/region rules and supported motion.
 The guide is available inside the app through `read_workflow_guide`.
 
-- **Hard surfaces:** approve a dimensioned `parts.json`, construct individual
+- **Hard surfaces:** check the dimensions in `parts.json`, construct individual
   pieces in Blender, review proportions and assembly, and export. Fully specified
   procedural objects do not need Tripo or paid multi-view generation.
-- **Organic shapes:** approve consistent reference views, generate or reuse a
+- **Organic shapes:** check that the reference views depict a consistent subject, generate or reuse a
   Tripo GLB, and review its silhouette before cleanup. Prefer a clear A-pose with
   limbs separated; preserve a requested T-pose. Weapons stay separate from hands.
   Normalize the source, review explicit joints and region assignments, rig, inspect
@@ -109,16 +109,31 @@ show unresolved regions instead of describing a generic automatic-weight pass as
 quality assurance. Numeric foot-contact, loop and weight checks do not establish
 natural movement or attractive deformation.
 
-Human reviews happen in the existing conversation/questionnaire: dimensions or
-references, initial shape, joints/regions, stress-pose deformation, then animation.
-The Agent presents concrete files and waits for the user's decision, retaining
-accepted decisions in the asset document. These are production review steps, not
-a claim that a script can certify visual quality.
+By default the Agent checks the dimensions or references, silhouette, joint
+placement, deformation in stress poses, and animation against the brief. It
+reads the reports, opens the relevant views, checks motion across the clips
+and corrects defects locally before continuing. It records what it could
+verify. The user can ask to see progress or to approve a particular stage.
+When the brief leaves a consequential choice open, for example whether the
+character's cloak may be shortened to fix clipping, show the relevant evidence
+and ask for that decision before changing the design. Additional paid generation
+outside the request also requires confirmation.
 
-Model review uses the interactive Canvas model as its primary evidence. Each
-bundled modeling stage produces `review.glb`; export produces `model.glb`.
-Successful runs automatically add the model and supporting images to the selected
-`boardId` (or the first board). Drag inside the model to rotate, zoom over it,
+Each bundled modeling stage produces `review.glb`; export produces `model.glb`.
+New `run_blender` calls default to `reviewPresentation: "internal"`. Reports,
+renders and models stay available at the returned project paths. After checking
+the result, the Agent calls `recover_blender_run` with its `runId` and
+`reviewPresentation: "final"` to show the same model on the selected `boardId`
+(or the first board). For a requested intermediate view or a necessary decision it uses
+`reviewPresentation: "checkpoint"`. Presenting a retained run does not start
+Blender or generate another model.
+
+Final presentation shows the interactive model and up to three supporting views.
+When a run contains a large set of pose tests, only clearly identified standard
+views accompany the model. The full set remains in the editable run directory.
+The user reviews the final candidate in the Canvas and can answer in everyday
+terms, for example “use this version” or “the feet slide when it walks.”
+Drag inside the model to rotate, zoom over it,
 and use play/pause and the clip selector for animations. Drag the node header to
 move the card. Canvas models rotate slowly at 10 degrees per second, independently
 of animation playback, so both moving and paused poses can be reviewed from all
@@ -137,8 +152,9 @@ tool results as a local recovery issue rather than a provider request failure.
 
 GLB is the primary project runtime format. Export verifies a clean reimport, then
 `get_model_asset` prepares the model through the existing inspected-resource path.
-Register the final asset on the Canvas, integrate it into the actual game and play
-every clip with the target engine. FBX is optional exchange output, and its existing
+Use the returned Canvas node for final review. For a game integration, exercise
+the candidate and its clips in the target engine before asking the user to accept
+it. Record any checks the project could not run. FBX is optional exchange output, and its existing
 static preview path does not validate skeletal animation. Report structural,
 visual, human and in-game checks separately.
 

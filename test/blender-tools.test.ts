@@ -25,6 +25,7 @@ import { AssetLibrary } from "../src/daemon/asset-library.js";
 import { CanvasStore } from "../src/daemon/canvas-workspace.js";
 import { temporaryTestDirectory } from "./temporary-test-directory.js";
 import { model3DFixture } from "./model3d-fixture.js";
+import { referencePng } from "./video-reference-png-fixture.js";
 import {
   projectFiles,
   inspectProjectSourceBudget,
@@ -39,7 +40,7 @@ import {
 
 afterEach(() => vi.unstubAllEnvs());
 
-async function fixture(blendHeader = "BLENDER17-01v0503") {
+async function fixture(blendHeader = "BLENDER17-01v0503", technicalChecksPassed = false) {
   const root = await realpath(
     await temporaryTestDirectory("ohmygame-blender-tools-"),
   );
@@ -78,7 +79,7 @@ async function fixture(blendHeader = "BLENDER17-01v0503") {
     ],
     [
       "report.json",
-      Buffer.from('{"technicalChecksPassed":false,"humanReview":"pending"}'),
+      Buffer.from(JSON.stringify({ technicalChecksPassed, humanReview: "pending" })),
     ],
   ]);
   for (const [name, bytes] of buffers)
@@ -98,7 +99,13 @@ async function fixture(blendHeader = "BLENDER17-01v0503") {
       available: true,
       executable: "/Applications/Blender.app/Contents/MacOS/Blender",
     })),
-    run: vi.fn(async (_input: BlenderRunInput) => retained),
+    run: vi.fn(async (input: BlenderRunInput) => {
+      if (input.workflowRequest)
+        await writeFile(path.join(directory, "workflow.json"), JSON.stringify(input.workflowRequest));
+      if (input.invocation)
+        await writeFile(path.join(directory, "invocation.json"), JSON.stringify(input.invocation));
+      return retained;
+    }),
     readJob: vi.fn(async (requested: string) => {
       if (requested !== id) throw new Error("Unknown retained run");
       return retained;
@@ -109,9 +116,7 @@ async function fixture(blendHeader = "BLENDER17-01v0503") {
       log: "local fixture",
     })),
   };
-  const bindModel = vi.fn((file: string) =>
-    projects.ensureLibraryAsset(project.id, file),
-  );
+  const bindModel = vi.spyOn(projects, "ensureLibraryAsset");
   const enabled = vi.fn(() => true);
   const canvas = new CanvasStore(projects, library, {} as never);
   const presentReview = vi.fn(
@@ -120,17 +125,10 @@ async function fixture(blendHeader = "BLENDER17-01v0503") {
       workflow: string;
       stage: string;
       boardId?: string;
-      files: string[];
-    }) => {
-      const entries = [];
-      for (const [index, file] of review.files.entries())
-        entries.push({
-          nodeId: `blender-${review.runId}-${index}`,
-          assetId: await projects.ensureLibraryAsset(project.id, file),
-          title: `${review.workflow} · ${review.stage} · ${path.basename(file)}`,
-        });
-      return canvas.presentLocalAssets(project.id, entries, review.boardId);
-    },
+      files: { path: string; nodeId: string }[];
+    }) => canvas.presentLocalAssets(project.id, review.files.map(file => ({
+      ...file, title: `${review.workflow} · ${review.stage} · ${path.basename(file.path)}`,
+    })), review.boardId),
   );
   const workflow = new BlenderWorkflow({
     workspace: project.workspacePath,
@@ -139,7 +137,6 @@ async function fixture(blendHeader = "BLENDER17-01v0503") {
     enabled,
     bundledScriptsDirectory: bundle,
     mutate: (operation) => operation(),
-    bindModel,
     presentReview,
   });
   const guard = new AutoContinueTools(workflow.tools());
@@ -163,6 +160,7 @@ async function fixture(blendHeader = "BLENDER17-01v0503") {
       .execute(callId, args as never, undefined, undefined, context as never);
   return {
     root,
+    library,
     project,
     projects,
     directory,
@@ -183,6 +181,156 @@ async function fixture(blendHeader = "BLENDER17-01v0503") {
 }
 
 describe("controlled Blender project tools", () => {
+  it("keeps intermediate work available for Agent inspection and promotes the same checked run for final user review", async () => {
+    const f = await fixture(undefined, true);
+    for (const name of ["front.png", "side.png", "back.png", "pose-1.png", "pose-2.png"]) {
+      const bytes = referencePng();
+      await writeFile(path.join(f.outputDirectory, name), bytes);
+      f.retained.files.push({ path: name, size: bytes.length });
+    }
+    const internal = (await f.call("run_blender", { workflow: "hero", stage: "parts", configPath: "parts.json" })).details!.blender;
+    expect(internal).toMatchObject({
+      reviewPresentation: "internal", review: "pending-agent-review", technicalChecksPassed: true,
+      models: [{ originalPath: expect.stringContaining("assets/blender/hero/"), model: { animations: ["Idle", "Walk"] } }],
+    });
+    expect(internal).not.toHaveProperty("canvas");
+    expect(internal).not.toHaveProperty("models.0.assetId");
+    expect((await f.call("recover_blender_run", { runId: f.retained.id })).details!.blender).toEqual(internal);
+    expect((await f.canvas.workspace(f.project.id)).assets).toHaveLength(0);
+    expect(f.bindModel).not.toHaveBeenCalled();
+    expect(f.presentReview).not.toHaveBeenCalled();
+    const source = path.join(f.project.workspacePath, (internal as { directory: string }).directory);
+    expect(await readFile(path.join(source, "front.png"))).toEqual(referencePng());
+    const originalReceipt = await readFile(path.join(source, "run.json"));
+    const input = { runId: f.retained.id, reviewPresentation: "final" };
+    const final = (await f.call("recover_blender_run", input)).details!.blender;
+    expect(final).toMatchObject({ reviewPresentation: "final", review: "pending-human-review", models: [{ assetId: expect.any(String) }] });
+    const { canvas } = final as { canvas: { boardId: string; nodeIds: string[] } };
+    expect(canvas.nodeIds).toHaveLength(4);
+    expect((await f.canvas.board(f.project.id, canvas.boardId)).board.nodes).toMatchObject([
+      { data: { mediaType: "model" } }, ...["front", "side", "back"].map(angle => ({
+        title: expect.stringContaining(`${angle}.png`), data: { mediaType: "image" },
+      })),
+    ]);
+    expect((await f.call("recover_blender_run", { runId: f.retained.id })).details!.blender).toEqual(final);
+    expect((await f.call("recover_blender_run", input)).details!.blender).toEqual(final);
+    expect((await f.canvas.board(f.project.id, canvas.boardId)).board.nodes).toHaveLength(4);
+    expect(await readFile(path.join(source, "run.json"))).toEqual(originalReceipt);
+    expect(f.runner.run).toHaveBeenCalledOnce();
+  });
+
+  it("matches the original raw invocation on interrupted chat continuation while retaining the internal default", async () => {
+    const f = await fixture();
+    const input = { workflow: "hero", stage: "parts", configPath: "parts.json" };
+    await f.guardedCall("run_blender", input, "original");
+    const tool = f.workflow.tools().find(item => item.name === "run_blender") as RecoverableTool;
+    const recovered = await tool.recoverAfterHttp500!("original", input, undefined, undefined, f.context as never);
+    expect(recovered.details).toMatchObject({ blender: { reviewPresentation: "internal", review: "pending-agent-review" } });
+    expect(f.presentReview).not.toHaveBeenCalled();
+    expect(f.runner.run).toHaveBeenCalledOnce();
+  });
+
+  it("settles a lost final presentation response from the exact retained run during automatic continuation", async () => {
+    const f = await fixture(undefined, true);
+    await f.call("run_blender", { workflow: "hero", stage: "parts", configPath: "parts.json" });
+    const present = f.presentReview.getMockImplementation()!;
+    f.presentReview.mockImplementationOnce(async review => {
+      await present(review);
+      throw new Error("connection lost after Canvas was saved");
+    });
+    const request = { runId: f.retained.id, reviewPresentation: "final" };
+    await expect(f.guardedCall("recover_blender_run", request, "show-final")).rejects.toThrow("connection lost");
+    await f.guard.prepare(new AbortController().signal);
+    const { blender: delivered } = (await f.guardedCall("recover_blender_run", request, "show-final")).details as { blender: unknown };
+    const { canvas } = delivered as { canvas: { boardId: string; nodeIds: string[] } };
+    expect(delivered).toMatchObject({ reviewPresentation: "final", review: "pending-human-review" });
+    expect((await f.canvas.board(f.project.id, canvas.boardId)).board.nodes.map(node => node.id)).toEqual([`blender-${f.retained.id}-0`]);
+    expect((await f.canvas.workspace(f.project.id)).assets).toHaveLength(1);
+    expect(f.runner.run).toHaveBeenCalledOnce();
+
+    f.runner.inspectJob.mockResolvedValue({ id: f.retained.id, status: "interrupted", log: "" });
+    const tool = f.workflow.tools().find(item => item.name === "recover_blender_run") as RecoverableTool;
+    await expect(tool.recoverAfterHttp500!("show-final", request, undefined, undefined, f.context as never)).rejects.toThrow("still unconfirmed");
+    expect(f.runner.run).toHaveBeenCalledOnce();
+  });
+
+  it("restores an interrupted final presentation to its chosen board and keeps large pose sets off the final review", async () => {
+    const f = await fixture(undefined, true);
+    for (const name of ["pose1.png", "pose2.png", "pose3.png", "pose4.png"]) {
+      const image = referencePng();
+      await writeFile(path.join(f.outputDirectory, name), image);
+      f.retained.files.push({ path: name, size: image.length });
+    }
+    await f.call("run_blender", { workflow: "hero", stage: "parts", configPath: "parts.json" });
+    const index = await f.canvas.changeBoards(f.project.id, { type: "create", name: "Final asset" });
+    const boardId = index.boards.at(-1)!.id;
+    f.presentReview.mockRejectedValueOnce(new Error("Canvas is temporarily unavailable"));
+    await expect(f.call("recover_blender_run", { runId: f.retained.id, boardId, reviewPresentation: "final" })).rejects.toThrow("temporarily unavailable");
+    const recovered = (await f.call("recover_blender_run", { runId: f.retained.id })).details!.blender;
+    expect(recovered).toMatchObject({ reviewPresentation: "final", canvas: { boardId, nodeIds: [`blender-${f.retained.id}-0`] } });
+    expect((await f.canvas.workspace(f.project.id)).assets).toHaveLength(1);
+    await expect(f.call("recover_blender_run", {
+      runId: f.retained.id, boardId: index.boards[0].id, reviewPresentation: "final",
+    })).rejects.toThrow("original Blender review board changed");
+    expect(f.runner.run).toHaveBeenCalledOnce();
+  });
+
+  it.each(["failed report", "no model", "ambiguous model"])("keeps an unpresentable final candidate with the Agent (%s)", async issue => {
+    const f = await fixture(undefined, issue !== "failed report");
+    if (issue === "no model") f.retained.files = f.retained.files.filter(file => file.path !== "model.glb");
+    if (issue === "ambiguous model") {
+      const model = f.buffers.get("model.glb")!;
+      await writeFile(path.join(f.outputDirectory, "other.glb"), model);
+      f.retained.files.push({ path: "other.glb", size: model.length });
+    }
+    const input = { workflow: "hero", stage: "parts", configPath: "parts.json" };
+    await expect(f.call("run_blender", { ...input, reviewPresentation: "final" })).rejects.toThrow("Invalid Blender workflow arguments");
+    await f.call("run_blender", input);
+    const blocked = (await f.call("recover_blender_run", { runId: f.retained.id, reviewPresentation: "final" })).details!.blender;
+    expect(blocked).toMatchObject({
+      review: "pending-agent-review", next: expect.stringContaining(issue === "failed report" ? "failed technical checks" : "exactly one"),
+    });
+    expect(blocked).not.toHaveProperty("canvas");
+    expect(f.bindModel).not.toHaveBeenCalled();
+    expect(f.presentReview).not.toHaveBeenCalled();
+    expect(f.runner.run).toHaveBeenCalledOnce();
+  });
+
+  it("recovers a legacy raw invocation as its original checkpoint and preserves its run receipt when promoted", async () => {
+    const f = await fixture(undefined, true);
+    const request = { workflow: "old-hero", stage: "parts", configPath: "parts.json" };
+    await writeFile(path.join(f.directory, "invocation.json"), JSON.stringify({ callId: "old", request }));
+    const input = { runId: f.retained.id };
+    const legacy = (await f.call("recover_blender_run", input)).details!.blender as { directory: string; canvas: { boardId: string; nodeIds: string[] } };
+    expect(legacy).toMatchObject({ reviewPresentation: "checkpoint", review: "pending-human-review" });
+    const source = path.join(f.project.workspacePath, legacy.directory, "run.json");
+    const bytes = await readFile(source);
+    expect(JSON.parse(bytes.toString())).toMatchObject({ request, review: "pending-human-review" });
+    expect(JSON.parse(bytes.toString()).request).not.toHaveProperty("reviewPresentation");
+    expect(JSON.parse(await readFile(path.join(f.directory, "canvas-review.json"), "utf8"))).toEqual({ boardId: legacy.canvas.boardId });
+    const final = (await f.call("recover_blender_run", { ...input, reviewPresentation: "final" })).details!.blender;
+    expect(final).toMatchObject({ canvas: legacy.canvas, reviewPresentation: "final", review: "pending-human-review" });
+    expect((await f.call("recover_blender_run", input)).details!.blender).toEqual(final);
+    expect((await f.call("recover_blender_run", { ...input, reviewPresentation: "checkpoint" })).details!.blender).toEqual(final);
+    expect(await readFile(source)).toEqual(bytes);
+    expect(f.runner.run).not.toHaveBeenCalled();
+  });
+
+  it("keeps a candidate out of the Library when its requested final board was deleted", async () => {
+    const f = await fixture(undefined, true);
+    const index = await f.canvas.changeBoards(f.project.id, { type: "create", name: "Temporary board" });
+    const deleted = index.boards.at(-1)!.id;
+    await f.canvas.changeBoards(f.project.id, { type: "delete", boardId: deleted });
+    await f.call("run_blender", { workflow: "hero", stage: "parts", configPath: "parts.json" });
+    await expect(f.call("recover_blender_run", {
+      runId: f.retained.id, reviewPresentation: "final", boardId: deleted,
+    })).rejects.toThrow("Canvas board not found");
+    expect(f.library.list()).toHaveLength(0);
+    expect(f.bindModel).not.toHaveBeenCalled();
+    expect((await f.call("recover_blender_run", { runId: f.retained.id })).details!.blender)
+      .toMatchObject({ review: "pending-agent-review", reviewPresentation: "internal" });
+  });
+
   it("keeps a missing script correctable without launching or replaying a Blender job", async () => {
     const f = await fixture();
     const input = { workflow: "hero", stage: "custom", scriptPath: "missing.py" };
@@ -199,12 +347,15 @@ describe("controlled Blender project tools", () => {
 
   it.each([false, true])("keeps the original default review board after reordering (missing receipt=%s)", async missingReceipt => {
     const f = await fixture();
-    const response = await f.call("run_blender", { workflow: "hero", stage: "parts", configPath: "parts.json" });
+    const response = await f.call("run_blender", { workflow: "hero", stage: "parts", configPath: "parts.json", reviewPresentation: "checkpoint" });
     const original = (response.details!.blender as { canvas: { boardId: string } }).canvas.boardId;
     expect(JSON.parse(await readFile(path.join(f.directory, "canvas-review.json"), "utf8"))).toEqual({ boardId: original });
     if (missingReceipt) await rm(path.join(f.directory, "canvas-review.json"));
     const index = await f.canvas.changeBoards(f.project.id, { type: "create", name: "Other board" });
     const other = index.boards.at(-1)!.id;
+    if (missingReceipt) await expect(f.call("recover_blender_run", {
+      runId: f.retained.id, boardId: other, reviewPresentation: "checkpoint",
+    })).rejects.toThrow("original Blender review board changed");
     await f.canvas.changeBoards(f.project.id, { type: "move", boardId: other, direction: -1 });
     const recovered = await f.call("recover_blender_run", { runId: f.retained.id });
     expect(recovered.details!.blender).toMatchObject({ canvas: { boardId: original } });
@@ -215,7 +366,7 @@ describe("controlled Blender project tools", () => {
 
   it("does not redirect a retained review after its original board is deleted", async () => {
     const f = await fixture();
-    const response = await f.call("run_blender", { workflow: "hero", stage: "parts", configPath: "parts.json" });
+    const response = await f.call("run_blender", { workflow: "hero", stage: "parts", configPath: "parts.json", reviewPresentation: "checkpoint" });
     const original = (response.details!.blender as { canvas: { boardId: string } }).canvas.boardId;
     const index = await f.canvas.changeBoards(f.project.id, { type: "create", name: "Other board" });
     const other = index.boards.at(-1)!.id;
@@ -227,7 +378,7 @@ describe("controlled Blender project tools", () => {
 
   it("preserves a user's replacement model instead of claiming the original review was restored", async () => {
     const f = await fixture();
-    const response = await f.call("run_blender", { workflow: "hero", stage: "parts", configPath: "parts.json" });
+    const response = await f.call("run_blender", { workflow: "hero", stage: "parts", configPath: "parts.json", reviewPresentation: "checkpoint" });
     const original = (response.details!.blender as { canvas: { boardId: string } }).canvas.boardId;
     await writeFile(path.join(f.project.workspacePath, "other.glb"), f.buffers.get("model.glb")!);
     const replacement = await f.projects.ensureLibraryAsset(f.project.id, "other.glb");
@@ -244,7 +395,7 @@ describe("controlled Blender project tools", () => {
 
   it("refuses ambiguous review placement when a delivery receipt is missing", async () => {
     const f = await fixture();
-    const response = await f.call("run_blender", { workflow: "hero", stage: "parts", configPath: "parts.json" });
+    const response = await f.call("run_blender", { workflow: "hero", stage: "parts", configPath: "parts.json", reviewPresentation: "checkpoint" });
     const original = (response.details!.blender as { canvas: { boardId: string } }).canvas.boardId;
     await rm(path.join(f.directory, "canvas-review.json"));
     const index = await f.canvas.changeBoards(f.project.id, { type: "create", name: "Copied review" });
@@ -259,12 +410,13 @@ describe("controlled Blender project tools", () => {
     expect(f.runner.run).toHaveBeenCalledOnce();
   });
 
-  it("automatically publishes a stage model to Canvas and recovers without replacing user edits", async () => {
+  it("publishes a requested checkpoint model to Canvas and recovers without replacing user edits", async () => {
     const f = await fixture();
     const response = await f.call("run_blender", {
       workflow: "hero",
       stage: "parts",
       configPath: "parts.json",
+      reviewPresentation: "checkpoint",
     });
     const delivery = response.details!.blender as {
       canvas: { boardId: string; nodeIds: string[] };
@@ -313,6 +465,7 @@ describe("controlled Blender project tools", () => {
         workflow: "hero",
         stage: "parts",
         configPath: "parts.json",
+        reviewPresentation: "checkpoint",
         boardId,
       }),
     ).rejects.toThrow("is retained");
@@ -337,6 +490,7 @@ describe("controlled Blender project tools", () => {
       workflow: "hero",
       stage: "parts",
       configPath: "parts.json",
+      reviewPresentation: "checkpoint",
     };
     const output = await f.guardedCall("run_blender", input, "same-call");
     const data = (output.details as { blender: unknown }).blender as {
@@ -349,7 +503,7 @@ describe("controlled Blender project tools", () => {
     expect(data).toMatchObject({
       runId: f.retained.id,
       technicalChecksPassed: false,
-      review: "pending-human-review",
+      review: "checkpoint-presented",
     });
     if (desktop) expect(data).toMatchObject({ liveView: { shown: true, updates: 3 } });
     else expect(data).not.toHaveProperty("liveView");
@@ -439,6 +593,7 @@ describe("controlled Blender project tools", () => {
         workflow: "crate",
         stage: "parts",
         configPath: "parts.json",
+        reviewPresentation: "checkpoint",
       }),
     ).rejects.toThrow(`run ${f.retained.id} is retained`);
     const recovered = await f.call("recover_blender_run", {
@@ -649,6 +804,7 @@ describe("controlled Blender project tools", () => {
       workflow: "hero",
       stage: "parts",
       configPath: "parts.json",
+      reviewPresentation: "checkpoint",
     };
     await expect(
       f.guardedCall("run_blender", input, "original"),

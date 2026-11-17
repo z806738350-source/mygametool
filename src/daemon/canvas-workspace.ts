@@ -38,8 +38,11 @@ export function withCanvasLock<T>(workspace: string, operation: () => Promise<T>
 }
 const validId = (id: string) => { if (!/^[a-zA-Z0-9_-]{1,100}$/.test(id)) throw new CanvasError("Invalid canvas ID"); return id; };
 const revision = (value: unknown) => createHash("sha256").update(typeof value === "string" ? value : JSON.stringify(value)).digest("hex");
-const CANVAS_MEDIA_WORKFLOW = "Before submitting new project media, save its generation node on the board, then call generate_canvas_media. It records history, assets and results on that node. Only register a result manually when it already exists outside the board.";
-const LEGACY_CANVAS_MEDIA_WORKFLOW = "After each media result is saved, register its path in assets.json and add or update its board node before the next long-running step. Do not defer board writes until the final response.";
+const CANVAS_MEDIA_WORKFLOW = "For provider-generated media, save its generation node on the board before calling generate_canvas_media. It records history, assets and results on that node. Keep internal Blender runs off the board. Present the checked candidate through recover_blender_run for final review or a checkpoint the user requested or needs to make a decision. Only register other media manually when the user should see the result and it already exists outside the board.";
+const PREVIOUS_CANVAS_MEDIA_WORKFLOWS = [
+  "Before submitting new project media, save its generation node on the board, then call generate_canvas_media. It records history, assets and results on that node. Only register a result manually when it already exists outside the board.",
+  "After each media result is saved, register its path in assets.json and add or update its board node before the next long-running step. Do not defer board writes until the final response.",
+];
 const CANVAS_INSTRUCTIONS = `# Canvas workspace
 
 Canvas files are the source of truth in both Design and Asset Canvas. Use normal read, edit, and write tools to create and change boards, nodes, documents, and references.
@@ -89,7 +92,7 @@ export async function ensureCanvasContract(workspace: string, replaceReadme = fa
     if (await readCanvasFile(workspace, file) !== text) await writeAtomic(workspace, file, text);
   }
   const previous = await readCanvasFile(workspace, "AGENTS.md");
-  if (previous === undefined || previous === CANVAS_INSTRUCTIONS.replace(CANVAS_MEDIA_WORKFLOW, LEGACY_CANVAS_MEDIA_WORKFLOW))
+  if (previous === undefined || PREVIOUS_CANVAS_MEDIA_WORKFLOWS.some((workflow) => previous === CANVAS_INSTRUCTIONS.replace(CANVAS_MEDIA_WORKFLOW, workflow)))
     await writeAtomic(workspace, "AGENTS.md", CANVAS_INSTRUCTIONS);
   if (replaceReadme || await readCanvasFile(workspace, "README.md") === undefined)
     await writeAtomic(workspace, "README.md", CANVAS_README);
@@ -478,24 +481,30 @@ export class CanvasStore {
     });
   }
   /** Add retained local review media without replacing the user's nodes or layout. */
-  async presentLocalAssets(id: string, entries: readonly { nodeId: string; assetId: string; title: string }[], boardId?: string): Promise<{ boardId: string; nodeIds: string[] }> {
+  async presentLocalAssets(id: string, files: readonly { nodeId: string; path: string; title: string }[], boardId?: string) {
     const project = this.#project(id), workspace = project.workspacePath;
     return withCanvasLock(workspace, async () => {
       const index = await ensureCanvasIndex(workspace);
-      let selected = boardId;
-      if (!selected) {
+      const nodeIds = new Set(files.map(entry => entry.nodeId));
+      const requested = boardId ? (await this.board(id, boardId)).board : undefined;
+      let board = requested;
+      if (!board?.nodes.some(node => nodeIds.has(node.id))) {
         // A board write can succeed before its caller retains the delivery receipt.
-        const nodeIds = new Set(entries.map(entry => entry.nodeId));
-        const existing: string[] = [];
+        const existing = [];
         for (const item of index.boards) {
-          const { board } = await this.board(id, item.id);
-          if (board.nodes.some(node => nodeIds.has(node.id))) existing.push(item.id);
+          if (item.id === requested?.id) continue;
+          const candidate = (await this.board(id, item.id)).board;
+          if (candidate.nodes.some(node => nodeIds.has(node.id))) existing.push(candidate);
         }
         if (existing.length > 1) throw new CanvasError("The retained review nodes exist on multiple boards; review their original placement before recovery", 409);
-        selected = existing[0] ?? index.boards[0]!.id;
+        if (requested && existing.length) throw new CanvasError("The original Blender review board changed; review its retained placement before recovery", 409);
+        board = requested ?? existing[0] ?? (await this.board(id, index.boards[0]!.id)).board;
       }
-      const { board } = await this.board(id, selected);
-      for (const entry of entries) {
+      const entries = [];
+      for (const file of files) {
+        validId(file.nodeId);
+        const entry = { ...file, assetId: await this.projects.ensureLibraryAsset(id, file.path) };
+        entries.push(entry);
         const node = board.nodes.find(node => node.id === entry.nodeId);
         if (node && (node.type !== "asset" || node.data.assetId !== entry.assetId))
           throw new CanvasError("A retained review node changed its asset or type; preserving the user's edit instead of replacing it", 409);
@@ -505,7 +514,6 @@ export class CanvasStore {
         const manifest = await ensureCanvasAssets(project, this.projects, this.library, pending.map(entry => entry.assetId));
         const assets = await canvasAssetCatalog(workspace, manifest, pending.map(entry => entry.assetId));
         for (const entry of pending) {
-          validId(entry.nodeId);
           const asset = assets.find(asset => asset.id === entry.assetId)!;
           board.nodes.push({ id: entry.nodeId, type: "asset", position: { x: 0, y: 0 }, title: entry.title, data: { assetId: entry.assetId, mediaType: asset.mediaType } });
         }
@@ -514,7 +522,7 @@ export class CanvasStore {
         await writeCanvasBoard(workspace, board);
         await this.projects.touch(id);
       }
-      return { boardId: selected, nodeIds: entries.map(entry => entry.nodeId) };
+      return { boardId: board.id, nodeIds: entries.map(entry => entry.nodeId), assetsByPath: Object.fromEntries(entries.map(entry => [entry.path, entry.assetId])) };
     });
   }
   /** Publish an agent request and its sources atomically before any provider call. */

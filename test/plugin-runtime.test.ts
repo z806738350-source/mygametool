@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -31,7 +31,7 @@ describe("plugin runtime", () => {
     expect(await read("web-game-studio")).toContain("generate_canvas_media");
     expect(await read("threejs-world", "world-contract.md")).toContain("Three.js");
     const blender = await read("blender-assets");
-    expect(blender).toContain("external Blender session");
+    expect(blender).toBe(await readFile("plugins/blender/skills/blender-assets/SKILL.md", "utf8"));
     expect(blender).not.toContain("--python");
     await expect(read("threejs-world", "../SKILL.md")).rejects.toThrow("filename");
     await expect(read("game-studio")).rejects.toThrow("unavailable");

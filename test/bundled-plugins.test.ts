@@ -15,10 +15,20 @@ describe("bundled plugins", () => {
     await settings.load();
     const tool = workflowGuideTools("web-game", store, settings)[0]!;
     const read = (reference?: string) => tool.execute("guide", { guide: "blender-assets", reference }, undefined, undefined, {} as never);
-    const guide = JSON.stringify((await read()).content);
+    const guide = (await read()).content.find(item => item.type === "text")?.text;
     expect(guide).toContain("## Deliver to the game");
     expect(guide).toContain("recover_blender_run");
-    expect(JSON.stringify((await read("pipeline.md")).content)).toContain("contactPoint");
+    expect(guide).toContain("the main Agent reviews intermediate stages");
+    expect(guide).toContain("see progress, show it and keep working.");
+    expect(guide).toContain("additional spending the user has not authorized");
+    expect(guide?.replace(/\s+/g, " ")).toContain("Wait for the user's answer before taking the dependent step.");
+    const reference = (await read("pipeline.md")).content.find(item => item.type === "text")?.text;
+    expect(reference).toContain("contactPoint");
+    for (const mode of ["internal", "checkpoint", "final"]) {
+      expect(guide).toContain(`reviewPresentation: "${mode}"`);
+    }
+    expect(reference).toContain("Ask for final user acceptance on the exact candidate presented.");
+    expect(reference).toContain("for a choice only the user can make.");
     await expect(read("../scripts/pipeline.py")).rejects.toThrow();
     await settings.update(store.read("ohmygame:blender")!, { enabled: false, components: {} });
     await expect(read()).rejects.toThrow("unavailable");
@@ -40,7 +50,7 @@ describe("bundled plugins", () => {
     }
     expect(store.read("ohmygame:blender")).toMatchObject({
       enabled: true,
-      skills: [{ id: "skills/blender-assets/SKILL.md" }],
+      skills: [{ id: "skills/blender-assets/SKILL.md", description: expect.stringContaining("final user review") }],
       mcpServers: [],
     });
     expect(store.read("ohmygame:godot")).toMatchObject({

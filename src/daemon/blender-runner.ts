@@ -62,6 +62,8 @@ export interface BlenderRunInput {
   timeoutMs?: number;
   /** Host-owned desktop display; never changes the worker's execution policy. */
   liveView?: boolean;
+  /** Effective workflow and review mode, including runs without a chat session. */
+  workflowRequest?: object;
   /** Host-owned call identity, retained before execution for recovery without replay. */
   invocation?: { callId: string; sessionFile: string; request: unknown };
 }
@@ -471,6 +473,8 @@ export class BlenderRunner {
         }),
         { flag: "wx", mode: 0o400 },
       );
+      if (input.workflowRequest)
+        await writeFile(path.join(directory, "workflow.json"), JSON.stringify(input.workflowRequest), { flag: "wx", mode: 0o400 });
       if (input.invocation)
         await writeFile(
           path.join(directory, "invocation.json"),

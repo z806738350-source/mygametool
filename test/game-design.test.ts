@@ -1162,7 +1162,7 @@ describe("Markdown design workspace", () => {
     expect((await checkCanvasWorkspace(project.workspacePath)).ok).toBe(true);
     expect(await readFile(path.join(project.workspacePath, "canvas/schemas/board.schema.json"), "utf8")).toContain("documentId");
 
-    expect(await readFile(path.join(project.workspacePath, "canvas/AGENTS.md"), "utf8")).toContain("Before submitting new project media, save its generation node on the board, then call generate_canvas_media");
+    expect(await readFile(path.join(project.workspacePath, "canvas/AGENTS.md"), "utf8")).toContain("save its generation node on the board before calling generate_canvas_media");
 
     const document = await store.createDocument(project.id, "Rules");
     await store.save(project.id, { ...document.document, markdown: "# Keep these rules" }, document.revision, document.document.id);

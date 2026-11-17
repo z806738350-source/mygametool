@@ -30,7 +30,12 @@ describe("OhMyGame system prompt", () => {
       expect(text).toContain("save the generation node on the Canvas before submitting");
       expect(text).toContain("read_workflow_guide");
       expect(text).toContain("blender_status");
-      expect(text).toContain("recover_blender_run");
+      expect(text).toContain("By default the main Agent reviews intermediate Blender stages");
+      expect(text).toContain("reviewPresentation=internal (the default)");
+      expect(text).toContain("recover_blender_run with its original runId, reviewPresentation=final");
+      expect(text).toContain("Use reviewPresentation=checkpoint to show a requested progress view or the evidence for a decision only the user can make");
+      expect(text).toContain("ask one concrete question and wait before taking the dependent step");
+      expect(text).toContain("Wait for the user's final acceptance");
       expect(text).toContain("Do not switch to paid provider rigging as a fallback");
       expect(text).toContain("Never mark artistic acceptance from a numeric report");
       expect(text).toContain("recover_isolated_changes instead of rerunning the command");

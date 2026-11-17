@@ -7,7 +7,7 @@
     "beta": true,
     "displayName": "Blender",
     "shortDescription": "Make game assets and export project-ready GLB files.",
-    "longDescription": "Use a local Blender installation to create or refine game assets, preserve editable blend sources, export GLB, and validate the result in the target project. Includes a collection-aware export helper. Blender is required; this workflow uses its command line and Python API.",
+    "longDescription": "The main Agent uses local Blender to create models and animations, check each stage and repair defects. Rotate the finished model and play its animations on the Canvas, then accept it or request changes. You can also ask to review an intermediate stage. The workflow preserves editable Blender files and exports GLB for the target project.",
     "icon": {
       "type": "asset",
       "path": "./assets/icon.png"

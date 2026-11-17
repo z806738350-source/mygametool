@@ -20,6 +20,8 @@ import {
   type BlenderRunner,
   type BlenderRunResult,
 } from "./blender-runner.js";
+import { CanvasError } from "./canvas-files.js";
+import { writeAtomically } from "./checkpoint-objects.js";
 import { localAgentPath } from "./agent-local-files.js";
 import { readSafeProjectFile } from "./safe-project-file.js";
 import { inspectModel3D } from "./model3d-inspect.js";
@@ -41,6 +43,22 @@ const stages = [
   "export",
   "custom",
 ] as const;
+const boardIdParameter = Type.Optional(Type.String({
+  pattern: "^[a-zA-Z0-9_-]{1,100}$",
+  description: "Canvas board for user review; use the current board when known.",
+}));
+const checkpointPresentation = Type.Literal("checkpoint", { description: "Show progress the user requested or a concrete decision the Agent needs from them." });
+const finalPresentation = Type.Literal("final", { description: "Show the inspected, delivery-ready model for the user's final decision." });
+const recoverParameters = Type.Object({
+  runId: Type.String({ pattern: UUID.source }),
+  reviewPresentation: Type.Optional(Type.Union([checkpointPresentation, finalPresentation])),
+  boardId: boardIdParameter,
+}, { additionalProperties: false });
+const canvasReviewReceipt = Type.Object({
+  boardId: boardIdParameter,
+  requestedBoardId: boardIdParameter,
+  reviewPresentation: Type.Optional(Type.Union([checkpointPresentation, finalPresentation])),
+});
 const runParameters = Type.Object(
   {
     workflow: Type.String({
@@ -84,17 +102,16 @@ const runParameters = Type.Object(
       }),
     ),
     timeoutSeconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })),
-    boardId: Type.Optional(
-      Type.String({
-        pattern: "^[a-zA-Z0-9_-]{1,100}$",
-        description:
-          "Canvas board for interactive review. Use the current board when known; otherwise the first project board is used.",
-      }),
-    ),
+    reviewPresentation: Type.Optional(Type.Union([
+      Type.Literal("internal", { description: "Default. Retain files for the Agent to inspect and refine." }),
+      checkpointPresentation,
+    ])),
+    boardId: boardIdParameter,
   },
   { additionalProperties: false },
 );
 type RunRequest = Static<typeof runParameters>;
+type RecoveryRequest = Static<typeof recoverParameters>;
 type Runner = Pick<BlenderRunner, "run" | "status" | "readJob" | "inspectJob">;
 type Mutate = <T>(operation: () => Promise<T>) => Promise<T>;
 
@@ -105,15 +122,14 @@ export interface BlenderToolsOptions {
   runner: Runner;
   enabled?: () => boolean;
   mutate: Mutate;
-  bindModel: (relativePath: string) => Promise<string>;
   touch?: () => Promise<unknown>;
   presentReview?: (review: {
     runId: string;
     workflow: string;
     stage: string;
     boardId?: string;
-    files: string[];
-  }) => Promise<{ boardId: string; nodeIds: string[] }>;
+    files: { path: string; nodeId: string }[];
+  }) => Promise<{ boardId: string; nodeIds: string[]; assetsByPath: Record<string, string> }>;
 }
 
 const result = (value: unknown) => ({
@@ -126,6 +142,13 @@ export class BlenderWorkflow {
   constructor(private readonly options: BlenderToolsOptions) {}
 
   tools() {
+    const recover = (input: unknown, signal?: AbortSignal, requireTerminal = false) => this.options.mutate(async () => {
+      signal?.throwIfAborted();
+      this.#assertEnabled();
+      if (!Check(recoverParameters, input) || (input.boardId && !input.reviewPresentation))
+        throw toolPreflightError("Use a retained Blender run ID and select a presentation when specifying a board.", "invalid_blender_input");
+      return this.#recover(input.runId, signal, requireTerminal, input);
+    });
     return [
       defineTool({
         name: "blender_status",
@@ -159,7 +182,7 @@ export class BlenderWorkflow {
               .slice(-64),
             stages,
             humanReview:
-              "Required for shape, joints, deformation and motion; numeric checks do not establish artistic quality.",
+              "The Agent inspects intermediate reports, rendered views and motion, corrects defects, then asks the user for final artistic acceptance. Show intermediate checkpoints for requested progress or a decision that genuinely needs the user.",
           });
         },
       }),
@@ -168,7 +191,7 @@ export class BlenderWorkflow {
           name: "run_blender",
           label: "Run Blender stage",
           description:
-            "Run one reproducible local Blender stage in a private, network-disabled environment. Read blender-assets and its pipeline reference first. Use Tripo only for an initial organic mesh when needed; this tool never calls a paid provider. Review dimensions/views before modeling, joints before rigging, deformation before animation, and motion before final use. New output is retained with its editable .blend, reports and previews; previous files are preserved. Custom Python can import the bundled pipeline and export_glb helpers and has access only to declared input snapshots and the private output directory. Use recover_blender_run after interrupted delivery instead of rerunning.",
+            "Run one reproducible local Blender stage. Read blender-assets and its pipeline reference first. Use Tripo only for a needed initial organic mesh. Intermediate runs default to internal: inspect the retained reports and actual renders, fix defects, and continue without interrupting the user. Use recover_blender_run with reviewPresentation=final to show a checked candidate without rerunning; use checkpoint when the user asks to see progress or a specific decision truly needs their input. Custom Python can import bundled pipeline and export_glb helpers and only access declared input snapshots and the private output directory.",
           parameters: runParameters,
           execute: async (callId, input, signal, _update, context) => {
             if (!Check(runParameters, input))
@@ -181,7 +204,7 @@ export class BlenderWorkflow {
             const sessionFile = context?.sessionManager?.getSessionFile?.();
             return this.options.mutate(() =>
               this.#run(
-                input,
+                { ...input, reviewPresentation: input.reviewPresentation ?? "internal" },
                 signal,
                 sessionFile
                   ? { callId, sessionFile, request: input }
@@ -237,24 +260,16 @@ export class BlenderWorkflow {
           },
         } satisfies Pick<RecoverableTool, "recoverAfterHttp500">,
       ),
-      defineTool({
+      Object.assign(defineTool({
         name: "recover_blender_run",
         label: "Recover Blender result",
         description:
-          "Validate and deliver a retained successful Blender run from this project without starting Blender or submitting a provider request. Conflicting edited output is preserved and reported. Failed or incomplete runs cannot be promoted to successful results.",
-        parameters: Type.Object(
-          { runId: Type.String({ pattern: UUID.source }) },
-          { additionalProperties: false },
-        ),
-        execute: async (_id, { runId }, signal) =>
-          this.options.mutate(async () => {
-            signal?.throwIfAborted();
-            this.#assertEnabled();
-            if (!UUID.test(runId))
-              throw new Error("Use a retained Blender run ID");
-            return this.#recover(runId, signal);
-          }),
-      }),
+          "Recover a retained Blender run with its recorded review presentation. To present already-inspected files from that exact run on Canvas, explicitly select final for the user's final decision, or checkpoint for a requested preview or a decision requiring the user. This reuses the retained files and never starts Blender again.",
+        parameters: recoverParameters,
+        execute: (_id, input, signal) => recover(input, signal),
+      }), {
+        recoverAfterHttp500: (_id, input, signal) => recover(input, signal, true),
+      } satisfies Pick<RecoverableTool, "recoverAfterHttp500">),
     ].filter(
       (tool) =>
         tool.name === "blender_status" || this.options.enabled?.() !== false,
@@ -268,7 +283,7 @@ export class BlenderWorkflow {
       );
   }
 
-  async #recover(runId: string, signal?: AbortSignal, requireTerminal = false) {
+  async #recover(runId: string, signal?: AbortSignal, requireTerminal = false, presentation?: RecoveryRequest) {
     signal?.throwIfAborted();
     const diagnostic = await this.options.runner.inspectJob(runId);
     if (diagnostic.status === "failed")
@@ -292,7 +307,7 @@ export class BlenderWorkflow {
       return result({ runId, ...diagnostic, published: false });
     }
     const run = await this.options.runner.readJob(runId);
-    return this.#publish(run, await this.#request(run), signal);
+    return this.#publish(run, await this.#request(run), signal, presentation);
   }
 
   async #run(
@@ -381,6 +396,7 @@ export class BlenderWorkflow {
           inputs,
           args,
           bundledScripts,
+          workflowRequest: input,
           liveView: process.env.OHMYGAME_BLENDER_WINDOW_IPC === "1",
           ...(invocation ? { invocation } : {}),
           ...(input.timeoutSeconds
@@ -403,11 +419,6 @@ export class BlenderWorkflow {
       throw error;
     }
     try {
-      await writeFile(
-        path.join(run.directory, "workflow.json"),
-        JSON.stringify(input),
-        { flag: "wx", mode: 0o600 },
-      );
       return await this.#publish(run, input, signal);
     } catch (error) {
       throw new Error(
@@ -455,6 +466,7 @@ export class BlenderWorkflow {
     run: BlenderRunResult,
     request: RunRequest,
     signal?: AbortSignal,
+    presentation?: RecoveryRequest,
   ) {
     signal?.throwIfAborted();
     this.#assertEnabled();
@@ -532,52 +544,90 @@ export class BlenderWorkflow {
         ),
       );
     const directory = `assets/blender/${request.workflow}/runs/${run.id}`;
+    // A retained request with no mode predates internal review and originally presented every stage.
+    const originalPresentation = request.reviewPresentation ?? "checkpoint";
     const receipt = {
       runId: run.id,
       workflow: request.workflow,
       stage: request.stage,
       request,
       outputs: run.files,
-      review: "pending-human-review",
+      review: originalPresentation === "internal" ? "pending-agent-review" : request.reviewPresentation ? "checkpoint-presented" : "pending-human-review",
       technicalChecksPassed,
       models,
     };
     files.set("run.json", Buffer.from(JSON.stringify(receipt, null, 2) + "\n"));
     await this.#writeDirectory(directory, files, signal);
-    const bindings = [];
-    for (const item of models) {
-      signal?.throwIfAborted();
-      const originalPath = `${directory}/${item.file}`;
-      bindings.push({
-        originalPath,
-        assetId: await this.options.bindModel(originalPath),
-        model: item.model,
-      });
+    const receiptPath = path.join(run.directory, "canvas-review.json");
+    const retained = await readSafeProjectFile(run.directory, receiptPath, 4096)
+      .catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return; throw error; });
+    const prior: unknown = retained ? JSON.parse(retained.toString("utf8")) : undefined;
+    if (prior !== undefined && (!Check(canvasReviewReceipt, prior) || (!prior.boardId && !prior.reviewPresentation)))
+      throw new Error("The retained Blender review board or presentation is invalid");
+    const requestedPresentation = prior?.reviewPresentation === "final" ? "final"
+      : presentation?.reviewPresentation ?? prior?.reviewPresentation ?? originalPresentation;
+    const lockedBoard = prior?.boardId ?? (originalPresentation === "checkpoint" ? request.boardId : undefined);
+    const boardId = presentation?.boardId ?? lockedBoard ?? prior?.requestedBoardId ?? request.boardId;
+    if ((lockedBoard && boardId !== lockedBoard) ||
+        (prior?.boardId && originalPresentation === "checkpoint" && request.boardId && prior.boardId !== request.boardId))
+      throw new Error("The original Blender review board changed; review its retained placement before recovery");
+    const finalIssue = requestedPresentation !== "final" ? undefined : technicalChecksPassed === false
+      ? "The retained report contains failed technical checks. Inspect the report, correct the failed stage, and recheck its output."
+      : models.length !== 1
+        ? "A final presentation needs exactly one inspectable GLB candidate. Export the intended model and inspect it before presenting it."
+        : undefined;
+    const publish = requestedPresentation !== "internal" && !finalIssue && !!this.options.presentReview;
+    const changedIntent = publish && !!presentation?.reviewPresentation &&
+      (requestedPresentation !== (prior?.reviewPresentation ?? originalPresentation) || (!lockedBoard && boardId !== prior?.requestedBoardId && !!presentation.boardId));
+    if (changedIntent) {
+      // Recover the exact promotion (including its intended board) if binding or Canvas delivery is interrupted.
+      await writeAtomically(run.directory, receiptPath, JSON.stringify({
+        ...(lockedBoard ? { boardId: lockedBoard } : { requestedBoardId: boardId }),
+        reviewPresentation: requestedPresentation,
+      }));
     }
     await this.options.touch?.();
-    const reviewFiles = [...files.keys()]
-      .filter((file) => /\.(?:glb|png|jpe?g)$/i.test(file))
-      .sort(
-        (a, b) =>
-          Number(!a.endsWith(".glb")) - Number(!b.endsWith(".glb")) ||
-          a.localeCompare(b),
-      )
-      .map((file) => `${directory}/${file}`);
+    let assetsByPath: Record<string, string> = {};
     let canvas: { boardId: string; nodeIds: string[] } | undefined;
-    if (reviewFiles.length && this.options.presentReview) {
-      const receiptPath = path.join(run.directory, "canvas-review.json");
-      const retained = await readSafeProjectFile(run.directory, receiptPath, 4096)
-        .catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return; throw error; });
-      const selected: unknown = retained ? JSON.parse(retained.toString("utf8"))?.boardId : request.boardId;
-      if (selected !== undefined && (typeof selected !== "string" || !/^[a-zA-Z0-9_-]{1,100}$/.test(selected)))
-        throw new Error("The retained Blender review board is invalid");
-      if (retained && (!selected || request.boardId && request.boardId !== selected))
-        throw new Error("The original Blender review board changed; review its retained placement before recovery");
-      canvas = await this.options.presentReview({
-        runId: run.id, workflow: request.workflow, stage: request.stage,
-        boardId: selected as string | undefined, files: reviewFiles,
-      });
-      if (!retained) await writeFile(receiptPath, JSON.stringify({ boardId: canvas.boardId }), { flag: "wx", mode: 0o600 });
+    if (publish && this.options.presentReview) {
+      // Historical node IDs use this exact ordering, including the case-sensitive .glb suffix.
+      const modelFirst = (file: string) => (request.reviewPresentation ? file.toLowerCase() : file).endsWith(".glb");
+      const reviewFiles = [...files.keys()].filter(file => /\.(?:glb|png|jpe?g)$/i.test(file))
+        .sort((a, b) => Number(modelFirst(b)) - Number(modelFirst(a)) || a.localeCompare(b))
+        .map((file, index) => ({ path: `${directory}/${file}`, nodeId: `blender-${run.id}-${index}` }));
+      let selection = reviewFiles;
+      if (requestedPresentation === "final" && reviewFiles.length > 4) {
+        // For large pose sets, expose only the model and unambiguous standard views.
+        selection = reviewFiles.filter(file => /\.glb$/i.test(file.path));
+        for (const angle of ["front", "side", "back"]) {
+          const views = reviewFiles.filter(file =>
+            /\.(?:png|jpe?g)$/i.test(file.path) && path.parse(file.path).name.toLowerCase().replace(/^review-/, "") === angle,
+          );
+          if (views.length === 1) selection.push(views[0]);
+        }
+      }
+      if (selection.length) {
+        try {
+          const delivery = await this.options.presentReview({
+            runId: run.id, workflow: request.workflow, stage: request.stage, boardId,
+            files: selection,
+          });
+          assetsByPath = delivery.assetsByPath;
+          canvas = { boardId: delivery.boardId, nodeIds: delivery.nodeIds };
+        } catch (error) {
+          // A rejected destination is definitive. Preserve the prior placement for a later recovery.
+          if (changedIntent && error instanceof CanvasError && [404, 409].includes(error.statusCode)) {
+            if (retained) await writeAtomically(run.directory, receiptPath, retained.toString("utf8"));
+            else await rm(receiptPath);
+          }
+          throw error;
+        }
+        if (!prior?.boardId)
+          await writeAtomically(run.directory, receiptPath, JSON.stringify({
+            boardId: canvas.boardId,
+            ...(requestedPresentation !== originalPresentation ? { reviewPresentation: requestedPresentation } : {}),
+          }));
+      }
     }
     return result({
       runId: run.id,
@@ -585,12 +635,23 @@ export class BlenderWorkflow {
       stage: request.stage,
       directory,
       files: [...files.keys()].map((file) => `${directory}/${file}`),
-      models: bindings,
+      models: models.map(item => {
+        const originalPath = `${directory}/${item.file}`;
+        const assetId = assetsByPath[originalPath];
+        return { originalPath, ...(assetId ? { assetId } : {}), model: item.model };
+      }),
       ...(run.liveView ? { liveView: run.liveView } : {}),
       ...(canvas ? { canvas } : {}),
-      review: "pending-human-review",
+      reviewPresentation: requestedPresentation,
+      ...(finalIssue ? { presentationIssue: finalIssue } : {}),
+      review: !canvas ? "pending-agent-review" : requestedPresentation === "checkpoint" && request.reviewPresentation
+        ? "checkpoint-presented" : "pending-human-review",
       technicalChecksPassed,
-      next: "Inspect the reports. The returned Canvas nodes show the interactive stage GLB and auxiliary images; reuse them, do not add duplicates. Ask the user to rotate/zoom the model and play/switch every available animation before accepting the corresponding stage. Resolve failed technical checks before advancing. For custom modeling stages, include a review.glb from the saved scene; images alone are not a model review. For final delivery use get_model_asset, then load and play all clips in the target game. Preview and numeric checks do not imply human or engine acceptance.",
+      next: requestedPresentation === "final" && finalIssue ? finalIssue
+        : requestedPresentation !== "internal" && !canvas ? "No Canvas review was presented. Check Canvas availability and the retained review files before requesting acceptance."
+        : requestedPresentation === "final" ? "Use the returned assetId with get_model_asset to verify the model and required clips in the target game when available. Then ask for the user's final artistic decision on the rotatable, playable Canvas model."
+        : requestedPresentation === "checkpoint" ? "The checkpoint is visible. If a decision genuinely needs the user, explain the tradeoff in plain language and wait for their answer. For a progress-only preview, continue unless asked to pause."
+        : "Read the retained reports and inspect actual renders or motion samples, correct defects, and continue the workflow. When the checked model is ready, present this exact run with recover_blender_run and reviewPresentation=final.",
       log: run.log,
     });
   }

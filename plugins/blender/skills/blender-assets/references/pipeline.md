@@ -1,11 +1,10 @@
 # Repeatable Blender stages
 
-The bundled pipeline is a starting implementation for measured primitive props
-and explicitly described humanoid rigs. The main Agent authors and revises the
-JSON and, where needed, custom Blender Python. It does not infer anatomy, cut
-fused garments, retopologize a character, invent good animation, or approve its
-own artwork. Keep the original reference images, Tripo GLB, stage sources and
-human decisions. Existing models do not require another Tripo request.
+The bundled pipeline builds measured primitive props and explicitly described
+humanoid rigs. The main Agent authors and revises the JSON and any custom
+Blender Python needed for anatomy, garment separation, topology or animation.
+Keep the original references, Tripo GLB, stage sources, the Agent's observations
+and any user decisions. Existing models do not require another Tripo request.
 
 ## Invocation and outputs
 
@@ -35,17 +34,27 @@ source path, not a guessed filename.
 An interrupted stage is not permission to discard its earlier outputs.
 
 `report.technicalChecksPassed` describes only the checks actually recorded.
-`humanReview` remains `pending`; it is never an approval token. A process can
-finish successfully with failed technical checks. Read them before continuing.
+The report's `humanReview: "pending"` means the script has recorded no human
+approval. The Agent continues intermediate work after inspecting the evidence.
+A process can finish successfully with failed technical checks. Read them before continuing.
 Missing information or unsupported data produces an error report. Set
 `previews:false` only for a repeat of an already inspected technical check;
-production reviews need actual images and the user's decisions.
-The host publishes the model and images as Canvas assets on the supplied `boardId`
-(otherwise the first board), returning the node IDs. The model viewer supports
-rotation, zoom, play/pause and clip selection; use it as the primary review.
-Keep joint/region overlays and stress-pose images alongside it. Recovery reuses
-the same nodes and preserves their edited titles and layout. Preview publication
-does not mark the asset approved or add it to the running game.
+visual checks need actual images. `run_blender` retains stage outputs internally
+by default. The Agent reads the reports, joint overlays, stress poses and motion
+evidence at the returned paths and repairs defects before proceeding.
+To show the checked candidate, call `recover_blender_run` on its `runId` with
+`reviewPresentation: "final"` and the current `boardId` when known. Use
+`reviewPresentation: "checkpoint"` to show progress on request or show the evidence
+for a choice only the user can make. A progress request allows work to continue.
+Wait if the user explicitly requests approval before proceeding, or if proceeding
+would settle an open design choice, visibly change the reference, require an
+unauthorized additional charge, or trade an unresolved defect for a design change.
+For example, show the walking pose where the boot still passes through the coat.
+Explain the options and ask “Would you like to keep this version, or shorten the
+coat so the boot clears it?” Wait before changing the coat. Fix ordinary defects
+and check the result independently.
+Reuse the returned nodes. The model viewer supports rotation, zoom, play/pause and
+clip selection. Ask for final user acceptance on the exact candidate presented.
 
 When `blender_status.liveWorkWindow` is true, the desktop opens a movable,
 resizable Blender work window for each running task and closes it automatically
@@ -55,8 +64,8 @@ commands executed through that window or a recording played after completion.
 Native operations such as remeshing, weight solving or baking can leave the last
 scene visible until control returns to the script and it reaches a checkpoint.
 Observation warnings do not change the production outcome: retain the run and
-its outputs rather than rerunning or buying a replacement. Canvas model playback
-and the user's milestone review remain the acceptance step.
+its outputs rather than rerunning or buying a replacement. The user reviews
+the final candidate on the Canvas.
 
 The shipped baseline has been exercised with Blender 5.3. Its ordinary Python
 uses Blender's `bpy`, `bmesh` and `mathutils`, with no external Python packages.
@@ -132,7 +141,7 @@ threshold merely to make a check green.
 
 ## Parts: dimensions before geometry
 
-Write `parts.json`, show the dimensions to the user, then run `parts`. Each
+Write `parts.json`, check its dimensions against the brief and reference, then run `parts`. Each
 primitive has a unique name, positive XYZ size, XYZ position, optional XYZ Euler
 rotation in degrees, and RGB/RGBA color in 0–1. Types are `box`, `cylinder`
 (local Z axis), and `sphere`. Optional bevel is a width in meters, no greater
@@ -166,7 +175,7 @@ primitive schema.
 
 The report measures the assembled bounds, triangle counts, materials and
 topology. It does not infer whether the pieces are mechanically attached.
-Inspect the renders and compare them with the approved dimensions/reference.
+Inspect the renders and compare them with the dimensions and reference.
 
 ## Clean: preserve the original, normalize a copy
 
@@ -313,7 +322,7 @@ Use the same reviewed joint/region configuration with `rig`.
 
 Fused sleeves/capes may need mesh separation, retopology and explicit garment
 bones before they can deform well. Those are model-specific custom edits.
-Preserve the previous stage and show the user the changed mesh and stress images.
+Preserve the previous stage and compare the changed mesh and stress images with it.
 
 ## Animate: a measured two-leg baseline
 
@@ -384,8 +393,8 @@ Do not describe in-place raw world-foot coordinates as planted.
 Reports include contact slip, sole and mesh penetration, pose-loop position and
 rotation mismatch, and the expected root travel. Loop error compares poses in
 armature space so intentional root translation does not count as an error.
-Preview output shows four Walk phases from front and side; inspect actual game
-playback and obtain human approval before describing motion as natural.
+Preview output shows four Walk phases from front and side. Inspect those samples
+and verify actual playback before presenting the motion for final user review.
 
 ## Export and actual game delivery
 

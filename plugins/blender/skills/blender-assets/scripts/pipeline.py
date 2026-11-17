@@ -1,7 +1,7 @@
 """Repeatable Blender asset stages. Run inside Blender, never ordinary Python.
 
 Inputs stay unchanged. Every stage writes a fresh output directory. The report
-separates measured technical checks from the human review still required.
+records measured technical checks for the Agent's review. The user reviews the final candidate.
 """
 
 import argparse

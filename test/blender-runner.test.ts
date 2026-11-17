@@ -267,8 +267,9 @@ bpy.ops.render.render(write_still=True)
       path.join(workspace, "model.py"),
       'import argparse\np = argparse.ArgumentParser()\np.add_argument("--input-dir", required=True)\np.parse_args()\n',
     );
+    const workflowRequest = { ...invocation.request, reviewPresentation: "internal" };
     const failure = await runner
-      .run({ workspace, scriptPath: "model.py", inputs: [], invocation })
+      .run({ workspace, scriptPath: "model.py", inputs: [], invocation, workflowRequest })
       .catch((error) => error as BlenderRunError);
     expect(failure).toBeInstanceOf(BlenderRunError);
     const id = (failure as BlenderRunError).jobId!;
@@ -284,6 +285,7 @@ bpy.ops.render.render(write_still=True)
         ),
       ),
     ).toEqual(invocation);
+    expect(JSON.parse(await readFile(path.join(directory, "jobs", id, "workflow.json"), "utf8"))).toEqual(workflowRequest);
     await mkdir(path.join(workspace, "nested"));
     await writeFile(
       path.join(workspace, "nested/source.json"),
