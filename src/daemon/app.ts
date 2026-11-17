@@ -1,3 +1,4 @@
+import { GPT_IMAGE_26_SCHEMA, GPT_IMAGE_FORMATS } from "../shared/gpt-image-26.js";
 import { releaseRetiredProjectRecoverySpace, restoreLocalImageRecoverySpaces, restoreRecoverySpaceReservations } from "./recovery-space.js";
 import { isMeshyIdentifier, isMeshyProviderConfiguration, MESHY_DISABLED_MESSAGE } from "../shared/disabled-media-providers.js";
 import { PluginIntegrationHost } from "./plugin-integration.js";
@@ -26,7 +27,7 @@ import { randomUUID } from "node:crypto";
 import { assertNoKnownSecretBytes, SafeProjectFileError } from "./safe-project-file.js";
 import { CheckedMediaSnapshotError, CheckedMediaSnapshotStore, type CheckedMediaSnapshot } from "./checked-media-snapshot.js";
 import { mediaPreviewReadLimit, mediaSnapshotResponse } from "./media-snapshot-response.js";
-import { KUNPO_BASE_URL, KUNPO_DEFAULT_MODEL_REFS, KUNPO_MODEL_ROLES, kunpoModelOption, validateKunpoSelection, type KunpoModelRole } from "../shared/kunpo-models.js";
+import { KUNPO_BASE_URL, KUNPO_DEFAULT_MODEL_REFS, KUNPO_MODEL_OPTIONS, KUNPO_MODEL_ROLES, kunpoModelOption, validateKunpoSelection, type KunpoModelRole } from "../shared/kunpo-models.js";
 import { imageModelsForProvider } from "./image-models.js";
 import { readFile, rm, lstat, realpath } from "node:fs/promises";
 import { OnboardingStore } from "./onboarding.js";
@@ -519,6 +520,11 @@ const MAX_LIBRARY_UPLOAD_BYTES = 200 * 1024 * 1024;
 /** A prompt rechecks a plugin connection, such as an account login, at most this often. */
 const PLUGIN_CONNECTION_MAX_AGE_MS = 10 * 60_000;
 
+const pngEditLayer = {
+  type: "object", additionalProperties: false, required: ["mediaType", "data"],
+  properties: { mediaType: { const: "image/png" }, data: { type: "string", minLength: 1, maxLength: 45_000_000 } },
+} as const;
+
 const toolRunSchema = {
   body: {
     type: "object",
@@ -534,12 +540,12 @@ const toolRunSchema = {
       aspectRatio: { type: "string", enum: [...new Set([...IMAGE_ASPECT_RATIOS, ...VIDEO_ASPECT_RATIOS])] },
       outputs: { type: "integer", enum: [...IMAGE_OUTPUT_COUNTS] },
       quality: { enum: ["auto", "low", "medium", "high", "xhigh", "max"] },
-      outputFormat: { enum: ["png", "jpeg"] },
+      ...GPT_IMAGE_26_SCHEMA,
+      outputFormat: { enum: GPT_IMAGE_FORMATS },
       outputCompression: { type: "integer", minimum: 0, maximum: 100 },
       background: { enum: ["auto", "opaque", "transparent"] },
-      mask: { type: "object", additionalProperties: false, required: ["mediaType", "data"], properties: {
-        mediaType: { const: "image/png" }, data: { type: "string", minLength: 1, maxLength: 45_000_000 },
-      } },
+      mask: pngEditLayer,
+      markup: pngEditLayer,
       duration: { type: "integer", minimum: 1, maximum: 30 },
       durationSeconds: { type: "number", minimum: 0.1, maximum: 600 },
       language: { type: "string", minLength: 1, maxLength: 40 },
@@ -842,7 +848,7 @@ export function createApp(options: AppOptions = {}) {
     openAIConnection: async () => {
       await getModelRuntime();
       if (!kunpoApiKey || !providerEnabled("kunpo") || openAIImages.get().mode === "disabled") return imageConnection.resolve();
-      return { source: { baseUrl: KUNPO_BASE_URL, apiKey: kunpoApiKey }, models: openAIImages.models() ?? imageModelsForProvider("openai", "KunpoAPI", ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare", "Image-GI2.1"]), connected: true };
+      return { source: { baseUrl: KUNPO_BASE_URL, apiKey: kunpoApiKey }, models: openAIImages.models() ?? imageModelsForProvider("openai", "KunpoAPI", KUNPO_MODEL_OPTIONS.filter(model => model.role === "image").map(model => model.id)), connected: true };
     },
     customProviders: () => providerModelSettings.customProviderCatalog(),
     migrateLegacyModels: (id, models) => providerModelSettings.migrateLegacyImageModels(id, models, async () => { await (await getModelRuntime()).refresh({ allowNetwork: false, providers: [id] }); }),

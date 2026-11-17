@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ImageModel } from "../src/shared/contracts.js";
-import { imageModelsForProvider, preferredImageModelId } from "../src/daemon/image-models.js";
+import { imageModelCapabilities, imageModelsForProvider, preferredImageModelId } from "../src/daemon/image-models.js";
 
 const CATALOG: ImageModel[] = [
   catalogModel("openai/gpt-image-2", "OpenAI: GPT Image 2", ["1:1", "16:9", "9:16"], 16),
@@ -11,6 +11,13 @@ const CATALOG: ImageModel[] = [
 ];
 
 describe("image model families", () => {
+  it("exposes GPT Image 2.6 formats only on the native Images protocol", () => {
+    for (const id of ["gpt-image-2.6-sunburst", "gpt-image-2.6-flare"]) {
+      expect(imageModelCapabilities(id, "openai-images").outputFormats).toEqual(["png", "jpeg", "webp", "svg", "gif"]);
+      expect(imageModelCapabilities(id, "openrouter-images").outputFormats).toBeUndefined();
+    }
+  });
+
   it("keeps image models from a provider's model list and drops everything else", () => {
     const models = imageModelsForProvider("openai", "OpenAI", ["gpt-5.5", "text-embedding-3", "gpt-image-2", "gpt-5-image", "gpt-image-2.5-flare", "tts-1"], CATALOG);
 

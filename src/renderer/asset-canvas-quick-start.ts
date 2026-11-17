@@ -1,5 +1,6 @@
 import type { ImageModel, ProjectState, VideoModel } from "../shared/contracts.js";
 import { createAssetCanvasStarterDocument, preferredImageOption, type AssetCanvasStarter } from "../shared/asset-canvas.js";
+import { isGptImage26 } from "../shared/gpt-image-26.js";
 import { videoReferenceAspectRatios } from "../shared/video-references.js";
 import { createProject, listImageModels, listVideoModels, waitForRuntime } from "./api.js";
 import { getCanvasWorkspace, getCanvasBoard, saveCanvasBoard } from "./canvas-api.js";
@@ -9,7 +10,7 @@ export interface AssetCanvasQuickStart {
   key: string;
   type: AssetCanvasStarter;
   label: string;
-  /** Provider-agnostic model ID; matches both "gpt-image-2.5-flare" and "openai/gpt-image-2.5-flare". */
+  /** Model-specific starters match the catalog entry retained in the new node. */
   modelId?: string;
 }
 
@@ -17,6 +18,8 @@ export const ASSET_CANVAS_QUICK_STARTS: readonly AssetCanvasQuickStart[] = [
   { key: "image", type: "image", label: t("assetCanvas.node.image") },
   { key: "video", type: "video", label: t("assetCanvas.node.video") },
   { key: "model-3d", type: "model-3d", label: "3D" },
+  { key: "gpt-image-2.6-sunburst", type: "image", label: "GPT Image 2.6 Sunburst", modelId: "gpt-image-2.6-sunburst" },
+  { key: "gpt-image-2.6-flare", type: "image", label: "GPT Image 2.6 Flare", modelId: "gpt-image-2.6-flare" },
   { key: "gpt-image-2.5", type: "image", label: "GPT Image 2.5", modelId: "gpt-image-2.5-flare" },
   { key: "nano-banana-2", type: "image", label: "Nano Banana 2", modelId: "gemini-3.1-flash-image" },
   { key: "seedance-2.0", type: "video", label: "Seedance 2.0", modelId: "seedance-2.0" },
@@ -83,7 +86,7 @@ async function modelsFor(item: AssetCanvasQuickStart): Promise<MediaModels> {
 }
 
 function hasModel(item: AssetCanvasQuickStart, models: MediaModels): boolean {
-  return Boolean(item.modelId) && starterModels(item, models).some((model) => matchesModelId(model.id, item.modelId!));
+  return Boolean(item.modelId) && starterModels(item, models).some((model) => matchesStarterModel(model, item.modelId!));
 }
 
 function starterModels(item: AssetCanvasQuickStart, models: MediaModels): ReadonlyArray<ImageModel | VideoModel> {
@@ -107,11 +110,12 @@ function starterOptions(item: AssetCanvasQuickStart, models: MediaModels): Param
 }
 
 // Generic starters take the first available model, like a new node on the canvas does.
-function pickModel<Model extends { id: string }>(item: AssetCanvasQuickStart, models: readonly Model[]): Model | undefined {
-  return item.modelId ? models.find((model) => matchesModelId(model.id, item.modelId!)) : models[0];
+function pickModel<Model extends { id: string; provider: string }>(item: AssetCanvasQuickStart, models: readonly Model[]): Model | undefined {
+  return item.modelId ? models.find((model) => matchesStarterModel(model, item.modelId!)) : models[0];
 }
 
-function matchesModelId(id: string, modelId: string): boolean {
+function matchesStarterModel({ id, provider }: { id: string; provider: string }, modelId: string): boolean {
+  if (isGptImage26(modelId)) return provider === "openai" && id === modelId;
   if (id === modelId || id.endsWith(`/${modelId}`)) return true;
   const normalizedId = id.toLowerCase().replaceAll(".", "-");
   const normalizedModelId = modelId.toLowerCase().replaceAll(".", "-");

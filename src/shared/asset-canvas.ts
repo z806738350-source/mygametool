@@ -126,7 +126,9 @@ export function validateAssetCanvasDocument(document: AssetCanvasDocument): void
     }
     if (node.type === "image" || node.type === "model-3d") {
       for (const reference of node.data.images) validateReference(node.id, reference, nodes, ["image", "asset"]);
-      if (node.type === "image" && node.data.mask) validateReference(node.id, node.data.mask, nodes, ["image", "asset"]);
+      if (node.type === "image") for (const layer of [node.data.mask, node.data.markup]) {
+        if (layer) validateReference(node.id, layer, nodes, ["image", "asset"]);
+      }
     }
     if (node.type === "video") {
       for (const reference of node.data.references) validateReference(node.id, reference, nodes, ["image", "video", "asset"]);

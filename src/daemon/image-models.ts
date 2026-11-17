@@ -1,3 +1,4 @@
+import { GPT_IMAGE_26_IDS, GPT_IMAGE_COMPLEXITIES, GPT_IMAGE_FORMATS, isGptImage26 } from "../shared/gpt-image-26.js";
 import { IMAGE_ASPECT_RATIOS, type ImageAspectRatio, type ImageModel, type ImageOutputCount, type ImageProtocol, type ImageResolution } from "../shared/contracts.js";
 import { knownImageReferenceLimit } from "../shared/image-reference-limits.js";
 
@@ -27,7 +28,7 @@ const FAMILIES: readonly ImageModelFamily[] = [
 ];
 
 /** Listed first, and used when no model is requested. */
-const PREFERRED_IDS = ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare", "Image-GI2.1", "gemini-3.1-flash-image"];
+const PREFERRED_IDS = ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare", "Image-GI2.1", ...GPT_IMAGE_26_IDS, "gemini-3.1-flash-image"];
 
 /** Image models a provider offers, from its `/models` IDs and the public catalog's capabilities. */
 export function imageModelsForProvider(
@@ -65,7 +66,8 @@ export function imageModelDefinition(id: string, catalog: readonly ImageModel[] 
   };
 }
 
-export function imageModelCapabilities(id: string): Pick<ImageModel, "qualities" | "outputFormats" | "supportsTransparency" | "supportsMask"> {
+export function imageModelCapabilities(id: string, protocol: ImageModel["protocol"] = "openai-images"): Pick<ImageModel, "qualities" | "outputFormats" | "supportsTransparency" | "supportsMask" | "supportsMarkup" | "complexities"> {
+  if (protocol === "openai-images" && isGptImage26(id)) return { qualities: ["auto", "low", "medium", "high", "xhigh", "max"], outputFormats: GPT_IMAGE_FORMATS, complexities: GPT_IMAGE_COMPLEXITIES, supportsTransparency: true, supportsMask: true, supportsMarkup: true };
   if (/^gpt-image-2\.5-(?:sunburst|flare)$/.test(id)) return { qualities: ["auto", "low", "medium", "high", "xhigh", "max"], outputFormats: ["png", "jpeg"], supportsTransparency: true, supportsMask: true };
   if (id === "Image-GI2.1") return { qualities: [], outputFormats: [], supportsTransparency: false, supportsMask: false };
   return {};

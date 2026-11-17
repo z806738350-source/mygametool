@@ -8,6 +8,7 @@ import { imageModelCapabilities, imageModelsForProvider } from "./image-models.j
 import { createImageProtocolAdapters, type ImageSource } from "./image-adapters.js";
 import { customMediaSource } from "./custom-media-source.js";
 import { ImageGenerationError, type GeneratedImage, type ImageGenerationInput, type ImageGenerator } from "./openai-image.js";
+import { validateGptImage26Settings } from "../shared/gpt-image-26.js";
 import { listOpenRouterImageModels, resolveOpenRouterMediaSource } from "./openrouter-media.js";
 import { SEEDREAM_BASE_URL, SEEDREAM_PROVIDER_ID, SEEDREAM_PROVIDER_NAME, seedreamModel, seedreamModels } from "./seedream-models.js";
 
@@ -79,7 +80,7 @@ export class ProviderImages implements ImageGenerator {
       !localOnly && this.isEnabled("codex-cli") && this.options.codexImages ? this.options.codexImages.catalog(signal).then((catalog) => ({ models: catalog.models, status: catalog.providers[0]! })) : undefined,
     ]);
     const connected = entries.filter((entry): entry is CatalogEntry => Boolean(entry));
-    const models = connected.flatMap((entry) => entry.models).filter(model => !isMeshyModelReference(model)).map((model) => ({ ...model, ...imageModelCapabilities(model.id) }));
+    const models = connected.flatMap((entry) => entry.models).filter(model => !isMeshyModelReference(model)).map((model) => ({ ...model, ...imageModelCapabilities(model.id, model.protocol) }));
     const savedDefault = this.options.defaultModel?.();
     const defaultModel = await this.#blockedSelection(savedDefault) ? undefined : savedDefault;
     const defaultIndex = models.findIndex((model) => model.provider === defaultModel?.provider && model.id === defaultModel.id);
@@ -140,7 +141,7 @@ export class ProviderImages implements ImageGenerator {
     }
     return provider.models.filter((model) => !this.#blockedCustom(provider, model.id) && !provider.hiddenModelIds.includes(model.id)).flatMap((model) => {
       const image = customImageModel(provider, model);
-      return image ? [{ ...image, ...imageModelCapabilities(image.id) }] : [];
+      return image ? [{ ...image, ...imageModelCapabilities(image.id, image.protocol) }] : [];
     });
   }
 
@@ -177,6 +178,8 @@ export class ProviderImages implements ImageGenerator {
       ? "The selected image model is unavailable. Choose a connected image provider or update the default image model in Providers."
       : "Image generation is not configured", 503);
     if (isMeshyModelReference(definition) || isMeshyEndpoint(selection.source?.baseUrl)) throw new ImageGenerationError(MESHY_DISABLED_MESSAGE, 410, false, true);
+    const invalidSettings = validateGptImage26Settings(definition.protocol === "openai-images" ? definition.id : undefined, input, input.images?.length ?? 0);
+    if (invalidSettings) throw new ImageGenerationError(invalidSettings, 400, false, true);
     if (input.execution?.recoveryOnly && definition.protocol !== "openai-images") throw new ImageGenerationError("Saved-result recovery is unavailable for this image protocol; no new generation was submitted.", 409);
     if (input.images?.length && !definition.supportsReferenceImage) throw new ImageGenerationError("Reference images are not supported by the selected model", 400);
     if (input.images && definition.maxReferenceImages !== undefined && input.images.length > definition.maxReferenceImages) throw new ImageGenerationError(`The selected image model supports up to ${definition.maxReferenceImages} reference images`, 400);
@@ -312,7 +315,7 @@ export class ProviderImages implements ImageGenerator {
     const connection = await this.options.openAIConnection();
     if (isMeshyEndpoint(connection.source?.baseUrl)) throw new ImageGenerationError(MESHY_DISABLED_MESSAGE, 410, false, true);
     if (!connection.source) return undefined;
-    const models = (connection.models ?? await this.#sourceModels("openai", "OpenAI", connection.source, signal)).map((model) => ({ ...model, ...imageModelCapabilities(model.id) }));
+    const models = (connection.models ?? await this.#sourceModels("openai", "OpenAI", connection.source, signal)).map((model) => ({ ...model, ...imageModelCapabilities(model.id, model.protocol) }));
     const model = requestedId ? models.find((candidate) => candidate.id === requestedId) : models[0];
     return model ? { model, source: connection.source } : undefined;
   }

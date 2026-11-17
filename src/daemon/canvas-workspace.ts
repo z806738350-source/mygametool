@@ -1,3 +1,4 @@
+import { gptImage26Options } from "../shared/gpt-image-26.js";
 import { CANVAS_TABLE_SCHEMA, createCanvasTable, isCanvasTable, canvasTablePath, type CanvasTable, type CanvasTableDetail } from "../shared/canvas-table.js";
 import { createHash, randomUUID } from "node:crypto";
 import { validVideoReferencePreparation } from "../shared/video-reference-preparation.js";
@@ -339,7 +340,8 @@ export async function removeCanvasAssetReferences(workspace: string, assetIds: s
         }
         if ("images" in data) data.images = data.images.filter((reference) => !removesReference(reference));
         if ("references" in data && data.references) data.references = data.references.filter((reference) => reference.type === "library" ? !ids.has(reference.assetId) : !removed.has(reference.nodeId));
-        if ("mask" in data && data.mask && (data.mask.type === "library" ? ids.has(data.mask.assetId) : removed.has(data.mask.nodeId))) delete data.mask;
+        if ("mask" in data && data.mask && removesReference(data.mask)) delete data.mask;
+        if ("markup" in data && data.markup && removesReference(data.markup)) delete data.markup;
         if ("source" in data && data.source && (data.source.type === "library" ? ids.has(data.source.assetId) : removed.has(data.source.nodeId))) delete data.source;
         return { ...node, data } as AssetCanvasNode;
       });
@@ -534,8 +536,8 @@ export class CanvasStore {
         } else if ("attachmentReference" in source) {
           source.signal?.throwIfAborted();
           const bytes = Buffer.from(source.image.data, "base64"), digest = createHash("sha256").update(bytes).digest("hex");
-          if (!["image/png", "image/jpeg"].includes(source.image.mediaType)) throw new CanvasError("Attachment references require PNG or JPEG");
-          const extension = source.image.mediaType === "image/png" ? "png" : "jpg";
+          if (!["image/png", "image/jpeg", "image/webp"].includes(source.image.mediaType)) throw new CanvasError("Attachment references require PNG, JPEG or WebP");
+          const extension = source.image.mediaType === "image/jpeg" ? "jpg" : source.image.mediaType.slice(6);
           assetId = (await this.library.add(`attachment-${digest}.${extension}`, bytes, {
             origin: "uploaded", purpose: "reference", signal: source.signal, saved: false,
             sourceKey: `project:${id}:attachment:${createHash("sha256").update(JSON.stringify([id, source.attachmentReference, digest])).digest("hex")}`,
@@ -735,6 +737,7 @@ export class CanvasStore {
         ...("images" in prepared ? prepared.images?.map(image => image.libraryAssetId) ?? [] : []),
         ...("references" in prepared ? prepared.references?.map(reference => reference.assetId) ?? [] : []),
         "mask" in prepared ? prepared.mask?.libraryAssetId : undefined,
+        "markup" in prepared ? prepared.markup?.libraryAssetId : undefined,
         "assetId" in prepared ? prepared.assetId : undefined,
         "sourceAssetId" in prepared ? prepared.sourceAssetId : undefined,
         "referenceAssetId" in prepared ? prepared.referenceAssetId : undefined,
@@ -844,7 +847,9 @@ export class CanvasStore {
       ...(node.data.outputFormat !== undefined ? { outputFormat: node.data.outputFormat } : {}),
       ...(node.data.outputCompression !== undefined ? { outputCompression: node.data.outputCompression } : {}),
       ...(node.data.background !== undefined ? { background: node.data.background } : {}),
+      ...gptImage26Options(node.data),
       ...(node.data.mask ? { mask: await image(node.data.mask) } : {}),
+      ...(node.data.markup ? { markup: await image(node.data.markup) } : {}),
       images: await Promise.all(node.data.images.map(image)),
     });
     const referenceIds = node.data.references.map(assetId);

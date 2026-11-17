@@ -101,6 +101,10 @@ import { canvasAssetDownloadName, downloadAssetBlob, loadLibraryAssets, type Lib
 import { SendToProjectDialog } from "./send-to-project-dialog.js";
 import { useAgentModels, type AgentModelCatalogStatus } from "./model-selector.js";
 import { clampReasoningLevel } from "../shared/reasoning.js";
+import {
+  GPT_IMAGE_26_DEFAULTS, GPT_IMAGE_SVG_MODELS, GPT_IMAGE_SVG_EFFORTS,
+  gptImage26FrameSize, gptImage26Options, isGptImage26, validateGptImage26Settings, type GptImage26Options,
+} from "../shared/gpt-image-26.js";
 import { CanvasChipSelect, type CanvasChipNote } from "./canvas-chip-select.js";
 import { settingsHash } from "./routes.js";
 import { useCanvasAssetSources, useWorkspaceAssetUrl } from "./use-workspace-asset-url.js";
@@ -205,7 +209,8 @@ function canvasCreationGroups(documents: CanvasDocuments, tables: CanvasTables, 
   return [{ label: t("assetCanvas.group.documents"), items }, ...assetGroups];
 }
 
-type AssetCanvasFlowData = {
+type CanvasImageSettings = Omit<ImageGenerationSettings, "mask" | "markup"> & { mask?: AssetCanvasReference; markup?: AssetCanvasReference };
+type AssetCanvasFlowData = CanvasImageSettings & {
   resizeRuntime?: CanvasNodeResizeRuntime;
   nodeDetails?: CanvasNodeDetails;
   panelOpen?: boolean;
@@ -244,11 +249,6 @@ type AssetCanvasFlowData = {
   lyrics?: string;
   resolution?: ImageResolution;
   aspectRatio?: ImageAspectRatio;
-  quality?: ImageGenerationSettings["quality"];
-  outputFormat?: ImageGenerationSettings["outputFormat"];
-  outputCompression?: ImageGenerationSettings["outputCompression"];
-  background?: ImageGenerationSettings["background"];
-  mask?: AssetCanvasReference;
   videoModel?: VideoModelRef;
   videoResolution?: VideoResolution;
   videoAspectRatio?: VideoAspectRatio;
@@ -363,6 +363,7 @@ interface Animate3DNodeRuntime extends ReferenceMediaNodeRuntime {
 
 interface MediaReferenceView {
   assetId?: string;
+  contentType?: string;
   key: string;
   name: string;
   label: string;
@@ -458,6 +459,7 @@ export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled
   const assetPaths = useCanvasAssetSources();
   const [nodeDetails, setNodeDetails] = useState<{ id: string; title: string; description: string; job?: ToolJob }>();
   const libraryImages = useMemo(() => libraryAssets.filter((asset) => asset.mediaType === "image"), [libraryAssets]);
+  const staticImageReferences = useMemo(() => libraryImages.filter(asset => ["image/png", "image/jpeg", "image/webp"].includes(asset.contentType)), [libraryImages]);
 
   const [imageModels, setImageModels] = useState<ImageModel[]>([]);
   const [globalDefaultImageModel, setDefaultImageModel] = useState<ImageModelRef>();
@@ -1898,7 +1900,7 @@ export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled
           : candidate));
       },
       onUploadReferences: (files) => node.type === "image" ? void uploadReferenceImages(node, files) : void uploadVideoReferences(node, files),
-      libraryImages,
+      libraryImages: node.type === "image" ? staticImageReferences : libraryImages,
       onReloadLibrary: reloadLibraryAssets,
       onAddLibraryReference: (asset) => addLibraryReference(node, asset),
     };
@@ -1924,6 +1926,8 @@ export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled
   const confirmationJob = mediaConfirmation && canvasJobs[mediaConfirmation.nodeId];
   const confirmationType = confirmationJob?.toolId === "generate-video" ? "newVideo" : confirmationJob?.toolId === "generate-image" || confirmationJob?.toolId === "image-to-3d" || confirmationJob?.toolId === "animate-3d" ? "newMedia" : "newAudio";
   const confirmationRecovery = recoveryLabel(confirmationJob);
+  const confirmationNode = mediaConfirmation && nodes.find(node => node.id === mediaConfirmation.nodeId);
+  const imageConfirmation = confirmationNode?.type === "image" && isGptImage26(confirmationNode.data.model?.id) ? confirmationNode.data : undefined;
 
   return (
     <section className="viewer-pane interactive-story-workspace" hidden={hidden} aria-label={t("canvas.assetCanvasWorkspace")}>
@@ -2091,7 +2095,13 @@ export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled
         <button type="button" data-autofocus onClick={() => answerMediaConfirmation("cancel")}>{t("common.cancel")}</button>
         {confirmationRecovery ? <button type="button" onClick={() => answerMediaConfirmation("recover")}>{t(confirmationRecovery)}</button> : null}
         <button type="button" onClick={() => answerMediaConfirmation("new")}>{t("assetCanvas.newVideoConfirm")}</button>
-      </>}><p>{t(`assetCanvas.${confirmationType}Description`)}</p></CanvasConfirmationDialog> : null}
+      </>}><p>{t(`assetCanvas.${confirmationType}Description`)}</p>
+        {imageConfirmation ? <p>
+          {imageConfirmation.model?.id} · {(imageConfirmation.outputFormat ?? "png").toUpperCase()} · {t(imageConfirmation.background === "transparent" ? "kunpoModels.transparent" : imageConfirmation.background === "opaque" ? "kunpoModels.opaque" : "kunpoModels.backgroundAuto")}<br />
+          {imageConfirmation.pixelSize ?? (imageConfirmation.outputFormat === "gif" ? gptImage26FrameSize(imageConfirmation.aspectRatio) : [imageConfirmation.resolution, imageConfirmation.aspectRatio].filter(Boolean).join(" · "))}
+          {imageConfirmation.outputFormat === "gif" ? ` · ${t("kunpoModels.animationSummary", { frames: imageConfirmation.frameCount ?? GPT_IMAGE_26_DEFAULTS.frameCount, ms: imageConfirmation.frameDurationMs ?? GPT_IMAGE_26_DEFAULTS.frameDurationMs })}` : ""}
+        </p> : null}
+      </CanvasConfirmationDialog> : null}
     </section>
   );
 }
@@ -2150,6 +2160,13 @@ function ImageNode({ data, selected }: Pick<NodeProps<AssetCanvasFlowNode>, "dat
     finally { checkingNetwork.current = false; }
   };
   const selectedModel = runtime?.models.find((model) => sameImageModel(model, data.model));
+  const modern = Boolean(selectedModel?.complexities?.length);
+  const format = data.outputFormat ?? "png";
+  const isGif = modern && format === "gif";
+  const isSvg = modern && format === "svg";
+  const [settingsReset, setSettingsReset] = useState(false);
+  const [invalidDrafts, setInvalidDrafts] = useState<Partial<Record<"pixelSize" | "outputCompression" | "frameDurationMs", string>>>({});
+  useEffect(() => setInvalidDrafts({}), [selectedModel?.id, format]);
   const modelOptions = selectedModel?.generationOptions ?? [];
   const resolutions = [...new Set(modelOptions.map((option) => option.resolution))];
   const aspectRatios = [...new Set(modelOptions
@@ -2157,10 +2174,51 @@ function ImageNode({ data, selected }: Pick<NodeProps<AssetCanvasFlowNode>, "dat
     .map((option) => option.aspectRatio))];
 
   const referenceLimit = selectedModel?.maxReferenceImages ?? IMAGE_MAX_REFERENCE_IMAGES;
-  const referenceError = selectedModel && (data.images?.length ?? 0) > referenceLimit ? t("assetCanvas.modeLimit", { limit: referenceLimit }) : data.mask && !data.images?.length ? t("kunpoModels.maskNeedsReference") : undefined;
+  const referenceCount = data.images?.length ?? 0;
+  const referenceError = selectedModel && referenceCount > referenceLimit ? t("assetCanvas.modeLimit", { limit: referenceLimit })
+    : !modern && data.mask && !referenceCount ? t("kunpoModels.maskNeedsReference") : undefined;
+  const optionError = modern ? validateGptImage26Settings(selectedModel?.id, data, referenceCount, 1, key => t(`kunpoModels.imageProblem.${key}`))
+    ?? (runtime?.references.some(ref => ref.contentType && !["image/png", "image/jpeg", "image/webp"].includes(ref.contentType)) ? t("kunpoModels.referenceFormats") : undefined) : undefined;
   const compatible = selectedModel ? compatibleImageSettings(data, selectedModel) : undefined;
-  const incompatible = compatible && (["quality", "outputFormat", "background", "outputCompression", "mask"] as const).some((key) => data[key] !== undefined && JSON.stringify(data[key]) !== JSON.stringify(compatible[key]));
-  const canGenerate = !runtime?.busy && !runtime?.generating && Boolean(effectivePrompt(data, runtime).trim() && selectedModel && !referenceError && !incompatible);
+  const incompatible = compatible && (Object.keys(compatible) as (keyof CanvasImageSettings)[]).some((key) => data[key] !== undefined && data[key] !== compatible[key]);
+  const canGenerate = !runtime?.busy && !runtime?.generating && Boolean(effectivePrompt(data, runtime).trim() && selectedModel && !referenceError && !optionError && !incompatible && !Object.keys(invalidDrafts).length);
+
+  function update(settings: Partial<CanvasImageSettings>) {
+    setSettingsReset(false);
+    runtime?.onChange({ ...data, imageRuntime: undefined, ...settings });
+  }
+
+  function inputField(field: keyof typeof invalidDrafts, label: string, placeholder: string, min?: number, max?: number) {
+    const hint = field === "pixelSize" ? t("kunpoModels.pixelHint") : t("kunpoModels.integerRange", { min, max });
+    return <label className="story-inspector-field">
+      <span>{label}</span>
+      <input aria-label={label} aria-invalid={invalidDrafts[field] !== undefined} title={hint} inputMode={field === "pixelSize" ? "text" : "numeric"}
+        placeholder={placeholder} disabled={runtime?.busy} value={invalidDrafts[field] ?? data[field] ?? ""} onChange={(event) => {
+          const raw = event.currentTarget.value;
+          const next = field === "pixelSize" ? raw.trim().toLowerCase().replace("×", "x") : Number(raw);
+          const valid = !raw || (field === "pixelSize"
+            ? !validateGptImage26Settings(selectedModel?.id, { pixelSize: String(next) }, 0)
+            : /^\d+$/.test(raw) && Number.isInteger(next) && Number(next) >= min! && Number(next) <= max!);
+          setInvalidDrafts((previous) => {
+            const drafts = { ...previous };
+            if (valid) delete drafts[field]; else drafts[field] = raw;
+            return drafts;
+          });
+          if (valid) update({ [field]: raw ? next : undefined });
+        }} />
+      {invalidDrafts[field] !== undefined ? <span role="alert">{hint}</span> : null}
+    </label>;
+  }
+
+  function layerPicker(field: "mask" | "markup") {
+    const ref = data[field];
+    if (!ref && (isSvg || isGif || (field === "mask" ? data.markup : data.mask))) return null;
+    return <CanvasChipSelect label={t(field === "mask" ? "kunpoModels.mask" : "kunpoModels.markup")}
+      value={ref?.type === "library" ? ref.assetId : ref?.type === "node" ? `node:${ref.nodeId}` : ""}
+      options={[{ value: "", label: t(field === "mask" ? "kunpoModels.noMask" : "kunpoModels.noMarkup") }, ...(ref?.type === "node" ? [{ value: `node:${ref.nodeId}`, label: t("assetCanvas.node.image"), disabled: true }] : []),
+        ...(runtime?.libraryImages ?? []).filter((asset) => asset.contentType === "image/png").map((asset) => ({ value: asset.id, label: asset.name }))]}
+      disabled={runtime?.busy || !referenceCount && !ref} onChange={(assetId) => update({ [field]: assetId ? { type: "library", assetId } : undefined })} />;
+  }
 
   function selectModel(key: string): void {
     const model = runtime?.models.find((candidate) => !isMeshyModelReference(candidate) && modelRefKey(candidate) === key);
@@ -2168,6 +2226,7 @@ function ImageNode({ data, selected }: Pick<NodeProps<AssetCanvasFlowNode>, "dat
       ?? preferredImageOption(model, data.aspectRatio);
     if (!model || !runtime) return;
     const settings = compatibleImageSettings(data, model);
+    setSettingsReset((Object.keys(settings) as (keyof CanvasImageSettings)[]).some(key => data[key] !== undefined && data[key] !== settings[key]));
     runtime.onChange({ ...data, imageRuntime: undefined, model: { provider: model.provider, id: model.id }, ...settings, ...(option ? { resolution: option.resolution, aspectRatio: option.aspectRatio } : {}) });
   }
 
@@ -2189,7 +2248,8 @@ function ImageNode({ data, selected }: Pick<NodeProps<AssetCanvasFlowNode>, "dat
         onChange={(prompt) => runtime?.onChange({ ...data, imageRuntime: undefined, prompt })}
       />
       {networkCheck && networkCheck !== "checking" ? <p className={`story-media-status${networkCheck === "ready" ? " is-neutral" : ""}`} role="status">{t(`assetCanvas.imageNetwork.${networkCheck}`)}</p> : runtime?.error ? <p className={`story-media-status${isImageWaitCancelled(runtime.error) ? " is-neutral" : ""}`} role={isImageWaitCancelled(runtime.error) ? "status" : "alert"} aria-label={imageRecoveryMessage(runtime.error)} title={imageRecoveryMessage(runtime.error)}>{imageRecoveryMessage(runtime.error, true)}</p> : null}
-      {referenceError ? <p role="alert">{referenceError}</p> : null}
+      {referenceError || optionError ? <p className="story-media-status" role="alert">{referenceError ?? optionError}</p> : null}
+      {settingsReset ? <p role="status" className="canvas-chip-menu-note">{t("kunpoModels.settingsReset")}</p> : null}
       {incompatible ? <p className="canvas-chip-menu-note">{t("kunpoModels.incompatibleSettings")} <button type="button" className="canvas-chip" disabled={runtime?.busy} onClick={() => { runtime?.onChange({ ...data, ...compatible }); }}>{t("kunpoModels.resetSettings")}</button></p> : null}
       <div className="story-media-controls">
         <CanvasChipSelect
@@ -2203,14 +2263,14 @@ function ImageNode({ data, selected }: Pick<NodeProps<AssetCanvasFlowNode>, "dat
           disabled={runtime?.busy}
           onChange={selectModel}
         />
-        {selectedModel?.supportsAspectRatio !== false ? <CanvasChipSelect
+        {!data.pixelSize && selectedModel?.supportsAspectRatio !== false ? <CanvasChipSelect
           label={t("assetCanvas.imageAspect")}
           value={data.aspectRatio}
           options={aspectRatios.map((ratio) => ({ value: ratio, label: ratio }))}
           disabled={!selectedModel || runtime?.busy}
           onChange={(aspectRatio) => runtime?.onChange({ ...data, imageRuntime: undefined, aspectRatio })}
         /> : null}
-        {selectedModel?.supportsResolution !== false ? <CanvasChipSelect
+        {!isGif && !data.pixelSize && selectedModel?.supportsResolution !== false ? <CanvasChipSelect
           label={t("assetCanvas.imageResolution")}
           value={data.resolution}
           options={resolutions.map((resolution) => ({ value: resolution, label: resolution }))}
@@ -2221,14 +2281,42 @@ function ImageNode({ data, selected }: Pick<NodeProps<AssetCanvasFlowNode>, "dat
           options={selectedModel.qualities.map((quality) => ({ value: quality, label: t(`kunpoModels.qualities.${quality}`), shortLabel: `${t("kunpoModels.quality")} · ${t(`kunpoModels.qualities.${quality}`)}` }))} disabled={runtime?.busy}
           onChange={(quality) => runtime?.onChange({ ...data, quality: quality as ImageGenerationSettings["quality"] })} /> : null}
         {selectedModel?.outputFormats?.length ? <CanvasChipSelect label={t("kunpoModels.format")} value={data.outputFormat ?? "png"}
-          options={selectedModel.outputFormats.map((format) => ({ value: format, label: format.toUpperCase() }))} disabled={runtime?.busy}
-          onChange={(outputFormat) => { runtime?.onChange({ ...data, outputFormat: outputFormat as ImageGenerationSettings["outputFormat"], ...(outputFormat === "jpeg" && data.background === "transparent" ? { background: "opaque" as const } : {}), ...(outputFormat !== "jpeg" ? { outputCompression: undefined } : {}) }); }} /> : null}
+          options={selectedModel.outputFormats.map((value) => ({ value, label: value === "webp" ? "WebP" : value.toUpperCase() }))} disabled={runtime?.busy}
+          onChange={(outputFormat) => update({ outputFormat,
+            ...(outputFormat !== "jpeg" && outputFormat !== "webp" ? { outputCompression: undefined } : {}),
+            ...(!modern && outputFormat === "jpeg" && data.background === "transparent" ? { background: "opaque" } : {}),
+            ...(outputFormat !== "svg" ? { svgModel: undefined, svgReasoningEffort: undefined } : {}),
+            ...(outputFormat !== "gif" ? { frameCount: undefined, frameDurationMs: undefined } : {}),
+          })} /> : null}
         {selectedModel?.supportsTransparency ? <CanvasChipSelect label={t("kunpoModels.background")} value={data.background ?? "auto"}
           options={(["auto", "opaque", "transparent"] as const).map((background) => { const label = t(background === "auto" ? "kunpoModels.automatic" : `kunpoModels.${background}`); return { value: background, label, shortLabel: `${t("kunpoModels.background")} · ${label}` }; })} disabled={runtime?.busy}
-          onChange={(background) => runtime?.onChange({ ...data, background: background as ImageGenerationSettings["background"], ...(background === "transparent" ? { outputFormat: "png" as const, outputCompression: undefined } : {}) })} /> : null}
-        {selectedModel?.supportsMask ? <CanvasChipSelect label={t("kunpoModels.mask")} value={data.mask?.type === "library" ? data.mask.assetId : data.mask?.type === "node" ? `node:${data.mask.nodeId}` : ""}
-          options={[{ value: "", label: t("kunpoModels.noMask") }, ...(data.mask?.type === "node" ? [{ value: `node:${data.mask.nodeId}`, label: t("assetCanvas.node.image"), disabled: true }] : []), ...(runtime?.libraryImages ?? []).filter((asset) => asset.contentType === "image/png").map((asset) => ({ value: asset.id, label: asset.name }))]}
-          disabled={runtime?.busy || !data.images?.length && !data.mask} onChange={(assetId) => runtime?.onChange({ ...data, mask: assetId ? { type: "library", assetId } : undefined })} /> : null}
+          onChange={(background) => update({ background, ...(!modern && background === "transparent" ? { outputFormat: "png", outputCompression: undefined } : {}) })} /> : null}
+        {!modern && selectedModel?.supportsMask ? layerPicker("mask") : null}
+        {modern ? <details className="story-image-options nodrag nopan nowheel nokey">
+          <summary>{t("kunpoModels.imageOptions")}</summary>
+          <div className="story-media-controls">
+            <CanvasChipSelect label={t("kunpoModels.complexity")} value={data.complexity ?? GPT_IMAGE_26_DEFAULTS.complexity} disabled={runtime?.busy}
+              options={selectedModel!.complexities!.map(value => ({ value, label: t(`kunpoModels.qualities.${value}`), shortLabel: `${t("kunpoModels.complexity")} · ${t(`kunpoModels.qualities.${value}`)}` }))}
+              onChange={(complexity) => update({ complexity })} />
+            {isSvg ? <>
+              <CanvasChipSelect label={t("kunpoModels.svgAuthor")} value={data.svgModel ?? GPT_IMAGE_26_DEFAULTS.svgModel} disabled={runtime?.busy}
+                options={GPT_IMAGE_SVG_MODELS.map(value => ({ value, label: value }))} onChange={(svgModel) => update({ svgModel })} />
+              <CanvasChipSelect label={t("kunpoModels.svgEffort")} value={data.svgReasoningEffort ?? GPT_IMAGE_26_DEFAULTS.svgReasoningEffort} disabled={runtime?.busy}
+                options={GPT_IMAGE_SVG_EFFORTS.filter(value => value !== "none" || data.svgModel !== "gpt-6.1-sol").map(value => ({ value, label: value, shortLabel: `${t("kunpoModels.svgEffort")} · ${value}` }))} onChange={(svgReasoningEffort) => update({ svgReasoningEffort })} />
+            </> : null}
+            {selectedModel?.supportsMask ? layerPicker("mask") : null}
+            {selectedModel?.supportsMarkup ? layerPicker("markup") : null}
+          </div>
+          <div className="story-image-fields">
+            {inputField("pixelSize", t(isGif ? "kunpoModels.frameSize" : "kunpoModels.pixelSize"), isGif ? gptImage26FrameSize(data.aspectRatio) : t("kunpoModels.automatic"))}
+            {format === "jpeg" || format === "webp" ? inputField("outputCompression", t("kunpoModels.compression"), t("kunpoModels.automatic"), 0, 100) : null}
+            {isGif ? <>
+              <label className="story-inspector-field"><span>{t("kunpoModels.frameCount")}</span><select value={data.frameCount ?? GPT_IMAGE_26_DEFAULTS.frameCount} disabled={runtime?.busy}
+                onChange={(event) => update({ frameCount: Number(event.currentTarget.value) })}>{Array.from({ length: 15 }, (_, index) => <option key={index} value={index + 2}>{index + 2}</option>)}</select></label>
+              {inputField("frameDurationMs", t("kunpoModels.frameDuration"), String(GPT_IMAGE_26_DEFAULTS.frameDurationMs), 20, 2000)}
+            </> : null}
+          </div>
+        </details> : null}
         {networkCheck || runtime?.error && /Fake-IP|Image CDN|provider artifact address|download failed/.test(runtime.error) ? <button className="canvas-chip story-media-recover nodrag nopan" type="button" disabled={runtime?.busy || networkCheck === "checking"} title={t("assetCanvas.imageNetworkHint")} onClick={() => void checkNetwork()}>{networkCheck === "checking" ? <LoaderCircle size={12} className="spin" aria-hidden="true" /> : <Search size={12} aria-hidden="true" />}<span>{t(networkCheck === "checking" ? "assetCanvas.imageNetworkChecking" : "assetCanvas.imageNetworkCheck")}</span></button> : null}
         {runtime?.onRecover || runtime?.recovering ? <button className="canvas-chip story-media-recover nodrag nopan" type="button" disabled={runtime.busy || runtime.recovering} title={t("assetCanvas.recoverImageHint")} onClick={runtime.onRecover}><Download size={12} aria-hidden="true" /><span>{t("assetCanvas.recoverImage")}</span></button> : null}
         <GenerateMediaButton kind="image" assetId={data.assetId} runtime={runtime} disabled={!canGenerate} />
@@ -2237,11 +2325,18 @@ function ImageNode({ data, selected }: Pick<NodeProps<AssetCanvasFlowNode>, "dat
   );
 }
 
-export function compatibleImageSettings(data: Pick<AssetCanvasFlowData, "quality" | "outputFormat" | "background" | "outputCompression" | "mask">, model: ImageModel): Pick<AssetCanvasFlowData, "quality" | "outputFormat" | "background" | "outputCompression" | "mask"> {
+export function compatibleImageSettings(data: CanvasImageSettings, model: ImageModel): CanvasImageSettings {
+  const modern = Boolean(model.complexities?.length);
   const quality = model.qualities?.includes(data.quality ?? "auto") ? data.quality : model.qualities?.includes("auto") ? "auto" : model.qualities?.[0];
   const background = model.supportsTransparency ? data.background : undefined;
-  const outputFormat = background === "transparent" ? "png" : model.outputFormats?.includes(data.outputFormat ?? "png") ? data.outputFormat : model.outputFormats?.[0];
-  return { quality, outputFormat, background, outputCompression: outputFormat === "jpeg" ? data.outputCompression : undefined, mask: model.supportsMask ? data.mask : undefined };
+  const outputFormat = !modern && background === "transparent" ? "png" : model.outputFormats?.includes(data.outputFormat ?? "png") ? data.outputFormat : model.outputFormats?.[0];
+  return {
+    quality, outputFormat, background, outputCompression: outputFormat === "jpeg" || outputFormat === "webp" ? data.outputCompression : undefined,
+    mask: model.supportsMask ? data.mask : undefined, markup: model.supportsMarkup ? data.markup : undefined,
+    complexity: modern ? data.complexity : undefined, pixelSize: modern ? data.pixelSize : undefined,
+    svgModel: modern && outputFormat === "svg" ? data.svgModel : undefined, svgReasoningEffort: modern && outputFormat === "svg" ? data.svgReasoningEffort : undefined,
+    frameCount: modern && outputFormat === "gif" ? data.frameCount : undefined, frameDurationMs: modern && outputFormat === "gif" ? data.frameDurationMs : undefined,
+  };
 }
 
 export function VideoNode({ data, selected }: Pick<NodeProps<AssetCanvasFlowNode>, "data" | "selected">) {
@@ -3813,13 +3908,13 @@ function createFlowNode(type: Exclude<AssetCanvasNodeType, "asset">, position: {
 }
 
 /** The generation settings a node passes on to the next node of its type. */
-type NodeGenerationSettings = Pick<AssetCanvasFlowData, "textModel" | "reasoningLevel" | "model" | "resolution" | "aspectRatio" | "quality" | "outputFormat" | "outputCompression" | "background" | "videoModel" | "videoResolution" | "videoAspectRatio" | "duration" | "audioModel" | "speed" | "durationSeconds" | "loop" | "instrumental" | "model3DConfig">;
+type NodeGenerationSettings = GptImage26Options & Pick<AssetCanvasFlowData, "textModel" | "reasoningLevel" | "model" | "resolution" | "aspectRatio" | "quality" | "outputFormat" | "outputCompression" | "background" | "videoModel" | "videoResolution" | "videoAspectRatio" | "duration" | "audioModel" | "speed" | "durationSeconds" | "loop" | "instrumental" | "model3DConfig">;
 type RememberedSettings = Partial<Record<AssetCanvasNodeType, NodeGenerationSettings>>;
 
 export function nodeGenerationSettings(node: Pick<AssetCanvasFlowNode, "type" | "data">): NodeGenerationSettings | undefined {
   const { data } = node;
   if (node.type === "text") return { ...(data.textModel ? { textModel: { provider: data.textModel.provider, id: data.textModel.id } } : {}), ...(data.reasoningLevel ? { reasoningLevel: data.reasoningLevel } : {}) };
-  if (node.type === "image") return { model: data.model, resolution: data.resolution, aspectRatio: data.aspectRatio, quality: data.quality, outputFormat: data.outputFormat, outputCompression: data.outputCompression, background: data.background };
+  if (node.type === "image") return { model: data.model, resolution: data.resolution, aspectRatio: data.aspectRatio, quality: data.quality, outputFormat: data.outputFormat, outputCompression: data.outputCompression, background: data.background, ...gptImage26Options(data) };
   if (node.type === "video") return { videoModel: data.videoModel, videoResolution: data.videoResolution, videoAspectRatio: data.videoAspectRatio, duration: data.duration };
   if (node.type === "voice") return { ...(data.audioModel ? { audioModel: modelRef(data.audioModel) } : {}) };
   if (node.type === "speech") return { ...(data.audioModel ? { audioModel: { provider: data.audioModel.provider, id: data.audioModel.id } } : {}), ...(data.speed !== undefined ? { speed: data.speed } : {}) };
@@ -3978,7 +4073,9 @@ function assetCanvasNodeData(node: AssetCanvasFlowNode, model3DModels?: readonly
       ...(node.data.outputFormat ? { outputFormat: node.data.outputFormat } : {}),
       ...(node.data.outputCompression !== undefined ? { outputCompression: node.data.outputCompression } : {}),
       ...(node.data.background ? { background: node.data.background } : {}),
+      ...gptImage26Options(node.data),
       ...(node.data.mask ? { mask: node.data.mask } : {}),
+      ...(node.data.markup ? { markup: node.data.markup } : {}),
       images: node.data.images ?? [],
       ...(node.data.assetId ? { assetId: node.data.assetId } : {}),
     },
@@ -4096,12 +4193,13 @@ function imageReferenceViews(node: AssetCanvasFlowNode, nodes: AssetCanvasFlowNo
     const label = viewLabels ? viewLabels[index] ?? t("assetCanvas.viewNumber", { number: index + 1 }) : t("assetCanvas.imageNumber", { number: index + 1 });
     if (reference.type === "library") {
       const asset = libraryAssets.find((candidate) => candidate.id === reference.assetId);
-      return { assetId: reference.assetId, key: `library:${reference.assetId}:${index}`, name: asset?.name ?? t("assetCanvas.missingImage"), label, type: "image" };
+      return { assetId: reference.assetId, contentType: asset?.contentType, key: `library:${reference.assetId}:${index}`, name: asset?.name ?? t("assetCanvas.missingImage"), label, type: "image" };
     }
     const source = nodes.find((candidate) => candidate.id === reference.nodeId && isImageFlowSource(candidate));
     const assetId = source?.data.assetId;
     const asset = libraryAssets.find((candidate) => candidate.id === assetId);
     return {
+      contentType: asset?.contentType ?? source?.data.contentType,
       ...(assetId ? { assetId } : {}),
       key: `node:${reference.nodeId}`,
       type: "image",
@@ -4157,6 +4255,7 @@ function videoReferenceViews(node: AssetCanvasFlowNode, nodes: AssetCanvasFlowNo
 function imageReferenceLimit(node: AssetCanvasFlowNode, imageModels: ImageModel[]): number {
   if (node.type !== "image") return 0;
   const model = imageModels.find((candidate) => sameImageModel(candidate, node.data.model));
+  if (model?.complexities?.length && node.data.outputFormat === "svg") return 0;
   return model?.supportsReferenceImage ? Math.min(IMAGE_MAX_REFERENCE_IMAGES, model.maxReferenceImages ?? IMAGE_MAX_REFERENCE_IMAGES) : 0;
 }
 
@@ -4327,6 +4426,8 @@ export function removeNodesAndReferences(nodes: AssetCanvasFlowNode[], removedId
             ...node,
             data: {
               ...node.data,
+              ...(node.data.mask?.type === "node" && removedIds.has(node.data.mask.nodeId) ? { mask: undefined } : {}),
+              ...(node.data.markup?.type === "node" && removedIds.has(node.data.markup.nodeId) ? { markup: undefined } : {}),
               ...(node.data.model3DSource?.type === "node" && removedIds.has(node.data.model3DSource.nodeId) ? { model3DSource: undefined } : {}),
               images: (node.data.images ?? []).filter((image) => image.type !== "node" || !removedIds.has(image.nodeId)),
               ...(node.data.promptSource && removedIds.has(node.data.promptSource.nodeId) ? { promptSource: undefined } : {}),

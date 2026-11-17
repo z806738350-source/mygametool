@@ -9,6 +9,8 @@ import { createRoot } from "react-dom/client";
 import { ReactFlowProvider, type Node } from "@xyflow/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { CODEX_IMAGE_MODEL } from "../src/daemon/agent-runtimes/codex-image-provider.js";
+import { imageModelsForProvider } from "../src/daemon/image-models.js";
+import { GPT_IMAGE_26_IDS } from "../src/shared/gpt-image-26.js";
 import { kunpoVideoModels, seedanceModel } from "../src/daemon/seedance-models.js";
 import { MODEL_3D_MODELS } from "../src/shared/generation-config.js";
 import {
@@ -25,6 +27,7 @@ import { VIDEO_REFERENCE_BUDGET_ERROR } from "../src/shared/video-reference-prep
 type CanvasProps = Parameters<typeof EditorCanvas<Node>>[0];
 let canvasProps: CanvasProps;
 let speechReferences: LibraryAsset[] = [];
+let imageCatalog = [CODEX_IMAGE_MODEL];
 let model3DCatalog: typeof MODEL_3D_MODELS = [];
 let showAddControl = false;
 vi.doMock(path.resolve("src/renderer/editor-canvas.tsx"), async (original) => ({
@@ -67,7 +70,7 @@ vi.doMock(
 vi.doMock(path.resolve("src/renderer/api.ts"), async (original) => ({
   ...(await original<typeof import("../src/renderer/api.js")>()),
   listImageModelCatalog: async () => ({
-    models: [CODEX_IMAGE_MODEL],
+    models: imageCatalog,
     providers: [],
   }),
   listAudioModelCatalog: async () => ({ models: kunpoAudioModels("volcengine-tts", "Kunpo Speech", true), providers: [] }),
@@ -92,6 +95,7 @@ let host: HTMLDivElement;
 afterEach(async () => {
   speechReferences = [];
   model3DCatalog = [];
+  imageCatalog = [CODEX_IMAGE_MODEL];
   showAddControl = false;
   vi.restoreAllMocks();
   inspectDownload.mockReset().mockResolvedValue({ state: "fake-ip" });
@@ -514,6 +518,65 @@ it("reloads reference choices on every open without pruning existing canvas refe
   expect([...document.querySelectorAll<HTMLButtonElement>(".story-video-picker-list > button")].map(button => button.title)).toEqual(["new-choice.png"]);
   expect(canvasProps.nodes[0]!.data.references).toEqual(references);
   expect(f.generate).not.toHaveBeenCalled();
+});
+
+it("switches Kunpo 2.6 formats and models, keeping transparent WebP and blocking conflicting GIF settings", async () => {
+  const [sunburst, flare] = GPT_IMAGE_26_IDS;
+  imageCatalog = [CODEX_IMAGE_MODEL, ...imageModelsForProvider("openai", "Kunpo", [sunburst, flare])];
+  const f = await confirmationFixture({ submissionOutcome: "unknown" }, "image");
+  const data = () => canvasProps.nodes[0]!.data;
+  const chip = (label: string) => host.querySelector<HTMLButtonElement>(`button[aria-label^="${label}:"]`);
+  async function pick(label: string, option: string) {
+    await act(async () => chip(label)!.click());
+    const choice = [...document.querySelectorAll<HTMLButtonElement>('button[role="option"]')].find(button => button.textContent?.includes(option));
+    expect(choice).toBeDefined();
+    await act(async () => choice!.click());
+  }
+  async function input(label: string, value: string) {
+    const field = host.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`)!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(field, value);
+      field.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  }
+
+  await pick(t("assetCanvas.imageModel"), "GPT Image 2.6 Sunburst");
+  await pick(t("kunpoModels.background"), t("kunpoModels.transparent"));
+  await pick(t("kunpoModels.format"), "WebP");
+  await act(async () => host.querySelector("summary")!.click());
+  await input(t("kunpoModels.compression"), "0");
+  expect(data()).toMatchObject({ model: { id: sunburst }, outputFormat: "webp", outputCompression: 0, background: "transparent" });
+  await pick(t("assetCanvas.imageModel"), "GPT Image 2.6 Flare");
+  expect(data()).toMatchObject({ model: { id: flare }, outputFormat: "webp", outputCompression: 0, background: "transparent" });
+  await pick(t("kunpoModels.format"), "SVG");
+  expect(chip(t("kunpoModels.svgAuthor"))?.textContent).toBe("gpt-6-sol");
+  expect(chip(t("kunpoModels.svgEffort"))?.textContent).toContain("low");
+  expect(f.button.disabled).toBe(false);
+  await pick(t("kunpoModels.format"), "GIF");
+  expect(data().background).toBe("transparent");
+  expect(host.textContent).toContain(t("kunpoModels.imageProblem.transparency"));
+  expect(f.button.disabled).toBe(true);
+  await pick(t("kunpoModels.background"), t("kunpoModels.opaque"));
+  expect(chip(t("assetCanvas.imageResolution"))).toBeNull();
+  expect(host.querySelector<HTMLInputElement>(`input[aria-label="${t("kunpoModels.frameSize")}"]`)?.placeholder).toBe("512x512");
+  expect(host.querySelector<HTMLInputElement>(`input[aria-label="${t("kunpoModels.frameDuration")}"]`)?.placeholder).toBe("200");
+  await input(t("kunpoModels.frameDuration"), "1");
+  expect(f.button.disabled).toBe(true);
+  expect(data().frameDurationMs).toBeUndefined();
+  await input(t("kunpoModels.frameDuration"), "120");
+  await input(t("kunpoModels.frameSize"), "768×432");
+  expect(f.button.disabled).toBe(false);
+  expect(data()).toMatchObject({ frameDurationMs: 120, pixelSize: "768x432", outputFormat: "gif" });
+  await pick(t("assetCanvas.imageModel"), "GPT Image 2.6 Sunburst");
+  expect(data()).toMatchObject({ model: { id: sunburst }, frameDurationMs: 120, pixelSize: "768x432", outputFormat: "gif" });
+  await act(async () => f.button.click());
+  const dialog = document.querySelector<HTMLElement>('[role="alertdialog"]')!;
+  expect(dialog.textContent).toContain("768x432");
+  expect(dialog.textContent).toContain(t("kunpoModels.animationSummary", { frames: 9, ms: 120 }));
+  expect(f.generate).not.toHaveBeenCalled();
+  await act(async () => [...dialog.querySelectorAll("button")].find(button => button.textContent === t("assetCanvas.newVideoConfirm"))!.click());
+  expect(f.generate).toHaveBeenCalledOnce();
+  expect(vi.mocked(f.storage.save).mock.calls.at(-1)?.[0].nodes[0]?.data).toMatchObject({ frameDurationMs: 120, pixelSize: "768x432", outputFormat: "gif" });
 });
 
 it("selects Codex without fake dimension options and hides its dimension controls", async () => {

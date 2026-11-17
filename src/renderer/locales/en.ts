@@ -1,6 +1,8 @@
 // English is the source language. Add every UI string here first.
 import { blenderLiveViewLabels } from "../../shared/blender-live-view-labels.js";
 
+import { GPT_IMAGE_26_PROBLEMS } from "../../shared/gpt-image-26.js";
+
 const en = {
   blenderLiveView: blenderLiveViewLabels.en,
   localEdition: {
@@ -36,6 +38,23 @@ const en = {
     previewRebuilding: "Working locally…",
     previewFailed: "The local preview or download is unavailable. The FBX original is retained; no new generation was submitted.",
     smartUv: "Smart UV",
+    imageProblem: GPT_IMAGE_26_PROBLEMS as Record<keyof typeof GPT_IMAGE_26_PROBLEMS, string>,
+    referenceFormats: "Use a static PNG, JPEG or WebP reference image.",
+    backgroundAuto: "Automatic background",
+    animationSummary: "{{frames}} frames · {{ms}} ms/frame",
+    imageOptions: "Image options",
+    complexity: "Complexity",
+    svgAuthor: "SVG author",
+    svgEffort: "SVG reasoning",
+    frameCount: "Frames",
+    frameDuration: "Frame duration (ms)",
+    frameSize: "Frame size (px)",
+    pixelSize: "Custom size (px)",
+    pixelHint: "Enter width × height in multiples of 16, with an aspect ratio from 1:3 to 3:1.",
+    integerRange: "Enter a whole number from {{min}} to {{max}}.",
+    compression: "Compression (0–100)",
+    markup: "Markup layer",
+    noMarkup: "No markup",
     quality: "Quality",
     qualities: { auto: "Auto", low: "Low", medium: "Medium", high: "High", xhigh: "Extra high", max: "Maximum" },
     mask: "Edit mask",

@@ -16,7 +16,7 @@ import { mediaFileInfo } from "../shared/media-files.js";
 // imported paths may already be in use by a game, even when listed on a board.
 export function isCanvasMediaPath(file: string): boolean {
   const media = mediaFileInfo(file);
-  return /^assets\/canvas\/[^./\\][^/\\]*$/.test(file) && !!media && media.contentType !== "image/svg+xml";
+  return /^assets\/canvas\/[^./\\][^/\\]*$/.test(file) && !!media;
 }
 
 export async function canvasCandidatePaths(workspace: string): Promise<Set<string>> {

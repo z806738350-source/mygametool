@@ -235,6 +235,38 @@ describe("Kunpo app integration", () => {
     expect(guard.recoverySummary).toContain("not_executed (invalid_media_options)");
   });
 
+  it.each(["gpt-image-2.6-sunburst", "gpt-image-2.6-flare"])("runs the selected %s through the Agent, saved canvas and image library", async id => {
+    const { inject, connect, request } = await fixture(); await connect();
+    const project = (await inject("POST", "/projects", { type: "web-game" })).json();
+    const model = { provider: "openai", id };
+    expect((await inject("PATCH", `/projects/${project.id}/model-selections`, { image: model })).statusCode).toBe(200);
+    const conversation = (await inject("POST", `/projects/${project.id}/conversations`, {})).json();
+    const session = vi.spyOn(agentRuntime, "createPiSession").mockRejectedValue(new Error("Offline image tool capture"));
+    await inject("POST", `/projects/${project.id}/conversations/${conversation.id}/turns`, { prompt: "Draw a vector icon" });
+    await vi.waitFor(() => expect(session).toHaveBeenCalled());
+    const registered = session.mock.calls[0]![2]!;
+    const tool = registered.find(entry => entry.name === "generate_image")!;
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5" fill="red"/></svg>';
+    request.mockClear().mockImplementation(async () => Response.json({ data: [{ b64_json: Buffer.from(svg).toString("base64") }] }));
+    const invalid = await tool.execute("invalid-svg", { prompt: "Draw", outputFormat: "svg", imagePaths: ["reference.png"], resolution: "1K", aspectRatio: "1:1" }, undefined, undefined, {} as never).catch(error => error);
+    expect(getToolPreflightFailure(invalid)).toMatchObject({ effect: "none", reason: "invalid_media_options" });
+    expect(request).not.toHaveBeenCalled();
+    await tool.execute("vector-icon", { prompt: "Draw", outputFormat: "svg", background: "transparent", complexity: "medium", svgReasoningEffort: "medium", pixelSize: "256x256" }, undefined, undefined, {} as never);
+    expect(request).toHaveBeenCalledTimes(1);
+    const [url, init] = request.mock.calls[0]!;
+    expect(String(url)).toMatch(/\/images\/generations$/);
+    expect(JSON.parse(String(init?.body))).toMatchObject({ model: id, output_format: "svg", n: 1, background: "transparent", size: "256x256", complexity: "medium", svg: { model: "gpt-6-sol", reasoning: { effort: "medium" } } });
+    const canvas = `/projects/${project.id}/canvas`;
+    const jobs = (await inject("GET", `${canvas}/jobs`)).json();
+    expect(jobs).toEqual([expect.objectContaining({ status: "succeeded" })]);
+    const { context: { boardId, nodeId }, run } = jobs[0];
+    const board = (await inject("GET", `${canvas}/boards/${boardId}`)).json().board;
+    expect(board.nodes.find((node: { id: string }) => node.id === nodeId)?.data).toMatchObject({ outputFormat: "svg", svgReasoningEffort: "medium", pixelSize: "256x256", assetId: run.files[0].assetId });
+    const original = await inject("GET", `/library/assets/${run.files[0].assetId}/content`);
+    expect(original.statusCode).toBe(200);
+    expect(original.body).toBe(svg);
+  });
+
   it("lets an Agent read the current project's effective media models before sending any provider request", async () => {
     const { inject, connect, request } = await fixture(); await connect();
     const project = (await inject("POST", "/projects", { type: "web-game" })).json();

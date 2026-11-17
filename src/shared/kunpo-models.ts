@@ -1,3 +1,4 @@
+import { GPT_IMAGE_26_IDS } from "./gpt-image-26.js";
 import type { CustomProviderDetails, CustomProviderModel, ModelRef } from "./contracts.js";
 
 export const KUNPO_PROVIDER_ID = "kunpo";
@@ -36,6 +37,7 @@ export const KUNPO_MODEL_OPTIONS: readonly KunpoModelOption[] = [
   option("agent", "kunpo", "kimi-k3.1-pro", "openai-completions", "kimi-k3-1-pro", "Text chat is documented; screenshot plus tool continuation is not confirmed.", {}, "pending"),
   option("image", "openai", "gpt-image-2.5-sunburst", "openai-images", "image-generation/models/gpt-image-series", "Synchronous image generation and editing; PNG transparency and edit masks.", { images: true, transparency: true, mask: true, maxReferences: 16 }),
   option("image", "openai", "gpt-image-2.5-flare", "openai-images", "image-generation/models/gpt-image-series", "Synchronous image generation and editing; PNG transparency and edit masks.", { images: true, transparency: true, mask: true, maxReferences: 16 }),
+  ...GPT_IMAGE_26_IDS.map(id => option("image", "openai", id, "openai-images", "image-generation/models/gpt-image-series", "Static images and edits, text-to-SVG and animated GIF.", { images: true, transparency: true, mask: true, maxReferences: 16 })),
   option("image", "openai", "Image-GI2.1", "openai-images", "image-generation/models/nano-banana-series", "Reference-image generation; no transparency or masks. Ratios are not exact output-pixel guarantees.", { images: true, transparency: false, mask: false, maxReferences: 14 }),
   option("video", "volcengine-ark", "doubao-seedance-2-5-260628", "seedance", "seedance-25", "Native task API; 4–30 seconds, up to 1080p. Poll the saved task instead of submitting it again."),
   option("video", "kunpo", "tencent-vod-vs-2.5", "kunpo-videos", "video-vs25", "Videos task API; 4–30 seconds, up to 4K. Its statuses differ from the native Seedance API."),

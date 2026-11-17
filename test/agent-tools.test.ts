@@ -859,18 +859,20 @@ describe("agent tools", () => {
     expect(await readdir(path.join(dataDirectory, "tools", "runs"))).toEqual([]);
   });
 
-  it("passes original attachment bytes to a direct image request without Canvas", async () => {
+  it.each(["png", "webp"] as const)("passes original %s attachment bytes to a direct image request without Canvas", async (format) => {
     const directory = await temporaryTestDirectory("ohmygame-direct-attachment-");
     try {
       const projects = new ProjectManager(directory); await projects.load();
-      const project = await projects.create("Direct reference"), bytes = referencePng();
-      const attachment = await new AgentAttachmentStore().store(project, { batchId: "f2da1f75-4d77-462f-a75b-48dff99b7212", name: "reference.png", contents: bytes });
+      const project = await projects.create("Direct reference");
+      const bytes = format === "webp" ? await sharp(referencePng()).webp().toBuffer() : referencePng();
+      const imageModel = format === "webp" ? { provider: "openai", id: "gpt-image-2.6-flare" } : undefined;
+      const attachment = await new AgentAttachmentStore().store(project, { batchId: "f2da1f75-4d77-462f-a75b-48dff99b7212", name: `reference.${format}`, contents: bytes });
       const reference = `attachment:${attachment.batchId}/${attachment.id}`, runner = new ToolRunner(directory, { generate: vi.fn() });
       const run = vi.spyOn(runner, "run").mockRejectedValue(new Error("Offline request captured"));
       const tool = createAgentTools(project, runner, projects, undefined, undefined, undefined, "chat", undefined, ({ batchId, id }) => batchId === attachment.batchId && id === attachment.id).find(tool => tool.name === "generate_image")!;
-      await expect(tool.execute("direct-reference", { prompt: "Forest", imagePaths: [reference], resolution: "1K", aspectRatio: "1:1" }, undefined, undefined, {} as never)).rejects.toThrow("Offline request captured");
+      await expect(tool.execute("direct-reference", { prompt: "Forest", ...(imageModel ? { imageModel } : {}), imagePaths: [reference], resolution: "1K", aspectRatio: "1:1" }, undefined, undefined, {} as never)).rejects.toThrow("Offline request captured");
       expect(run).toHaveBeenCalledOnce();
-      expect(run.mock.calls[0]![1]).toMatchObject({ images: [{ mediaType: "image/png", data: bytes.toString("base64") }] });
+      expect(run.mock.calls[0]![1]).toMatchObject({ images: [{ mediaType: `image/${format}`, data: bytes.toString("base64") }] });
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
 

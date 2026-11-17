@@ -55,8 +55,14 @@ describe("Asset Canvas quick start", () => {
 
   it("lists generic starters first, then every model starter", () => {
     expect(quickStart.ASSET_CANVAS_QUICK_STARTS.map((item) => item.label)).toEqual([
-      "Image", "Video", "3D", "GPT Image 2.5", "Nano Banana 2", "Seedance 2.0", "Seedance 2.5",
+      "Image", "Video", "3D", "GPT Image 2.6 Sunburst", "GPT Image 2.6 Flare", "GPT Image 2.5", "Nano Banana 2", "Seedance 2.0", "Seedance 2.5",
     ]);
+  });
+
+  it.each(["gpt-image-2.6-flare", "gpt-image-2.6-sunburst"])("starts the exact %s variant", async id => {
+    api.listImageModels.mockResolvedValue([imageModel("openrouter", `openai/${id}`), imageModel("other", id), GPT_IMAGE, imageModel("openai", "gpt-image-2.6-sunburst"), imageModel("openai", "gpt-image-2.6-flare")]);
+    await createAssetCanvasQuickStart(starter(id));
+    expect(api.saveCanvasBoard.mock.calls[0]?.[1].board.nodes[0].data.model).toEqual({ provider: "openai", id });
   });
 
   it("drops cached models after provider settings change", async () => {

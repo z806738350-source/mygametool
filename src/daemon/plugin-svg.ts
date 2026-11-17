@@ -17,12 +17,25 @@ const paintAttributes = new Set(["fill", "stroke", "stop-color"]);
 const localReference = /^url\(#[\w:.-]+\)$/;
 const color =
   /^(?:[a-z]+|#[\da-f]{3,8}|(?:rgb|rgba|hsl|hsla)\([\d\s.,%+\-/]+\))$/i;
+const vectorElements = new Set("path circle ellipse rect line polyline polygon text".split(" "));
+const textAttributes = new Set("dx dy font-family font-size font-weight letter-spacing text-anchor dominant-baseline".split(" "));
+export const GENERATED_SVG_MAX_BYTES = 2 * 1024 * 1024;
 
 /** Accept only self-contained, static vector artwork; reject unsupported input. */
 export function validatePluginSvg(bytes: Buffer): void {
+  validateStaticSvg(bytes, false);
+}
+
+export function validateGeneratedSvg(bytes: Buffer): { width: number; height: number } {
+  if (bytes.length > GENERATED_SVG_MAX_BYTES) throw new Error("Generated SVG exceeds the local 2 MiB vector validation limit");
+  return validateStaticSvg(bytes, true);
+}
+
+function validateStaticSvg(bytes: Buffer, generated: boolean): { width: number; height: number } {
+  const dimensionLimit = generated ? 16384 : PLUGIN_ICON_MAX_DIMENSION;
   const invalid = (): never => {
     throw new Error(
-      "Use a static SVG icon with a viewBox, shapes, and presentation attributes; scripts, styles, and external resources are not supported",
+      "Use a static SVG with a viewBox or dimensions, shapes, and presentation attributes; scripts, styles, and external resources are not supported",
     );
   };
   let source: string;
@@ -59,28 +72,33 @@ export function validatePluginSvg(bytes: Buffer): void {
     .trim()
     .split(/[\s,]+/)
     .map(Number);
-  if (viewBox.length !== 4 || viewBox.some((value) => !Number.isFinite(value)))
-    invalid();
-  for (const value of viewBox.slice(2)) {
-    if (value <= 0 || value > PLUGIN_ICON_MAX_DIMENSION)
-      throw new Error("SVG icon viewBox must be at most 2048 × 2048 units");
-  }
+  if (!generated || root.hasAttribute("viewBox")) {
+    if (viewBox.length !== 4 || viewBox.some((value) => !Number.isFinite(value)))
+      invalid();
+    for (const value of viewBox.slice(2)) {
+      if (value <= 0 || value > dimensionLimit)
+        throw new Error(`SVG viewBox must be at most ${dimensionLimit} × ${dimensionLimit} units`);
+    }
+  } else if (!root.hasAttribute("width") || !root.hasAttribute("height")) invalid();
   for (const name of ["width", "height"]) {
     if (!root.hasAttribute(name)) continue;
     const value = root.getAttribute(name) ?? "";
     if (!/^(?:\d+(?:\.\d+)?|\.\d+)(?:px)?$/.test(value)) invalid();
     const size = Number.parseFloat(value);
-    if (size <= 0 || size > PLUGIN_ICON_MAX_DIMENSION)
-      throw new Error("SVG icons must be at most 2048 × 2048 pixels");
+    if (size <= 0 || size > dimensionLimit)
+      throw new Error(`SVG dimensions must be at most ${dimensionLimit} × ${dimensionLimit} pixels`);
   }
   const pending: Element[] = [root];
   let count = 0;
+  let hasVector = false;
   while (pending.length) {
     const element = pending.pop()!;
+    const isText = generated && (element.tagName === "text" || element.tagName === "tspan");
+    if (vectorElements.has(element.tagName)) hasVector = true;
     if (
-      ++count > 2048 ||
+      ++count > (generated ? 10000 : 2048) ||
       element.namespaceURI !== SVG_NAMESPACE ||
-      !elements.has(element.tagName)
+      (!elements.has(element.tagName) && !isText)
     )
       invalid();
     for (let index = 0; index < element.attributes.length; index++) {
@@ -95,7 +113,8 @@ export function validatePluginSvg(bytes: Buffer): void {
         if (!/^#[\w:.-]+$/.test(value)) invalid();
         continue;
       }
-      if (attribute.namespaceURI || !attributes.has(name)) invalid();
+      if (attribute.namespaceURI || (!attributes.has(name) && !(generated && textAttributes.has(name)))) invalid();
+      if (generated && textAttributes.has(name) && !/^[\p{L}\p{N}\s.,'"%+-]+$/u.test(value)) invalid();
       if (
         paintAttributes.has(name) &&
         !color.test(value) &&
@@ -114,7 +133,7 @@ export function validatePluginSvg(bytes: Buffer): void {
       else if (child.nodeType === 8) continue;
       else if (
         (child.nodeType === 3 || child.nodeType === 4) &&
-        (element.tagName === "title" ||
+        (isText || element.tagName === "title" ||
           element.tagName === "desc" ||
           !child.nodeValue?.trim())
       )
@@ -122,4 +141,12 @@ export function validatePluginSvg(bytes: Buffer): void {
       else invalid();
     }
   }
+  if (generated && !hasVector) invalid();
+  const width = Number.parseFloat(root.getAttribute("width") ?? "");
+  const height = Number.parseFloat(root.getAttribute("height") ?? "");
+  const ratio = viewBox[2]! / viewBox[3]!;
+  const w = width || (height ? height * ratio : viewBox[2]!);
+  const h = height || (width ? width / ratio : viewBox[3]!);
+  if (generated && (w > dimensionLimit || h > dimensionLimit)) invalid();
+  return { width: Math.max(1, Math.round(w)), height: Math.max(1, Math.round(h)) };
 }

@@ -1,14 +1,17 @@
+import { GPT_IMAGE_26_SCHEMA, GPT_IMAGE_FORMATS, GPT_IMAGE_COMPLEXITIES, GPT_IMAGE_SVG_MODELS, GPT_IMAGE_SVG_EFFORTS, gptImage26Options, isGptImage26, validateGptImage26Settings } from "../shared/gpt-image-26.js";
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { defineTool, type SessionEntry, type ToolDefinition as PiToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { Check } from "typebox/value";
 import { containsKnownSensitiveValue } from "../shared/sensitive-values.js";
+import { fileExtension } from "../shared/media-files.js";
 import { IMAGE_MAX_REFERENCE_IMAGES, type PlanMode, type PlanState, type ProjectState, type PromptImage, type QuestionnaireResult, type RunImageToolRequest, type RunToolRequest, type RunVideoToolRequest, type ToolId } from "../shared/contracts.js";
 import { agentCanvasBoard, resolveAgentAnimation, saveAgentCanvasMedia } from "./agent-canvas-media.js";
 import { mediaGenerationNeedsConfirmation, DEFAULT_CHARACTER_HEIGHT_METERS, MAX_ANIMATION_ACTIONS } from "../shared/generation-config.js";
 import { supportsWebPreview } from "../shared/project-runtime.js";
 import type { ProjectManager } from "./projects.js";
+import { toolPreflightError } from "./agent-tool-errors.js";
 import { assertSafeGenerationInput, type ToolRunner } from "./tools.js";
 import { getWorkspaceMedia } from "./workspace.js";
 import { readWebpModelReference } from "./image-working-assets.js";
@@ -109,12 +112,19 @@ const imageParameters = Type.Object({
   prompt: Type.String({ minLength: 1, description: "A detailed description of the new image, required for a new generation." }),
   recoverCallId: recoverCallIdParameter(),
   imageModel: Type.Optional(mediaModelParameter()),
-  imagePaths: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: IMAGE_MAX_REFERENCE_IMAGES, description: "PNG/JPEG references: project-relative paths or exact attachment:batch/id receipts from the current conversation branch (attachments up to 20 MiB). Requires resolution and aspectRatio together. Session image IDs and URLs are not paths." })),
+  imagePaths: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: IMAGE_MAX_REFERENCE_IMAGES, description: "Static PNG/JPEG or supported WebP references: project-relative paths or exact attachment:batch/id receipts from the current conversation branch (attachments up to 20 MiB). Requires resolution and aspectRatio together. Session image IDs and URLs are not paths." })),
   maskPath: Type.Optional(Type.String({ minLength: 1, description: "Project-relative PNG edit mask. Requires at least one reference and a model that supports masks." })),
   quality: Type.Optional(Type.Union((["auto", "low", "medium", "high", "xhigh", "max"] as const).map((value) => Type.Literal(value)), { description: "Selected-model quality level; xhigh/max can require a long synchronous wait." })),
-  outputFormat: Type.Optional(Type.Union([Type.Literal("png"), Type.Literal("jpeg")])),
-  outputCompression: Type.Optional(Type.Integer({ minimum: 0, maximum: 100, description: "JPEG compression only; omit for PNG." })),
-  background: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("opaque"), Type.Literal("transparent")], { description: "Transparent output requires a supporting model and PNG; a prompt alone does not enable alpha." })),
+  outputFormat: Type.Optional(Type.Union(GPT_IMAGE_FORMATS.map(value => Type.Literal(value)))),
+  complexity: Type.Optional(Type.Union(GPT_IMAGE_COMPLEXITIES.map(value => Type.Literal(value)))),
+  pixelSize: Type.Optional(Type.String({ ...GPT_IMAGE_26_SCHEMA.pixelSize, description: "Optional explicit WxH, divisible by 16. For GIF this is per frame. Omit to use the format default." })),
+  svgModel: Type.Optional(Type.Union(GPT_IMAGE_SVG_MODELS.map(value => Type.Literal(value)))),
+  svgReasoningEffort: Type.Optional(Type.Union(GPT_IMAGE_SVG_EFFORTS.map(value => Type.Literal(value)))),
+  frameCount: Type.Optional(Type.Integer(GPT_IMAGE_26_SCHEMA.frameCount)),
+  frameDurationMs: Type.Optional(Type.Integer(GPT_IMAGE_26_SCHEMA.frameDurationMs)),
+  markupPath: Type.Optional(Type.String({ minLength: 1, description: "Project-relative transparent PNG annotation layer matching the first static reference, mutually exclusive with maskPath." })),
+  outputCompression: Type.Optional(Type.Integer({ minimum: 0, maximum: 100, description: "JPEG or supported WebP compression; omit for other formats." })),
+  background: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("opaque"), Type.Literal("transparent")], { description: "Choose a supported transparent format, PNG or (on 2.6) WebP or SVG." })),
   size: Type.Optional(Type.Union([
     Type.Literal("1024x1024"),
     Type.Literal("1536x1024"),
@@ -277,12 +287,22 @@ function checkMediaArguments(tool: PiToolDefinition, value: unknown, options: {
       corrections.push("Conflicting fields: size and resolution/aspectRatio. For modern sizing remove the size key entirely and keep resolution and aspectRatio together. Example: {\"prompt\":\"Forest at dusk\",\"resolution\":\"1K\",\"aspectRatio\":\"16:9\"}.");
     }
     if (!options.originalRecovery && tool.name === "generate_image" && input.outputFormat === "png" && Object.hasOwn(input, "outputCompression")) {
-      corrections.push("outputCompression applies only to JPEG. Keep outputFormat png and remove outputCompression for PNG.");
+      corrections.push("outputCompression applies to JPEG or supported WebP. Keep outputFormat png and remove outputCompression for PNG.");
+    }
+    if (!options.originalRecovery && tool.name === "generate_image") {
+      const model = input.imageModel && Check(mediaModelParameter(), input.imageModel) ? input.imageModel : options.currentSelections?.()?.image;
+      if (model) {
+        const problem = validateGptImage26Settings(model.id, { ...input, mask: input.maskPath, markup: input.markupPath }, Array.isArray(input.imagePaths) ? input.imagePaths.length : 0);
+        if (problem && !corrections.length && !Object.hasOwn(input, recoveryKey)) {
+          throw toolPreflightError(`${tool.name}: ${problem} No generation was submitted.`, "invalid_media_options");
+        }
+        if (problem) corrections.push(problem);
+      }
     }
     if (tool.name === "generate_3d_asset" && input.imagePath !== undefined && input.imagePaths !== undefined) {
       corrections.push("Choose one image input. For production keep the inspected front, left, back and optional right in imagePaths and remove imagePath. For a single image remove the imagePaths key entirely.");
     }
-    for (const field of ["maskPath", "imagePath", "sourcePath", "referenceAssetId"]) {
+    for (const field of ["maskPath", "markupPath", "imagePath", "sourcePath", "referenceAssetId"]) {
       if (Object.hasOwn(input, field) && placeholder(input[field])) corrections.push(`Omit the unused ${field} key entirely or supply a real value.`);
     }
     if (Array.isArray(input.imagePaths) && (input.imagePaths.some(placeholder) || !input.imagePaths.length &&
@@ -310,7 +330,7 @@ function checkMediaArguments(tool: PiToolDefinition, value: unknown, options: {
         const modelMatches = !model || selected && Check(mediaModelParameter(), model) && model.provider === selected.provider && model.id === selected.id;
         const nativeFormat = !corrected.outputFormat || corrected.outputFormat === "png" && selected?.provider === "openai"
           && imageModelCapabilities(selected.id).outputFormats?.includes("png");
-        const useReference = modelMatches && nativeFormat && corrected.outputCompression === undefined;
+        const useReference = modelMatches && nativeFormat && corrected.outputCompression === undefined && !corrected.markupPath && !Object.keys(GPT_IMAGE_26_SCHEMA).some(key => key in corrected);
         const args = useReference ? Object.fromEntries(Object.entries(corrected).filter(([key]) => Object.hasOwn(referenceImageParameters.properties, key))) : corrected;
         corrections.push(`For a new whole-image request without a mask, send a fresh ${useReference ? REFERENCE_IMAGE_TOOL : "generate_image"} call with this exact object: ${JSON.stringify(args)}. For a localized edit, supply the real PNG mask instead.`);
       }
@@ -325,15 +345,15 @@ async function readProjectImage(workspacePath: string, file: string, purpose: "r
   const source = await getWorkspaceMedia(workspacePath, file);
   const mask = purpose === "mask";
   if (purpose === "model" && source.contentType === "image/webp") return readWebpModelReference(workspacePath, source);
-  if (source.contentType !== "image/png" && (mask || source.contentType !== "image/jpeg")) {
-    throw new Error(mask ? "Edit masks require PNG" : purpose === "model" ? "3D generation requires PNG, JPEG or WebP reference images" : "Image references require PNG or JPEG");
+  if (source.contentType !== "image/png" && (mask || !["image/jpeg", "image/webp"].includes(source.contentType))) {
+    throw new Error(mask ? "Edit masks require PNG" : purpose === "model" ? "3D generation requires PNG, JPEG or WebP reference images" : "Image references require PNG, JPEG or WebP");
   }
   if (!source.size || source.size > 32 * 1024 * 1024) throw new Error("Image inputs must be between 1 byte and 32 MiB");
   const bytes = await readFile(source.absolutePath);
   signal?.throwIfAborted();
   if (!bytes.length || bytes.length > 32 * 1024 * 1024) throw new Error("Image inputs must be between 1 byte and 32 MiB");
   const libraryAssetId = mask ? undefined : (await readAssetMetadata(workspacePath)).libraryAssets[source.relativePath];
-  return { mediaType: source.contentType as "image/png" | "image/jpeg", data: bytes.toString("base64"), ...(libraryAssetId ? { libraryAssetId } : {}) };
+  return { mediaType: source.contentType as PromptImage["mediaType"], data: bytes.toString("base64"), ...(libraryAssetId ? { libraryAssetId } : {}) };
 }
 
 export function createAgentTools(
@@ -348,14 +368,21 @@ export function createAgentTools(
   authorizeAttachment?: AuthorizeAgentAttachment,
 ): PiToolDefinition[] {
   const attachmentRead = createAgentAttachmentReadTool(project.workspacePath, true, authorizeAttachment);
-  const readImageReference = async (file: string, signal?: AbortSignal): Promise<PromptImage> => {
-    if (!file.startsWith("attachment:")) return readProjectImage(project.workspacePath, file, "reference", signal);
-    const result = await attachmentRead.execute("image-reference", { path: file }, signal, undefined, {} as never);
-    const image = result.content.find(block => block.type === "image");
-    if (image?.type !== "image" || !["image/png", "image/jpeg"].includes(image.mimeType))
-      throw new Error("Image references require PNG or JPEG attachments; preserve the original. No generation was submitted.");
-    signal?.throwIfAborted();
-    return { mediaType: image.mimeType as "image/png" | "image/jpeg", data: image.data };
+  const readImageReference = async (file: string, request: Pick<RunImageToolRequest, "prompt" | "imageModel">, signal?: AbortSignal): Promise<PromptImage> => {
+    let image: PromptImage;
+    if (file.startsWith("attachment:")) {
+      const result = await attachmentRead.execute("image-reference", { path: file }, signal, undefined, {} as never);
+      const block = result.content.find(part => part.type === "image");
+      if (block?.type !== "image" || !["image/png", "image/jpeg", "image/webp"].includes(block.mimeType))
+        throw new Error("Image references require PNG, JPEG or supported WebP attachments; preserve the original. No generation was submitted.");
+      signal?.throwIfAborted();
+      image = { mediaType: block.mimeType as PromptImage["mediaType"], data: block.data };
+    } else image = await readProjectImage(project.workspacePath, file, "reference", signal);
+    if (image.mediaType === "image/webp") {
+      const prepared = request.imageModel ?? (await tools.prepare("generate-image", { prompt: request.prompt }, project.id) as RunImageToolRequest).imageModel;
+      if (!isGptImage26(prepared?.id)) throw new Error("Use a PNG or JPEG reference for this image model. No generation was submitted.");
+    }
+    return image;
   };
   const recoveryOptions = (toolId: ToolId, callId: string, signal?: AbortSignal) => {
     const scope = [project.id, generationScope ?? project.id, toolId];
@@ -463,7 +490,7 @@ export function createAgentTools(
     await tools.removeRun(runId);
     return result;
   }
-  async function generateImage(originalTool: string, toolCallId: string, input: Static<typeof imageParameters>, signal?: AbortSignal) {
+  async function generateImage(originalTool: string, toolCallId: string, input: Static<typeof imageParameters>, signal?: AbortSignal): ReturnType<PiToolDefinition["execute"]> {
     signal?.throwIfAborted();
     const { recoverCallId } = input;
     const options = recoveryOptions("generate-image", recoverCallId ?? toolCallId, signal);
@@ -474,9 +501,12 @@ export function createAgentTools(
     if (input.imagePaths?.length && !configured) throw new Error("Reference images require resolution and aspect ratio together");
     if (input.maskPath && !input.imagePaths?.length) throw new Error("An edit mask requires at least one reference image");
     const prepareInput = async (): Promise<RunImageToolRequest> => {
-      const images = await Promise.all((input.imagePaths ?? []).map((file) => readImageReference(file, signal)));
+      const images = await Promise.all((input.imagePaths ?? []).map((file) => readImageReference(file, input, signal)));
       const mask = input.maskPath ? await readProjectImage(project.workspacePath, input.maskPath, "mask", signal) : undefined;
+      const markup = input.markupPath ? await readProjectImage(project.workspacePath, input.markupPath, "mask", signal) : undefined;
       const settings = {
+        ...gptImage26Options(input),
+        ...(markup ? { markup } : {}),
         ...(input.imageModel ? { imageModel: input.imageModel } : {}),
         ...(input.quality !== undefined ? { quality: input.quality } : {}),
         ...(input.outputFormat !== undefined ? { outputFormat: input.outputFormat } : {}),
@@ -505,9 +535,15 @@ export function createAgentTools(
       const file = await tools.file(run.id, output.name);
       if (!file) throw new Error("Generated image could not be read");
       signal?.throwIfAborted();
-      const extension = output.mediaType === "image/png" ? "png" : output.mediaType === "image/jpeg" ? "jpg" : "webp";
-      const fileName = `image-${run.id}.${extension}`;
-      const resource = await projects.addGeneratedWorkingImage(project.id, fileName, file.bytes, { prompt: input.prompt, ...(file.assetId ? { libraryAssetId: file.assetId } : {}) }, signal);
+      const fileName = `image-${run.id}${fileExtension(output.name)}`;
+      const metadata = { prompt: input.prompt, ...(file.assetId ? { libraryAssetId: file.assetId } : {}) };
+      if (output.mediaType === "image/svg+xml" || output.mediaType === "image/gif") {
+        const saved = await projects.addGeneratedAsset(project.id, fileName, file.bytes, metadata);
+        originalRetained = true;
+        return { content: [{ type: "text" as const, text: `Generated original saved to ${saved}. Keep the original format for game use.` }],
+          details: { artifact: { type: "image", path: saved, mediaType: output.mediaType } } };
+      }
+      const resource = await projects.addGeneratedWorkingImage(project.id, fileName, file.bytes, metadata, signal);
       originalRetained = true;
       const transparencyWarning = resource.ready && input.background === "transparent" && !resource.hasTransparency
         ? "Requested transparency is absent: this output has no transparent pixels. The original and working copy are retained. Do not describe it as a transparent sprite; inspect or prepare it locally before game use."
@@ -726,7 +762,7 @@ export function createAgentTools(
   }), defineTool({
     name: PI_TOOL_NAMES["generate-image"],
     label: "Generate Image",
-    description: "Generate or edit an image using the project or global default model. If a submitted result could not be downloaded, call recover_media with the original tool name and call ID to retrieve the existing result. If recovery fails, report it and stop before starting another paid generation. Retain the original outside execution. Local working-image preparation preserves dimensions by default and remains subject to decoding, working-file and execution transfer budgets. Use optimize_image_asset with maxEdge only for an explicitly chosen runtime derivative; a transfer limit does not authorize silent resizing. For sprites and cutouts needing alpha, request outputFormat=png and background=transparent; do not choose JPEG or an opaque backdrop to reduce file size. Use optimize_image_asset locally for size recovery without billing. References accept project-relative PNG/JPEG files or exact authorized attachment:batch/id receipts; attachment originals are retained and added as Canvas reference sources before generation. Masks must be project-relative PNG files. Use only the selected model's documented parameters; unsupported options are rejected. Sunburst/Flare support transparent PNG and PNG masks; Image-GI2.1 does not support transparency or masks.",
+    description: "Generate or edit an image using the project or global default model. If a submitted result could not be downloaded, call recover_media with the original tool name and call ID to retrieve the existing result. If recovery fails, report it and stop before starting another paid generation. Retain the original outside execution. Local working-image preparation preserves dimensions by default and remains subject to decoding, working-file and execution transfer budgets. Use optimize_image_asset with maxEdge only for an explicitly chosen runtime derivative; a transfer limit does not authorize silent resizing. For sprites and cutouts needing alpha, request outputFormat=png and background=transparent; do not choose JPEG or an opaque backdrop to reduce file size. Use optimize_image_asset locally for size recovery without billing. GPT Image 2.6 supports PNG, JPEG, WebP, text-only SVG and animated GIF. Keep an explicitly chosen transparent WebP or SVG. Use list_media_capabilities for format-specific constraints. References accept project-relative static PNG/JPEG or supported WebP files or exact authorized attachment:batch/id receipts; attachment originals are retained and added as Canvas reference sources before generation. Masks must be project-relative PNG files. Use only the selected model's documented parameters; unsupported options are rejected. Sunburst/Flare support transparent PNG and PNG masks; Image-GI2.1 does not support transparency or masks.",
     parameters: imageParameters,
     execute: (id, input, signal) => generateImage(PI_TOOL_NAMES["generate-image"], id, input, signal),
   }), defineTool({
@@ -1188,7 +1224,7 @@ export function createAgentTools(
             if (!previous && ["generate-speech", "generate-sound-effect", "generate-music"].includes(toolId))
               await tools.assertMediaAvailable(toolId, { ...input, output: { format: input.format, sampleRate: input.sampleRate } } as RunToolRequest);
             const target = previous?.context?.boardId ? { boardId: previous.context.boardId, nodeId: previous.context.nodeId }
-              : await saveAgentCanvasMedia(project.id, canvasStore, projects, tools, toolId, input, `agent-${recoveryId}`, agentCanvasBoard(args[4]?.sessionManager?.getBranch?.() ?? []), readImageReference, args[2]);
+              : await saveAgentCanvasMedia(project.id, canvasStore, projects, tools, toolId, input, `agent-${recoveryId}`, agentCanvasBoard(args[4]?.sessionManager?.getBranch?.() ?? []), (file, signal) => readImageReference(file, input as Pick<RunImageToolRequest, "prompt" | "imageModel">, signal), args[2]);
             args[2]?.throwIfAborted();
             const generate = registeredTools.find(tool => tool.name === "generate_canvas_media")!;
             try { return await directCanvasResult(await generate.execute(args[0], target, args[2], args[3], args[4])); }

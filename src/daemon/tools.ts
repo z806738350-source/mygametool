@@ -1,3 +1,4 @@
+import { GPT_IMAGE_26_SCHEMA, gptImage26Options, isGptImage26, validateGptImage26Settings } from "../shared/gpt-image-26.js";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readFile, readdir, rename, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
@@ -497,6 +498,12 @@ export class ToolRunner {
 
   /** Resolved options only: check before Canvas/source writes or a new task journal. */
   async assertMediaInputOptions(toolId: string, input: RunToolRequest): Promise<void> {
+    if (toolId === "generate-image") {
+      const image = input as RunImageToolRequest;
+      const problem = validateGptImage26Settings(image.imageModel?.id, image, "images" in image ? image.images?.length ?? 0 : 0, image.outputs);
+      if (problem) throw inheritToolPreflightFailure(new ToolRunError(problem, 400, undefined, undefined, undefined, true), toolPreflightError(problem, "invalid_media_options"));
+      return;
+    }
     if (toolId !== "image-to-3d" && toolId !== "animate-3d") return;
     assertSafeGenerationInput(input);
     await this.assertMediaAvailable(toolId, input);
@@ -595,7 +602,7 @@ export class ToolRunner {
     assertSafeGenerationInput(input);
     assertSafeGenerationInput(recoveryId);
     await this.assertMediaAvailable(toolId, input, model3DRecoveryOnly);
-    if (!model3DRecoveryOnly) await this.assertMediaInputOptions(toolId, input);
+    if (!model3DRecoveryOnly && !imageRecoveryOnly) await this.assertMediaInputOptions(toolId, input);
     if (toolId === "image-to-3d") {
       assertOnlyKeys(input, ["images", "model", "targetPolycount", "texture", "pbr", "operation", "prompt", "sourceAssetId", "options"]);
       return this.#run3D(input as Run3DToolRequest, signal, recoveryId, await model3DJournal(path.join(this.#runsDirectory, "../model3d-tasks"), recoveryId, model3DRecoveryOnly), canvasContext).catch(model3DToolError);
@@ -625,7 +632,7 @@ export class ToolRunner {
       return this.#runAudio(toolId, { operation: "music", ...(input as RunMusicToolRequest) }, signal, recoveryId, canvasContext);
     }
     if (toolId !== "generate-image") throw new ToolRunError("Tool not found", 404);
-    assertOnlyKeys(input, ["prompt", "imageModel", "size", "resolution", "aspectRatio", "outputs", "images", "quality", "outputFormat", "outputCompression", "background", "mask"]);
+    assertOnlyKeys(input, ["prompt", "imageModel", "size", "resolution", "aspectRatio", "outputs", "images", "quality", "outputFormat", "outputCompression", "background", "mask", "markup", ...Object.keys(GPT_IMAGE_26_SCHEMA)]);
     return this.#runImage(input as RunImageToolRequest, signal, recoveryId, imageRecoveryOnly, canvasContext, previousImageRunId);
   }
 
@@ -676,9 +683,11 @@ export class ToolRunner {
           ...(input.outputFormat !== undefined ? { outputFormat: input.outputFormat } : {}),
           ...(input.outputCompression !== undefined ? { outputCompression: input.outputCompression } : {}),
           ...(input.background !== undefined ? { background: input.background } : {}),
+          ...gptImage26Options(input),
           ...(input.mask ? { mask: input.mask } : {}),
+          ...(input.markup ? { markup: input.markup } : {}),
           ...(input.imageModel ? { imageModel: input.imageModel } : {}),
-          ...(usesConfiguredOptions ? { resolution: resolution!, aspectRatio: aspectRatio!, ...(imageInput?.length ? { images: imageInput } : {}) } : { size }),
+          ...(usesConfiguredOptions ? { resolution: resolution!, aspectRatio: aspectRatio!, ...(imageInput?.length ? { images: imageInput } : {}) } : (input.outputFormat === "gif" || isGptImage26(input.imageModel?.id)) && !input.size ? {} : { size }),
         }, signal);
         const mediaType = sniffImageType(image.bytes) ?? image.mediaType;
         return { image, file: { name: imageFileName(mediaType, outputs > 1 ? index + 1 : undefined), mediaType } as ToolRunFile };
@@ -1297,7 +1306,7 @@ function isRunId(value: string): boolean {
 }
 
 function isToolRunFileName(value: string): boolean {
-  return /^(?:output(?:-[1-4])?\.(?:png|jpg|webp)|model(?:-preview)?\.glb|model-original\.fbx|output\.(?:mp4|mp3|wav))$/.test(value);
+  return /^(?:output(?:-[1-4])?\.(?:png|jpg|webp|gif|svg)|model(?:-preview)?\.glb|model-original\.fbx|output\.(?:mp4|mp3|wav))$/.test(value);
 }
 
 function isToolId(value: unknown): value is ToolId {
@@ -1306,7 +1315,9 @@ function isToolId(value: unknown): value is ToolId {
 
 function imageFileName(mediaType: string, index?: number): string {
   const suffix = index ? `-${index}` : "";
-  return mediaType === "image/png" ? `output${suffix}.png` : mediaType === "image/jpeg" ? `output${suffix}.jpg` : `output${suffix}.webp`;
+  const extension = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/svg+xml": "svg", "image/gif": "gif" }[mediaType];
+  if (!extension) throw new ToolRunError("Unsupported generated image format", 400);
+  return `output${suffix}.${extension}`;
 }
 
 function selectedModel(toolId: string, input: RunToolRequest | undefined): ModelRef | undefined {

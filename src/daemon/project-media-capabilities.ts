@@ -1,3 +1,4 @@
+import { GPT_IMAGE_26_DEFAULTS, GPT_IMAGE_SVG_MODELS, GPT_IMAGE_SVG_EFFORTS, isGptImage26 } from "../shared/gpt-image-26.js";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { ImageModel, Model3DModel, Model3DOptions, ModelRef, ProjectState, VideoModel } from "../shared/contracts.js";
@@ -37,6 +38,12 @@ function selection<T extends ModelRef>(candidates: readonly T[], project: ModelR
 
 function imageCandidate(model: ImageModel) {
   return { ...ref(model), sizes: model.sizes, generationOptions: model.generationOptions, outputFormats: model.outputFormats, qualities: model.qualities,
+    ...(isGptImage26(model.id) && model.complexities ? {
+      complexities: model.complexities, supportsMarkup: model.supportsMarkup, transparentFormats: ["png", "webp", "svg"], compressionFormats: ["jpeg", "webp"],
+      svg: { textOnly: true, outputs: 1, authors: GPT_IMAGE_SVG_MODELS, reasoningEfforts: GPT_IMAGE_SVG_EFFORTS, unavailableEffort: { "gpt-6.1-sol": "none" } },
+      gif: { staticReferences: true, squareFrameSize: "512x512", frameCount: [2, 16], frameDurationMs: [20, 2000], mask: false, markup: false },
+      pixelSize: "Optional explicit WxH, multiples of 16, ratio 1:3 to 3:1. Applies per frame for GIF.", defaults: GPT_IMAGE_26_DEFAULTS,
+    } : {}),
     supportsResolution: model.supportsResolution, supportsAspectRatio: model.supportsAspectRatio, maxOutputs: model.maxOutputs,
     supportsReferenceImage: model.supportsReferenceImage, maxReferenceImages: model.maxReferenceImages, supportsMask: model.supportsMask, supportsTransparency: model.supportsTransparency };
 }

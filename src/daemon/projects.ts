@@ -3,6 +3,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants, createReadStream } from "node:fs";
 import { access, copyFile, cp, link, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { buffer as streamBuffer } from "node:stream/consumers";
+import { GENERATED_SVG_MAX_BYTES, validateGeneratedSvg } from "./plugin-svg.js";
 import type { LibraryAssetProject, MediaModelDefaults, PreviewViewport, ProjectCoverMode, ProjectCoverState, ProjectModelSelectionPatch, ProjectPackageManager, ProjectRunSettings, ProjectState, ProjectType, PublicationState, ToolJob } from "../shared/contracts.js";
 import { defaultProjectName } from "../shared/project-names.js";
 import { isProjectType, isWebRuntimeProjectType, supportsWebPreview } from "../shared/project-runtime.js";
@@ -708,7 +710,7 @@ export class ProjectManager {
     if (!this.assetLibrary) throw new ProjectAssetError("Asset Library is not configured", 503);
     await this.assetLibrary.associateProject(assetId, id);
     const { asset, absolutePath } = await this.assetLibrary.content(assetId);
-    const candidate = canvasCandidate && isCanvasMediaPath(`assets/canvas/${asset.name}`);
+    const candidate = canvasCandidate && isCanvasMediaPath(`assets/canvas/${asset.name}`) && (asset.contentType !== "image/svg+xml" || asset.origin === "generated");
     const folder = [candidate ? "canvas" : "imported"];
     return this.#writeAssetMetadata(id, async () => {
       signal?.throwIfAborted();
@@ -777,13 +779,13 @@ export class ProjectManager {
       const targetType = mediaFileInfo(destination)?.contentType;
       const usePreview = targetType === "model/gltf-binary" && mediaFileInfo(asset.path)?.contentType === "application/vnd.autodesk.fbx";
       const source = usePreview ? asset.modelPreviewPath : asset.path;
-      if (!source || !targetType || targetType === "image/svg+xml" || targetType === "application/vnd.autodesk.fbx" || mediaFileInfo(source)?.contentType !== targetType)
+      if (!source || !targetType || targetType === "application/vnd.autodesk.fbx" || mediaFileInfo(source)?.contentType !== targetType)
         throw new ProjectAssetError("Keep the media format and file extension; FBX requires a ready GLB preview for GLB use", 400);
       const budgetFailure = (message: string) => inheritToolPreflightFailure(new ProjectAssetError(message, 413), toolPreflightError(message, "runtime_media_budget"));
       const guidance = "Preserve the original. Inspect the project storage/capacity diagnostic and explicitly choose a supported runtime derivative or another supported workflow. Do not automatically transcode, shrink or regenerate the asset.";
       const profile = await this.sourceProfile?.(project);
       signal?.throwIfAborted();
-      const limit = runtimeMediaFileLimit(destination, profile);
+      const limit = targetType === "image/svg+xml" ? GENERATED_SVG_MAX_BYTES : runtimeMediaFileLimit(destination, profile);
       let sourceRoot = root, sourcePath: string, expectedOriginalSha256: string | undefined;
       if (useOriginalImage) {
         const linkedId = (await readAssetMetadata(root, { strict: true })).libraryAssets[source];
@@ -812,7 +814,13 @@ export class ProjectManager {
         throw budgetFailure(`Canvas runtime copy was not written: projected complete eligible workspace exceeds the ${selected}. Runtime media ${budget.mediaBytes}/${budget.limits.mediaBytes} bytes, format-specific file limit ${limit} bytes; source ${budget.totalBytes}/${budget.limits.totalBytes} bytes, per-file limit ${budget.limits.fileBytes} bytes; files ${budget.fileCount}/${budget.limits.fileCount}, entries ${budget.entryCount}/${budget.limits.entries}. ${guidance}`);
       }
       return withCheckedFileStream(sourceRoot, sourcePath, { maxBytes: limit, expectedSize: sourceInfo.size, signal }, async (stream, checked) => {
-        if (!mediaHeaderMatches(destination, checked.prefix, checked.size, profile)) throw new ProjectAssetError("The Canvas asset content does not match the runtime file format. Preserve the original and inspect the asset; no runtime copy was written.", 400);
+        // A local Canvas file may have changed since generation. Validate the exact SVG snapshot copied into the game.
+        let svg: Buffer | undefined;
+        if (targetType === "image/svg+xml") {
+          svg = await streamBuffer(stream);
+          try { validateGeneratedSvg(svg); }
+          catch { throw new ProjectAssetError("Only a verified self-contained static SVG can be copied to the game", 400); }
+        } else if (!mediaHeaderMatches(destination, checked.prefix, checked.size, profile)) throw new ProjectAssetError("The Canvas asset content does not match the runtime file format. Preserve the original and inspect the asset; no runtime copy was written.", 400);
         if (expectedOriginalSha256 && checked.sha256 !== expectedOriginalSha256) throw new ProjectAssetError("The saved image no longer matches the Library original integrity binding. Preserve the files and inspect the Library asset; no runtime copy was written.", 409);
         if (expected && checked.sha256 !== expected) throw new ProjectAssetError("The saved model no longer matches the Canvas binding", 409);
         const assertPolicy = () => { if (checked.scannerRevision !== knownSensitiveValueRevision()) throw new ProjectAssetError("The protected-data policy changed; inspect the asset again before copying.", 409); };
@@ -837,7 +845,8 @@ export class ProjectManager {
           const writer = await open(temporary, "wx", 0o600); closed = false;
           try {
             const info = await writer.stat(); identity = { dev: info.dev, ino: info.ino };
-            for await (const chunk of stream) { signal?.throwIfAborted(); await writer.writeFile(chunk); }
+            if (svg) await writer.writeFile(svg);
+            else for await (const chunk of stream) { signal?.throwIfAborted(); await writer.writeFile(chunk); }
             await writer.sync(); complete = true;
           } finally { await writer.close(); closed = true; }
           signal?.throwIfAborted(); assertPolicy();

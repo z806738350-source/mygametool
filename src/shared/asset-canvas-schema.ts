@@ -1,3 +1,4 @@
+import { GPT_IMAGE_26_SCHEMA, GPT_IMAGE_FORMATS } from "./gpt-image-26.js";
 import {
   AGENT_REASONING_LEVELS,
   IMAGE_ASPECT_RATIOS,
@@ -84,10 +85,12 @@ const nodes = [
       resolution: { enum: IMAGE_RESOLUTIONS },
       aspectRatio: { enum: IMAGE_ASPECT_RATIOS },
       quality: { enum: ["auto", "low", "medium", "high", "xhigh", "max"] },
-      outputFormat: { enum: ["png", "jpeg"] },
+      ...GPT_IMAGE_26_SCHEMA,
+      outputFormat: { enum: GPT_IMAGE_FORMATS },
       outputCompression: { type: "integer", minimum: 0, maximum: 100 },
       background: { enum: ["auto", "opaque", "transparent"] },
       mask: reference,
+      markup: reference,
       images: { type: "array", maxItems: IMAGE_MAX_REFERENCE_IMAGES, items: reference },
       assetId: id,
     },

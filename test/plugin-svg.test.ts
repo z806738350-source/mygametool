@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import Fastify from "fastify";
 import { registerPluginIconRoutes, validatePluginIconImage } from "../src/daemon/plugin-icons.js";
 import { registerSensitiveValue } from "../src/shared/sensitive-values.js";
+import { validateGeneratedSvg } from "../src/daemon/plugin-svg.js";
 
 const svg = (body: string, attributes = "") =>
   Buffer.from(
@@ -54,6 +55,14 @@ describe("static SVG plugin icons", () => {
     "<g><path></g>",
   ])("rejects active, external, or malformed content: %s", async (body) => {
     await expect(validatePluginIconImage(svg(body))).rejects.toThrow();
+    expect(() => validateGeneratedSvg(svg('<rect width="32" height="32"/>' + body))).toThrow();
+  });
+
+  it("accepts static text in generated vectors and rejects empty artwork without widening icon support", async () => {
+    const vector = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="2560" height="1600"><text font-family="sans-serif">Game</text></svg>');
+    expect(validateGeneratedSvg(vector)).toEqual({ width: 2560, height: 1600 });
+    await expect(validatePluginIconImage(vector)).rejects.toThrow();
+    expect(() => validateGeneratedSvg(svg("<title>Empty</title>"))).toThrow();
   });
 
   it.each([

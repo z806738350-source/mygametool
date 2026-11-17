@@ -27,6 +27,7 @@ import {
 import { CheckedMediaSnapshotStore } from "./checked-media-snapshot.js";
 import { canvasCandidatePaths } from "./canvas-assets.js";
 import { sniffImageType } from "./image-format.js";
+import { GENERATED_SVG_MAX_BYTES, validateGeneratedSvg } from "./plugin-svg.js";
 import { isFbxArtifact } from "./fbx-preview.js";
 import {
   assertNoKnownSecretBytes,
@@ -409,7 +410,10 @@ async function isCanvasMediaSnapshot(
       throw new Error(
         "Only ordinary non-executable Canvas media can be retained outside execution",
       );
-    const header = Buffer.alloc(100);
+    const extension = path.extname(relative).toLowerCase();
+    const isSvg = extension === ".svg";
+    if (isSvg && stat.size > GENERATED_SVG_MAX_BYTES) return false;
+    const header = Buffer.alloc(isSvg ? Number(stat.size) : 100);
     const { bytesRead } = await handle.read(header, 0, header.length, 0);
     const prefix = header.subarray(0, bytesRead);
     const current = await lstat(target, { bigint: true });
@@ -419,7 +423,11 @@ async function isCanvasMediaSnapshot(
       current.ctimeNs !== stat.ctimeNs
     )
       throw new Error("Canvas media changed during isolated preparation");
-    return path.extname(relative).toLowerCase() === ".fbx"
+    if (isSvg) {
+      if (bytesRead !== Number(stat.size)) return false;
+      try { validateGeneratedSvg(prefix); return true; } catch { return false; }
+    }
+    return extension === ".fbx"
       ? isFbxArtifact(prefix)
       : mediaHeaderMatches(relative, prefix, Number(stat.size));
   } finally {

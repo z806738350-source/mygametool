@@ -43,6 +43,27 @@ describe("Asset Canvas node serialization", () => {
     node.data.outputCompression = 101;
     expect(isAssetCanvasDocument(canvas)).toBe(false);
   });
+  it("round-trips a layered 2.6 image and remaps its markup when copying or deleting nodes", async () => {
+    const { createCanvasClipboard, duplicateCanvasSelection } = await import("../src/renderer/asset-canvas-clipboard.js");
+    const { removeNodesAndReferences } = await import("../src/renderer/asset-canvas-workspace.js");
+    const source = createAssetGenerationNode("image", { x: 0, y: 0 });
+    const flow = { id: "edited", type: "image" as const, position: { x: 350, y: 0 }, data: {
+      prompt: "Edit here", model: { provider: "openai", id: "gpt-image-2.6-flare" }, images: [{ type: "library" as const, assetId: "subject" }],
+      outputFormat: "webp" as const, background: "transparent" as const, outputCompression: 0, complexity: "medium" as const,
+      pixelSize: "768x768", markup: { type: "node" as const, nodeId: source.id },
+    } };
+    const persisted = toAssetCanvasNode(flow);
+    expect(toAssetCanvasNode(toFlowNode(persisted, [], []))).toEqual(persisted);
+    expect(persisted.data).toMatchObject(flow.data);
+    const board = createAssetCanvasDocument(); board.nodes = [source, persisted]; board.editorLayout.nodes = Object.fromEntries(board.nodes.map(n => [n.id, n.position]));
+    expect(isAssetCanvasDocument(board)).toBe(true);
+    const clip = createCanvasClipboard("project", board.nodes, []);
+    const copy = duplicateCanvasSelection(clip.nodes, [], { x: 10, y: 10 });
+    expect(copy.nodes[1]?.data).toMatchObject({ markup: { type: "node", nodeId: copy.nodes[0]?.id } });
+    expect(createCanvasClipboard("project", [persisted], []).nodes[0]?.data).not.toHaveProperty("markup");
+    expect(removeNodesAndReferences([flow], new Set([source.id]))[0]?.data.markup).toBeUndefined();
+  });
+
   it("keeps resize history and serialization while rejecting invalid node dimensions", () => {
     const canvas = createAssetCanvasDocument();
     const node = toAssetCanvasNode({ id: "notes", type: "text", position: { x: 0, y: 0 }, width: 600, height: 400, data: { text: "Notes" } });

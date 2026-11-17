@@ -60,7 +60,7 @@ export function canvasNodeAssetIds(nodes: readonly AssetCanvasNode[]): string[] 
     if ("assetId" in node.data && node.data.assetId) ids.add(node.data.assetId);
     if (node.type === "speech" && node.data.referenceAssetId) ids.add(node.data.referenceAssetId);
     if (node.type === "voice" && node.data.selectedAssetId) ids.add(node.data.selectedAssetId);
-    const references = node.type === "image" ? [...node.data.images, ...(node.data.mask ? [node.data.mask] : [])] : node.type === "model-3d" ? node.data.images
+    const references = node.type === "image" ? [...node.data.images, ...(node.data.mask ? [node.data.mask] : []), ...(node.data.markup ? [node.data.markup] : [])] : node.type === "model-3d" ? node.data.images
       : node.type === "video" ? node.data.references : node.type === "animate-3d" && node.data.source ? [node.data.source] : [];
     if (node.type === "model-3d" && node.data.source?.type === "library") ids.add(node.data.source.assetId);
     for (const reference of references) if (reference.type === "library") ids.add(reference.assetId);

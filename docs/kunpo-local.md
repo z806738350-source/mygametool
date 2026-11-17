@@ -27,7 +27,7 @@ Agent 的直接生成工具会在可恢复的失败中给出原调用编号。�
 | 角色 | 新项目首选 | 已提供适配的其他选择 | 当前边界 |
 | --- | --- | --- | --- |
 | Agent | `gpt-5.6-sol` | `claude-opus-5-5`、`gpt-6.1-sol` | 分别为 Chat、Messages、Responses；6.1 模型支持视觉，此 Kunpo 连接的图片协议待确认，暂未启用，详见下文 |
-| 图片 | `gpt-image-2.5-sunburst` | `gpt-image-2.5-flare`、`Image-GI2.1` | Sunburst/Flare PNG/JPEG、参考图、PNG mask/透明；GI2.1 无透明/mask |
+| 图片 | `gpt-image-2.5-sunburst` | `gpt-image-2.5-flare`、`gpt-image-2.6-sunburst`、`gpt-image-2.6-flare`、`Image-GI2.1` | 2.6 支持静态图片、文字生成 SVG、GIF 动画以及标注编辑 |
 | 视频 | `doubao-seedance-2-5-260628` | `tencent-vod-vs-2.5`、`minimax-video-h3` | Native Seedance 与 Videos API 分开建任务/续查/下载 |
 | 音效 | `seed-audio-1.0` | `seed-audio-1.0-multilingual` | 同步二进制 MP3/WAV，非流式；时长提示不是精确保证 |
 | 角色配音 | `seed-audio-1.0`（候选） | multilingual | 支持音色节点样音、上传 MP3/WAV 参考或无参考；精确朗读、音色稳定及字幕未验证 |
@@ -38,6 +38,15 @@ Agent 的直接生成工具会在可恢复的失败中给出原调用编号。�
 | 3D 重贴图 | `v3.5-20260815` | `v3.0-20250812`、`v2.5-20250123` | 可选工序；已有贴图合适时无需再次调用 |
 
 `gemini-3.8-flash`、`claude-sonnet-5-5`、`kimi-k3.1-pro` 保留为待接入列表项，界面禁用，后端执行拒绝；历史选择显示原值，不悄悄替换。所有已适配型号均标记“未实测”，不能把目录列表当作真实调用成功。
+
+### GPT Image 2.6 图片与动画
+
+在项目画布顶部打开「默认模型」，在「图片」中选择 Sunburst 或 Flare，主 Agent 会沿用项目选择。单个画布图片节点也可以单独指定型号。使用自定义启用列表时，需要在图片连接中启用对应的模型 ID。
+
+- 静态图片可选 PNG、JPEG、WebP。PNG 和 WebP 支持透明背景。JPEG 和 WebP 可设置 0–100 的压缩质量。编辑可使用最多 16 张静态参考图。可选的蒙版和标注层二选一，标注层使用与第一张参考图同尺寸的透明 PNG。
+- SVG 每次从文字生成一张矢量图。默认作者为 `gpt-6-sol`，作者规划为 `low`。带参考图的节点需移除参考图或选择位图格式。作者访问权限由 Kunpo 账号决定。
+- GIF 支持文字或静态参考图。方形默认每帧 512×512，共 9 帧，每帧 200 毫秒。可以指定每帧尺寸、2–16 帧及 20–2000 毫秒。高画质沿用所选尺寸。
+- SVG 和 GIF 原件按原格式保存。生成中断后，使用原任务的恢复入口可取回已保留的结果。服务商未返回可恢复结果时，需要用户决定是否重新生成。
 
 ## 本批行为与限制
 

@@ -1,3 +1,4 @@
+import { isGptImage26 } from "../shared/gpt-image-26.js";
 import { registerSensitiveValue } from "../shared/sensitive-values.js";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -194,7 +195,7 @@ export function openAIConfiguredImageModel(
   model: OpenAIImageModelConfiguration,
 ): ImageModel {
   return {
-    ...imageModelDefinition(model.template)!,
+    ...imageModelDefinition(isGptImage26(model.id) ? model.id : model.template)!,
     id: model.id,
     name: model.name,
     provider: "openai",

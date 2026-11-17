@@ -1,4 +1,8 @@
 import type { ImageAspectRatio, ImageGenerationSettings, ImageModelRef, ImageResolution, ImageSize, PromptImage } from "../shared/contracts.js";
+import { GPT_IMAGE_26_DEFAULTS, gptImage26FrameSize, isGptImage26, validateGptImage26Settings } from "../shared/gpt-image-26.js";
+import sharp from "sharp";
+import { serializeRasterDecoding } from "./raster-policy.js";
+import { validateGeneratedImage } from "./generated-image-format.js";
 import { assertProviderBytes, providerCredentialValues, fetchProviderArtifact, providerArtifactTarget, providerArtifactUrl, ProviderArtifactAddressError, providerControlUrl, providerRequest } from "./provider-network.js";
 import { sniffImageType } from "./image-format.js";
 import { containsKnownSensitiveValue } from "../shared/sensitive-values.js";
@@ -8,7 +12,7 @@ export const IMAGE_REQUEST_TIMEOUT_MS = 16 * 60_000;
 const IMAGE_RESPONSE_LIMIT_BYTES = 64 * 1024 * 1024;
 const IMAGE_INPUT_LIMIT_BYTES = 32 * 1024 * 1024;
 
-export type GeneratedImageMediaType = "image/png" | "image/jpeg" | "image/webp";
+export type GeneratedImageMediaType = "image/png" | "image/jpeg" | "image/webp" | "image/svg+xml" | "image/gif";
 
 export interface GeneratedImage {
   bytes: Buffer;
@@ -69,16 +73,26 @@ export class OpenAIImageGenerator implements ImageGenerator {
     const model = input.model ?? "gpt-image-2.5-sunburst";
     const images = input.images ?? [];
     const nano = model === "Image-GI2.1";
-    validateImageInput(input, nano);
+    const gpt26 = isGptImage26(model);
+    const problem = validateGptImage26Settings(model, gpt26 && input.size && !input.pixelSize ? { ...input, pixelSize: input.size } : input, images.length);
+    if (problem) throw new ImageGenerationError(problem, 400, false, true);
+    validateImageInput(input, nano, gpt26);
+    const firstReferenceSize = gpt26 && images.length ? await serializeRasterDecoding(() => validate26References(input)) : undefined;
     const endpoint = imageEndpoint(this.baseUrl, !nano && images.length > 0);
     const timeout = AbortSignal.timeout(IMAGE_REQUEST_TIMEOUT_MS);
     const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-    const size = nano ? input.aspectRatio ?? legacyRatio(input.size) : openAIImageSize(input);
+    const size = nano ? input.aspectRatio ?? legacyRatio(input.size) : gpt26 ? gpt26Size(input, firstReferenceSize) : openAIImageSize(input);
+    const format = input.outputFormat ?? "png";
+    const svg = gpt26 && format === "svg" ? { model: input.svgModel?.trim() || GPT_IMAGE_26_DEFAULTS.svgModel, reasoning: { effort: input.svgReasoningEffort ?? GPT_IMAGE_26_DEFAULTS.svgReasoningEffort } } : undefined;
     const parameters: Record<string, string | number | boolean> = nano
       ? { size, imageSize: input.resolution ?? "1K", n: 1, stream: false }
-      : { size, quality: input.quality ?? "auto", output_format: input.outputFormat ?? "png", background: input.background ?? "auto", n: 1, response_format: "url",
+      : { size, quality: input.quality ?? "auto", output_format: format, background: input.background ?? "auto", n: 1,
+        ...(!gpt26 || input.imageModel?.provider === "kunpo" || providerControlUrl(this.baseUrl, true).origin === "https://llm.ziy.cc" ? { response_format: "url" } : {}),
+        ...(gpt26 ? { complexity: input.complexity ?? GPT_IMAGE_26_DEFAULTS.complexity } : {}),
+        ...(gpt26 && format === "gif" ? { frame_count: input.frameCount ?? GPT_IMAGE_26_DEFAULTS.frameCount, frame_duration_ms: input.frameDurationMs ?? GPT_IMAGE_26_DEFAULTS.frameDurationMs } : {}),
         ...(input.outputCompression !== undefined ? { output_compression: input.outputCompression } : {}) };
-    const generation: NonNullable<GeneratedImage["generation"]> = { ...(input.imageModel ? { provider: input.imageModel.provider } : {}), model, protocol: "openai-images", parameters: { ...parameters, referenceCount: images.length, masked: Boolean(input.mask) } };
+    const generation: NonNullable<GeneratedImage["generation"]> = { ...(input.imageModel ? { provider: input.imageModel.provider } : {}), model, protocol: "openai-images", parameters: { ...parameters, referenceCount: images.length, masked: Boolean(input.mask),
+      ...(gpt26 ? { markedUp: Boolean(input.markup) } : {}), ...(svg ? { svgModel: svg.model, svgReasoningEffort: svg.reasoning.effort } : {}) } };
 
     const submit = async (): Promise<ImageSubmission> => {
       requestSignal.throwIfAborted();
@@ -93,7 +107,7 @@ export class OpenAIImageGenerator implements ImageGenerator {
       try { if (!input.mask && images.length) referenceUrls = await kunpoReferenceImageUrls(images, this.baseUrl, providerCredentialValues(this.apiKey, this.headers), requestSignal); }
       catch { throw new ImageGenerationError("Image reference preparation cancelled before submission", 499, false, true); }
       try {
-        const multipart = !nano && images.length > 0 && (Boolean(input.mask) || !referenceUrls.some(Boolean));
+        const multipart = !nano && images.length > 0 && (Boolean(input.mask) || !gpt26 && !referenceUrls.some(Boolean));
         generation.parameters.referenceUrlCount = multipart ? 0 : referenceUrls.filter(Boolean).length;
         generation.parameters.referenceLocalCount = images.length - Number(generation.parameters.referenceUrlCount);
         const body = multipart
@@ -102,7 +116,12 @@ export class OpenAIImageGenerator implements ImageGenerator {
               model,
               prompt: input.prompt,
               ...parameters,
-              ...(images.length ? { ...(nano ? { imageMimeType: images[0]!.mediaType } : {}), images: images.map((image, index) => referenceUrls[index] ?? `data:${image.mediaType};base64,${image.data}`) } : {}),
+              ...(svg ? { svg } : {}),
+              ...(input.markup ? { markup: { image_url: `data:image/png;base64,${input.markup.data}` } } : {}),
+              ...(images.length ? { ...(nano ? { imageMimeType: images[0]!.mediaType } : {}), images: images.map((image, index) => {
+                const url = referenceUrls[index] ?? `data:${image.mediaType};base64,${image.data}`;
+                return gpt26 ? { image_url: url } : url;
+              }) } : {}),
             });
         response = await awaitImageResponse(providerRequest(this.request, endpoint, {
           method: "POST",
@@ -122,19 +141,24 @@ export class OpenAIImageGenerator implements ImageGenerator {
         throw new ImageGenerationError(message, 502, true);
       }
 
+      const errorContext = gpt26 ? { model, svgAuthor: svg?.model, format } : undefined;
       const body = await imageJson(response, requestSignal).catch((cause) => {
         if (signal?.aborted) throw signal.reason ?? cause;
+        if (gpt26 && !response.ok) throw openAIError(response.status, undefined, errorContext);
         throw new ImageGenerationError("Image response could not be read; the upstream result is unknown. Do not automatically submit again.", 502, true);
       }) as {
         data?: Array<{ b64_json?: unknown; url?: unknown }>;
         error?: { code?: unknown; message?: unknown };
       };
-      if (!response.ok) throw openAIError(response.status, body.error);
-      const result = body.data?.[0];
+      if (!response.ok) throw openAIError(response.status, body?.error, errorContext);
+      if (gpt26 && Array.isArray(body?.data) && body.data.length > 1)
+        throw new ImageGenerationError("The provider returned unexpected additional results for one image request. Review the original operation before submitting again.", 502, true);
+      const result = body?.data?.[0];
       const encoded = result?.b64_json;
       if (typeof encoded === "string" && encoded) {
         const bytes = assertProviderBytes(Buffer.from(encoded, "base64"), providerCredentialValues(this.apiKey, this.headers));
-        const mediaType = verifiedImageType(bytes);
+        if (gpt26 && bytes.toString("base64") !== encoded) throw new ImageGenerationError("Invalid Base64 in the provider's image result", 502, true);
+        const mediaType = await verifiedImageType(bytes, gpt26 ? input : undefined);
         return { inline: {
           bytes,
           mediaType,
@@ -155,17 +179,17 @@ export class OpenAIImageGenerator implements ImageGenerator {
     };
     const result = input.execution ? await input.execution.submitted(
       JSON.stringify([this.baseUrl, this.authentication, this.apiKey, this.headers]),
-      { provider: input.imageModel?.provider, model, prompt: input.prompt, parameters, images, mask: input.mask }, submit, requestSignal,
+      { provider: input.imageModel?.provider, model, prompt: input.prompt, parameters, images, mask: input.mask, ...(svg ? { svg } : {}), ...(input.markup ? { markup: input.markup } : {}) }, submit, requestSignal,
     ) : await submit();
     requestSignal.throwIfAborted();
     if (result.inline) return result.inline;
     if (!result.url) throw new ImageGenerationError("The saved image result is unavailable", 409);
-    const generated = { ...await this.downloadImage(result.url, requestSignal, result.requestId ?? null), generation: result.generation };
+    const generated = { ...await this.downloadImage(result.url, requestSignal, result.requestId ?? null, gpt26 ? input : undefined), generation: result.generation };
     rememberKunpoImageSource(generated, result.url, this.baseUrl);
     return generated;
   }
 
-  private async downloadImage(url: string, signal: AbortSignal | undefined, requestId: string | null): Promise<GeneratedImage> {
+  private async downloadImage(url: string, signal: AbortSignal | undefined, requestId: string | null, expected?: ImageGenerationInput): Promise<GeneratedImage> {
     let imageResponse: Response;
     const timeout = AbortSignal.timeout(30_000);
     const downloadSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
@@ -179,7 +203,7 @@ export class OpenAIImageGenerator implements ImageGenerator {
     const bytes = await imageBytes(imageResponse, downloadSignal);
     return {
       bytes,
-      mediaType: verifiedImageType(bytes),
+      mediaType: await verifiedImageType(bytes, expected),
       requestId: requestId ?? undefined,
     };
   }
@@ -263,25 +287,69 @@ function editForm(input: ImageGenerationInput & { model?: string }, parameters: 
   return form;
 }
 
-function validateImageInput(input: ImageGenerationInput, nano: boolean): void {
+function gpt26Size(input: ImageGenerationInput, first?: { width: number; height: number }): string {
+  if (input.pixelSize) return input.pixelSize;
+  if (input.size) return input.size;
+  if (input.outputFormat === "gif") {
+    const ratio = input.aspectRatio ?? (first ? `${first.width}:${first.height}` : undefined);
+    return gptImage26FrameSize(ratio);
+  }
+  if (input.aspectRatio && input.resolution && input.resolution !== "512") return openAIImageSize(input);
+  if (first) {
+    const ratio = Math.min(3, Math.max(1 / 3, first.width / first.height));
+    return `${Math.round(64 * Math.sqrt(ratio)) * 16}x${Math.round(64 / Math.sqrt(ratio)) * 16}`;
+  }
+  return "1024x1024";
+}
+
+/** Validate references locally before a paid POST, including oriented dimensions for markup. */
+async function validate26References(input: ImageGenerationInput): Promise<{ width: number; height: number }> {
+  const limitInputPixels = 16_777_216;
+  let first!: { width: number; height: number };
+  try {
+    for (const [index, image] of input.images!.entries()) {
+      const bytes = Buffer.from(image.data, "base64");
+      if (bytes.toString("base64") !== image.data || sniffImageType(bytes) !== image.mediaType) throw new Error();
+      const metadata = await sharp(bytes, !index && input.markup ? { limitInputPixels } : {}).metadata();
+      if ((metadata.pages ?? 1) !== 1) throw new Error();
+      if (!index) first = metadata.autoOrient;
+    }
+    if (input.markup) {
+      const bytes = Buffer.from(input.markup.data, "base64");
+      if (input.markup.mediaType !== "image/png" || bytes.toString("base64") !== input.markup.data || sniffImageType(bytes) !== "image/png") throw new Error();
+      const layer = sharp(bytes, { limitInputPixels }).timeout({ seconds: 10 });
+      const meta = await layer.metadata();
+      if (meta.autoOrient.width !== first.width || meta.autoOrient.height !== first.height ||
+        !meta.hasAlpha || (meta.pages ?? 1) !== 1 || (await layer.stats()).isOpaque) throw new Error();
+    }
+  } catch {
+    throw new ImageGenerationError(input.markup
+      ? "Markup requires a static PNG with transparent pixels and the same oriented dimensions as the first reference, both within 16 megapixels."
+      : "Provide valid static PNG, JPEG, or WebP references.", 400, false, true);
+  }
+  return first;
+}
+
+function validateImageInput(input: ImageGenerationInput, nano: boolean, gpt26: boolean): void {
   if (typeof input.prompt !== "string" || !input.prompt.trim()) throw new ImageGenerationError("An image prompt is required", 400);
   if (input.quality !== undefined && !["auto", "low", "medium", "high", "xhigh", "max"].includes(input.quality)) throw new ImageGenerationError("Unsupported image quality", 400);
-  if (input.outputFormat !== undefined && !["png", "jpeg"].includes(input.outputFormat)) throw new ImageGenerationError("Unsupported image output format", 400);
+  if (input.outputFormat !== undefined && !gpt26 && !["png", "jpeg"].includes(input.outputFormat)) throw new ImageGenerationError("Unsupported image output format", 400);
   if (input.background !== undefined && !["auto", "opaque", "transparent"].includes(input.background)) throw new ImageGenerationError("Unsupported image background", 400);
   if (input.background === "transparent" && input.outputFormat === "jpeg") throw new ImageGenerationError("Transparent backgrounds require PNG output", 400);
-  if (input.outputCompression !== undefined && (!Number.isInteger(input.outputCompression) || input.outputCompression < 0 || input.outputCompression > 100 || input.outputFormat !== "jpeg")) throw new ImageGenerationError("JPEG output compression must be an integer from 0 to 100", 400);
+  if (input.outputCompression !== undefined && (!Number.isInteger(input.outputCompression) || input.outputCompression < 0 || input.outputCompression > 100 || input.outputFormat !== "jpeg" && !(gpt26 && input.outputFormat === "webp"))) throw new ImageGenerationError("Image output compression must be an integer from 0 to 100 for a supported format", 400);
   const images = input.images ?? [];
   if (!Array.isArray(images) || images.length > (nano ? 14 : 16)) throw new ImageGenerationError(`The selected image model supports up to ${nano ? 14 : 16} references`, 400);
   if (input.mask && (!images.length || input.mask.mediaType !== "image/png")) throw new ImageGenerationError("A PNG mask requires a reference image", 400);
-  const resources = [...images, ...(input.mask ? [input.mask] : [])];
-  if (resources.some((image) => !image || !["image/png", "image/jpeg", ...(nano ? ["image/webp"] : [])].includes(image.mediaType)
+  const resources = [...images, ...(input.mask ? [input.mask] : []), ...(input.markup ? [input.markup] : [])];
+  if (resources.some((image) => !image || !["image/png", "image/jpeg", ...(nano || gpt26 ? ["image/webp"] : [])].includes(image.mediaType)
     || typeof image.data !== "string" || !image.data || !/^[A-Za-z0-9+/]*={0,2}$/.test(image.data))) {
-    throw new ImageGenerationError(nano ? "Provide PNG, JPEG, or WebP reference images" : "Provide PNG or JPEG reference images", 400);
+    throw new ImageGenerationError(nano || gpt26 ? "Provide PNG, JPEG, or WebP reference images" : "Provide PNG or JPEG reference images", 400);
   }
   if (resources.reduce((bytes, image) => bytes + Buffer.byteLength(image.data, "base64"), 0) > IMAGE_INPUT_LIMIT_BYTES) throw new ImageGenerationError("Image references and mask exceed the local 32 MiB limit", 400);
   if (resources.some((image) => containsKnownSensitiveValue(Buffer.from(image.data, "base64").toString("utf8")))) throw new ImageGenerationError("Protected data cannot be included in image references or masks", 400);
   if (input.mask) {
     const mask = Buffer.from(input.mask.data, "base64"), first = Buffer.from(images[0]!.data, "base64");
+    if (gpt26 && (sniffImageType(first) !== "image/png" || mask.length >= 4 * 1024 * 1024)) throw new ImageGenerationError("Use a PNG first reference and a PNG mask smaller than 4 MiB", 400, false, true);
     const maskSize = imagePixelSize(mask), sourceSize = imagePixelSize(first);
     if (!maskSize || !sourceSize || sniffImageType(mask) !== "image/png" || ![4, 6].includes(mask[25]!)
       || maskSize.width !== sourceSize.width || maskSize.height !== sourceSize.height) throw new ImageGenerationError("The mask must be a PNG with an alpha channel and the same dimensions as the first reference", 400);
@@ -318,8 +386,20 @@ function legacyRatio(size?: ImageSize): string {
   return size === "1536x1024" ? "3:2" : size === "1024x1536" ? "2:3" : "1:1";
 }
 
-function verifiedImageType(bytes: Buffer): GeneratedImageMediaType {
+async function verifiedImageType(bytes: Buffer, expected?: ImageGenerationInput): Promise<GeneratedImageMediaType> {
   if (containsKnownSensitiveValue(bytes.toString("utf8"))) throw new ImageGenerationError("The image result contains protected data");
+  if (expected) {
+    const format = expected.outputFormat ?? "png";
+    try {
+      await validateGeneratedImage(bytes, format, format === "gif" ? {
+        frameCount: expected.frameCount ?? GPT_IMAGE_26_DEFAULTS.frameCount,
+        frameDurationMs: expected.frameDurationMs ?? GPT_IMAGE_26_DEFAULTS.frameDurationMs,
+      } : undefined);
+    } catch (error) {
+      throw new ImageGenerationError(error instanceof Error ? error.message : "Invalid generated image", 502, true);
+    }
+    return format === "svg" ? "image/svg+xml" : `image/${format}`;
+  }
   const type = sniffImageType(bytes);
   if (!type) throw new ImageGenerationError("The provider returned an unsupported image file");
   return type;
@@ -371,7 +451,15 @@ async function imageBytes(response: Response, signal?: AbortSignal): Promise<Buf
   } finally { signal?.removeEventListener("abort", abort); }
 }
 
-function openAIError(status: number, error?: { code?: unknown; message?: unknown }): ImageGenerationError {
+function openAIError(status: number, error?: { code?: unknown; message?: unknown }, request?: { model: string; svgAuthor?: string; format: string }): ImageGenerationError {
+  if (status === 403 && request) {
+    const selection = request.svgAuthor ? `${request.model} with SVG author ${request.svgAuthor}` : request.model;
+    return new ImageGenerationError(`Access denied for ${selection} (403). Check the configured model permissions.`, 403);
+  }
+  if (request && status === 401) return new ImageGenerationError("The image provider rejected the configured API key.", 401);
+  if (request && (status >= 500 || status === 408 || status === 499)) return new ImageGenerationError(`Image provider returned ${status}; the generation outcome is unknown. Review the original request before submitting again.`, 502, true);
+  if (request?.format === "gif" && status === 400 && typeof error?.message === "string" && /pixel|budget|sheet/i.test(error.message))
+    return new ImageGenerationError("The provider rejected this GIF's pixel budget. Choose a smaller frame size or fewer frames.", 400);
   if (status === 401 || status === 403) {
     return new ImageGenerationError("OpenAI API key was rejected", 503);
   }

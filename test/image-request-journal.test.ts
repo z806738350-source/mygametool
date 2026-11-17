@@ -145,6 +145,28 @@ describe("synchronous image recovery journal", () => {
     expect(request.mock.calls.filter(([, options]) => options?.method === "GET")).toHaveLength(2);
   });
 
+  it.each([403, 408, 502])("preserves the original HTTP %i outcome after reopen without a replacement POST", async status => {
+    const folder = await directory(), request = vi.fn<typeof fetch>(async () => new Response("upstream error", { status }));
+    const gen = new OpenAIImageGenerator("fixture-key", base, request);
+    const settings = { ...input, model: "gpt-image-2.6-flare", outputFormat: "svg" as const, svgModel: "gpt-6-sol" };
+    const run = async (recover = false) => gen.generate({ ...settings, execution: await imageRequestJournal(folder, "denied-0", recover) });
+    await expect(run()).rejects.toMatchObject({ outcomeUnknown: status !== 403, statusCode: status === 403 ? 403 : 502 });
+    await expect(run(true)).rejects.toMatchObject({ statusCode: 409 });
+    if (status === 403) await expect(stat(path.join(folder, "denied-0.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    else await expect(run()).rejects.toMatchObject({ outcomeUnknown: true });
+    expect(request).toHaveBeenCalledOnce();
+  });
+
+  it("admits only one caller from independent journal instances racing for a fresh slot", async () => {
+    const folder = await directory(), first = await imageRequestJournal(folder, "race");
+    vi.resetModules(); // A second module registry has its own in-process lock map.
+    const second = await (await import("../src/daemon/image-request-journal.js")).imageRequestJournal(folder, "race");
+    const create = vi.fn(async () => submitted);
+    const results = await Promise.allSettled([first.submitted("scope", input, create), second.submitted("scope", input, create)]);
+    expect(results.some(result => result.status === "fulfilled")).toBe(true);
+    expect(create).toHaveBeenCalledOnce();
+  });
+
   it("leaves an unknown submission blocked after a lost response, even after reopening", async () => {
     const folder = await directory();
     const request = vi.fn<typeof fetch>().mockRejectedValue(new Error("connection lost"));
@@ -172,6 +194,29 @@ describe("synchronous image recovery journal", () => {
     const result = await Promise.all([first.submitted("same-scope", input, create), second.submitted("same-scope", input, create)]);
     expect(result).toEqual([submitted, submitted]);
     expect(create).toHaveBeenCalledOnce();
+  });
+
+  it("recovers a GPT Image 2.6 inline original locally and rejects a replaced or linked sidecar", async () => {
+    const folder = await directory(), original = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M0 0h16v16z"/></svg>');
+    const request = vi.fn<typeof fetch>(async () => Response.json({ data: [{ b64_json: original.toString("base64") }] }, { headers: { "x-request-id": "svg-1" } }));
+    const generator = new OpenAIImageGenerator("fixture-key", base, request), settings = { ...input, model: "gpt-image-2.6-flare", outputFormat: "svg" as const };
+    const run = async (recover = false) => generator.generate({ ...settings, execution: await imageRequestJournal(folder, "vector-0", recover) });
+    await expect(run()).resolves.toMatchObject({ bytes: original, requestId: "svg-1" });
+    const file = path.join(folder, "vector-0.json.result");
+    expect((await stat(file)).mode & 0o777).toBe(0o600);
+    expect(await hasSavedImageResult(folder, "vector")).toBe(true);
+    await expect(run(true)).resolves.toMatchObject({ bytes: original, mediaType: "image/svg+xml", requestId: "svg-1" });
+    await writeFile(file, Buffer.alloc(original.length));
+    await expect(run(true)).rejects.toMatchObject({ statusCode: 409 });
+    await rm(file);
+    expect(await hasSavedImageResult(folder, "vector")).toBe(false);
+    await expect(run()).rejects.toMatchObject({ statusCode: 409 });
+    await symlink(path.join(folder, "vector-0.json"), file);
+    expect(await hasSavedImageResult(folder, "vector")).toBe(false);
+    await expect(run(true)).rejects.toMatchObject({ statusCode: 409 });
+    await rm(path.join(folder, "vector-0.json"));
+    await expect(run()).rejects.toMatchObject({ statusCode: 409, outcomeUnknown: true });
+    expect(request).toHaveBeenCalledOnce();
   });
 
   it("does not persist inline base64 and refuses crash-style replay", async () => {

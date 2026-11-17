@@ -1,3 +1,4 @@
+import { GPT_IMAGE_26_SCHEMA } from "../shared/gpt-image-26.js";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
@@ -131,10 +132,12 @@ export async function saveAgentCanvasMedia(
             "quality",
             "outputFormat",
             "outputCompression",
+            ...Object.keys(GPT_IMAGE_26_SCHEMA),
             "background",
           ]),
           ...(input.imageModel ? { model: input.imageModel } : {}),
           images: await images(),
+          ...(input.markupPath ? { markup: await reference({ path: input.markupPath as string }) } : {}),
           ...(input.maskPath
             ? { mask: await reference({ path: input.maskPath as string }) }
             : {}),

@@ -1,4 +1,5 @@
 import { open, stat, type FileHandle } from "node:fs/promises";
+import { GENERATED_SVG_MAX_BYTES, validateGeneratedSvg } from "./plugin-svg.js";
 
 export interface MediaDimensions { width: number; height: number }
 
@@ -31,6 +32,8 @@ async function parse(handle: FileHandle, size: number): Promise<MediaDimensions 
   if (ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP") return webp(head);
   if (head[0] === 0xff && head[1] === 0xd8) return jpeg(handle, size);
   if (["ftyp", "moov", "mdat", "free", "wide"].includes(ascii(4, 8))) return mp4(handle, size);
+  if (size <= GENERATED_SVG_MAX_BYTES && /^\s*</.test(head.toString("utf8")))
+    return validateGeneratedSvg(await read(handle, 0, size));
   return undefined;
 }
 

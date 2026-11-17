@@ -25,6 +25,7 @@ import { AutoContinueTools, type RecoverableTool } from "../src/daemon/agent-aut
 import { getToolPreflightFailure } from "../src/daemon/agent-tool-errors.js";
 import { closeRuntimeMediaSnapshots, projectFiles, type RuntimeMedia } from "../src/daemon/isolated-project-files.js";
 import { ImageGenerationError, type ImageGenerator } from "../src/daemon/openai-image.js";
+import { validateGeneratedImage } from "../src/daemon/generated-image-format.js";
 import { SessionManager, type ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { createCanvasDocument, canvasDocumentPath, mergeCanvasDocumentContent } from "../src/shared/canvas-document.js";
 import { createAssetGenerationNode } from "../src/shared/asset-canvas.js";
@@ -83,6 +84,60 @@ async function sparseMedia(filename: string, size: number) {
   finally { await file.close(); }
 }
 describe("Canvas runtime copy admission", () => {
+  it.each(["svg", "gif"] as const)("preserves a generated %s through Agent delivery, Canvas, game use and download after reopen", async format => {
+    const mediaType = format === "svg" ? "image/svg+xml" : "image/gif";
+    const bytes = format === "svg"
+      ? Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 32"><text x="1" y="16" font-size="12">Game</text></svg>')
+      : await sharp(Buffer.from([255, 0, 0, 255, 0, 0, 255, 255]), { raw: { width: 1, height: 2, channels: 4, pageHeight: 1 } }).gif({ delay: [240, 240], loop: 0 }).toBuffer();
+    const model = { id: "gpt-image-2.6-flare", provider: "kunpo" };
+    const parameters: Record<string, string | number | boolean> = { output_format: format, complexity: "high", markedUp: false,
+      ...(format === "svg" ? { svgModel: "gpt-6-sol", svgReasoningEffort: "low" } : { frame_count: 2, frame_duration_ms: 237 }) };
+    const generate = vi.fn<ImageGenerator["generate"]>().mockResolvedValue({ bytes, mediaType, generation: { model: model.id, protocol: "openai-images", parameters } });
+    const { directory, project, projects, tools, store, library } = await runtime({ generate });
+    const input = { imageModel: model, prompt: "Game art", outputFormat: format, ...(format === "gif" ? { frameCount: 2, frameDurationMs: 237 } : {}) };
+    await validateGeneratedImage(bytes, format, input);
+    if (format === "gif") {
+      await expect(validateGeneratedImage(bytes, format, { frameCount: 3 })).rejects.toThrow("frame count");
+      await expect(validateGeneratedImage(bytes, format, { frameDurationMs: 120 })).rejects.toThrow("frame times");
+    }
+    const direct = createAgentTools(project, tools, projects).find(tool => tool.name === "generate_image")!;
+    const delivered = await direct.execute("local", input, undefined, undefined, {} as never);
+    const artifact = (delivered.details as { artifact: { path: string; mediaType: string } }).artifact;
+    expect(artifact.path).toMatch(new RegExp(`\\.${format}$`));
+    expect(artifact.mediaType).toBe(mediaType);
+    expect(await readFile(path.join(project.workspacePath, artifact.path))).toEqual(bytes);
+    const canvasTool = createAgentTools(project, tools, projects, undefined, undefined, store, "canvas").find(tool => tool.name === "generate_image")!;
+    const result = await canvasTool.execute("canvas", input, undefined, undefined, {} as never);
+    const job = (result.details as { canvasGeneration: { run: ToolRun } }).canvasGeneration;
+    const file = job.run.files[0]!;
+    expect(file).toMatchObject({ name: `output.${format}`, mediaType });
+    const asset = (await readCanvasAssets(project.workspacePath)).assets[file.assetId!]!;
+    expect(asset.canvasOnly).toBe(true);
+    expect(await readFile(path.join(project.workspacePath, asset.path))).toEqual(bytes);
+    const dest = `public/game-art.${format}`;
+    await projects.useCanvasAsset(project.id, file.assetId!, dest);
+    expect(await readFile(path.join(project.workspacePath, dest))).toEqual(bytes);
+    const media: RuntimeMedia[] = [];
+    const source = await projectFiles(project.workspacePath, media);
+    const transferred = [...source, ...media].map(item => item.path);
+    expect(transferred).not.toContain(asset.path); expect(transferred).toContain(dest);
+    if (format === "svg") {
+      await writeFile(path.join(project.workspacePath, asset.path), '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><script/></svg>');
+      await expect(projects.useCanvasAsset(project.id, file.assetId!, "public/changed.svg")).rejects.toThrow("verified self-contained static SVG");
+      await expect(lstat(path.join(project.workspacePath, "public/changed.svg"))).rejects.toMatchObject({ code: "ENOENT" });
+    }
+    await store.close(); await tools.close(); await library.close();
+    const app = createApp({ dataDirectory: directory, imageGenerator: { generate } }); apps.push(app);
+    const download = await app.inject({ url: `/library/assets/${file.assetId}/content` });
+    expect(download.statusCode).toBe(200); expect(download.headers["content-type"]).toContain(mediaType);
+    if (format === "svg") expect(download.headers["content-security-policy"]).toContain("sandbox");
+    expect(download.rawPayload).toEqual(bytes);
+    const reopened = new AssetLibrary(directory); await reopened.load();
+    try { expect(reopened.get(file.assetId!)).toMatchObject({ name: file.name, generation: { parameters }, ...(format === "svg" ? { width: 64, height: 32 } : { width: 1, height: 1 }) }); }
+    finally { await reopened.close(); }
+    expect(generate).toHaveBeenCalledTimes(2);
+  });
+
   it("rejects media above 32 MiB before allocating a copy or touching project metadata", async () => {
     const { projects, project, source } = await canvasCopyFixture();
     await sparseMedia(source, 32 * 1024 * 1024 + 1);

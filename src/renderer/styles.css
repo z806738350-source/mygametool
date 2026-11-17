@@ -9140,6 +9140,20 @@ button {
   opacity: 0.45;
 }
 
+.story-image-options {
+  flex-basis: 100%;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.story-image-options summary { cursor: pointer; }
+.story-image-options[open] > div { margin-top: 8px; }
+.story-image-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+  gap: 6px;
+}
+.story-image-fields input[aria-invalid="true"] { border-color: var(--danger); }
+
 .story-inspector-field > span {
   color: var(--text-muted);
   font-size: 10px;

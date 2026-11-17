@@ -6,6 +6,7 @@ import { Readable } from "node:stream";
 import type { GenerationProvenance, LibraryAsset, LibraryAssetDerivation, LibraryAssetOrigin, LibraryAssetPurpose } from "../shared/contracts.js";
 import { containsKnownSensitiveValue, knownSensitiveValueOverlap } from "../shared/sensitive-values.js";
 import { isPrivateProjectPath } from "../shared/private-project-paths.js";
+import { GPT_IMAGE_COMPLEXITIES, GPT_IMAGE_FORMATS, GPT_IMAGE_SVG_EFFORTS, GPT_IMAGE_SVG_MODELS } from "../shared/gpt-image-26.js";
 import { workspaceMediaInfo } from "./workspace.js";
 import { readMediaDimensions } from "./media-dimensions.js";
 import { ProviderImageSourceStore } from "./provider-image-source.js";
@@ -625,7 +626,8 @@ function isLibraryAsset(value: unknown): value is LibraryAsset {
 
 const PUBLIC_STRING_VALUES: Record<string, readonly string[]> = {
   quality: ["auto", "low", "medium", "high", "xhigh", "max"], background: ["auto", "opaque", "transparent"],
-  output_format: ["png", "jpeg", "mp4", "mov", "mp3", "wav", "pcm", "ogg_opus"], outputFormat: ["png", "jpeg", "mp4", "mov"],
+  output_format: [...GPT_IMAGE_FORMATS, "mp4", "mov", "mp3", "wav", "pcm", "ogg_opus"], outputFormat: [...GPT_IMAGE_FORMATS, "mp4", "mov"],
+  complexity: GPT_IMAGE_COMPLEXITIES, svgModel: GPT_IMAGE_SVG_MODELS, svgReasoningEffort: GPT_IMAGE_SVG_EFFORTS,
   response_format: ["url", "b64_json", "mp3", "wav", "pcm", "ogg_opus"], format: ["png", "jpeg", "mp3", "wav", "pcm", "ogg_opus", "mp4", "mov", "glb", "fbx"],
   imageSize: ["1K", "2K", "4K"], referenceMode: ["frame", "reference"], operation: ["speech", "dialogue", "sound-effect", "music", "image", "text", "remesh", "retexture", "animate"],
   thinkingLevel: ["minimal", "low", "medium", "high", "xhigh", "max"],
@@ -633,11 +635,11 @@ const PUBLIC_STRING_VALUES: Record<string, readonly string[]> = {
   rig_type: ["biped", "quadruped", "hexapod", "octopod", "avian", "serpentine", "aquatic", "others"],
   spec: ["tripo", "mixamo", "actorcore", "unity", "unreal", "vrm"], out_format: ["glb", "fbx"],
 };
-const PUBLIC_NUMBER_KEYS = new Set(["n", "referenceCount", "referenceUrlCount", "referenceLocalCount", "referenceRequestBytes", "referenceOriginalRequestBytes", "referencePreparationVersion", "referenceBudgetBytes", "referenceBudgetPasses", "referenceBudgetConverted", "referenceBudgetResized", "referenceBudgetQuality", "referenceBudgetMaxEdge", "referenceJpegConverted", "referenceJpegSkipped", "referenceJpegTransparent", "referenceJpegLimited", "referenceJpegResized", "referenceJpegOriented", "referenceJpegQuality", "referenceJpegMaxEdge", "referencePngOptimized", "referencePngUnchanged", "referencePngUnsupported", "referencePngInvalid", "referencePngLimited", "referencePngBytesOriginal", "referencePngBytesSent", "output_compression", "duration", "seconds", "sample_rate", "sampleRate", "speech_rate", "speechRate", "requested_duration_seconds", "face_limit", "seed"]);
-const PUBLIC_BOOLEAN_KEYS = new Set(["stream", "masked", "generateAudio", "generate_audio", "watermark", "quad", "smart_uv", "bake", "texture", "pbr", "animate_in_place", "export_with_geometry", "voiceDesign"]);
+const PUBLIC_NUMBER_KEYS = new Set(["frame_count", "frame_duration_ms", "n", "referenceCount", "referenceUrlCount", "referenceLocalCount", "referenceRequestBytes", "referenceOriginalRequestBytes", "referencePreparationVersion", "referenceBudgetBytes", "referenceBudgetPasses", "referenceBudgetConverted", "referenceBudgetResized", "referenceBudgetQuality", "referenceBudgetMaxEdge", "referenceJpegConverted", "referenceJpegSkipped", "referenceJpegTransparent", "referenceJpegLimited", "referenceJpegResized", "referenceJpegOriented", "referenceJpegQuality", "referenceJpegMaxEdge", "referencePngOptimized", "referencePngUnchanged", "referencePngUnsupported", "referencePngInvalid", "referencePngLimited", "referencePngBytesOriginal", "referencePngBytesSent", "output_compression", "duration", "seconds", "sample_rate", "sampleRate", "speech_rate", "speechRate", "requested_duration_seconds", "face_limit", "seed"]);
+const PUBLIC_BOOLEAN_KEYS = new Set(["markedUp", "stream", "masked", "generateAudio", "generate_audio", "watermark", "quad", "smart_uv", "bake", "texture", "pbr", "animate_in_place", "export_with_geometry", "voiceDesign"]);
 const PUBLIC_STRING_PATTERNS: Record<string, RegExp> = {
   referenceAssetId: /^[A-Za-z0-9_-]{1,120}$/, referenceSha256: /^[a-f0-9]{64}$/,
-  size: /^(?:\d{1,5}x\d{1,5}|\d{1,2}:\d{1,2})$/, aspectRatio: /^(?:adaptive|\d{1,2}:\d{1,2})$/, ratio: /^(?:adaptive|\d{1,2}:\d{1,2})$/,
+  size: /^(?:auto|\d{1,5}x\d{1,5}|\d{1,2}:\d{1,2})$/, aspectRatio: /^(?:adaptive|\d{1,2}:\d{1,2})$/, ratio: /^(?:adaptive|\d{1,2}:\d{1,2})$/,
   resolution: /^(?:480[pP]|720[pP]|768[pP]|1080[pP]|[124]K)$/,
   speaker: /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/,
   texture_version: /^v\d\.\d-\d{8}$/,

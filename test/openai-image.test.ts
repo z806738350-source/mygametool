@@ -1,3 +1,4 @@
+import sharp from "sharp";
 import { describe, expect, it, vi } from "vitest";
 import { ImageGenerationError, OpenAIImageGenerator } from "./local-secure-provider-fixtures.js";
 import { OpenAIImageGenerator as DirectImageGenerator, IMAGE_REQUEST_TIMEOUT_MS } from "../src/daemon/openai-image.js";
@@ -6,6 +7,80 @@ import { rememberKunpoImageSource, copyProviderImageSource } from "../src/daemon
 vi.mock("node:dns/promises", async original => ({ ...await original<typeof import("node:dns/promises")>(), lookup: vi.fn(async () => [{ address: "8.8.8.8", family: 4 }]) }));
 
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==", "base64");
+
+describe("GPT Image 2.6 via Images API", () => {
+  const baseUrl = "http://127.0.0.1:43199/v1";
+  const models = ["gpt-image-2.6-sunburst", "gpt-image-2.6-flare"];
+  const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M0 0h16v16z"/></svg>');
+  const gif = Buffer.from("R0lGODlhAQABAIAAAExpcf8AACH/C05FVFNDQVBFMi4wAwEAAAAh+QQFGAAAACwAAAAAAQABAAACAkwBACH5BAUYAAAALAAAAAABAAEAgExpcQAA/wICTAEAOw==", "base64");
+  const bitmap = () => sharp({ create: { width: 16, height: 16, channels: 4, background: { r: 2, g: 4, b: 8, alpha: 0.5 } } });
+
+  it.each(models)("sends the format-specific fields for %s and preserves original bytes", async model => {
+    for (const format of ["png", "jpeg", "webp", "svg", "gif"] as const) {
+      const bytes = format === "svg" ? svg : format === "gif" ? gif : await bitmap().toFormat(format).toBuffer();
+      const request = vi.fn<typeof fetch>(async () => Response.json({ data: [{ b64_json: bytes.toString("base64") }] }));
+      const generator = new DirectImageGenerator("fixture-key", baseUrl, request);
+      const options = format === "gif" ? { frameCount: 2, frameDurationMs: 237 } : format === "jpeg" || format === "webp" ? { outputCompression: 0 } : {};
+      const background = ["png", "svg", "webp"].includes(format) ? "transparent" : "auto";
+      const result = await generator.generate({ imageModel: { provider: "kunpo", id: model }, model, prompt: "Icon", outputFormat: format, background, ...options });
+      expect(result.bytes).toEqual(bytes);
+      expect(result.mediaType).toBe(format === "svg" ? "image/svg+xml" : `image/${format}`);
+      expect(request).toHaveBeenCalledOnce();
+      expect(request.mock.calls[0]![0]).toBe(`${baseUrl}/images/generations`);
+      expect(JSON.parse(String(request.mock.calls[0]![1]?.body))).toEqual({
+        model, prompt: "Icon", output_format: format, size: format === "gif" ? "512x512" : "1024x1024", background, quality: "auto", n: 1,
+        complexity: "high", response_format: "url",
+        ...(format === "svg" ? { svg: { model: "gpt-6-sol", reasoning: { effort: "low" } } } : {}),
+        ...(format === "jpeg" || format === "webp" ? { output_compression: 0 } : {}),
+        ...(format === "gif" ? { frame_count: 2, frame_duration_ms: 237 } : {}),
+      });
+    }
+  });
+
+  it("sends ordered reference objects and separate transparent markup in JSON edits", async () => {
+    const img = { mediaType: "image/webp" as const, data: (await bitmap().webp().toBuffer()).toString("base64") };
+    const mark = { mediaType: "image/png" as const, data: (await bitmap().png().toBuffer()).toString("base64") };
+    const request = vi.fn<typeof fetch>(async () => Response.json({ data: [{ b64_json: mark.data }] }));
+    const result = await new DirectImageGenerator("fixture-key", baseUrl, request).generate({ model: models[0], prompt: "Move the icon", images: [img, mark], markup: mark, complexity: "medium", pixelSize: "4096x4096" });
+    expect(request.mock.calls[0]![0]).toBe(`${baseUrl}/images/edits`);
+    const payload = JSON.parse(String(request.mock.calls[0]![1]?.body));
+    expect(payload).toMatchObject({ size: "4096x4096", complexity: "medium", images: [img, mark].map(im => ({ image_url: `data:${im.mediaType};base64,${im.data}` })), markup: { image_url: `data:image/png;base64,${mark.data}` } });
+    expect(payload).not.toHaveProperty("response_format");
+    expect(result.generation?.parameters).toMatchObject({ markedUp: true, masked: false, referenceCount: 2 });
+  });
+
+  it("downloads the original from a URL and checks requested format against its bytes", async () => {
+    const request = vi.fn<typeof fetch>(async (_url, options) => options?.method === "POST"
+      ? Response.json({ data: [{ url: `${baseUrl}/files/result` }] }) : new Response(gif, { headers: { "content-type": "image/png" } }));
+    const generator = new DirectImageGenerator("fixture-key", baseUrl, request);
+    const options = { model: models[0], prompt: "Sprite", aspectRatio: "16:9" as const, outputFormat: "gif" as const, frameCount: 2, frameDurationMs: 240 };
+    await expect(generator.generate(options)).resolves.toMatchObject({ bytes: gif, mediaType: "image/gif" });
+    expect(JSON.parse(String(request.mock.calls[0]![1]?.body)).size).toBe("768x432");
+    await expect(generator.generate({ model: models[1], prompt: "Icon", outputFormat: "svg" })).rejects.toMatchObject({ outcomeUnknown: true });
+    expect(request.mock.calls.map(([, options]) => options?.method)).toEqual(["POST", "GET", "POST", "GET"]);
+    expect(new Headers(request.mock.calls[1]?.[1]?.headers).has("authorization")).toBe(false);
+  });
+
+  it("rejects malformed references and markup before dispatch", async () => {
+    const ref = { mediaType: "image/png" as const, data: (await bitmap().png().toBuffer()).toString("base64") };
+    const opaque = { ...ref, data: (await bitmap().flatten().png().toBuffer()).toString("base64") };
+    const small = { ...ref, data: (await bitmap().resize(8, 8).png().toBuffer()).toString("base64") };
+    const request = vi.fn<typeof fetch>(), generator = new DirectImageGenerator("fixture-key", baseUrl, request);
+    for (const opts of [{ images: [{ ...ref, data: "dGVzdA==" }] }, { images: [ref], markup: opaque }, { images: [ref], markup: small },
+      { images: [ref], outputFormat: "svg" as const }, { images: [ref], markup: ref, mask: ref }, { outputFormat: "gif" as const, background: "transparent" as const }])
+      await expect(generator.generate({ model: models[0], prompt: "Icon", ...opts })).rejects.toMatchObject({ statusCode: 400 });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("identifies a denied SVG author and an uncertain server response without a second submission", async () => {
+    const request = vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json({ error: { message: "no access" } }, { status: 403 })).mockResolvedValueOnce(Response.json({}, { status: 502 }));
+    const generator = new DirectImageGenerator("fixture-key", baseUrl, request);
+    const opts = { model: models[0], prompt: "Icon", outputFormat: "svg" as const, svgModel: "gpt-6.1-sol", svgReasoningEffort: "xhigh" as const };
+    await expect(generator.generate(opts)).rejects.toMatchObject({ statusCode: 403, message: expect.stringContaining("gpt-6.1-sol") });
+    await expect(generator.generate(opts)).rejects.toMatchObject({ statusCode: 502, outcomeUnknown: true });
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+});
 
 describe("OpenAI image generator", () => {
   it.each([false, true])("keeps mask=%s semantics while selecting known reference URLs only for supported JSON edits", async masked => {

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { ImageModel, VideoModel, Model3DModel } from "../src/shared/contracts.js";
 import type { AudioModel } from "../src/shared/audio.js";
 import { applyRememberedSettings, canvasNodeTypeAvailable, compatibleImageSettings, compatibleVideoDraft, nodeGenerationSettings, tripoRigTypes } from "../src/renderer/asset-canvas-workspace.js";
+import { imageModelsForProvider } from "../src/daemon/image-models.js";
 import { kunpoVideoModels, seedanceModel } from "../src/daemon/seedance-models.js";
 import { videoReferenceAspectRatios } from "../src/shared/video-references.js";
 
@@ -173,6 +174,20 @@ describe("Asset Canvas remembered settings", () => {
     const selected = { provider: "volcengine-tts", id: "seed-audio-1.0" };
     expect(applyRememberedSettings(speech, undefined, { ...catalogs, modelSelections: { speech: selected } }).data.audioModel).toEqual(selected);
     expect(applyRememberedSettings(music, undefined, { ...catalogs, audioModels: [{ ...selected, capabilities: { operations: ["music"] } } as AudioModel] }).data.audioModel).toBeUndefined();
+  });
+
+  it("inherits supported 2.6 settings and clears SVG author settings when switching to 2.5", () => {
+    const [modern] = imageModelsForProvider("openai", "Kunpo", ["gpt-image-2.6-flare"]);
+    const [older] = imageModelsForProvider("openai", "Kunpo", ["gpt-image-2.5-flare"]);
+    const base: FlowNode = { id: "image", type: "image", position: { x: 0, y: 0 }, data: { prompt: "" } };
+    const saved = { model: modern!, resolution: "2K", aspectRatio: "3:2", outputFormat: "svg", background: "transparent", quality: "high", complexity: "low",
+      svgModel: "gpt-6.1-sol", svgReasoningEffort: "xhigh", pixelSize: "768x512" } as const;
+    const remembered = nodeGenerationSettings({ type: "image", data: saved });
+    expect(applyRememberedSettings(base, remembered, { ...catalogs, imageModels: [modern!] }).data).toMatchObject({ ...saved, model: { id: modern!.id } });
+    expect(applyRememberedSettings(base, remembered, { ...catalogs, imageModels: [modern!, older!], defaultImageModel: older }).data).toMatchObject({
+      model: { id: older!.id }, resolution: "2K", aspectRatio: "3:2", quality: "high", background: "transparent", outputFormat: "png",
+      complexity: undefined, svgModel: undefined, svgReasoningEffort: undefined, pixelSize: undefined,
+    });
   });
 
   it("clears mask and alpha-only settings when switching to a model that cannot honor them", () => {

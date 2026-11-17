@@ -30,6 +30,15 @@ function remapReferences(node: AssetCanvasNode, ids: ReadonlyMap<string, string>
   }
   const reference = (value: AssetCanvasReference): AssetCanvasReference[] => value.type === "library" ? [value] : ids.has(value.nodeId) ? [{ ...value, nodeId: ids.get(value.nodeId)! }] : [];
   if (node.type === "image" || node.type === "model-3d") node.data.images = node.data.images.flatMap(reference);
+  if (node.type === "image") {
+    for (const key of ["mask", "markup"] as const) {
+      const current = node.data[key];
+      if (!current) continue;
+      const mapped = reference(current)[0];
+      if (mapped) node.data[key] = mapped;
+      else delete node.data[key];
+    }
+  }
   if ((node.type === "text" || node.type === "document") && node.data.references) {
     node.data.references = node.data.references.flatMap((value) => ids.has(value.nodeId) ? [{ type: "node" as const, nodeId: ids.get(value.nodeId)! }] : []);
   }

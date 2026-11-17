@@ -1,3 +1,4 @@
+import { type GptImage26Options, type GPT_IMAGE_FORMATS } from "./gpt-image-26.js";
 import type { ProjectPreviewSettings } from "./preview-settings.js";
 import type { PublishCommunityGame, PublishDeployment } from "./publish-v1.js";
 import type { WebSearchToolMetadata } from "./web-search.js";
@@ -370,6 +371,8 @@ export interface ImageModel extends ImageModelRef {
   outputFormats?: readonly NonNullable<ImageGenerationSettings["outputFormat"]>[];
   supportsTransparency?: boolean;
   supportsMask?: boolean;
+  supportsMarkup?: boolean;
+  complexities?: readonly NonNullable<GptImage26Options["complexity"]>[];
 }
 
 export type ImageProtocol = "openai-images" | "gemini-generate-content" | "openrouter-images" | "volcengine-images";
@@ -526,7 +529,7 @@ export type AssetCanvasNode = (
     reasoningLevel?: AgentReasoningLevel;
     references?: AssetCanvasTextReference[];
   } }
-  | { id: string; type: "image"; position: AssetCanvasPosition; data: {
+  | { id: string; type: "image"; position: AssetCanvasPosition; data: GptImage26Options & {
     prompt: string;
     promptSource?: AssetCanvasTextReference;
     model?: ImageModelRef;
@@ -537,6 +540,7 @@ export type AssetCanvasNode = (
     outputCompression?: ImageGenerationSettings["outputCompression"];
     background?: ImageGenerationSettings["background"];
     mask?: AssetCanvasReference;
+    markup?: AssetCanvasReference;
     images: AssetCanvasReference[];
     assetId?: string;
   } }
@@ -1222,12 +1226,13 @@ interface RunConfiguredImageToolRequest {
   images?: PromptImage[];
 }
 
-export interface ImageGenerationSettings {
+export interface ImageGenerationSettings extends GptImage26Options {
   quality?: "auto" | "low" | "medium" | "high" | "xhigh" | "max";
-  outputFormat?: "png" | "jpeg";
+  outputFormat?: typeof GPT_IMAGE_FORMATS[number];
   outputCompression?: number;
   background?: "auto" | "opaque" | "transparent";
   mask?: PromptImage;
+  markup?: PromptImage;
 }
 export type RunImageToolRequest = (RunSizedImageToolRequest | RunConfiguredImageToolRequest) & ImageGenerationSettings;
 

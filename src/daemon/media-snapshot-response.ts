@@ -60,6 +60,8 @@ export function mediaSnapshotResponse(
     "content-length": String(snapshot.size),
     etag,
   };
+  if (options.contentType.split(";", 1)[0] === "image/svg+xml")
+    headers["content-security-policy"] = "sandbox; default-src 'none'; style-src 'unsafe-inline'";
   if (options.method === "HEAD") return { status: 200, headers };
   const range =
     options.ifRange === undefined || options.ifRange.trim() === etag
