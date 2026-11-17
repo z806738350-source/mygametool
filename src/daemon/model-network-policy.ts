@@ -4,6 +4,7 @@ import { guardedProviderFetch, providerControlUrl } from "./provider-network.js"
 import { kunpoReferenceImageUrls } from "./provider-image-source.js";
 import type { AssetLibrary } from "./asset-library.js";
 import { isMeshyModelReference, MESHY_DISABLED_MESSAGE } from "../shared/disabled-media-providers.js";
+import { isRemovedKunpoAgent } from "../shared/kunpo-models.js";
 
 const GUARDED_MODEL_APIS = new Set(["openai-completions", "openai-responses", "anthropic-messages"]);
 
@@ -19,6 +20,7 @@ export function assertModelImageInput(model: Pick<RuntimeModel, "input">, contex
 type TransportModel = Pick<RuntimeModel, "api" | "baseUrl"> & Partial<Pick<RuntimeModel, "provider" | "id">>;
 export function assertLocalModelTransport(model: TransportModel): void {
   if (isMeshyModelReference(model)) throw new Error(MESHY_DISABLED_MESSAGE);
+  if (model.provider && model.id && isRemovedKunpoAgent({ provider: model.provider, id: model.id })) throw new Error("This Kunpo Agent model is no longer available. Choose another model.");
   if (!GUARDED_MODEL_APIS.has(model.api)) throw new Error("This model protocol is unavailable until its network transport is isolated.");
   providerControlUrl(model.baseUrl, true);
 }

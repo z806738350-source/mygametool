@@ -22,10 +22,10 @@
 | 功能 | 本地版范围 |
 | --- | --- |
 | 项目、代码、画布、素材、故事 | 本地保存与导入导出；秘密文件、链接越界及已登记 Key 内容拒绝交付 |
-| Agent | Kunpo Chat / Messages / Responses 的已适配候选；实际质量与账号权限未实测 |
+| Agent | GPT-5.6 Sol、Claude Opus 5.5、Claude Fable 5.2；Fable 仅支持文字对话 |
 | 文件工具 | 受保护的 read/write/edit/搜索；不允许读取凭据与私有目录 |
 | Shell、依赖、动态构建与预览 | 仅专用 VM 工作副本；离线任务、硬配额、回传检查及并发冲突拒绝；不等于开放宿主 Shell |
-| Web 自动试玩 | Electron 的 click/key/touch/screenshot 工具；GPT-6.1 仍是文字工具模型，拒绝图片/截图会话 |
+| Web 自动试玩 | Electron 的 click/key/touch/screenshot 工具；Fable 仅支持文字对话，使用自动试玩时选择 GPT-5.6 Sol 或 Opus 5.5 |
 | 原生引擎、外部 CLI/MCP/插件 | 框架保留，通用安装/执行仍关闭；不宣称已恢复 |
 | 登录、作者 Cloud/Community、发布、遥测、自动更新 | 本地版退役，不能通过环境变量重新开启 |
 | 音乐、严格配音、部分视频操作 | 完整 BGM 无已确认默认；SeedAudio 严格朗读/音色需人工验证，无字幕承诺；未接入编辑/延长不提供入口 |
@@ -135,7 +135,7 @@ Code 面板目前是代码查看器；手工改代码可使用现有“外部编
 5. 展开聊天里的工具记录，确认发生了文件写入/读取，而不只是口头说完成。右侧「代码 / Code」页签中找到该文件，确认内容；代码页是查看器，不要求在这里直接改字。
 6. 回首页再打开，确认文件仍在。模型每次继续思考和工具续接可能产生多次上游请求，一条聊天消息不一定只计费一次。
 
-**可选视觉测试，另有费用**：仍用 `gpt-5.6-sol`，通过聊天框的「＋」→「添加文件」，只选第 4 项生成的非私密小图，输入 `Describe this image in one sentence. Do not use tools.`（只描述图片，不用工具）。确认回答符合图片。真实 Kunpo 视觉效果仍待验证；`gpt-6.1-sol` 当前明确不接收图片/截图，应显示限制，不能用它测 game_use。包含历史图片的会话切到文字模型也可能被拒绝，可换回视觉型号或开纯文字新会话。
+**可选视觉测试，另有费用**：仍用 `gpt-5.6-sol`，通过聊天框的「＋」→「添加文件」，只选第 4 项生成的非私密小图，输入 `Describe this image in one sentence. Do not use tools.`（只描述图片，不用工具）。确认回答符合图片。真实 Kunpo 视觉效果仍待验证；`claude-fable-5-2` 当前仅支持文字，应显示限制，不能用它测 game_use。包含历史图片的会话切到文字模型也可能被拒绝，可换回视觉型号或开纯文字新会话。
 
 **失败时**：401/403、余额/配额或型号权限错误先记原提示；退出后由你检查配置与 Kunpo 账号，不贴出 Key。超时/中断的消息可能已计费，手动重发是新请求。文件越界/凭据文件被拒绝是预期保护，不要要求绕过。一次失败就暂停该分项，不反复换模型试费。
 
@@ -251,7 +251,7 @@ In this new test project only, prepare a web game with no external dependencies.
 
 **8C Agent 自动试玩，另有模型费用**：
 
-1. 选支持视觉的 `gpt-5.6-sol`，确认预览已能手动打开。不要用当前只接文字的 `gpt-6.1-sol`。
+1. 选支持视觉的 `gpt-5.6-sol`，确认预览已能手动打开。仅文字的 Fable 可用于单独的文字聊天检查。
 2. 预览工具栏有悬停为「Agent 试玩时显示窗口」的按钮，开启以便观察。它只控制观看已有会话，不会自己启动 Agent。
    开启后提示变为「隐藏 Agent 试玩窗口」；完整退出再启动后默认为关闭，Agent 试玩窗红叉也会关闭显示开关。工具截图可以在窗口隐藏时成功，不能据截图认定桌面上显示过窗口。观察时录制整个桌面并留意其他窗口/桌面；主预览与 Agent 是独立页面，主预览计数不必跟随 Agent。未实际看到独立窗口时，将「窗口显示」单列为未确认。
 3. 使用现成 CU 项目时先发：`Use game_use to open this test game, click the counter button once, capture a screenshot, report the count actually visible, then close the playtest session. Do not modify source files, generate media, or call other external services.`（打开、点击、截图核对、关闭，不改文件。）

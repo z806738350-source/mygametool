@@ -26,7 +26,7 @@ Agent 的直接生成工具会在可恢复的失败中给出原调用编号。�
 
 | 角色 | 新项目首选 | 已提供适配的其他选择 | 当前边界 |
 | --- | --- | --- | --- |
-| Agent | `gpt-5.6-sol` | `claude-opus-5-5`、`gpt-6.1-sol` | 分别为 Chat、Messages、Responses；6.1 模型支持视觉，此 Kunpo 连接的图片协议待确认，暂未启用，详见下文 |
+| Agent | `gpt-5.6-sol` | `claude-opus-5-5`、`claude-fable-5-2` | GPT 与 Opus 可使用项目工具。Fable 通过 Messages 提供流式文字对话 |
 | 图片 | `gpt-image-2.5-sunburst` | `gpt-image-2.5-flare`、`gpt-image-2.6-sunburst`、`gpt-image-2.6-flare`、`Image-GI2.1` | 2.6 支持静态图片、文字生成 SVG、GIF 动画以及标注编辑 |
 | 视频 | `doubao-seedance-2-5-260628` | `tencent-vod-vs-2.5`、`minimax-video-h3` | Native Seedance 与 Videos API 分开建任务/续查/下载 |
 | 音效 | `seed-audio-1.0` | `seed-audio-1.0-multilingual` | 同步二进制 MP3/WAV，非流式；时长提示不是精确保证 |
@@ -37,7 +37,9 @@ Agent 的直接生成工具会在可恢复的失败中给出原调用编号。�
 | 3D 绑骨 | `v3.0-20260909` | `v2.5-20260210` | 非人形按兼容版本；内置 retarget 用 tripo spec，最多 5 个动作 |
 | 3D 重贴图 | `v3.5-20260815` | `v3.0-20250812`、`v2.5-20250123` | 可选工序；已有贴图合适时无需再次调用 |
 
-`gemini-3.8-flash`、`claude-sonnet-5-5`、`kimi-k3.1-pro` 保留为待接入列表项，界面禁用，后端执行拒绝；历史选择显示原值，不悄悄替换。所有已适配型号均标记“未实测”，不能把目录列表当作真实调用成功。
+Fable 5.2 可在「默认模型 → Agent」和聊天模型菜单中选择。Kunpo 为该型号开放了文本输入和流式文本输出。要在已有工具调用或图片的对话中继续工作，可选 GPT-5.6 Sol 或 Opus 5.5；要使用 Fable，可新建文字对话。[Kunpo Fable 5.2 型号说明](https://docs.ziy.cc/api-reference/claude-fable-52/)
+
+早期项目或对话保存的已下架型号仍可查看，继续发送前需选择当前可用的 Agent。
 
 ### GPT Image 2.6 图片与动画
 
@@ -49,14 +51,6 @@ Agent 的直接生成工具会在可恢复的失败中给出原调用编号。�
 - SVG 和 GIF 原件按原格式保存。生成中断后，使用原任务的恢复入口可取回已保留的结果。服务商未返回可恢复结果时，需要用户决定是否重新生成。
 
 ## 本批行为与限制
-
-### 2026-11-08 GPT-6.1 Sol 图片能力与连接策略
-
-[OpenAI 官方模型页](https://developers.openai.com/api/docs/models/gpt-6.1-sol)明确列出 `gpt-6.1-sol` 支持图片输入，工具调用使用 Responses。此前本地把“尚未确认 Kunpo 路由图片协议”写成 `capabilities.images: false`，这个标记不能作为模型不支持图片的证据。现已把模型能力标为支持图片，并单独记录 `imageInputStatus: unverified`。
-
-本工具的实际路由是 `POST https://llm.ziy.cc/v1/responses`，不是 OpenAI 原厂端点，也不是 Chat Completions。[Kunpo 模型专页](https://docs.ziy.cc/api-reference/gpt-6-1-sol/)当前给出文本、SSE 和函数工具续接示例，未给出此路由的图片输入或带图片工具结果契约；不能从文档未举例推断不支持，也不能把原厂能力当作网关实测。当前 `supportsImages: false` 仅表示这条配置连接未启用图片，保留用户已有配置，不自动放开或覆盖。模型菜单使用实际连接能力，已有图片的会话或草稿会在切换前提示；服务端在保存模型选择前再次检查当前上下文，拒绝时不更改原选择或发出模型请求。
-
-无付费模拟测试覆盖标准 Responses 的用户 `input_image`、工具 `function_call_output.output` 内的 `input_text`/`input_image` 数组及 Base64 data URL，并确认图片没有退化为文字占位符。这验证本地 SDK 的构造能力，不验证 Kunpo 接受、底层路由或识图质量。进一步启用需要网关的明确协议证据或另行授权的真实验收；本批不调用模型或产生费用。
 
 ### 2026-10-31 图片模型输入按来源分流
 
@@ -81,7 +75,7 @@ Seedance 2.5、H3、VS 2.5 的普通参考、单首帧和首尾帧现在逐张�
 | 画布图片生成文本、Markdown 文档 | 从当前画布文件解析来源，完整字节复核；Chat Completions 在真实 Pi SDK 的 `onPayload` 中替换对应图片字段，按出现顺序区分相同字节但不同来源的图片，不改会话上下文。`canvas-text-references.ts`、`text-generation.ts`、`model-network-policy.ts`、`local-model-runtime.ts`。实际画布→SDK→假上游的两个入口通过。 |
 | 主 Agent 的图片、跟进/排队/历史 | 对应用已知资产 ID，使用 Pi 公开 `appendCustomEntry` 保存紧邻实际用户消息的来源回执，仅含消息摘要与逐图资产 ID；完整核对规范化后 MIME、字节、顺序和数量，重开后再按消息 ID 与当前字节恢复来源。跟进、排队转立即执行、移除排队及修改上一条消息均覆盖；不改 SDK、用户消息或依赖。普通文件选择器/附件仍属于本地上传，不从相同像素猜来源；无回执的旧历史、绕开应用管理的裸 SDK 会话和规范化改变过的图片安全内嵌。`agent.ts`、`session-images.ts`、`app.ts`。 |
 | `game_use` 截图、`recall_image`、图片历史预览/缩小 | 截图保持本地内嵌；`recall_image` 可从原会话消息恢复其已验证资产线索。缩放/转码后字节不匹配、来源记录缺失或 DNS 不安全时仍内嵌。会话历史与预览预算机制继续有效，文字模型的视觉拒绝规则不变。`playtest-tools.ts`、`session-images.ts`、`session-image-requests.ts`。 |
-| Opus Messages 与 GPT-6.1 Responses | 仅精确型号 `claude-opus-5-5` 的原生 Messages 接通已验证来源的 `source: {type: "url", url}`，包括工具返回中的图片；其余图片仍 Base64。保留思考签名、工具续接和原会话，模拟验证不等于 Kunpo 实际 URL 读取验收。其他未审核 Messages 型号不套用。6.1 没有已验证视觉契约，仍在发送前拒绝图片/截图，不由 CDN 规则绕过。 |
+| Claude Messages | 仅精确型号 `claude-opus-5-5` 的原生 Messages 接通已验证来源的 `source: {type: "url", url}`，包括工具返回中的图片；其余图片仍 Base64。保留思考签名、工具续接和原会话，模拟验证不等于 Kunpo 实际 URL 读取验收。其他未审核 Messages 型号不套用。Fable 当前只接受文字。 |
 | 其他图像/视频/3D 协议适配器（Seedream、OpenRouter、Gemini、旧 MiniMax、Hyper3D） | 不能仅因有相似字段就套用 URL；保留其已有 data URL、inlineData 或文件 token 形式。原厂网络入口与未接入候选仍受既有安全/能力策略限制，loopback 协议夹具不是正式支持或真实上游证明。 |
 | Meshy 历史协议／任务 | 已停用全部可识别调用及远程恢复；不套用 URL、不下载或重新提交。本地资产和回执保留，历史协议夹具不代表当前功能可用。 |
 | 原生 CLI 图片/Agent、DeepSeek Files、Cloud/插件旁路 | 维持既有退役/禁用或端点拒绝，不为使用图片 URL 恢复外部执行、原作者服务或未审核文件上传。`agent-runtimes/*`、`deepseek-image-files.ts`、`model-network-policy.ts`。 |
@@ -129,7 +123,7 @@ Seedance 2.5、H3、VS 2.5 的普通参考、单首帧和首尾帧现在逐张�
 - 主 Agent 收到响应头后会持续接收 SSE。只要每 180 秒内有数据或心跳到达，就会继续等待。每条响应最多 32 MiB，整条通过本地校验后再显示内容。本地空闲超时、本地校验失败和响应中断分别提示，失败后不会自动重发。HTTP 200 后发生这三种情况，上游仍可能计费，可先核对服务商用量。
 - SDK 两层自动重试及缓存预热固定关闭，旧设置或调用参数不能重新启用；HTTP 503/连接中断不自动重复收费请求。用户手动重新发起 Agent 消息仍是新请求，不等于查回此前结果。
 - 经明确授权，应用层现在仅对当前回合中有结构化 HTTP 500 的模型失败执行有限自动续接（5/15/45 秒，最多 3 次）。正常完成、手动停止与进程重启不触发续接；生成结果不明先恢复原任务，无法确认则停止。见 [续接边界与持久化](agent-errors.md#automatic-continuation-after-http-500)。它不修复网关内部错误，也不改变生成恢复、费用确认或 SDK 禁止重试的边界。
-- GPT-6.1 仍不声明视觉能力：Composer 遇图片或会截图的上下文时阻止发送、提示切换视觉模型并保留草稿；纯文字附件可发送。后端在用户图片、工具图片及历史截图进入 SDK 前明确拒绝，不能替换成“已看图”文字占位。该会话不注册 game_use/recall_image；视觉/文字模型互换时重建会话工具列表。含图片的旧历史切到文字模型也会拒绝，须选视觉模型或开纯文字新会话。
+- 历史记录：曾提供的 GPT-6.1 接口仅支持文字。Composer 遇图片或会截图的上下文时阻止发送、提示切换视觉模型并保留草稿；纯文字附件可发送。后端在用户图片、工具图片及历史截图进入 SDK 前明确拒绝，不能替换成“已看图”文字占位。该会话不注册 game_use/recall_image；视觉/文字模型互换时重建会话工具列表。含图片的旧历史切到文字模型也会拒绝，须选视觉模型或开纯文字新会话。
 
 ## 验证证据
 

@@ -4,14 +4,14 @@ import { chmod, lstat, mkdir, open, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { createProvider, type ApiKeyCredential, type Credential, type CredentialStore, type Provider, type ProviderStreams, type AuthOperationOptions } from "@earendil-works/pi-ai";
+import { createProvider, getCurrentTools, type ApiKeyCredential, type Credential, type CredentialStore, type Provider, type ProviderStreams, type AuthOperationOptions } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { assertLocalModelTransport, assertModelImageInput, kunpoImagePayload } from "./model-network-policy.js";
 import type { AssetLibrary } from "./asset-library.js";
 import type { RuntimeModel } from "./agent.js";
-import { KUNPO_PROVIDER_ID } from "../shared/kunpo-models.js";
+import { isRemovedKunpoAgent, KUNPO_FABLE_MODEL_ID, KUNPO_PROVIDER_ID } from "../shared/kunpo-models.js";
 import { monitorModelRequest } from "./provider-request-monitor.js";
 import { isMeshyEndpoint, isMeshyModelReference, isMeshyProviderConfiguration, MESHY_DISABLED_MESSAGE } from "../shared/disabled-media-providers.js";
 
@@ -115,8 +115,20 @@ const literalAuth: Provider["auth"] = { apiKey: {
   resolve: async ({ credential }) => credential?.key ? { auth: { apiKey: credential.key }, source: "local API key" } : undefined,
 } };
 function withoutAutomaticRetries(api: ProviderStreams, library?: Pick<AssetLibrary, "attachImageSource">): ProviderStreams {
-  const requestOptions = (model: Parameters<ProviderStreams["stream"]>[0], context: Parameters<ProviderStreams["stream"]>[1], options: Parameters<ProviderStreams["stream"]>[2]) => ({ ...options, maxRetries: 0,
-    onPayload: async (payload: unknown, current: typeof model) => kunpoImagePayload(model, context, await options?.onPayload?.(payload, current) ?? payload, options?.signal, library) });
+  const requestOptions = (model: Parameters<ProviderStreams["stream"]>[0], context: Parameters<ProviderStreams["stream"]>[1], options: Parameters<ProviderStreams["stream"]>[2]) => {
+    const fable = model.api === "anthropic-messages" && model.provider === KUNPO_PROVIDER_ID && model.id === KUNPO_FABLE_MODEL_ID;
+    if (fable && (getCurrentTools(context.messages).length || context.messages.some(message => message.role === "toolResult"
+      || message.role === "assistant" && message.content.some(block => block.type === "toolCall")))) {
+      throw new Error("Kunpo Fable supports text only. Choose a tool-enabled model for this conversation or start a new text conversation.");
+    }
+    return { ...options, maxRetries: 0, onPayload: async (payload: unknown, current: typeof model) => {
+      const prepared = await options?.onPayload?.(payload, current) ?? payload;
+      if (!fable) return kunpoImagePayload(model, context, prepared, options?.signal, library);
+      // Kunpo enables adaptive thinking by default and documents only low as an explicit Messages effort.
+      const { model: id, messages, system, max_tokens, stream, output_config } = prepared as Record<string, unknown> & { output_config?: { effort?: string } };
+      return { model: id, messages, max_tokens, stream, ...(system ? { system } : {}), ...(output_config?.effort === "low" ? { output_config: { effort: "low" } } : {}) };
+    } };
+  };
   return { ...api,
     // A failed response does not establish that a billed POST was never submitted.
     stream: (model, context, options) => monitorModelRequest(model.api, () => { assertModelImageInput(model, context); return api.stream(model, context, requestOptions(model, context, options)); }, options?.signal),
@@ -138,7 +150,7 @@ function localProvider(id: string, config: ProviderConfig, previous?: Provider, 
   const safeModels: RuntimeModel[] = models.filter((model) => !model.type || model.type === "chat").flatMap((model) => {
     const api = model.api ?? config.api;
     const baseUrl = config.models ? model.baseUrl ?? config.baseUrl ?? "" : config.baseUrl ?? model.baseUrl ?? previous?.baseUrl ?? "";
-    if (isMeshyModelReference({ provider: id, id: model.id }) || isMeshyProviderConfiguration({ baseUrl })) return [];
+    if (isRemovedKunpoAgent({ provider: id, id: model.id }) || isMeshyModelReference({ provider: id, id: model.id }) || isMeshyProviderConfiguration({ baseUrl })) return [];
     // Built-in official catalogs remain visible as metadata, but their transports are unavailable.
     if (!api || !(api in apis)) return [];
     return [{
@@ -149,8 +161,8 @@ function localProvider(id: string, config: ProviderConfig, previous?: Provider, 
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       ...("thinkingLevelMap" in model && model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap } : {}),
       // Only this reviewed adapter policy is copied; user-provided compat never enters the runtime.
-      ...(id === KUNPO_PROVIDER_ID && model.id === "claude-opus-5-5" && api === "anthropic-messages"
-        ? { compat: { forceAdaptiveThinking: true, supportsTemperature: false } } : {}),
+      ...(id === KUNPO_PROVIDER_ID && (model.id === "claude-opus-5-5" || model.id === KUNPO_FABLE_MODEL_ID) && api === "anthropic-messages"
+        ? { compat: { forceAdaptiveThinking: true, supportsTemperature: false, ...(model.id === KUNPO_FABLE_MODEL_ID ? { supportsLongCacheRetention: false } : {}) } } : {}),
     } as RuntimeModel];
   });
   return createProvider({ id, name: config.name ?? previous?.name ?? id, baseUrl: config.baseUrl ?? previous?.baseUrl,

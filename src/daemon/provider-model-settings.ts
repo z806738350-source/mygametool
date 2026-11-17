@@ -10,7 +10,7 @@ import type { RuntimeModel } from "./agent.js";
 import { automaticCustomReasoning, normalizeThinkingLevelMap, resolveCustomModelCapabilities, type CustomModelCatalog } from "./custom-model-capabilities.js";
 import { supportedReasoningLevels } from "../shared/reasoning.js";
 import type { LocalRuntimeProvider } from "./local-model-runtime.js";
-import { KUNPO_PROVIDER_ID, kunpoProviderDetails } from "../shared/kunpo-models.js";
+import { KUNPO_BASE_URL, KUNPO_FABLE_MODEL_ID, KUNPO_PROVIDER_ID, isRemovedKunpoAgent, kunpoProviderDetails } from "../shared/kunpo-models.js";
 import { isDeepStrictEqual } from "node:util";
 import { isMeshyEndpoint, isMeshyModelReference, isMeshyProviderConfiguration, MESHY_DISABLED_MESSAGE } from "../shared/disabled-media-providers.js";
 
@@ -201,14 +201,14 @@ export class ProviderModelSettingsStore {
   /** Replay inert model metadata only; SDK command keys, headers, OAuth and extensions are never loaded. */
   async localRuntimeProviders(): Promise<LocalRuntimeProvider[]> {
     const { config } = await this.#readModels();
-    const configured = Object.entries(isObject(config.providers) ? config.providers : {}).flatMap(([id, entry]) => {
+    const configured: LocalRuntimeProvider[] = Object.entries(isObject(config.providers) ? config.providers : {}).flatMap(([id, entry]) => {
       if (!isObject(entry) || typeof entry.api !== "string" || typeof entry.baseUrl !== "string") return [];
       if (isMeshyProviderConfiguration({ id, preset: this.#customProviders[id]?.preset, baseUrl: entry.baseUrl })) return [];
       try {
         if (!["openai-completions", "openai-responses", "anthropic-messages"].includes(entry.api)) return [];
         const api = entry.api as "openai-completions" | "openai-responses" | "anthropic-messages";
         const baseUrl = normalizeEndpoint(entry.baseUrl);
-        const models = (Array.isArray(entry.models) ? entry.models.filter(isObject) : []).filter((model) => !isMeshyModelReference({ provider: id, id: model.id }) && !isMeshyEndpoint(model.baseUrl)).map((model) => {
+        const models = (Array.isArray(entry.models) ? entry.models.filter(isObject) : []).filter((model) => !isRemovedKunpoAgent({ provider: id, id: String(model.id) }) && !isMeshyModelReference({ provider: id, id: model.id }) && !isMeshyEndpoint(model.baseUrl)).map((model) => {
           const normalized = normalizeCustomProviderModel({ ...model, supportsImages: Array.isArray(model.input) && model.input.includes("image") }, api, baseUrl);
           return {
             id: normalized.id, name: normalized.name, api: normalized.api as typeof api, baseUrl: normalized.baseUrl,
@@ -224,8 +224,15 @@ export class ProviderModelSettingsStore {
         return [];
       }
     });
-    // Explicit existing provider metadata retains precedence; defaults never rewrite models.json.
-    return configured.some((provider) => provider.id === KUNPO_PROVIDER_ID) ? configured : [kunpoRuntimeProvider(), ...configured];
+    const builtIn = kunpoRuntimeProvider();
+    const kunpo = configured.find(provider => provider.id === KUNPO_PROVIDER_ID);
+    if (!kunpo) return [builtIn, ...configured];
+    // Older local installs can have a saved catalog for the official gateway. Preserve unrelated entries and endpoints.
+    if ([KUNPO_BASE_URL, "https://llm.ziy.cc"].includes(kunpo.config.baseUrl ?? "")) {
+      const fable = builtIn.config.models!.find(model => model.id === KUNPO_FABLE_MODEL_ID)!;
+      kunpo.config.models = [...(kunpo.config.models ?? []).filter(model => model.id !== fable.id), fable];
+    }
+    return configured;
   }
 
   #customProvider(id: string, config: JsonObject, catalog: CustomModelCatalog): CustomProviderDetails {

@@ -178,7 +178,7 @@ describe("Kunpo app integration", () => {
   it("refuses an incompatible model change before persistence or any provider request, while allowing a text-only conversation", async () => {
     const { inject, connect, request } = await fixture(); await connect();
     const project = (await inject("POST", "/projects", { name: "Image history preflight" })).json();
-    const model = { provider: "kunpo", id: "gpt-5.6-sol" }, text = { provider: "kunpo", id: "gpt-6.1-sol" };
+    const model = { provider: "kunpo", id: "gpt-5.6-sol" }, text = { provider: "kunpo", id: "claude-fable-5-2" };
     const catalog = (await inject("GET", "/models")).json();
     expect(catalog.models.find((entry: any) => entry.id === text.id)).toMatchObject({ supportsImages: false });
     expect(catalog.models.find((entry: any) => entry.id === model.id)).toMatchObject({ supportsImages: true });
@@ -198,6 +198,25 @@ describe("Kunpo app integration", () => {
     const fresh = (await inject("POST", `/projects/${project.id}/conversations`, { model })).json();
     expect((await inject("PUT", `/projects/${project.id}/conversations/${fresh.id}/model`, text)).statusCode).toBe(200);
     expect((await inject("PUT", `${base}/model`, { provider: "kunpo", id: "claude-opus-5-5" })).statusCode).toBe(200);
+    expect(request).not.toHaveBeenCalled();
+  });
+  it("keeps conversations with tool history on their original model when switching to Fable", async () => {
+    const { inject, connect, request } = await fixture(); await connect();
+    const project = (await inject("POST", "/projects", { name: "Tool history" })).json();
+    const model = DEFAULTS.agent;
+    const session = SessionManager.create(project.workspacePath, path.join(path.dirname(project.workspacePath), "session"));
+    session.appendModelChange(model.provider, model.id);
+    session.appendMessage({ role: "user", timestamp: 1, content: "Read my file" });
+    session.appendMessage({ role: "assistant", api: "openai-completions", provider: model.provider, model: model.id, stopReason: "toolUse", timestamp: 2,
+      content: [{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "index.html" } }],
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+    session.appendMessage({ role: "toolResult", toolCallId: "call_1", toolName: "read", content: [{ type: "text", text: "Done" }], isError: false, timestamp: 3 });
+    const base = `/projects/${project.id}/conversations/${session.getSessionId()}`;
+    request.mockClear();
+    const response = await inject("PUT", `${base}/model`, { provider: "kunpo", id: "claude-fable-5-2" });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().code).toBe("tool_history_incompatible");
+    expect((await inject("GET", base)).json().settings.model).toEqual(model);
     expect(request).not.toHaveBeenCalled();
   });
   it("rejects incompatible resolved 3D options before app effects and retains one corrected text generation", async () => {
@@ -325,7 +344,7 @@ describe("Kunpo app integration", () => {
     expect(await readFile(path.join(directory, "library/files", `${uploaded.json().id}.jpg`))).toEqual(bytes);
   });
 
-  it.each(["gpt-5.6-sol", "claude-opus-5-5", "gpt-6.1-sol"])("continues guarded HTTP 500 for %s through the app and does not replay it after reopening", async id => {
+  it.each(["gpt-5.6-sol", "claude-opus-5-5", "claude-fable-5-2"])("continues guarded HTTP 500 for %s through the app and does not replay it after reopening", async id => {
     const { inject, connect, request, directory, app } = await fixture(); await connect();
     vi.spyOn(continuation, "waitForContinuation").mockResolvedValue(true);
     const project = (await inject("POST", "/projects", { name: "Offline continuation" })).json();
@@ -333,12 +352,11 @@ describe("Kunpo app integration", () => {
     const base = `/projects/${project.id}/conversations/${conversation.id}`;
     const event = (value: object) => `data: ${JSON.stringify(value)}\n\n`;
     const wire = id === "gpt-5.6-sol" ? event({ id: "fixture", choices: [{ index: 0, delta: { content: "Done" }, finish_reason: "stop" }] }) + "data: [DONE]\n\n"
-      : id === "claude-opus-5-5" ? [
+      : [
         { type: "message_start", message: { id: "fixture", type: "message", role: "assistant", model: id, content: [], usage: { input_tokens: 1, output_tokens: 0 } } },
         { type: "content_block_start", index: 0, content_block: { type: "text", text: "Done" } }, { type: "content_block_stop", index: 0 },
         { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } }, { type: "message_stop" },
-      ].map(value => `event: ${value.type}\n${event(value)}`).join("")
-      : event({ type: "response.created", response: { id: "fixture", status: "in_progress" } }) + event({ type: "response.completed", response: { id: "fixture", status: "completed", output: [], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } });
+      ].map(value => `event: ${value.type}\n${event(value)}`).join("");
     request.mockClear().mockResolvedValueOnce(Response.json({ error: { type: "api_error", message: "PRIVATE_ERROR_BODY" } }, { status: 500, headers: { "x-request-id": "req_auto_500" } }))
       .mockImplementation(async () => new Response(wire, { headers: { "content-type": "text/event-stream" } }));
     const started = await inject("POST", `${base}/turns`, { prompt: "AUTO_CONTINUE_CANARY_TASK" }); expect(started.statusCode).toBe(202);
@@ -353,6 +371,11 @@ describe("Kunpo app integration", () => {
     for (const [target, init] of request.mock.calls) {
       const raw = init?.body ?? (target instanceof Request ? await target.clone().text() : "");
       const body = raw instanceof Uint8Array ? Buffer.from(raw).toString("utf8") : String(raw);
+      if (id === "claude-fable-5-2") {
+        expect(new URL(target instanceof Request ? target.url : String(target)).pathname).toBe("/v1/messages");
+        expect(JSON.parse(body)).toMatchObject({ model: id, stream: true });
+        expect(JSON.parse(body)).not.toHaveProperty("tools");
+      }
       expect(body.match(/AUTO_CONTINUE_CANARY_TASK/g)).toHaveLength(1);
     }
     await app.close(); applications.splice(applications.indexOf(app), 1);
@@ -1302,7 +1325,7 @@ describe("Kunpo app integration", () => {
 
   it("snapshots the agreed defaults only for newly created projects and preserves legacy projects", async () => {
     const directory = await temporary(), oldId = randomUUID(), chosenId = randomUUID();
-    const explicit = { image: { provider: "legacy-image-provider", id: "legacy-explicit-image" } };
+    const explicit = { agent: { provider: "kunpo", id: "gpt-6.1-sol" }, image: { provider: "legacy-image-provider", id: "legacy-explicit-image" } };
     for (const [id, extra] of [[oldId, {}], [chosenId, { modelSelections: explicit, mediaModelDefaults: { image: explicit.image } }]] as const) {
       const projectDirectory = path.join(directory, "projects", id);
       await mkdir(path.join(projectDirectory, "workspace"), { recursive: true });
@@ -1311,6 +1334,14 @@ describe("Kunpo app integration", () => {
     const { inject } = await fixture(directory);
     expect((await inject("GET", `/projects/${oldId}`)).json().modelSelections).toBeUndefined();
     expect((await inject("GET", `/projects/${chosenId}`)).json()).toMatchObject({ modelSelections: explicit, mediaModelDefaults: { image: explicit.image } });
+    const conversations = `/projects/${chosenId}/conversations`;
+    const historical = await inject("POST", conversations, {});
+    expect(historical.statusCode, historical.body).toBe(201);
+    expect((await inject("GET", `${conversations}/${historical.json().id}`)).json().settings.model).toEqual(explicit.agent);
+    const fable = { provider: "kunpo", id: "claude-fable-5-2" };
+    expect((await inject("PATCH", `/projects/${chosenId}/model-selections`, { agent: fable })).statusCode).toBe(200);
+    const fresh = await inject("POST", conversations, {});
+    expect((await inject("GET", `${conversations}/${fresh.json().id}`)).json().settings.model).toEqual(fable);
     const created = await inject("POST", "/projects", { name: "New Kunpo project" });
     expect(created.statusCode, created.body).toBe(201);
     expect(created.json().modelSelections).toEqual(DEFAULTS);
@@ -1346,27 +1377,20 @@ describe("Kunpo app integration", () => {
     expect((await reopened.inject("GET", `/projects/${project.id}`)).json().modelSelections).toEqual({ ...DEFAULTS, image: alternate });
   });
 
-  it("retains a pending Agent selection but refuses to execute it without substituting another model", async () => {
-    const { inject, request } = await fixture();
+  it("offers exactly the three current Kunpo Agents and rejects new selections of retired IDs", async () => {
+    const { inject, request, connect } = await fixture(); await connect();
     const project = (await inject("POST", "/projects", {})).json();
-    const pending = { provider: "kunpo", id: "gemini-3.8-flash" };
-    const saved = await inject("PATCH", `/projects/${project.id}/model-selections`, { agent: pending });
-    expect(saved.statusCode, saved.body).toBe(200);
-    expect((await inject("GET", `/projects/${project.id}`)).json().modelSelections.agent).toEqual(pending);
-    const conversation = await inject("POST", `/projects/${project.id}/conversations`, { model: pending });
-    expect(conversation.statusCode, conversation.body).toBe(201);
-    const inherited = await inject("POST", `/projects/${project.id}/conversations`, {});
-    expect(inherited.statusCode, inherited.body).toBe(201);
-    for (const selected of [conversation.json(), inherited.json()]) {
-      const turn = await inject("POST", `/projects/${project.id}/conversations/${selected.id}/turns`, { prompt: "Do not execute this pending model" });
-      expect(turn.statusCode, turn.body).toBe(202);
-      await vi.waitFor(async () => {
-        const detail = (await inject("GET", `/projects/${project.id}/conversations/${selected.id}`)).json();
-        expect(detail.settings.model).toEqual(pending);
-        expect(detail.agent).toMatchObject({ status: "error", error: expect.stringContaining("not integrated") });
-      });
+    const catalog = (await inject("GET", "/models")).json();
+    expect(catalog.models.filter((model: { provider: string }) => model.provider === "kunpo").map((model: { id: string }) => model.id).sort())
+      .toEqual(["claude-fable-5-2", "claude-opus-5-5", "gpt-5.6-sol"]);
+    request.mockClear();
+    for (const id of ["gpt-6.1-sol", "gemini-3.8-flash", "claude-sonnet-5-5", "kimi-k3.1-pro"]) {
+      const model = { provider: "kunpo", id };
+      expect((await inject("PATCH", `/projects/${project.id}/model-selections`, { agent: model })).statusCode).toBe(400);
+      expect((await inject("POST", `/projects/${project.id}/conversations`, { model })).statusCode).toBe(400);
     }
-    expect((await inject("GET", `/projects/${project.id}/conversations`)).json()).toHaveLength(2);
+    expect((await inject("GET", `/projects/${project.id}`)).json().modelSelections.agent).toEqual(DEFAULTS.agent);
+    expect((await inject("GET", `/projects/${project.id}/conversations`)).json()).toEqual([]);
     expect(request).not.toHaveBeenCalled();
   });
 

@@ -2,6 +2,7 @@ import { GPT_IMAGE_26_IDS } from "./gpt-image-26.js";
 import type { CustomProviderDetails, CustomProviderModel, ModelRef } from "./contracts.js";
 
 export const KUNPO_PROVIDER_ID = "kunpo";
+export const KUNPO_FABLE_MODEL_ID = "claude-fable-5-2";
 export const KUNPO_BASE_URL = "https://llm.ziy.cc/v1";
 export const KUNPO_MODEL_ROLES = ["agent", "image", "video", "sound-effect", "speech", "music", "3d-generation", "3d-remesh", "3d-rig", "3d-texture"] as const;
 export type KunpoModelRole = typeof KUNPO_MODEL_ROLES[number];
@@ -14,8 +15,6 @@ export interface KunpoModelOption extends ModelRef {
   status: "unverified" | "pending";
   description: string;
   docsUrl: string;
-  /** Gateway/adapter verification is separate from the upstream model's capabilities. */
-  imageInputStatus?: "unverified";
   capabilities: {
     images?: boolean; tools?: boolean; transparency?: boolean; mask?: boolean;
     maxReferences?: number; strictText?: boolean; loop?: boolean;
@@ -31,10 +30,7 @@ function option(role: KunpoModelRole, provider: string, id: string, protocol: st
 export const KUNPO_MODEL_OPTIONS: readonly KunpoModelOption[] = [
   option("agent", "kunpo", "gpt-5.6-sol", "openai-completions", "text-chat", "Images and tools are listed in the model square; reasoning controls and context limits are not independently documented.", { images: true, tools: true }),
   option("agent", "kunpo", "claude-opus-5-5", "anthropic-messages", "claude-opus-55", "Adaptive thinking is always enabled; tools use auto and preserve signed thinking history.", { images: true, tools: true }),
-  { ...option("agent", "kunpo", "gpt-6.1-sol", "openai-responses", "gpt-6-1-sol", "OpenAI documents image input. This Kunpo Responses route's image/tool continuation is not verified.", { images: true, tools: true }), imageInputStatus: "unverified" },
-  option("agent", "kunpo", "gemini-3.8-flash", "openai-completions", "text-chat", "Model-square metadata only; dedicated reasoning and multimodal tool contracts need verification.", { images: true, tools: true }, "pending"),
-  option("agent", "kunpo", "claude-sonnet-5-5", "anthropic-messages", "claude-sonnet-55", "Candidate retained; its complete Agent request contract is not integrated yet.", { images: true }, "pending"),
-  option("agent", "kunpo", "kimi-k3.1-pro", "openai-completions", "kimi-k3-1-pro", "Text chat is documented; screenshot plus tool continuation is not confirmed.", {}, "pending"),
+  option("agent", "kunpo", KUNPO_FABLE_MODEL_ID, "anthropic-messages", "claude-fable-52", "Text chat and streamed text replies. The Kunpo route currently supports text input and output only.", { images: false, tools: false }),
   option("image", "openai", "gpt-image-2.5-sunburst", "openai-images", "image-generation/models/gpt-image-series", "Synchronous image generation and editing; PNG transparency and edit masks.", { images: true, transparency: true, mask: true, maxReferences: 16 }),
   option("image", "openai", "gpt-image-2.5-flare", "openai-images", "image-generation/models/gpt-image-series", "Synchronous image generation and editing; PNG transparency and edit masks.", { images: true, transparency: true, mask: true, maxReferences: 16 }),
   ...GPT_IMAGE_26_IDS.map(id => option("image", "openai", id, "openai-images", "image-generation/models/gpt-image-series", "Static images and edits, text-to-SVG and animated GIF.", { images: true, transparency: true, mask: true, maxReferences: 16 })),
@@ -68,6 +64,11 @@ export const KUNPO_DEFAULT_MODEL_REFS: Readonly<KunpoModelSelections> = {
   "3d-rig": { provider: "tripo", id: "v3.0-20260909" },
   "3d-texture": { provider: "tripo", id: "v3.5-20260815" },
 };
+const removedAgentIds = new Set(["gpt-6.1-sol", "gemini-3.8-flash", "claude-sonnet-5-5", "kimi-k3.1-pro"]);
+export function isRemovedKunpoAgent(ref?: ModelRef): boolean {
+  return ref?.provider === KUNPO_PROVIDER_ID && removedAgentIds.has(ref.id);
+}
+
 export function kunpoModelOption(role: KunpoModelRole, reference?: ModelRef): KunpoModelOption | undefined {
   return reference && KUNPO_MODEL_OPTIONS.find((entry) => entry.role === role && entry.provider === reference.provider && entry.id === reference.id);
 }
@@ -85,9 +86,9 @@ export function kunpoProviderDetails(): CustomProviderDetails {
     { id: "gpt-5.6-sol", name: "gpt-5.6-sol", api: "openai-completions", ...budget, reasoning: false, supportsImages: true, usages: { language: true } },
     { id: "claude-opus-5-5", name: "claude-opus-5-5", api: "anthropic-messages", baseUrl: "https://llm.ziy.cc", contextWindow: 1_000_000, maxTokens: 128_000,
       reasoning: true, thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: null, max: null }, supportsImages: true, usages: { language: true } },
-    { id: "gpt-6.1-sol", name: "gpt-6.1-sol", api: "openai-responses", contextWindow: 1_050_000, maxTokens: 128_000,
-      // Effective adapter setting, not an upstream model limitation. Keep closed until the gateway contract is confirmed.
-      reasoning: true, thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" }, supportsImages: false, usages: { language: true } },
+    { id: KUNPO_FABLE_MODEL_ID, name: KUNPO_FABLE_MODEL_ID, api: "anthropic-messages", baseUrl: "https://llm.ziy.cc", contextWindow: 1_000_000, maxTokens: 128_000,
+      // High is Kunpo's default; the Messages adapter sends an explicit effort only for Low.
+      reasoning: true, thinkingLevelMap: { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: null }, supportsImages: false, usages: { language: true } },
   ];
   const video: CustomProviderModel[] = ["tencent-vod-vs-2.5", "minimax-video-h3"].map((id) => ({
     id, name: id, api: "openai-completions", ...budget, reasoning: false, supportsImages: false,

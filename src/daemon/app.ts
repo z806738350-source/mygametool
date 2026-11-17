@@ -27,7 +27,7 @@ import { randomUUID } from "node:crypto";
 import { assertNoKnownSecretBytes, SafeProjectFileError } from "./safe-project-file.js";
 import { CheckedMediaSnapshotError, CheckedMediaSnapshotStore, type CheckedMediaSnapshot } from "./checked-media-snapshot.js";
 import { mediaPreviewReadLimit, mediaSnapshotResponse } from "./media-snapshot-response.js";
-import { KUNPO_BASE_URL, KUNPO_DEFAULT_MODEL_REFS, KUNPO_MODEL_OPTIONS, KUNPO_MODEL_ROLES, kunpoModelOption, validateKunpoSelection, type KunpoModelRole } from "../shared/kunpo-models.js";
+import { KUNPO_BASE_URL, KUNPO_DEFAULT_MODEL_REFS, KUNPO_MODEL_OPTIONS, KUNPO_MODEL_ROLES, isRemovedKunpoAgent, kunpoModelOption, validateKunpoSelection, type KunpoModelRole } from "../shared/kunpo-models.js";
 import { imageModelsForProvider } from "./image-models.js";
 import { readFile, rm, lstat, realpath } from "node:fs/promises";
 import { OnboardingStore } from "./onboarding.js";
@@ -793,6 +793,7 @@ export function createApp(options: AppOptions = {}) {
     return runtime;
   })();
   const resolveModels = (runtime: ModelRuntime, models: RuntimeModel[]) => {
+    models = models.filter(model => !isRemovedKunpoAgent(model));
     if (!models.some((model) => model.reasoning && providerModelSettings.isCustom(model.provider))) return models;
     const catalog = customModelCatalog(runtime.getModels());
     return models.map((model) => providerModelSettings.resolveModel(model, catalog));
@@ -807,7 +808,7 @@ export function createApp(options: AppOptions = {}) {
   };
   const availableModel = async (provider: string, id: string) => {
     if (!providerEnabled(provider)) return undefined;
-    if (kunpoModelOption("agent", { provider, id })?.status === "pending") return undefined;
+    if (isRemovedKunpoAgent({ provider, id }) || kunpoModelOption("agent", { provider, id })?.status === "pending") return undefined;
     const runtime = await getModelRuntime();
     return resolveModel(runtime, (await runtime.getAvailable(provider)).find((model) => model.id === id));
   };
@@ -1382,6 +1383,7 @@ export function createApp(options: AppOptions = {}) {
       await assertSourcePublicationSettled(project.workspacePath);
       const selected = await conversations.model(project, conversation);
       if (!selected) throw new Error("Select an available model before sending a prompt.");
+      if (isRemovedKunpoAgent(selected)) throw new Error("This Kunpo Agent is no longer available. Select another model to continue this conversation.");
       if (kunpoModelOption("agent", selected)) validateKunpoSelection("agent", selected, { forExecution: true });
       if (isAgentRuntimeId(selected.provider)) return createNativeSession(project, conversation, selected.provider, selected.id);
       const modelRuntime = await getModelRuntime();
@@ -1396,7 +1398,7 @@ export function createApp(options: AppOptions = {}) {
       return createPiSession(
         project,
         conversations.open(project, conversation),
-        projectAgentTools(project, conversation),
+        kunpoModelOption("agent", selected)?.capabilities.tools === false ? [] : projectAgentTools(project, conversation),
         modelRuntime,
         model,
         piAgentDirectory,
@@ -3522,6 +3524,11 @@ export function createApp(options: AppOptions = {}) {
         return reply.code(400).send({ error: "Invalid conversation request" });
       }
       const localChoice = request.body?.model ?? project.modelSelections?.agent;
+      if (localChoice && isRemovedKunpoAgent(localChoice)) {
+        if (request.body?.model) return reply.code(400).send({ error: "This Kunpo Agent is no longer available. Choose another model." });
+        // An older project must open even before its owner chooses a replacement.
+        return reply.code(201).send((await conversations.create(project, localChoice)).summary);
+      }
       if (localChoice && kunpoModelOption("agent", localChoice)) {
         if (request.body?.nativeReasoningLevel !== undefined) return reply.code(400).send({ error: "Native reasoning is only available for coding agents" });
         const metadata = await localAgentMetadata(localChoice);
@@ -3616,7 +3623,7 @@ export function createApp(options: AppOptions = {}) {
       agents.restorePlanState(conversation, planState);
       const agentRuntime = modelRef && isAgentRuntimeId(modelRef.provider) ? modelRef.provider : undefined;
       const localChoice = modelRef && kunpoModelOption("agent", modelRef);
-      const runtime = modelRef && !agentRuntime && !localChoice ? await getModelRuntime() : undefined;
+      const runtime = modelRef && !agentRuntime && !localChoice && !isRemovedKunpoAgent(modelRef) ? await getModelRuntime() : undefined;
       const model = localChoice && modelRef ? await localAgentMetadata(modelRef) : runtime && modelRef ? resolveModel(runtime, runtime.getModel(modelRef.provider, modelRef.id)) : undefined;
       // A coding agent's models load from its CLI; a slow one leaves the level to the picker rather than delay the conversation.
       const agentModel = agentRuntime && modelRef ? await Promise.race([agentRuntimes.model(agentRuntime, modelRef.id), new Promise<undefined>((resolve) => setTimeout(resolve, 2_000))]) : undefined;
@@ -3722,6 +3729,9 @@ export function createApp(options: AppOptions = {}) {
       if (!model && !agentModel) return reply.code(400).send({ error: "Model is not available" });
       if (model && !model.input?.includes("image") && await conversations.hasImageHistory(project, conversation)) {
         return reply.code(400).send({ code: "image_history_incompatible", error: "This conversation contains images. Image input is not enabled for the selected connection. Choose an image-enabled connection or start a new text conversation." });
+      }
+      if (kunpoModelOption("agent", request.body)?.capabilities.tools === false && await conversations.hasToolHistory(project, conversation)) {
+        return reply.code(400).send({ code: "tool_history_incompatible", error: "This conversation contains tool calls. Start a new text conversation to use this model, or choose a model with tool support." });
       }
       try {
         const persist = () => conversations.setModel(project, conversation, request.body);

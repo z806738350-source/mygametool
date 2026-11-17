@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { findAgentModel, preferredAgentModel, recommendedAgentModel } from "../src/shared/agent-models.js";
 import { isAgentRuntimeId } from "../src/shared/agent-runtimes.js";
-import { KUNPO_DEFAULT_MODEL_REFS, KUNPO_MODEL_OPTIONS, kunpoModelOption, kunpoProviderDetails, validateKunpoSelection } from "../src/shared/kunpo-models.js";
+import { KUNPO_DEFAULT_MODEL_REFS, KUNPO_MODEL_OPTIONS, isRemovedKunpoAgent, kunpoModelOption, kunpoProviderDetails, validateKunpoSelection } from "../src/shared/kunpo-models.js";
 
 const models = [
   { provider: "one", id: "first", name: "First" },
@@ -75,10 +75,14 @@ describe("reviewed Kunpo selections", () => {
     }
   });
 
-  it("allows retaining a pending candidate but fails execution and mismatched operations", () => {
-    const pending = { provider: "kunpo", id: "gemini-3.8-flash" };
-    expect(validateKunpoSelection("agent", pending).status).toBe("pending");
-    expect(() => validateKunpoSelection("agent", pending, { forExecution: true })).toThrow("not integrated");
+  it("rejects retired Kunpo Agents and mismatched operations", () => {
+    for (const id of ["gpt-6.1-sol", "gemini-3.8-flash", "claude-sonnet-5-5", "kimi-k3.1-pro"]) {
+      const retired = { provider: "kunpo", id };
+      expect(isRemovedKunpoAgent(retired)).toBe(true);
+      expect(isRemovedKunpoAgent({ provider: "codex-cli", id })).toBe(false);
+      expect(kunpoModelOption("agent", retired)).toBeUndefined();
+      expect(() => validateKunpoSelection("agent", retired)).toThrow();
+    }
     expect(() => validateKunpoSelection("3d-generation", { provider: "tripo", id: "v3.0" })).toThrow("reviewed option");
     expect(kunpoModelOption("speech", KUNPO_DEFAULT_MODEL_REFS.speech)?.capabilities.strictText).toBe(false);
     expect(kunpoModelOption("image", { provider: "openai", id: "Image-GI2.1" })?.capabilities.transparency).toBe(false);
@@ -88,11 +92,11 @@ describe("reviewed Kunpo selections", () => {
     const provider = kunpoProviderDetails();
     const language = provider.models.filter((entry) => entry.usages?.language);
     expect(language.map((entry) => [entry.id, entry.api])).toEqual([
-      ["gpt-5.6-sol", "openai-completions"], ["claude-opus-5-5", "anthropic-messages"], ["gpt-6.1-sol", "openai-responses"],
+      ["gpt-5.6-sol", "openai-completions"], ["claude-opus-5-5", "anthropic-messages"], ["claude-fable-5-2", "anthropic-messages"],
     ]);
     expect(language[0]!.reasoning).toBe(false);
     expect(language[2]!.supportsImages).toBe(false);
-    expect(kunpoModelOption("agent", { provider: "kunpo", id: "gpt-6.1-sol" })).toMatchObject({ capabilities: { images: true }, imageInputStatus: "unverified" });
+    expect(kunpoModelOption("agent", { provider: "kunpo", id: "claude-fable-5-2" })).toMatchObject({ capabilities: { images: false, tools: false } });
     const choices = language.map((entry) => ({ provider: provider.id, ...entry }));
     expect(recommendedAgentModel(choices, "kunpo")?.id).toBe("gpt-5.6-sol");
     expect(preferredAgentModel(choices, choices[1], KUNPO_DEFAULT_MODEL_REFS.agent)?.id).toBe("claude-opus-5-5");

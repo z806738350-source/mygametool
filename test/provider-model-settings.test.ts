@@ -174,7 +174,7 @@ describe("provider model settings", () => {
     await expect(store.addCustomModel("kunpo", { ...model, id: "meshy-7.1" })).rejects.toThrow("Meshy is disabled");
     const configured = await store.localRuntimeProviders();
     expect(configured.some(item => item.id === "old")).toBe(false);
-    expect(configured.find(item => item.id === "kunpo")?.config.models?.map(item => item.id)).toEqual(["good"]);
+    expect(configured.find(item => item.id === "kunpo")?.config.models?.map(item => item.id)).toEqual(["good", "claude-fable-5-2"]);
     expect(await readFile(path.join(directory, "models.json"), "utf8")).toBe(models);
     expect(await readFile(path.join(directory, "model-visibility.json"), "utf8")).toBe(preferences);
   });
@@ -201,7 +201,7 @@ describe("provider model settings", () => {
     expect(store.isBuiltIn("kunpo")).toBe(true);
     expect((await store.customProviderCatalog()).find((provider) => provider.id === "kunpo")?.models.map((model) => model.id)).toContain("gpt-5.6-sol");
     const providers = await store.localRuntimeProviders();
-    expect(providers.find((provider) => provider.id === "kunpo")?.config.models?.map((model) => model.id)).toEqual(["gpt-5.6-sol", "claude-opus-5-5", "gpt-6.1-sol"]);
+    expect(providers.find((provider) => provider.id === "kunpo")?.config.models?.map((model) => model.id)).toEqual(["gpt-5.6-sol", "claude-opus-5-5", "claude-fable-5-2"]);
     await expect(readFile(path.join(directory, "models.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     await expect(store.removeProviderSettings("kunpo", async () => {})).rejects.toThrow("built in");
   });
@@ -214,11 +214,11 @@ describe("provider model settings", () => {
     await writeFile(path.join(directory, "models.json"), text);
     const configured = (await store.localRuntimeProviders()).filter((provider) => provider.id === "kunpo");
     expect(configured).toHaveLength(1);
-    expect(configured[0]!.config.models?.map((model) => model.id)).toEqual(["explicit-existing"]);
+    expect(configured[0]!.config.models?.map((model) => model.id)).toEqual(["explicit-existing", "claude-fable-5-2"]);
     expect(await readFile(path.join(directory, "models.json"), "utf8")).toBe(text);
   });
 
-  it("refuses pending Kunpo Agents from legacy models.json and persisted conversations", async () => {
+  it("refuses retired Kunpo Agents from legacy models.json and preserves previous conversations", async () => {
     const { directory, store } = await fixture();
     const pending = { provider: "kunpo", id: "gemini-3.8-flash" };
     await writeFile(path.join(directory, "models.json"), JSON.stringify({ providers: { kunpo: {
@@ -226,7 +226,7 @@ describe("provider model settings", () => {
     } } }));
     const runtime = await createLocalModelRuntime(path.join(directory, "local-api-keys.json"), () => store.localRuntimeProviders());
     await runtime.login("kunpo", "api_key", { prompt: async () => "CANARY_PENDING_GATE_TEST_ONLY", notify: () => {} });
-    expect((await runtime.getAvailable("kunpo")).map((model) => model.id)).toContain(pending.id);
+    expect((await runtime.getAvailable("kunpo")).map((model) => model.id)).not.toContain(pending.id);
     const projects = new ProjectManager(directory);
     const project = await projects.create("Legacy pending Agent", "asset-canvas");
     const conversations = new ConversationManager();
@@ -237,16 +237,14 @@ describe("provider model settings", () => {
     const app = createApp({ dataDirectory: directory, piAgentDirectory: directory, createModelRuntime: async () => runtime, generateProjectName: async () => undefined });
     apps.push(app);
     const explicit = await app.inject({ method: "POST", url: `/projects/${project.id}/conversations`, payload: { model: pending } });
-    expect(explicit.statusCode, explicit.body).toBe(201);
-    for (const id of [conversation.summary.id, explicit.json().id]) {
-      const turn = await app.inject({ method: "POST", url: `/projects/${project.id}/conversations/${id}/turns`, payload: { prompt: "Continue this fixture" } });
-      expect(turn.statusCode, turn.body).toBe(202);
-      await vi.waitFor(async () => {
-        const detail = (await app.inject({ method: "GET", url: `/projects/${project.id}/conversations/${id}` })).json();
-        expect(detail.agent).toMatchObject({ status: "error", error: expect.stringContaining("not integrated") });
-        expect(detail.settings.model).toEqual(pending);
-      });
-    }
+    expect(explicit.statusCode, explicit.body).toBe(400);
+    const turn = await app.inject({ method: "POST", url: `/projects/${project.id}/conversations/${conversation.summary.id}/turns`, payload: { prompt: "Continue this fixture" } });
+    expect(turn.statusCode, turn.body).toBe(202);
+    await vi.waitFor(async () => {
+      const detail = (await app.inject({ method: "GET", url: `/projects/${project.id}/conversations/${conversation.summary.id}` })).json();
+      expect(detail.agent).toMatchObject({ status: "error", error: expect.stringContaining("no longer available") });
+      expect(detail.settings.model).toEqual(pending);
+    });
     expect(request).not.toHaveBeenCalled();
   });
 

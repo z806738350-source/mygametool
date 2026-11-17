@@ -1,9 +1,10 @@
 import type { AgentModelRef } from "./contracts.js";
 import { kunpoModelOption } from "./kunpo-models.js";
 
-/** Explicit runtime settings take precedence over the built-in connection policy. */
+/** A text-only Kunpo route cannot accept images even if saved runtime metadata says otherwise. */
 export function agentModelImageInput(model?: AgentModelRef & { supportsImages?: boolean }): boolean | undefined {
-  return model?.supportsImages ?? (kunpoModelOption("agent", model)?.imageInputStatus === "unverified" ? false : undefined);
+  const images = kunpoModelOption("agent", model)?.capabilities.images;
+  return images === false ? false : model?.supportsImages ?? images;
 }
 
 export function findAgentModel<T extends AgentModelRef>(

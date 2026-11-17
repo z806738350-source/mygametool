@@ -3,7 +3,7 @@ import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { MediaModelCatalog, MediaModelUsage, ModelRef, ProjectState, ProviderCapability } from "../shared/contracts.js";
 import { listImageModelCatalog, listModel3DCatalog, listVideoModelCatalog, MODELS_CHANGED_EVENT, setDefaultMediaModel, updateProjectModelSelections } from "./api.js";
-import { KUNPO_MODEL_OPTIONS, KUNPO_MODEL_ROLES, kunpoModelOption, type KunpoModelRole, type KunpoModelSelections } from "../shared/kunpo-models.js";
+import { KUNPO_MODEL_OPTIONS, KUNPO_MODEL_ROLES, kunpoModelOption, type KunpoModelOption, type KunpoModelRole, type KunpoModelSelections } from "../shared/kunpo-models.js";
 import { CanvasChipSelect, type CanvasChipOption } from "./canvas-chip-select.js";
 import { LoaderCircle, SlidersHorizontal } from "./icons.js";
 import { menuPlacement } from "./popover-placement.js";
@@ -167,17 +167,24 @@ function ProjectModelSelectionField({ role, selected, project, disabled, menuCon
   const legacy = role === "image" || role === "video" ? project.mediaModelDefaults?.[role] : role === "3d-generation" ? project.mediaModelDefaults?.["3d"] : undefined;
   const current = kunpoModelOption(role, selected);
   const fallback = legacy ? t("kunpoModels.inheritExisting", { label: legacy.id }) : role === "music" ? t("kunpoModels.noConfirmedDefault") : t("kunpoModels.inheritDefault");
-  const help = role === "speech" ? t("kunpoModels.speechHelp") : role === "music" ? t("kunpoModels.musicHelp") : current?.status === "pending" ? t("kunpoModels.pendingHelp") : role === "agent" && current?.imageInputStatus === "unverified" ? t("kunpoModels.textOnlyHelp") : t("kunpoModels.unverifiedHelp");
-  return <div className="media-default-field" title={help}>
+  return <div className="media-default-field" title={kunpoModelHelp(current, role)}>
     <span>{t(`kunpoModels.roles.${role}`)}</span>
     <CanvasChipSelect label={t(`kunpoModels.roles.${role}`)} value={selected ? modelKey(selected) : ""} menuContainer={menuContainer} disabled={disabled}
       options={[
         { value: "", label: fallback },
         ...(selected && !current ? [{ value: modelKey(selected), label: t("mediaDefaults.modelUnavailable", { id: selected.id }), disabled: true }] : []),
         ...options.map((option) => ({ value: modelKey(option), label: `${option.name} · ${t(`kunpoModels.status.${option.status}`)}`, shortLabel: option.name,
-          disabled: option.status === "pending", title: option.status === "pending" ? t("kunpoModels.pendingHelp") : help })),
+          disabled: option.status === "pending", title: kunpoModelHelp(option) })),
       ]} onChange={(key) => onChange(options.find((option) => modelKey(option) === key))} />
   </div>;
+}
+
+export function kunpoModelHelp(model: KunpoModelOption | undefined, role = model?.role): string {
+  if (model?.status === "pending") return t("kunpoModels.pendingHelp");
+  if (role === "speech") return t("kunpoModels.speechHelp");
+  if (role === "music") return t("kunpoModels.musicHelp");
+  if (model?.role === "agent" && model.capabilities.tools === false) return t("kunpoModels.textOnlyHelp");
+  return t("kunpoModels.unverifiedHelp");
 }
 
 function modelKey(model: ModelRef): string { return JSON.stringify([model.provider, model.id]); }

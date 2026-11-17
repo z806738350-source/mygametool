@@ -19,6 +19,7 @@ import { composerDrafts, type ComposerDraft } from "./composer-drafts.js";
 import { t } from "./i18n.js";
 import type { AgentContextUsage } from "../shared/contracts.js";
 import { isAgentRuntimeId } from "../shared/agent-runtimes.js";
+import { isRemovedKunpoAgent } from "../shared/kunpo-models.js";
 import { agentModelImageInput } from "../shared/agent-models.js";
 
 export type { ComposerDraft } from "./composer-drafts.js";
@@ -107,7 +108,7 @@ export function Composer({
   const textOnly = agentModelImageInput(models.find((entry) => entry.provider === model?.provider && entry.id === model?.id) ?? model) === false;
   const visualInputUnsupported = textOnly && (attachments.some(({ file }) => file.type.startsWith("image/") || /\.(?:png|jpe?g|webp|gif|bmp|svg|avif|tiff?|heic|ico)$/i.test(file.name))
     || contexts.some(({ kind }) => kind === "playable-element" || kind === "playable-drawing" || kind === "playable-asset" || kind === "playable-moment"));
-  const inputIssue = visualInputUnsupported ? t("kunpoModels.textOnlyDraft")
+  const inputIssue = isRemovedKunpoAgent(model) ? t("kunpoModels.removedAgent") : visualInputUnsupported ? t("kunpoModels.textOnlyDraft")
     : !selectedSkill && !selectedPlugin && prompt.trim().toLowerCase() === "/publish" ? t("localEdition.cloudUnavailable") : undefined;
   const updateDraft = draftSession.update;
   const [referencingDesign, setReferencingDesign] = useState(false);

@@ -23,6 +23,7 @@ import {
   Suspense,
 } from "react";
 import type { AgentContextUsage, AgentModel, AgentModelRef, AgentReasoningLevel, CheckpointChangeItem, ConversationCapabilities, ConversationSummary, PendingPrompt, PluginMention, PromptAttachment, PromptContext, PromptImage, PromptMode, PromptReference, ThreadItem } from "../shared/contracts.js";
+import { isRemovedKunpoAgent } from "../shared/kunpo-models.js";
 import { findAgentModel, preferredAgentModel } from "../shared/agent-models.js";
 import { supportsWebPreview } from "../shared/project-runtime.js";
 import {
@@ -663,7 +664,12 @@ export function ProjectShell({
       const settings = await setConversationModel(project.id, conversation.id, model);
       dispatch({ type: "conversation-settings", settings });
     } catch (error) {
-      dispatch({ type: "notice", message: error instanceof ApiError && error.code === "image_history_incompatible" ? t("modelSelector.imageHistoryIncompatible") : errorMessage(error) });
+      let message = errorMessage(error);
+      if (error instanceof ApiError) {
+        if (error.code === "image_history_incompatible") message = t("modelSelector.imageHistoryIncompatible");
+        if (error.code === "tool_history_incompatible") message = t("modelSelector.toolHistoryIncompatible");
+      }
+      dispatch({ type: "notice", message });
     } finally {
       setModelChanging(false);
     }
@@ -1069,7 +1075,7 @@ function leftUnfinished(error: unknown): boolean {
 }
 
 async function initialConversationModel(selected?: AgentModelRef): Promise<AgentModelRef | undefined> {
-  if (selected) return selected;
+  if (selected) return isRemovedKunpoAgent(selected) ? undefined : selected;
   try {
     // OhMyGame's own models come first; with none connected, the first coding agent that is set up.
     const catalog = await listModels({ agentRuntimes: true });

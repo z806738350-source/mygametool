@@ -27,7 +27,8 @@ import type { RuntimeEventBus } from "../shared/events.js";
 import type { AgentRuntimeId, ApprovalDecision, ApprovalRequestDetails } from "../shared/agent-runtimes.js";
 import { isVolumeMigrationReview, validVolumeMigrationConfirmation, type VolumeMigrationConfirmation } from "../shared/volume-migration.js";
 import { validSourceConfirmation, type IsolatedSourceConfirmation } from "../shared/execution-storage.js";
-import type { StoredConversation } from "./conversations.js";
+import { hasImageHistory, hasToolHistory, type StoredConversation } from "./conversations.js";
+import { kunpoModelOption } from "../shared/kunpo-models.js";
 import { replayNativeMessages } from "./agent-runtimes/replay.js";
 import { mcpToolInput, parseMcpToolIdentity } from "../shared/mcp.js";
 import type { PluginSkillRegistration } from "./plugin-runtime.js";
@@ -47,6 +48,10 @@ import { AUTO_CONTINUE_DELAYS, AUTO_CONTINUE_ENTRY, AUTO_CONTINUE_PROMPT, AutoCo
 import { getToolConfirmedFailure } from "./agent-tool-errors.js";
 
 const CONTINUATION_SUPERSEDED = Symbol("newer user message");
+
+function supportsAgentTools(model?: RuntimeModel): boolean {
+  return kunpoModelOption("agent", model)?.capabilities.tools !== false;
+}
 
 export interface CodingQueuedPrompt {
   id: string;
@@ -635,11 +640,11 @@ export class AgentManager {
       return;
     }
     if (!managed.session.setModel) throw new Error("The current agent session cannot change models");
-    const previousInput = managed.session.model?.input;
+    const previous = managed.session.model;
     await managed.session.setModel(compatibleRuntimeModel(model));
-    // Tool registration and the visual context warning are chosen when the session is created.
-    // Reopen the saved branch when changing this capability in either direction.
-    if (previousInput && previousInput.includes("image") !== model.input.includes("image")) this.#forgetConversation(key);
+    // Tool registration and visual context instructions are fixed when the session is created.
+    if (supportsAgentTools(previous) !== supportsAgentTools(model) ||
+        (previous?.input && previous.input.includes("image") !== model.input.includes("image"))) this.#forgetConversation(key);
   }
 
   /**
@@ -3226,14 +3231,20 @@ export async function createPiSession(
   };
   // Trusted-local phase: cwd guides Pi but is not an OS security boundary.
   const textOnly = model !== undefined && !model.input.includes("image");
+  const toolsAvailable = supportsAgentTools(model);
+  if (!toolsAvailable) {
+    const { messages } = sessionManager.buildSessionContext();
+    if (hasImageHistory(messages) || hasToolHistory(messages)) throw new Error("This conversation contains images or tool calls. Start a new text conversation to use this model, or choose a model that supports this history.");
+  }
   const { resourceLoader, sessionSettings } = await createPiResourceLoader(project.workspacePath, agentDir, {
+    toolsAvailable,
     appendSystemPrompt: [...appendSystemPromptForProject(project), ...(textOnly
       ? ["This connection does not have image input enabled. Image attachments and image history are rejected. game_use and recall_image are unavailable for this connection; choose an image-enabled connection for screenshot-based playtesting or visual verification."] : [])],
     checkpointFactory: guardedCheckpoints,
   });
   const images = new SessionImages(sessionManager, path.join(project.storagePath ?? path.dirname(project.workspacePath), "request-image-previews"));
   const authorizeAttachment = (reference: AttachmentReference) => authorizeConversationAttachment(sessionManager, reference);
-  const localTools = [...createLocalAgentFileTools(project.workspacePath, mutateWorkspace, model?.input.includes("image") === true, authorizeAttachment),
+  const localTools = !toolsAvailable ? [] : [...createLocalAgentFileTools(project.workspacePath, mutateWorkspace, model?.input.includes("image") === true, authorizeAttachment),
     createAgentAttachmentReadTool(project.workspacePath, model?.input.includes("image") === true, authorizeAttachment), ...(textOnly ? [] : [images.recallTool as ToolDefinition]),
     ...customTools.filter((tool) => LOCAL_AGENT_TOOL_NAMES.has(tool.name) && !BASE_TOOL_NAMES.includes(tool.name) && (!textOnly || tool.name !== "game_use"))];
   const continuationTools = new AutoContinueTools(localTools, { sessionManager, assertCurrent: assertCheckpoint });
@@ -3243,7 +3254,7 @@ export async function createPiSession(
     noTools: "builtin",
     // The SDK can retain inactive builtins and restored tool loadouts. Keep unsafe tools out of its registry as well.
     tools: localTools.map((tool) => tool.name),
-    excludeTools: ["bash", "powershell", "mcp", "mcp__*"],
+    excludeTools: toolsAvailable ? ["bash", "powershell", "mcp", "mcp__*"] : ["*"],
     customTools: continuationTools.wrap(),
     model: model ? compatibleRuntimeModel(model) : undefined,
     modelRuntime,
@@ -3276,7 +3287,7 @@ export async function createPiSession(
   };
   installDeepSeekImageFiles(session, agentDir);
   installSessionImageRequests(session, images, agentDir, { transportMode: responsesTransport });
-  mcp?.host.manage(session);
+  if (toolsAvailable) mcp?.host.manage(session);
   try { await session.bindExtensions({ mode: "rpc" }); } catch (cause) { session.dispose(); throw cause; }
   const prompt = session.prompt.bind(session);
   session.subscribe(event => {
@@ -3333,9 +3344,10 @@ async function createPiResourceLoader(
   workspacePath: string,
   agentDir: string,
   options: {
+    toolsAvailable: boolean;
     appendSystemPrompt?: readonly string[];
     checkpointFactory?: ExtensionFactory;
-  } = {},
+  },
 ): Promise<{ resourceLoader: DefaultResourceLoader; sessionSettings: SettingsManager }> {
   const persistedSettings = SettingsManager.create(workspacePath, agentDir);
   const sessionSettings = SettingsManager.inMemory({
@@ -3358,10 +3370,10 @@ async function createPiResourceLoader(
     noContextFiles: true,
     extensionFactories: [{ name: "assistant-thinking-sanitizer", factory: assistantThinkingSanitizerExtension, hidden: true },
       ...(options.checkpointFactory ? [{ name: "checkpoints", factory: options.checkpointFactory, hidden: true }] : [])],
-    appendSystemPrompt: [
+    appendSystemPrompt: options.toolsAvailable ? [
       ...(options.appendSystemPrompt ?? []),
       "Current local secure edition execution contract (overrides generic workflow guidance above): Host Shell, native CLI, MCP/plugin execution, custom host commands and Cloud/Community publication remain unavailable. When isolated_shell is explicitly registered, it runs only in a bounded Linux VM copy with no host HOME, credentials or external network; source additions/edits require an unchanged host baseline and acknowledged return. Deletions, private files, links, oversized returns and conflicts are refused. Cancellation or failure retains unreturned changes for explicit recovery and blocks replacement; report retained changes rather than claiming they were saved. Dependency preparation, builds and dynamic Web previews use the registered VM backend; public npm requires exact v3 locks and excludes Git/URL dependencies, private credentials and install lifecycle scripts. game_use may prepare a dynamic preview through that backend; inspect returned status and report unsupported cases rather than claiming success. Do not use an absent tool or assume a host shell. File tools support relative non-private UTF-8 files. With an image-capable model, read can also open project PNG/JPEG/WebP images for visual inspection. Hidden files, links and parent paths are unavailable. Preserve the project's stack. Without a VM backend, prefer self-contained static files for a new browser game.",
-    ],
+    ] : ["Answer in text. This connection has no tools or image input."],
     agentsFilesOverride: ({ agentsFiles }) => ({ agentsFiles: projectContextFiles(agentsFiles, workspacePath, agentDir) }),
   });
   await resourceLoader.reload();

@@ -23,7 +23,7 @@ afterEach(async () => {
 });
 
 describe("composer text-only model", () => {
-  const model = { provider: "kunpo", id: "gpt-6.1-sol" };
+  const model = { provider: "kunpo", id: "claude-fable-5-2" };
 
   it.each(["image/png", ""])("retains an image draft and refuses button and form submission (%s)", async (type) => {
     vi.stubGlobal("URL", class extends URL { static createObjectURL() { return "blob:mock"; } static revokeObjectURL() {} });
@@ -33,7 +33,7 @@ describe("composer text-only model", () => {
     session.update({ prompt: "Inspect this screenshot", attachments: [{ id: "shot", file, relativePath: file.name }] });
     const props = await render({ model });
     expect(container.querySelector<HTMLButtonElement>(".send-button")!.disabled).toBe(true);
-    expect(container.querySelector('[role="alert"]')?.textContent).toContain("cannot receive images");
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Image input is not enabled");
     await act(async () => container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
     expect(upload).not.toHaveBeenCalled();
     expect(props.onSubmit).not.toHaveBeenCalled();
@@ -49,6 +49,16 @@ describe("composer text-only model", () => {
     await render({ ...props, model: { provider: "kunpo", id: "gpt-5.6-sol" } });
     expect(container.querySelector<HTMLButtonElement>(".send-button")!.disabled).toBe(false);
     expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it("retains the draft until the user replaces a retired Kunpo Agent", async () => {
+    const props = await render({ model: { provider: "kunpo", id: "gpt-6.1-sol" }, initialDraft: { prompt: "Continue", mentions: [] } });
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("removed from this app’s KunpoAPI list");
+    await act(async () => container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    expect(props.onSubmit).not.toHaveBeenCalled();
+    await render({ ...props, model });
+    expect(container.querySelector("textarea")!.value).toBe("Continue");
+    expect(container.querySelector<HTMLButtonElement>(".send-button")!.disabled).toBe(false);
   });
 
   it("still sends text attachments and ordinary node context", async () => {

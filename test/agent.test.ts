@@ -3038,9 +3038,18 @@ describe("AgentManager", () => {
     await manager.close();
   });
 
-  it.each([false, true])("recreates the session when switching its image capability from %s", async (images) => {
-    const previous = { provider: "kunpo", id: images ? "gpt-5.6-sol" : "gpt-6.1-sol", input: images ? ["text", "image"] : ["text"] } as RuntimeModel;
-    const next = { provider: "kunpo", id: images ? "gpt-6.1-sol" : "gpt-5.6-sol", input: images ? ["text"] : ["text", "image"] } as RuntimeModel;
+  it.each([
+    ["image input enabled", "image input disabled"],
+    ["image input disabled", "image input enabled"],
+    ["Kunpo Fable", "another provider's Fable"],
+    ["another provider's Fable", "Kunpo Fable"],
+  ])("recreates the session when switching from %s to %s", async (from, to) => {
+    const model = (name: string) => ({
+      provider: name === "Kunpo Fable" ? "kunpo" : "custom-provider",
+      id: name.includes("Fable") ? "claude-fable-5-2" : name,
+      input: name === "image input enabled" ? ["text", "image"] : ["text"],
+    }) as RuntimeModel;
+    const previous = model(from), next = model(to);
     const session = Object.assign(new FakeSession(), { model: previous });
     const recreated = Object.assign(new FakeSession(), { model: next });
     const createSession = vi.fn().mockResolvedValueOnce(session).mockResolvedValueOnce(recreated);

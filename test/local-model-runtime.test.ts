@@ -2,6 +2,7 @@ import { access, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Context } from "@earendil-works/pi-ai";
 import { createLocalModelRuntime, LocalApiKeyStore } from "../src/daemon/local-model-runtime.js";
 import { kunpoRuntimeProvider } from "../src/daemon/provider-model-settings.js";
 import { kunpoImagePayload, localModelFetch } from "../src/daemon/model-network-policy.js";
@@ -28,10 +29,16 @@ async function directory() {
 const provider = {
   id: "custom-local",
   config: { name: "Reviewed gateway", api: "openai-responses" as const, baseUrl: "https://llm.ziy.cc/v1", models: [{
-    id: "fixture-model", name: "Fixture", input: ["text" as const], reasoning: false, contextWindow: 32_000, maxTokens: 4096,
+    id: "fixture-model", name: "Fixture", input: ["text" as const], reasoning: true, contextWindow: 32_000, maxTokens: 4096,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
   }] },
 };
+const testRoutes = [
+  { providerId: "kunpo", id: "gpt-5.6-sol" },
+  { providerId: "kunpo", id: "claude-opus-5-5" },
+  { providerId: "kunpo", id: "claude-fable-5-2" },
+  { providerId: provider.id, id: "fixture-model" },
+];
 const responsesSse = (...events: unknown[]) => new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
 const responseUsage = { input_tokens: 2, output_tokens: 1, total_tokens: 3 };
 
@@ -53,13 +60,13 @@ describe("local literal API key storage and model runtime", () => {
     expect(request).not.toHaveBeenCalled();
     await expect(access(path.join(root, "keys.json"))).rejects.toMatchObject({ code: "ENOENT" });
   });
-  describe.each(["gpt-5.6-sol", "claude-opus-5-5", "gpt-6.1-sol"])("passive protocol monitoring for %s", id => {
+  describe.each(testRoutes)("passive protocol monitoring for $id", ({ providerId, id }) => {
     it.each(["completed", "incomplete", "missing-terminal"])("records %s from the actual SDK and guarded fetch without retaining content or resubmitting", async outcome => {
       const log = vi.spyOn(console, "info").mockImplementation(() => {});
       const root = await directory();
-      const runtime = await createLocalModelRuntime(path.join(root, "local-api-keys.json"), async () => [kunpoRuntimeProvider()]);
-      await runtime.login("kunpo", "api_key", { prompt: async () => "CANARY_MONITOR_SDK_ONLY", notify: () => {} });
-      const model = runtime.getModel("kunpo", id)!;
+      const runtime = await createLocalModelRuntime(path.join(root, "local-api-keys.json"), async () => [kunpoRuntimeProvider(), provider]);
+      await runtime.login(providerId, "api_key", { prompt: async () => "CANARY_MONITOR_SDK_ONLY", notify: () => {} });
+      const model = runtime.getModel(providerId, id)!;
       const missing = outcome === "missing-terminal", limited = outcome === "incomplete";
       let wire: string;
       if (model.api === "openai-completions") wire = [
@@ -243,7 +250,7 @@ describe("local literal API key storage and model runtime", () => {
     expect(runtime.getModels("kunpo").map((model) => [model.id, model.api, model.baseUrl])).toEqual([
       ["gpt-5.6-sol", "openai-completions", "https://llm.ziy.cc/v1"],
       ["claude-opus-5-5", "anthropic-messages", "https://llm.ziy.cc"],
-      ["gpt-6.1-sol", "openai-responses", "https://llm.ziy.cc/v1"],
+      ["claude-fable-5-2", "anthropic-messages", "https://llm.ziy.cc"],
     ]);
     expect(await runtime.getAuth("kunpo")).toBeUndefined();
     await runtime.login("kunpo", "api_key", { prompt: async () => "CANARY_KUNPO_TEST_ONLY", notify: () => {} });
@@ -282,26 +289,96 @@ describe("local literal API key storage and model runtime", () => {
     expect(continued.messages).toContainEqual(expect.objectContaining({ role: "tool", tool_call_id: "call_fixture", content: "Fixture inspected" }));
   });
 
-  it.each(["gpt-5.6-sol", "claude-opus-5-5", "gpt-6.1-sol"])("cancels %s pending SDK stream and its upstream body without retrying", async (id) => {
+  it("does not revive a retired Kunpo Agent through an old registration or an already-resolved model", async () => {
+    const root = await directory();
+    const stale = { ...provider.config, models: [{ ...provider.config.models[0]!, id: "gpt-6.1-sol" }] };
+    const runtime = await createLocalModelRuntime(path.join(root, "keys.json"), async () => [kunpoRuntimeProvider(), { id: provider.id, config: stale }]);
+    const otherRoute = runtime.getModel(provider.id, "gpt-6.1-sol")!;
+    expect(otherRoute).toBeDefined();
+    runtime.registerProvider("kunpo", stale);
+    expect(runtime.getModel("kunpo", "gpt-6.1-sol")).toBeUndefined();
+    const request = vi.fn<typeof fetch>();
+    expect(() => runtime.streamSimple({ ...otherRoute, provider: "kunpo" }, { messages: [] }, { fetch: request })).toThrow("no longer available");
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("sends Fable text turns using native Messages authentication, implicit thinking, and only documented effort", async () => {
+    const root = await directory();
+    const runtime = await createLocalModelRuntime(path.join(root, "keys.json"), async () => [kunpoRuntimeProvider()]);
+    const key = "FABLE_TEST_FIXTURE";
+    await runtime.login("kunpo", "api_key", { prompt: async () => key, notify: () => {} });
+    const model = runtime.getModel("kunpo", "claude-fable-5-2")!;
+    const events = [
+      { type: "message_start", message: { id: "fixture", type: "message", role: "assistant", model: model.id, content: [], usage: { input_tokens: 1, output_tokens: 0 } } },
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Ready" } },
+      { type: "content_block_stop", index: 0 },
+      { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+      { type: "message_stop" },
+    ];
+    const request = vi.fn<typeof fetch>(async () => new Response(events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } }));
+    const context: Context = { systemPrompt: "Use plain text", messages: [{ role: "user", timestamp: 1, content: "First turn" }] };
+    for (const reasoning of [undefined, "low", "high"] as const) {
+      const reply = await runtime.completeSimple(model, context, { fetch: localModelFetch(model, request), maxTokens: 100, cacheRetention: "long", temperature: 0.1, reasoning });
+      expect(reply).toMatchObject({ stopReason: "stop", content: [{ type: "text", text: "Ready" }] });
+      const [input, init] = request.mock.calls.at(-1)!;
+      const url = new URL(String(input));
+      expect(url.origin + url.pathname).toBe("https://llm.ziy.cc/v1/messages");
+      const headers = new Headers(init?.headers);
+      expect(headers.get("x-api-key")).toBe(key);
+      expect(headers.get("anthropic-version")).toBe("2023-06-01");
+      const body = JSON.parse(String(init?.body));
+      expect(body).toEqual({ model: model.id, stream: true, max_tokens: 100, messages: expect.any(Array), system: expect.any(Array), ...(reasoning === "low" ? { output_config: { effort: "low" } } : {}) });
+      expect(body.messages.map((message: { role: string }) => message.role)).toEqual(context.messages.map(message => message.role));
+      expect(JSON.stringify(body)).not.toContain('"1h"');
+      context.messages.push(reply, { role: "user", timestamp: 2, content: "Follow up" });
+    }
+    expect(request).toHaveBeenCalledTimes(3);
+  });
+
+  it("rejects tools, tool history and images before sending a Fable text request", async () => {
+    const root = await directory();
+    const runtime = await createLocalModelRuntime(path.join(root, "keys.json"), async () => [kunpoRuntimeProvider()]);
+    await runtime.login("kunpo", "api_key", { prompt: async () => "FABLE_TEST_FIXTURE", notify: () => {} });
+    const model = runtime.getModel("kunpo", "claude-fable-5-2")!;
+    const request = vi.fn<typeof fetch>();
+    const guarded = localModelFetch(model, request);
+    const contexts: Context[] = [
+      { messages: [{ role: "user", timestamp: 1, content: "Use a tool" }], tools: [{ name: "inspect", description: "Inspect the fixture", parameters: { type: "object", properties: {} } }] },
+      { messages: [{ role: "assistant", api: model.api, provider: model.provider, model: model.id, stopReason: "toolUse", timestamp: 1,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        content: [{ type: "toolCall", id: "call_fixture", name: "inspect", arguments: {} }] }] },
+      { messages: [{ role: "toolResult", toolCallId: "call_fixture", toolName: "inspect", timestamp: 1, isError: false, content: [{ type: "text", text: "Fixture inspected" }] }] },
+    ];
+    for (const context of contexts) {
+      const reply = await runtime.completeSimple(model, context, { fetch: guarded });
+      expect(reply).toMatchObject({ stopReason: "error", errorMessage: expect.stringContaining("tool-enabled model") });
+    }
+    const image = await runtime.complete(model, { messages: [{ role: "user", timestamp: 1, content: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }] }] }, { fetch: guarded });
+    expect(image).toMatchObject({ stopReason: "error", errorMessage: expect.stringContaining("image input") });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it.each(testRoutes)("cancels $id pending SDK stream and its upstream body without retrying", async ({ providerId, id }) => {
     const log = vi.spyOn(console, "info").mockImplementation(() => {});
     const root = await directory();
-    const runtime = await createLocalModelRuntime(path.join(root, "local-api-keys.json"), async () => [kunpoRuntimeProvider()]);
+    const runtime = await createLocalModelRuntime(path.join(root, "local-api-keys.json"), async () => [kunpoRuntimeProvider(), provider]);
     const key = "CANARY_KUNPO_CANCEL_TEST_ONLY";
-    await runtime.login("kunpo", "api_key", { prompt: async () => key, notify: () => {} });
+    await runtime.login(providerId, "api_key", { prompt: async () => key, notify: () => {} });
+    const model = runtime.getModel(providerId, id)!;
     const cancelled = vi.fn(), upstreamAborted = vi.fn();
     const request = vi.fn<typeof fetch>(async (_input, init) => {
       init?.signal?.addEventListener("abort", upstreamAborted, { once: true });
       return new Response(new ReadableStream<Uint8Array>({
         start(controller) {
-          const event = id === "gpt-6.1-sol" ? { type: "response.created", response: { id: "resp_cancel", status: "in_progress" } }
-            : id === "claude-opus-5-5" ? { type: "message_start", message: { id: "fixture", type: "message", role: "assistant", model: id, content: [], usage: { input_tokens: 1, output_tokens: 0 } } }
+          const event = model.api === "openai-responses" ? { type: "response.created", response: { id: "resp_cancel", status: "in_progress" } }
+            : model.api === "anthropic-messages" ? { type: "message_start", message: { id: "fixture", type: "message", role: "assistant", model: id, content: [], usage: { input_tokens: 1, output_tokens: 0 } } }
             : { id: "fixture", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: "Unverified partial" }, finish_reason: null }] };
-          controller.enqueue(new TextEncoder().encode(`${id === "claude-opus-5-5" ? "event: message_start\n" : ""}data: ${JSON.stringify(event)}\n\n`));
+          controller.enqueue(new TextEncoder().encode(`${model.api === "anthropic-messages" ? "event: message_start\n" : ""}data: ${JSON.stringify(event)}\n\n`));
         },
         cancel: cancelled,
       }), { headers: { "content-type": "text/event-stream" } });
     });
-    const model = runtime.getModel("kunpo", id)!;
     const controller = new AbortController();
     const pending = runtime.completeSimple(model, { messages: [{ role: "user", timestamp: 1, content: "Inspect the fixture" }] },
       { fetch: localModelFetch(model, request), maxRetries: 0, signal: controller.signal });
@@ -321,10 +398,10 @@ describe("local literal API key storage and model runtime", () => {
     expect(finished[0]).toMatchObject({ outcome: "cancelled", statusCode: 200, wireComplete: false });
   });
 
-  it("continues GPT-6.1 Responses tools with distinct item IDs and call IDs through the actual SDK", async () => {
+  it("continues Responses tools with distinct item IDs and call IDs through the actual SDK", async () => {
     const root = await directory();
-    const runtime = await createLocalModelRuntime(path.join(root, "local-api-keys.json"), async () => [kunpoRuntimeProvider()]);
-    await runtime.login("kunpo", "api_key", { prompt: async () => "CANARY_KUNPO_RESPONSES_TEST_ONLY", notify: () => {} });
+    const runtime = await createLocalModelRuntime(path.join(root, "local-api-keys.json"), async () => [provider]);
+    await runtime.login(provider.id, "api_key", { prompt: async () => "CANARY_RESPONSES_TEST_ONLY", notify: () => {} });
     const call = { type: "function_call", id: "fc_fixture_item", call_id: "call_fixture", name: "inspect", arguments: '{"label":"fixture"}', status: "completed" };
     const answer = { type: "message", id: "msg_fixture_answer", role: "assistant", status: "completed", phase: "final_answer", content: [{ type: "output_text", text: "Ready", annotations: [] }] };
     const request = vi.fn<typeof fetch>()
@@ -344,7 +421,7 @@ describe("local literal API key storage and model runtime", () => {
         { type: "response.output_item.done", output_index: 0, item: answer },
         { type: "response.completed", response: { id: "resp_fixture_answer", status: "completed", output: [answer], usage: responseUsage } },
       ));
-    const model = runtime.getModel("kunpo", "gpt-6.1-sol")!;
+    const model = runtime.getModel(provider.id, "fixture-model")!;
     const user = { role: "user" as const, timestamp: 1, content: "Inspect the text fixture" };
     const tools = [{ name: "inspect", description: "Inspect text", parameters: { type: "object", properties: { label: { type: "string" } }, required: ["label"] } }];
     const options = { fetch: localModelFetch(model, request), maxRetries: 2, reasoning: "high" as const, maxTokens: 512 };
@@ -357,7 +434,7 @@ describe("local literal API key storage and model runtime", () => {
     expect(request).toHaveBeenCalledTimes(2);
     expect(request.mock.calls.every(([input]) => String(input) === "https://llm.ziy.cc/v1/responses")).toBe(true);
     const firstBody = JSON.parse(String(request.mock.calls[0]![1]?.body));
-    expect(firstBody).toMatchObject({ model: "gpt-6.1-sol", stream: true, reasoning: { effort: "high" }, max_output_tokens: 512, tools: [{ type: "function", name: "inspect" }] });
+    expect(firstBody).toMatchObject({ model: "fixture-model", stream: true, reasoning: { effort: "high" }, max_output_tokens: 512, tools: [{ type: "function", name: "inspect" }] });
     expect(firstBody.temperature).toBeUndefined();
     const secondBody = JSON.parse(String(request.mock.calls[1]![1]?.body));
     expect(secondBody.input).toContainEqual(expect.objectContaining({ type: "function_call", id: "fc_fixture_item", call_id: "call_fixture", name: "inspect", arguments: '{"label":"fixture"}' }));
@@ -367,8 +444,8 @@ describe("local literal API key storage and model runtime", () => {
 
   it.each(["incomplete", "missing-terminal"] as const)("does not treat a Responses %s stream as a completed answer or retry it", async (terminal) => {
     const root = await directory();
-    const runtime = await createLocalModelRuntime(path.join(root, "local-api-keys.json"), async () => [kunpoRuntimeProvider()]);
-    await runtime.login("kunpo", "api_key", { prompt: async () => "CANARY_KUNPO_RESPONSES_TEST_ONLY", notify: () => {} });
+    const runtime = await createLocalModelRuntime(path.join(root, "local-api-keys.json"), async () => [provider]);
+    await runtime.login(provider.id, "api_key", { prompt: async () => "CANARY_RESPONSES_TEST_ONLY", notify: () => {} });
     const partial = { type: "message", id: "msg_partial", role: "assistant", status: "incomplete", content: [{ type: "output_text", text: "Partial", annotations: [] }] };
     const events: unknown[] = [
       { type: "response.created", response: { id: "resp_incomplete", status: "in_progress" } },
@@ -377,7 +454,7 @@ describe("local literal API key storage and model runtime", () => {
     ];
     if (terminal === "incomplete") events.push({ type: "response.incomplete", response: { id: "resp_incomplete", status: "incomplete", incomplete_details: { reason: "max_output_tokens" }, output: [partial], usage: responseUsage } });
     const request = vi.fn<typeof fetch>(async () => responsesSse(...events));
-    const model = runtime.getModel("kunpo", "gpt-6.1-sol")!;
+    const model = runtime.getModel(provider.id, "fixture-model")!;
     const result = await runtime.completeSimple(model, { messages: [{ role: "user", timestamp: 1, content: "Inspect the text fixture" }] }, { fetch: localModelFetch(model, request), maxRetries: 2 });
     expect(result.stopReason).toBe(terminal === "incomplete" ? "length" : "error");
     if (terminal === "incomplete") expect(result.rawStopReason).toBe("incomplete.max_output_tokens");
@@ -388,9 +465,9 @@ describe("local literal API key storage and model runtime", () => {
   it.each(["user", "toolResult"] as const)("refuses text-only Responses %s images before the SDK can replace them with placeholders", async (role) => {
     const log = vi.spyOn(console, "info").mockImplementation(() => {});
     const root = await directory();
-    const runtime = await createLocalModelRuntime(path.join(root, "local-api-keys.json"), async () => [kunpoRuntimeProvider()]);
-    await runtime.login("kunpo", "api_key", { prompt: async () => "CANARY_KUNPO_RESPONSES_TEST_ONLY", notify: () => {} });
-    const model = runtime.getModel("kunpo", "gpt-6.1-sol")!;
+    const runtime = await createLocalModelRuntime(path.join(root, "local-api-keys.json"), async () => [provider]);
+    await runtime.login(provider.id, "api_key", { prompt: async () => "CANARY_RESPONSES_TEST_ONLY", notify: () => {} });
+    const model = runtime.getModel(provider.id, "fixture-model")!;
     const content = [{ type: "image" as const, data: "aGVsbG8=", mimeType: "image/png" }];
     const message = role === "user" ? { role, timestamp: 1, content }
       : { role, toolCallId: "call_fixture|fc_fixture", toolName: "game_use", content, isError: false, timestamp: 1 };
@@ -408,10 +485,10 @@ describe("local literal API key storage and model runtime", () => {
 
   it("constructs standard Responses user and tool-result images in an isolated hypothetical image-enabled connection", async () => {
     const root = await directory();
-    const runtime = await createLocalModelRuntime(path.join(root, "local-api-keys.json"), async () => [kunpoRuntimeProvider()]);
-    await runtime.login("kunpo", "api_key", { prompt: async () => "CANARY_RESPONSES_IMAGE_FIXTURE_ONLY", notify: () => {} });
-    const configured = runtime.getModel("kunpo", "gpt-6.1-sol")!;
-    expect(configured.input).not.toContain("image"); // A mock cannot verify the real Kunpo gateway.
+    const runtime = await createLocalModelRuntime(path.join(root, "local-api-keys.json"), async () => [provider]);
+    await runtime.login(provider.id, "api_key", { prompt: async () => "CANARY_RESPONSES_IMAGE_FIXTURE_ONLY", notify: () => {} });
+    const configured = runtime.getModel(provider.id, "fixture-model")!;
+    expect(configured.input).not.toContain("image");
     const enabled = { ...configured, input: ["text", "image"] as ("text" | "image")[] };
     const image = { type: "image" as const, data: "aGVsbG8=", mimeType: "image/png" };
     const request = vi.fn<typeof fetch>(async () => responsesSse(
@@ -436,13 +513,13 @@ describe("local literal API key storage and model runtime", () => {
     expect(configured.input).not.toContain("image");
   });
 
-  describe.each(["gpt-5.6-sol", "claude-opus-5-5", "gpt-6.1-sol"])("billed request retry boundary for %s", (id) => {
+  describe.each(testRoutes)("billed request retry boundary for $id", ({ providerId, id }) => {
     it.each(["http-503", "connection-reset"] as const)("never retries %s through complete or completeSimple even when requested", async (failure) => {
       const root = await directory();
-      const runtime = await createLocalModelRuntime(path.join(root, "local-api-keys.json"), async () => [kunpoRuntimeProvider()]);
+      const runtime = await createLocalModelRuntime(path.join(root, "local-api-keys.json"), async () => [kunpoRuntimeProvider(), provider]);
       const key = "CANARY_KUNPO_NO_RETRY_TEST_ONLY";
-      await runtime.login("kunpo", "api_key", { prompt: async () => key, notify: () => {} });
-      const model = runtime.getModel("kunpo", id)!;
+      await runtime.login(providerId, "api_key", { prompt: async () => key, notify: () => {} });
+      const model = runtime.getModel(providerId, id)!;
       for (const method of ["complete", "completeSimple"] as const) {
         const request = vi.fn<typeof fetch>(async () => {
           if (failure === "connection-reset") throw new TypeError("Simulated upstream connection reset");

@@ -15,6 +15,17 @@ export interface StoredConversation {
   sessionPath: string;
 }
 
+type ContextMessages = ReturnType<SessionManager["buildSessionContext"]>["messages"];
+
+export function hasToolHistory(messages: ContextMessages): boolean {
+  return messages.some(message => message.role === "toolResult" ||
+    (message.role === "assistant" && message.content.some(block => block.type === "toolCall")));
+}
+
+export function hasImageHistory(messages: ContextMessages): boolean {
+  return messages.some(message => "content" in message && Array.isArray(message.content) && message.content.some(block => block.type === "image"));
+}
+
 export class ConversationManager {
   readonly #pending = new Map<string, { stored: StoredConversation; manager: SessionManager; titled: boolean }>();
   readonly #cache: ConversationCache;
@@ -156,8 +167,11 @@ export class ConversationManager {
   }
 
   async hasImageHistory(project: ProjectState, stored: StoredConversation): Promise<boolean> {
-    const context = (await this.view(project, stored)).buildSessionContext();
-    return context.messages.some((message) => "content" in message && Array.isArray(message.content) && message.content.some((block) => block.type === "image"));
+    return hasImageHistory((await this.view(project, stored)).buildSessionContext().messages);
+  }
+
+  async hasToolHistory(project: ProjectState, stored: StoredConversation): Promise<boolean> {
+    return hasToolHistory((await this.view(project, stored)).buildSessionContext().messages);
   }
 
   setReasoningLevel(project: ProjectState, stored: StoredConversation, level: AgentReasoningLevel): void {

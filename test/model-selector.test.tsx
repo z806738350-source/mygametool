@@ -101,28 +101,28 @@ describe("ModelSelector interaction", () => {
     expect(generate.disabled).toBe(false);
   });
 
-  it("shows pending Kunpo candidates without selecting or silently replacing them", async () => {
+  it("keeps a retired Kunpo selection in history and excludes it from the new selection menu", async () => {
     const onChange = vi.fn();
     const ready = { ...model, provider: "kunpo", providerName: "KunpoAPI", id: "gpt-5.6-sol", name: "gpt-5.6-sol" };
     await act(async () => root.render(<ModelSelector models={[ready]} value={{ provider: "kunpo", id: "gemini-3.8-flash" }} onChange={onChange} onReasoningChange={() => {}} />));
     const trigger = container.querySelector<HTMLButtonElement>(".model-selector-trigger")!;
     expect(trigger.textContent).toContain("gemini-3.8-flash");
     await act(async () => trigger.click());
-    const pending = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')].find((button) => button.textContent?.includes("gemini-3.8-flash"))!;
-    expect(pending.disabled).toBe(true);
-    await act(async () => pending.click());
+    expect(trigger.textContent).toContain("Unavailable");
+    const options = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')];
+    expect(options.map(button => button.textContent)).toEqual(["gpt-5.6-sol"]);
     expect(onChange).not.toHaveBeenCalled();
     expect(trigger.textContent).not.toContain("gpt-5.6-sol");
   });
 
-  it("distinguishes GPT-6.1 vision from the unverified Kunpo connection", async () => {
-    const textOnly = { ...model, provider: "kunpo", providerName: "KunpoAPI", id: "gpt-6.1-sol", name: "gpt-6.1-sol" };
+  it("explains the Kunpo Fable text-only and project tools restrictions", async () => {
+    const textOnly = { ...model, provider: "kunpo", providerName: "KunpoAPI", id: "claude-fable-5-2", name: "claude-fable-5-2" };
     await act(async () => root.render(<ModelSelector models={[textOnly]} value={textOnly} onChange={() => {}} onReasoningChange={() => {}} />));
     const trigger = container.querySelector<HTMLButtonElement>(".model-selector-trigger")!;
-    expect(trigger.title).toContain("GPT-6.1 Sol supports image input");
+    expect(trigger.title).toContain("supports text chat only");
     await act(async () => trigger.click());
     const option = document.querySelector<HTMLButtonElement>('[role="menuitemradio"]')!;
-    expect(option.title).toContain("Kunpo Responses connection is not verified");
+    expect(option.title).toContain("run project tools");
     expect(option.disabled).toBe(false);
   });
 
@@ -142,8 +142,8 @@ describe("ModelSelector interaction", () => {
     expect(container.querySelector('.model-selector-trigger')?.getAttribute("aria-expanded")).toBe("false");
   });
 
-  it("honors explicitly image-enabled runtime metadata over the built-in gateway restriction", async () => {
-    const enabled = { ...model, provider: "kunpo", id: "gpt-6.1-sol", supportsImages: true };
+  it("honors the image capability of the same model ID on an independent provider", async () => {
+    const enabled = { ...model, provider: "independent", id: "claude-fable-5-2", supportsImages: true };
     await act(async () => root.render(<ModelSelector models={[enabled]} hasImageHistory onChange={() => {}} onReasoningChange={() => {}} />));
     await act(async () => container.querySelector<HTMLButtonElement>(".model-selector-trigger")!.click());
     expect(document.querySelector<HTMLButtonElement>('[role="menuitemradio"]')!.disabled).toBe(false);
@@ -164,7 +164,7 @@ describe("ModelSelector interaction", () => {
     expect(onChange).toHaveBeenCalledExactlyOnceWith("ready");
   });
 
-  it("disables pending project choices while retaining a previously saved pending selection", async () => {
+  it("offers Fable and keeps a previously saved retired project choice unavailable", async () => {
     const project = { id: "project", modelSelections: { agent: { provider: "kunpo", id: "gemini-3.8-flash" } } } as ProjectState;
     const saved = vi.fn();
     await act(async () => root.render(<ProjectMediaModelSettings project={project} onSaved={saved} />));
@@ -175,6 +175,9 @@ describe("ModelSelector interaction", () => {
     await act(async () => agent.click());
     const pending = [...document.querySelectorAll<HTMLButtonElement>('[role="option"]')].find((button) => button.textContent?.includes("gemini-3.8-flash"))!;
     expect(pending.disabled).toBe(true);
+    expect(pending.textContent).toContain("Unavailable");
+    const options = [...document.querySelectorAll<HTMLButtonElement>('[role="option"]')];
+    expect(options.find(button => button.textContent?.includes("claude-fable-5-2"))?.title).toContain("supports text chat only");
     await act(async () => pending.click());
     expect(saved).not.toHaveBeenCalled();
     expect(agent.textContent).toContain("gemini-3.8-flash");

@@ -317,14 +317,14 @@ describe("Web Game project codebase", () => {
     expect(JSON.parse(await readFile(path.join(directory, "projects", project.id, "project.json"), "utf8"))).not.toHaveProperty("mediaModelDefaults");
   });
 
-  it("snapshots new-project model choices and preserves explicit choices, pending candidates and legacy metadata", async () => {
+  it("snapshots new-project model choices and preserves explicit choices, retired choices and legacy metadata", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-project-models-"));
     try {
       const manager = new ProjectManager(directory);
       const project = await manager.create("Canvas", "asset-canvas");
       expect(project.modelSelections).toEqual(KUNPO_DEFAULT_MODEL_REFS);
       expect(project.modelSelections).not.toHaveProperty("music");
-      const selected = { agent: { provider: "kunpo", id: "gemini-3.8-flash" }, image: { provider: "openai", id: "gpt-image-2.5-flare" } };
+      const selected = { agent: { provider: "kunpo", id: "claude-fable-5-2" }, image: { provider: "openai", id: "gpt-image-2.5-flare" } };
       await Promise.all([manager.rename(project.id, "Chosen"), manager.setModelSelections(project.id, selected)]);
       const expected = { ...KUNPO_DEFAULT_MODEL_REFS, ...selected };
       expect(project.modelSelections).toEqual(expected);
@@ -337,9 +337,15 @@ describe("Web Game project codebase", () => {
       delete saved.modelSelections;
       saved.mediaModelDefaults = { image: { provider: "legacy-studio", id: "explicit-legacy" } };
       await writeFile(record, JSON.stringify(saved));
+      const duplicateRecord = path.join(directory, "projects", duplicate.id, "project.json");
+      const legacy = JSON.parse(await readFile(duplicateRecord, "utf8"));
+      const retired = { provider: "kunpo", id: "gemini-3.8-flash" };
+      legacy.modelSelections.agent = retired;
+      await writeFile(duplicateRecord, JSON.stringify(legacy));
       const restored = new ProjectManager(directory);
       await restored.load();
-      expect(restored.get(duplicate.id)?.modelSelections).toEqual(project.modelSelections);
+      expect(restored.get(duplicate.id)?.modelSelections).toEqual({ ...project.modelSelections, agent: retired });
+      await expect(restored.setModelSelections(duplicate.id, { agent: retired })).rejects.toThrow("Invalid project model selection");
       expect(restored.get(project.id)?.modelSelections).toBeUndefined();
       expect(restored.get(project.id)?.mediaModelDefaults).toEqual(saved.mediaModelDefaults);
       await restored.rename(project.id, "Legacy name");

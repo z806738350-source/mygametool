@@ -271,7 +271,7 @@ describe("local secure execution boundaries", () => {
     const agentDir = path.join(directory, "agent-config");
     await mkdir(agentDir);
     const runtime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: null, allowModelNetwork: false, refreshOnCreate: false });
-    const model: RuntimeModel = { ...runtime.getModels("openai")[0]!, provider: "kunpo", id: "gpt-6.1-sol", api: "openai-responses", baseUrl: "https://llm.ziy.cc/v1", input: ["text"] };
+    const model: RuntimeModel = { ...runtime.getModels("openai")[0]!, provider: "custom-provider", id: "text-only", api: "openai-responses", input: ["text"] };
     const gameTool = { ...createLocalAgentFileTools(directory)[0]!, name: "game_use" };
     const session = await createPiSession({ workspacePath: directory, type: "general" }, SessionManager.inMemory(directory), [gameTool], runtime, model, agentDir);
     const request = vi.fn<typeof fetch>();
@@ -287,6 +287,29 @@ describe("local secure execution boundaries", () => {
       }))).rejects.toThrow("image input enabled");
       expect(request).not.toHaveBeenCalled();
     } finally { session.dispose(); vi.unstubAllGlobals(); }
+  });
+
+  it("keeps Kunpo Fable's tool registry empty and refuses incompatible saved history", async () => {
+    const directory = await workspace(), agentDir = path.join(directory, "agent-config");
+    await mkdir(agentDir);
+    await writeFile(path.join(agentDir, "settings.json"), JSON.stringify({ defaultTools: ["read", "write"] }));
+    const runtime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: null, allowModelNetwork: false, refreshOnCreate: false });
+    const model: RuntimeModel = { ...runtime.getModels("anthropic")[0]!, provider: "kunpo", id: "claude-fable-5-2", input: ["text"] };
+    const history = SessionManager.inMemory(directory);
+    history.appendMessage({ role: "user", content: "Hello", timestamp: 1 });
+    const guide = { ...createLocalAgentFileTools(directory)[0]!, name: "read_workflow_guide" };
+    const openSession = () => createPiSession({ workspacePath: directory, type: "general" }, history, [guide], runtime, model, agentDir);
+    const session = await openSession();
+    try {
+      expect(session.getAllTools?.()).toEqual([]);
+      expect((session as AgentSession).systemPrompt).toContain("This connection has no tools or image input.");
+      session.setActiveToolsByName?.(["read", "write", "bash", guide.name]);
+      expect((session as AgentSession).getActiveToolNames()).toEqual([]);
+    } finally { session.dispose(); }
+    history.appendMessage({ role: "toolResult", toolCallId: "old", toolName: "read", content: [{ type: "text", text: "retained" }], isError: false, timestamp: 2 });
+    const before = history.getBranch();
+    await expect(openSession()).rejects.toThrow("Start a new text conversation");
+    expect(history.getBranch()).toEqual(before);
   });
 
   it("excludes executable tools from Pi's registry even with saved default tool and package settings", async () => {

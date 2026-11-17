@@ -33,7 +33,7 @@ import { ProviderModels } from "./provider-models.js";
 import { OpenAIImageModels } from "./openai-image-models.js";
 import { ProviderResponsesTransport } from "./responses-transport-settings.js";
 import { Provider3DBalance } from "./provider-3d-balance.js";
-import { GlobalMediaModelDefaults } from "./media-model-defaults.js";
+import { GlobalMediaModelDefaults, kunpoModelHelp } from "./media-model-defaults.js";
 import { openAgentRuntimeAuthExternal, openModelAuthExternal as openExternal, useModelProviderAuth } from "./use-model-provider-auth.js";
 import { SegmentedControl } from "./segmented-control.js";
 import { LocalEditionNotice } from "./local-edition-notice.js";
@@ -280,9 +280,10 @@ function KunpoProviderDetail({ provider, onBack, onCompleted }: { provider: Prov
     {KUNPO_MODEL_ROLES.map((role) => <section className="settings-detail-section provider-models" key={role} aria-label={t(`kunpoModels.roles.${role}`)}>
       <div className="provider-models-heading"><h4>{t(`kunpoModels.roles.${role}`)}</h4></div>
       <div className="provider-models-list" role="list" aria-label={t(`kunpoModels.roles.${role}`)}>
-        {KUNPO_MODEL_OPTIONS.filter((model) => model.role === role).map((model) => <div className="provider-model-row" role="listitem" key={`${model.provider}/${model.id}`} aria-disabled={model.status === "pending"} title={model.status === "pending" ? t("kunpoModels.pendingHelp") : role === "speech" ? t("kunpoModels.speechHelp") : role === "music" ? t("kunpoModels.musicHelp") : t("kunpoModels.unverifiedHelp")}>
+        {KUNPO_MODEL_OPTIONS.filter((model) => model.role === role).map((model) => <div className="provider-model-row" role="listitem" key={`${model.provider}/${model.id}`} aria-disabled={model.status === "pending"} title={kunpoModelHelp(model)}>
           <div className="provider-model-readonly"><span className="provider-model-copy"><strong>{model.name}</strong></span></div>
           {model.status === "pending" ? <small className="provider-model-custom">{t("kunpoModels.status.pending")}</small> : null}
+          {model.capabilities.tools === false ? <small className="provider-model-custom">{t("kunpoModels.textOnlyLabel")}</small> : null}
         </div>)}
       </div>
     </section>)}

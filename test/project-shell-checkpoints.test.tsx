@@ -244,6 +244,22 @@ async function click(name: string) {
 }
 
 describe("checkpoints in the project shell", () => {
+  it("opens a project with a retired Agent and no chats without explicitly requesting the removed model", async () => {
+    const empty = detail("unused");
+    empty.turns = [];
+    empty.conversation.messageCount = 0;
+    empty.settings.model = { provider: "kunpo", id: "kimi-k3.1-pro" };
+    const daemon = await openProject((route, init) => {
+      if (route === "/projects/project") return Response.json({
+        id: "project", type: "general", name: "Legacy", workspacePath: "/tmp/project", preview: { status: "stopped" },
+        modelSelections: { agent: empty.settings.model },
+      });
+      if (route === "/projects/project/conversations") return Response.json(init.method === "POST" ? empty.conversation : []);
+    }, empty);
+    expect(daemon.requests.find(request => request.method === "POST" && request.route === "/projects/project/conversations")?.body).toBe("{}");
+    expect(container.querySelector(".model-selector-trigger")?.textContent).toContain("kimi-k3.1-pro");
+  });
+
   it("shows an asynchronous no-key bootstrap error without changing hook order or losing navigation", async () => {
     const onHome = vi.fn();
     let finish!: (response: Response) => void;
