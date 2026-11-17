@@ -61,8 +61,9 @@ and the optional controlled coding-agent connections.
 On desktop, `blender_status.liveWorkWindow` reports whether live observation is
 available. A Blender work window opens automatically when a task starts. It can
 be moved and resized, and closes automatically when the task finishes or is
-cancelled. This separate observer displays copies of the worker's actual current
-scene at script checkpoints while production continues. It does not execute the
+cancelled. When the work window closes on macOS, the existing OhMyGame project
+window returns to the foreground. The observer displays copies of the worker's
+current scene at script checkpoints while production continues. It does not execute the
 Agent's instructions through the Blender interface. Long native operations may
 leave the last scene visible until the next checkpoint.
 

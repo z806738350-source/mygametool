@@ -25,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   register: vi.fn(),
   terminate: vi.fn(),
   bounds: vi.fn(),
+  closed: vi.fn(),
   conflicts: new Map<string, number>(),
 }));
 vi.mock("node:child_process", async (original) => ({
@@ -37,6 +38,7 @@ vi.mock("../src/daemon/process-lifecycle.js", () => ({
 }));
 vi.mock("../src/daemon/blender-window-bounds.js", () => ({
   resolveBlenderWindowBounds: mocks.bounds,
+  notifyBlenderWindowClosed: mocks.closed,
 }));
 vi.mock("../src/daemon/safe-project-file.js", async (original) => {
   const actual =
@@ -197,6 +199,7 @@ describe("per-job Blender work window", () => {
         second = view.finish();
       expect(first).toBe(second);
       expect(await first).toEqual({ shown: true, updates: 0 });
+      expect(mocks.closed).toHaveBeenCalledTimes(1);
       expect(mocks.terminate).toHaveBeenCalledTimes(1);
       expect(existsSync(relay)).toBe(false);
       expect(await readFile(path.join(job, "original.txt"), "utf8")).toBe(
@@ -217,6 +220,7 @@ describe("per-job Blender work window", () => {
       expect(existsSync(path.join(relay, "status.json"))).toBe(true),
     );
     expect(mocks.terminate).not.toHaveBeenCalled();
+    expect(mocks.closed).not.toHaveBeenCalled();
     expect(existsSync(path.join(relay, "stop.json"))).toBe(false);
     acknowledge = true;
     expect(await finished).toEqual({ shown: true, updates: 1 });
@@ -301,7 +305,16 @@ describe("per-job Blender work window", () => {
     expect(result.updates).toBe(0);
     expect(mocks.terminate).toHaveBeenCalledWith(child);
     expect(mocks.terminate).toHaveBeenCalledTimes(1);
+    expect(mocks.closed).toHaveBeenCalledTimes(1);
     expect(existsSync(relay)).toBe(false);
+  });
+
+  it("returns focus when the user closes the observer early, only once", async () => {
+    view = await startBlenderLiveView(job, async () => {});
+    closeObserver();
+    expect(mocks.closed).toHaveBeenCalledTimes(1);
+    expect(await view.finish()).toMatchObject({ shown: true, warning: expect.stringContaining("closed") });
+    expect(mocks.closed).toHaveBeenCalledTimes(1);
   });
 
   it("checks observer resources before accepting readiness and closes only the observer when its limit is exceeded", async () => {
@@ -315,6 +328,7 @@ describe("per-job Blender work window", () => {
       updates: 0,
       warning: "observer memory limit",
     });
+    expect(mocks.closed).not.toHaveBeenCalled();
     expect(mocks.terminate).toHaveBeenCalledWith(child);
     expect(existsSync(relay)).toBe(false);
     expect(await readFile(path.join(job, "original.txt"), "utf8")).toBe(

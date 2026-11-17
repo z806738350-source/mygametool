@@ -9,7 +9,10 @@ import {
   registerProjectProcess,
   terminateProjectProcess,
 } from "./process-lifecycle.js";
-import { resolveBlenderWindowBounds } from "./blender-window-bounds.js";
+import {
+  notifyBlenderWindowClosed,
+  resolveBlenderWindowBounds,
+} from "./blender-window-bounds.js";
 import { blenderLiveViewLabels } from "../shared/blender-live-view-labels.js";
 
 const EXECUTABLE = "/Applications/Blender.app/Contents/MacOS/Blender";
@@ -342,8 +345,10 @@ export async function startBlenderLiveView(
     );
     registerProjectProcess(child);
     child.on("error", warn);
-    child.on("close", () => {
-      if (active && result.shown)
+    child.once("close", () => {
+      if (!result.shown) return;
+      notifyBlenderWindowClosed();
+      if (active)
         warn(
           new Error(
             "The Blender work window closed; production continued in the background",

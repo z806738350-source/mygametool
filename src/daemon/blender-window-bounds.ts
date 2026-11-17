@@ -4,6 +4,13 @@ import {
   type BlenderWindowBounds,
 } from "../shared/blender-window-bounds.js";
 
+export function notifyBlenderWindowClosed(): void {
+  if (process.env.OHMYGAME_BLENDER_WINDOW_IPC === "1" && process.connected) {
+    // The desktop may already have disconnected during shutdown.
+    process.send?.({ channel: "ohmygame:blender-window:closed" }, () => {});
+  }
+}
+
 /** Optional placement only: an unavailable desktop must never block a Blender job. */
 export function resolveBlenderWindowBounds(): Promise<
   BlenderWindowBounds | undefined

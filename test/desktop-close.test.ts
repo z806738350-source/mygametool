@@ -12,6 +12,9 @@ const host = vi.hoisted(() => ({
   stopped: vi.fn(async () => {}),
   openExternal: vi.fn(async (_url: string) => {}),
   quit: vi.fn(), relaunch: vi.fn(), close: vi.fn(),
+  focusApp: vi.fn(), showWindow: vi.fn(), focusWindow: vi.fn(), restoreWindow: vi.fn(),
+  isMinimized: vi.fn(() => false),
+  onBlenderWindowClosed: undefined as (() => void) | undefined,
   options: undefined as Record<string, unknown> | undefined,
   mediaClosed: vi.fn(),
 }));
@@ -20,7 +23,7 @@ vi.mock("electron", () => ({
     isPackaged: false,
     on: (name: string, fn: (...args: any[]) => void) => host.appEvents.set(name, fn),
     whenReady: async () => {}, getPath: () => "/tmp/ohmygame-close-test", getVersion: () => "0.0.0",
-    isReady: () => true, quit: host.quit, relaunch: host.relaunch, exit: vi.fn(),
+    isReady: () => true, quit: host.quit, relaunch: host.relaunch, exit: vi.fn(), focus: host.focusApp,
   },
   ipcMain: {
     handle: (name: string, fn: (...args: any[]) => any) => host.handlers.set(name, fn),
@@ -36,7 +39,10 @@ vi.doMock(path.resolve("src/desktop/network.ts"), () => ({
   prepareDesktopNetwork: async () => ({ active: {}, environment: {} }), electronProxyConfig: () => ({}), proxyCredentials: vi.fn(),
 }));
 vi.doMock(path.resolve("src/desktop/daemon-process.ts"), () => ({
-  startDaemon: async () => ({ runtime: { url: "http://127.0.0.1:12345", token: "test" }, stop: host.stopped }),
+  startDaemon: async (options: { onBlenderWindowClosed?: () => void }) => {
+    host.onBlenderWindowClosed = options.onBlenderWindowClosed;
+    return { runtime: { url: "http://127.0.0.1:12345", token: "test" }, stop: host.stopped };
+  },
 }));
 vi.doMock(path.resolve("src/desktop/log-file.ts"), () => ({
   RotatingLogFile: class { line() {} write() {} flush() {} close() {} stream() { return { write() {}, flush() {} }; } },
@@ -73,6 +79,7 @@ vi.doMock(path.resolve("src/desktop/window.ts"), () => ({
     host.sender.mainFrame = mainFrame;
     const window = {
       webContents: host.sender, isDestroyed: () => false, close: host.close,
+      isMinimized: host.isMinimized, restore: host.restoreWindow, show: host.showWindow, focus: host.focusWindow,
       on: (name: string, fn: (...args: any[]) => void) => host.windowEvents.set(name, fn),
       once: (name: string, fn: (...args: any[]) => void) => host.windowEvents.set(name, fn),
     };
@@ -118,8 +125,21 @@ function acknowledge(error?: string, sender: { id: number; send: unknown } = hos
 }
 function quit() { const event = { preventDefault: vi.fn() }; host.appEvents.get("before-quit")!(event); expect(event.preventDefault).toHaveBeenCalledOnce(); }
 
+it.each([false, true])("returns to the existing editor when the Blender observer closes (minimized=%s)", (minimized) => {
+  host.isMinimized.mockReturnValueOnce(minimized);
+  host.onBlenderWindowClosed!();
+  expect(host.restoreWindow).toHaveBeenCalledTimes(minimized ? 1 : 0);
+  if (process.platform === "darwin") expect(host.focusApp).toHaveBeenCalledWith({ steal: true });
+  expect(host.showWindow).toHaveBeenCalledOnce();
+  expect(host.focusWindow).toHaveBeenCalledOnce();
+});
+
 it("keeps services running until Quit receives a save acknowledgement", async () => {
   quit(); quit();
+  host.onBlenderWindowClosed!();
+  expect(host.focusApp).not.toHaveBeenCalled();
+  expect(host.showWindow).not.toHaveBeenCalled();
+  expect(host.focusWindow).not.toHaveBeenCalled();
   expect(host.sender.send).toHaveBeenCalledTimes(1);
   expect(host.stopped).not.toHaveBeenCalled();
   acknowledge(); await settle();

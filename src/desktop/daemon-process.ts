@@ -44,6 +44,7 @@ export interface StartDaemonOptions {
   handlePlaytestRequest?: (request: PlaytestRequest, signal: AbortSignal) => Promise<PlaytestResult>;
   resolveSystemProxy?: () => Promise<string>;
   resolveBlenderWindowBounds?: () => Promise<BlenderWindowPlacement | undefined>;
+  onBlenderWindowClosed?: () => void;
   onUnexpectedExit?: (error: Error) => void;
   /** Keeps the daemon's output after the app closes. */
   log?: LogWriter;
@@ -120,6 +121,10 @@ export async function startDaemon(options: StartDaemonOptions): Promise<ManagedD
   if (options.resolveBlenderWindowBounds) {
     child.on("message", (value: unknown) => {
       const message = value as { channel?: unknown; id?: unknown } | null;
+      if (message?.channel === "ohmygame:blender-window:closed") {
+        options.onBlenderWindowClosed?.();
+        return;
+      }
       if (message?.channel !== "ohmygame:blender-window:resolve" || typeof message.id !== "string" || !message.id || message.id.length > 100) return;
       const send = (result?: BlenderWindowPlacement) => {
         if (child.connected) child.send({ channel: "ohmygame:blender-window:result", id: message.id, result }, () => {});

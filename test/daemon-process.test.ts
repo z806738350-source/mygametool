@@ -149,7 +149,7 @@ describe("desktop daemon process", () => {
       timers.mockRestore(); await rm(directory, { recursive: true, force: true });
     }
   });
-  it("resolves system proxy and Blender placement over private child IPC", async () => {
+  it("handles system proxy, Blender placement and observer closure over private child IPC", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-proxy-ipc-"));
     const entry = path.join(directory, "daemon.mjs");
     const resultFile = path.join(directory, "result.json");
@@ -163,7 +163,10 @@ describe("desktop daemon process", () => {
       const server = createServer((_request, response) => response.end());
       process.on("message", (message) => {
         if (message.channel === "ohmygame:system-proxy:result") writeFileSync(${JSON.stringify(resultFile)}, JSON.stringify(message));
-        if (message.channel === "ohmygame:blender-window:result") writeFileSync(${JSON.stringify(windowFile)}, JSON.stringify({ ...message, enabled: process.env.OHMYGAME_BLENDER_WINDOW_IPC }));
+        if (message.channel === "ohmygame:blender-window:result") {
+          writeFileSync(${JSON.stringify(windowFile)}, JSON.stringify({ ...message, enabled: process.env.OHMYGAME_BLENDER_WINDOW_IPC }));
+          process.send({ channel: "ohmygame:blender-window:closed" });
+        }
         if (message.channel === "ohmygame:shutdown") server.close(() => {
           writeFileSync(${JSON.stringify(shutdownFile)}, "closed");
           process.exit(0);
@@ -176,7 +179,8 @@ describe("desktop daemon process", () => {
       process.once("SIGTERM", () => {});
     `);
     const placement = { bounds: { x: 600, y: 100, width: 700, height: 650 }, screenHeight: 1080, language: "zh-CN" as const };
-    const daemon = await startDaemon({ daemonEntry: entry, dataDirectory: directory, token: "test-token", allowedOrigins: [], executable: process.execPath, environment: {}, resolveSystemProxy: async () => "PROXY 127.0.0.1:7890", resolveBlenderWindowBounds: async () => placement });
+    const onBlenderWindowClosed = vi.fn();
+    const daemon = await startDaemon({ daemonEntry: entry, dataDirectory: directory, token: "test-token", allowedOrigins: [], executable: process.execPath, environment: {}, resolveSystemProxy: async () => "PROXY 127.0.0.1:7890", resolveBlenderWindowBounds: async () => placement, onBlenderWindowClosed });
     try {
       await vi.waitFor(async () =>
         expect(JSON.parse(await readFile(resultFile, "utf8"))).toEqual({
@@ -186,6 +190,7 @@ describe("desktop daemon process", () => {
         }),
       );
       await vi.waitFor(async () => expect(JSON.parse(await readFile(windowFile, "utf8"))).toEqual({ channel: "ohmygame:blender-window:result", id: "test-window", result: placement, enabled: "1" }));
+      await vi.waitFor(() => expect(onBlenderWindowClosed.mock.calls).toEqual([[]]));
     } finally {
       await Promise.all([daemon.stop(), daemon.stop()]);
       expect(await readFile(shutdownFile, "utf8")).toBe("closed");

@@ -574,6 +574,13 @@ try {
       return systemProxySession.resolveProxy(SYSTEM_PROXY_TARGET);
     },
     resolveBlenderWindowBounds: readBlenderWindowPlacement,
+    onBlenderWindowClosed: () => {
+      if (!mainWindow || mainWindow.isDestroyed() || quitPending || shutdown) return;
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      if (process.platform === "darwin") app.focus({ steal: true });
+      mainWindow.show();
+      mainWindow.focus();
+    },
     development: !useBuiltRenderer,
     healthTimeoutMs: 60_000,
     log: daemonLog,
