@@ -143,6 +143,7 @@ export class QoderSdkHost {
   #daemon?: HostDaemon;
   #configuration?: {
     binaryPath: string;
+    runtimeVersion: string;
     privateDirectory: string;
     env: ObjectValue;
   };
@@ -232,11 +233,14 @@ export class QoderSdkHost {
   async #initialize(params: ObjectValue): Promise<unknown> {
     if (this.#daemon || this.#initializing)
       throw new HostError("Qoder host was already initialized");
-    const { sdkVersion, runtimeVersion, sdk } = this.dependencies;
-    if (sdkVersion !== SDK_VERSION || runtimeVersion !== RUNTIME_VERSION)
+    const { sdkVersion, runtimeVersion: sdkReferenceRuntimeVersion, sdk } = this.dependencies;
+    if (sdkVersion !== SDK_VERSION || sdkReferenceRuntimeVersion !== RUNTIME_VERSION)
       throw new HostError(
         "The controlled Qoder SDK/runtime version is unavailable",
       );
+    const runtimeVersion = nonempty(params.runtimeVersion);
+    if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(runtimeVersion))
+      throw new HostError("The expected Qoder CLI version is invalid");
     const binaryPath = absolutePath(params.binaryPath);
     const privateDirectory = absolutePath(params.privateDirectory);
     const configurationRoot = absolutePath(params.configurationRoot);
@@ -267,7 +271,8 @@ export class QoderSdkHost {
         pathToQoderCLIExecutable: binaryPath,
         env,
         initializeTimeoutMs: INITIALIZE_TIMEOUT_MS,
-        debug: false,
+        // The SDK otherwise writes a daemon log to the shared Qoder config.
+        debugFile: path.join(privateDirectory, "tmp", "qoder-sdk.log"),
         stderr: () => {},
       });
       if (this.#closed) {
@@ -275,7 +280,7 @@ export class QoderSdkHost {
         throw new HostError("Qoder host is closed");
       }
       this.#daemon = daemon;
-      this.#configuration = { binaryPath, privateDirectory, env };
+      this.#configuration = { binaryPath, runtimeVersion, privateDirectory, env };
       return { sdkVersion, runtimeVersion };
     } catch (cause) {
       throw sdkFailure(cause, "daemon-start");
@@ -642,6 +647,7 @@ export class QoderSdkHost {
               message,
               expected,
               this.#configuration!.privateDirectory,
+              this.#configuration!.runtimeVersion,
               turn.inputSent,
             );
             // CLI 1.1.83 emits another snapshot at the start of every user turn.
@@ -1067,11 +1073,12 @@ function verifyInventory(
   message: ObjectValue,
   expected: string[],
   cwd: string,
+  runtimeVersion: string,
   promptSent: boolean,
 ): void {
   const servers = Array.isArray(message.mcp_servers) ? message.mcp_servers : [];
   const checks: Record<InventoryField, boolean> = {
-    "runtime-version": message.qodercli_version === RUNTIME_VERSION,
+    "runtime-version": message.qodercli_version === runtimeVersion,
     "working-directory": message.cwd === cwd,
     "active-tools": sameStrings(message.tools, expected),
     skills: sameStrings(message.skills, []),

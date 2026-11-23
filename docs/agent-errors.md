@@ -52,6 +52,8 @@ the billing outcome. Interrupted or rejected streams are not automatically repla
 
 The guarded transport keeps the HTTP status, a bounded request ID and recognized structured error codes. It reads at most 8 KiB for one second, then cancels the error body. Free-form error messages, unknown codes, response bodies, cookies, URLs and other response headers are discarded. Request IDs must be short ASCII identifiers and must not contain registered credentials. Missing metadata remains missing; a 500 alone does not identify whether a gateway or its upstream rejected the request.
 
+When the SDK reports a connection error, the guarded transport retains a recognized native cause code through the SDK wrapper. Examples include `ECONNRESET`, `ENETUNREACH` and `UND_ERR_HEADERS_TIMEOUT`. The timeline labels the SDK message as connection details. A generic failure without a recognized cause stays unclassified for continuation. A local check that stops an outgoing request is distinguished from one that withholds a received response. Both stop automatic continuation.
+
 A `Provider HTTP request failed` line in `daemon.log` records the filtered status, code and request ID, checked request bytes when available, and milliseconds from opening the transport to receiving response headers. These durations are per HTTP request, not the whole agent turn, and exclude response-body inspection. No prompt or image data is logged. The normal Agent failure record also retains the filtered code and request ID through the SDK.
 
 ## Automatic continuation after an interruption

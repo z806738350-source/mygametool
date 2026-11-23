@@ -10,6 +10,24 @@ import tempfile
 import bpy
 
 
+def export_objects(collection=None, *, include_review=False):
+    """Select objects on a visible path inside the requested collection in the active view layer."""
+    visible = set()
+    pending = [(bpy.context.view_layer.layer_collection, collection is None)]
+    while pending:
+        branch, within_scope = pending.pop()
+        if branch.exclude or branch.hide_viewport or branch.collection.hide_viewport or branch.collection.hide_render:
+            continue
+        within_scope = within_scope or branch.collection == collection
+        if within_scope:
+            visible.update(branch.collection.objects)
+        pending.extend((child, within_scope) for child in branch.children)
+    shapes = {bone.custom_shape for arm in bpy.context.scene.objects if arm.type == "ARMATURE"
+              for bone in arm.pose.bones if bone.custom_shape}
+    return [obj for obj in bpy.context.scene.objects if obj in visible and obj.visible_get() and not obj.hide_render
+            and obj.type not in {"LIGHT", "CAMERA"} and obj not in shapes and (include_review or not obj.get("workflow_review"))]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True)
@@ -24,13 +42,12 @@ def main():
     if output.exists() and not options.overwrite:
         raise FileExistsError(f"Output exists; pass --overwrite to replace it: {output}")
 
-    objects = list(bpy.context.scene.objects)
+    collection = None
     if options.collection:
         collection = bpy.data.collections.get(options.collection)
         if collection is None:
             raise ValueError(f"Collection not found: {options.collection}")
-        objects = list(collection.all_objects)
-    objects = [obj for obj in objects if obj.visible_get() and not obj.hide_render]
+    objects = export_objects(collection)
     meshes = [obj for obj in objects if obj.type == "MESH"]
     depsgraph = bpy.context.evaluated_depsgraph_get()
     geometry = [

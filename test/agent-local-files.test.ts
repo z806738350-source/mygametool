@@ -1,10 +1,12 @@
 import { open, link, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import sharp from "sharp";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ProjectState } from "../src/shared/contracts.js";
 import { MEDIA_FILE_TYPES } from "../src/shared/media-files.js";
+import * as kunpoModels from "../src/shared/kunpo-models.js";
 import { createCanvasBoard } from "../src/shared/canvas-workspace.js";
 import { readCanvasBoard } from "../src/daemon/canvas-workspace.js";
 import { createAgentAttachmentReadTool, createLocalAgentFileTools, createProjectFileReadTool, localAgentPath } from "../src/daemon/agent-local-files.js";
@@ -46,6 +48,7 @@ vi.mock("node:fs/promises", async (load) => {
         await handle.close();
         throw new Error("Simulated failure after opening a new file");
       }
+      if (fileFault.point === "changed") await actual.writeFile(args[0], "someone else's edit\n");
       if (fileFault.point === "truncate") {
         const truncate = handle.truncate.bind(handle);
         handle.truncate = async (length) => { await truncate(length); throw new Error("Simulated failure after truncation"); };
@@ -76,6 +79,68 @@ async function rejected(operation: Promise<unknown>): Promise<unknown> {
   try { await operation; } catch (cause) { return cause; }
   throw new Error("Expected the operation to be rejected");
 }
+
+it("applies Pi's disjoint batch against one original, and leaves the file intact on any invalid replacement", async () => {
+  const dir = await workspace(), file = path.join(dir, "game.js");
+  const edit = createLocalAgentFileTools(dir).find(tool => tool.name === "edit")!;
+  const before = "\uFEFFalpha\r\nbeta\r\ngamma\r\n";
+  await writeFile(file, before);
+  const run = (edits: object[]) => edit.execute("batch", { path: "game.js", edits }, undefined, undefined, {} as never);
+  for (const edits of [
+    [],
+    [{ oldText: "", newText: "x" }],
+    [{ oldText: "alpha", newText: "changed" }, { oldText: "changed", newText: "dependent" }],
+    [{ oldText: "alpha", newText: "A" }, { oldText: "lph", newText: "B" }],
+    [{ oldText: "alpha", newText: "A" }, { oldText: "a", newText: "B" }],
+  ]) {
+    expect(getToolPreflightFailure(await rejected(run(edits)))?.reason).toBe("edit_text_not_unique");
+    expect(await readFile(file, "utf8")).toBe(before);
+  }
+  const args = { path: "game.js", oldText: "alpha", newText: "A", releaseReviewedImages: true };
+  expect(edit.prepareArguments?.(args)).toEqual({ path: args.path, edits: [{ oldText: "alpha", newText: "A" }], releaseReviewedImages: true });
+  await run([{ oldText: "gamma", newText: "G" }, { oldText: "alpha", newText: "gamma" }]);
+  expect(await readFile(file, "utf8")).toBe("\uFEFFgamma\r\nbeta\r\nG\r\n");
+  fileFault.point = "changed"; fileFault.target = await realpath(file);
+  await expect(run([{ oldText: "beta", newText: "B" }])).rejects.toThrow("changed");
+  expect(await readFile(file, "utf8")).toBe("someone else's edit\n");
+});
+
+it("reuses Pi's same-turn file receipt and requires a fresh observation if the file changed outside the edit range", async () => {
+  const dir = await workspace(), file = path.join(dir, "scene.py");
+  const sessionManager = SessionManager.inMemory(dir);
+  const ctx = { sessionManager } as never;
+  const tools = createLocalAgentFileTools(dir);
+  const read = tools.find(tool => tool.name === "read")!, edit = tools.find(tool => tool.name === "edit")!;
+  const version = async () => ({ path: "scene.py", sha256: createHash("sha256").update(await readFile(file)).digest("hex") });
+  await writeFile(file, "\uFEFFshape = 'coat'\nsize = 1\n");
+  const params = { path: "scene.py", edits: [{ oldText: "size = 1", newText: "size = 2" }] };
+  async function observe(id: string) {
+    const result = await read.execute(id, { path: "./scene.py", offset: 2, limit: 1 }, undefined, undefined, ctx);
+    const details = { projectFileVersion: await version() };
+    expect(result.details).toEqual(details);
+    expect(result.content).toEqual([{ type: "text", text: "size = 1" }]);
+    return sessionManager.appendMessage({ role: "toolResult", toolCallId: id, toolName: "read", content: result.content, details, isError: false, timestamp: 1 });
+  }
+  const turn = sessionManager.appendMessage({ role: "user", content: "Change the size", timestamp: 1 });
+  await observe("before");
+  await writeFile(file, "\uFEFFshape = 'cape'\nsize = 1\n");
+  const stale = await rejected(edit.execute("stale", params, undefined, undefined, ctx));
+  expect(getToolPreflightFailure(stale)?.reason).toBe("edit_text_not_unique");
+  expect(await readFile(file, "utf8")).toContain("size = 1");
+  await observe("refreshed");
+  const saved = await edit.execute("ok", params, undefined, undefined, ctx);
+  expect(saved.details).toMatchObject({ projectFileVersion: await version() });
+  expect(await readFile(file, "utf8")).toBe("\uFEFFshape = 'cape'\nsize = 2\n");
+  // An unrelated branch or new user turn must never inherit a stale veto.
+  sessionManager.branch(turn);
+  await writeFile(file, "fresh branch\nsize = 1\n");
+  await expect(edit.execute("branch", params, undefined, undefined, ctx)).resolves.toBeDefined();
+  await writeFile(file, "previous turn\nsize = 1\n");
+  await observe("previous-turn");
+  sessionManager.appendMessage({ role: "user", content: "Use my updated file", timestamp: 2 });
+  await writeFile(file, "new turn\nsize = 1\n");
+  await expect(edit.execute("new-turn", params, undefined, undefined, ctx)).resolves.toBeDefined();
+});
 
 it.each(["ls", "find", "grep"])("uses the project root for an omitted or empty %s directory without relaxing protected paths", async name => {
   const directory = await workspace(), outside = await workspace();
@@ -244,12 +309,14 @@ describe("local secure execution boundaries", () => {
     const edited = await edit.execute("edit", { path: "notes.txt", oldText: "first", newText: "changed" }, undefined, undefined, {} as never);
     expect(fileChangeMetadata(edited.details as Record<string, unknown>).lineChanges).toEqual({ added: 1, removed: 1 });
     await writeFile(path.join(directory, "large.txt"), "x".repeat(MAX_CHANGE_BYTES + 1));
-    expect((await write.execute("large", { path: "large.txt", content: "small" }, undefined, undefined, {} as never)).details).toBeUndefined();
+    expect((await write.execute("large", { path: "large.txt", content: "small" }, undefined, undefined, {} as never)).details).toEqual({
+      projectFileVersion: { path: "large.txt", sha256: createHash("sha256").update("small").digest("hex") },
+    });
     const secret = "local-tool-before-diff-secret-canary-20261028";
     registerSensitiveValue(secret);
     await writeFile(path.join(directory, "original.txt"), secret);
     const replaced = await write.execute("private-before", { path: "original.txt", content: "public replacement" }, undefined, undefined, {} as never);
-    expect(replaced.details).toBeUndefined();
+    expect(replaced.details).toEqual({ projectFileVersion: { path: "original.txt", sha256: createHash("sha256").update("public replacement").digest("hex") } });
     expect(JSON.stringify(replaced)).not.toContain(secret);
   });
 
@@ -289,12 +356,16 @@ describe("local secure execution boundaries", () => {
     } finally { session.dispose(); vi.unstubAllGlobals(); }
   });
 
-  it("keeps Kunpo Fable's tool registry empty and refuses incompatible saved history", async () => {
+  it("keeps an explicitly tool-disabled connection's registry empty and refuses incompatible saved history", async () => {
     const directory = await workspace(), agentDir = path.join(directory, "agent-config");
     await mkdir(agentDir);
     await writeFile(path.join(agentDir, "settings.json"), JSON.stringify({ defaultTools: ["read", "write"] }));
     const runtime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: null, allowModelNetwork: false, refreshOnCreate: false });
-    const model: RuntimeModel = { ...runtime.getModels("anthropic")[0]!, provider: "kunpo", id: "claude-fable-5-2", input: ["text"] };
+    const model: RuntimeModel = { ...runtime.getModels("anthropic")[0]!, provider: "kunpo", id: "fixture-text-only", input: ["text"] };
+    const capabilities = vi.spyOn(kunpoModels, "kunpoModelOption").mockReturnValue({
+      ...kunpoModels.KUNPO_MODEL_OPTIONS[0]!, id: model.id, capabilities: { images: false, tools: false },
+    });
+    onTestFinished(() => capabilities.mockRestore());
     const history = SessionManager.inMemory(directory);
     history.appendMessage({ role: "user", content: "Hello", timestamp: 1 });
     const guide = { ...createLocalAgentFileTools(directory)[0]!, name: "read_workflow_guide" };
@@ -334,6 +405,11 @@ describe("local secure execution boundaries", () => {
       expect((session as AgentSession).getActiveToolNames()).toEqual(["read"]);
       session.setActiveToolsByName?.(["optimize_image_asset", "prepare_three_runtime", "bash"]);
       expect((session as AgentSession).getActiveToolNames()).toEqual(["optimize_image_asset", "prepare_three_runtime"]);
+      session.setActiveToolsByName?.(["read", "tool_search"]);
+      const search = (session as AgentSession).getToolDefinition("tool_search")!;
+      const denied = await search.execute("search", { query: "generate_reference_image" }, undefined, undefined, {} as never);
+      expect(denied.details).toEqual({ matches: [] });
+      expect((session as AgentSession).getActiveToolNames()).toEqual(["read", "tool_search"]);
       for (const mode of ["planning", "normal"] as const) {
         session.setActiveToolsByName?.(projectPiToolNames(mode, ["generate-image"], session.getAllTools!().map(tool => tool.name)));
         const active = (session as AgentSession).getActiveToolNames();
@@ -449,11 +525,11 @@ describe("project-local agent file tools", () => {
     const result = await read.execute("image", { path: "mockup.png" }, undefined, undefined, {} as never);
     expect(result.content).toEqual([{ type: "image", mimeType: "image/png", data: bytes.toString("base64") }]);
     const textRead = createLocalAgentFileTools(directory).find((tool) => tool.name === "read")!;
-    await expect(textRead.execute("text-only", { path: "mockup.png" }, undefined, undefined, {} as never)).rejects.toThrow("image input enabled");
+    await expect(textRead.execute("text-only", { path: "mockup.png", offset: 1, limit: 1 }, undefined, undefined, {} as never)).rejects.toThrow("image input enabled");
     const secret = "image-read-protected-canary-20261106";
     registerSensitiveValue(secret);
     await writeFile(path.join(directory, "secret.png"), Buffer.concat([bytes, Buffer.from(secret)]));
-    await expect(read.execute("secret", { path: "secret.png" }, undefined, undefined, {} as never)).rejects.toThrow("Protected credential");
+    await expect(read.execute("secret", { path: "secret.png", offset: 1, limit: 1 }, undefined, undefined, {} as never)).rejects.toThrow("Protected credential");
     await writeFile(path.join(directory, "placeholder.png"), "placeholder");
     await expect(read.execute("invalid", { path: "placeholder.png" }, undefined, undefined, {} as never)).rejects.toThrow("does not contain a supported");
     await link(path.join(directory, "mockup.png"), path.join(directory, "linked.png"));
@@ -504,15 +580,16 @@ describe("project-local agent file tools", () => {
     }
   });
 
-  it("retains text pagination but rejects image receipt pagination and text-only image input", async () => {
+  it("paginates text and returns whole authorized images when line parameters are supplied", async () => {
     const textFixture = await storedAttachment("notes.txt", Buffer.from("first\nsecond\nthird"));
     const textRead = createLocalAgentFileTools(textFixture.directory, undefined, false, textFixture.authorize)[0]!;
     expect((await textRead.execute("text", { path: textFixture.reference, offset: 2, limit: 1 }, undefined, undefined, {} as never)).content)
       .toEqual([{ type: "text", text: "second" }]);
     const fixture = await storedAttachment("reference.png", REFERENCE_PNG);
     const read = createLocalAgentFileTools(fixture.directory, undefined, true, fixture.authorize)[0]!;
-    for (const pagination of [{ offset: 1 }, { limit: 1 }]) {
-      await expect(read.execute("partial", { path: fixture.reference, ...pagination }, undefined, undefined, {} as never)).rejects.toThrow("offset or limit");
+    for (const pagination of [{ offset: 2 }, { limit: 1 }, { offset: 1, limit: 1 }]) {
+      const result = await read.execute("image", { path: fixture.reference, ...pagination }, undefined, undefined, {} as never);
+      expect(result.content).toEqual([{ type: "image", mimeType: "image/png", data: REFERENCE_PNG.toString("base64") }]);
     }
     await expect(createAgentAttachmentReadTool(fixture.directory, false, fixture.authorize).execute("text-only", { path: fixture.reference }, undefined, undefined, {} as never)).rejects.toThrow("image input enabled");
     expect(await readFile(fixture.resolved.absolutePath)).toEqual(REFERENCE_PNG);

@@ -10,7 +10,7 @@ import type { RuntimeModel } from "./agent.js";
 import { automaticCustomReasoning, normalizeThinkingLevelMap, resolveCustomModelCapabilities, type CustomModelCatalog } from "./custom-model-capabilities.js";
 import { supportedReasoningLevels } from "../shared/reasoning.js";
 import type { LocalRuntimeProvider } from "./local-model-runtime.js";
-import { KUNPO_BASE_URL, KUNPO_FABLE_MODEL_ID, KUNPO_PROVIDER_ID, isRemovedKunpoAgent, kunpoProviderDetails } from "../shared/kunpo-models.js";
+import { KUNPO_ASTRA_MODEL_ID, KUNPO_BASE_URL, KUNPO_FABLE_MODEL_ID, KUNPO_PROVIDER_ID, isRemovedKunpoAgent, kunpoProviderDetails } from "../shared/kunpo-models.js";
 import { isDeepStrictEqual } from "node:util";
 import { isMeshyEndpoint, isMeshyModelReference, isMeshyProviderConfiguration, MESHY_DISABLED_MESSAGE } from "../shared/disabled-media-providers.js";
 
@@ -208,31 +208,32 @@ export class ProviderModelSettingsStore {
         if (!["openai-completions", "openai-responses", "anthropic-messages"].includes(entry.api)) return [];
         const api = entry.api as "openai-completions" | "openai-responses" | "anthropic-messages";
         const baseUrl = normalizeEndpoint(entry.baseUrl);
-        const models = (Array.isArray(entry.models) ? entry.models.filter(isObject) : []).filter((model) => !isRemovedKunpoAgent({ provider: id, id: String(model.id) }) && !isMeshyModelReference({ provider: id, id: model.id }) && !isMeshyEndpoint(model.baseUrl)).map((model) => {
-          const normalized = normalizeCustomProviderModel({ ...model, supportsImages: Array.isArray(model.input) && model.input.includes("image") }, api, baseUrl);
-          return {
-            id: normalized.id, name: normalized.name, api: normalized.api as typeof api, baseUrl: normalized.baseUrl,
-            contextWindow: normalized.contextWindow, maxTokens: normalized.maxTokens, reasoning: normalized.reasoning,
-            input: normalized.supportsImages ? ["text" as const, "image" as const] : ["text" as const],
-            ...(normalized.thinkingLevelMap ? { thinkingLevelMap: normalized.thinkingLevelMap } : {}),
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          };
-        });
-        return [{ id, config: { name: typeof entry.name === "string" ? entry.name : id, api, baseUrl, models } }];
+        const models = (Array.isArray(entry.models) ? entry.models.filter(isObject) : []).filter((model) => !isRemovedKunpoAgent({ provider: id, id: String(model.id) }) && !isMeshyModelReference({ provider: id, id: model.id }) && !isMeshyEndpoint(model.baseUrl))
+          .map((model) => normalizeCustomProviderModel({ ...model, supportsImages: Array.isArray(model.input) && model.input.includes("image") }, api, baseUrl));
+        return [{ id, config: { name: typeof entry.name === "string" ? entry.name : id, api, baseUrl,
+          models: this.#updatedKunpoModels(id, baseUrl, models).filter(model => modelUsages(model).language).map(runtimeModelDefinition) } }];
       } catch {
         // Old official endpoints and malformed legacy metadata stay unavailable. They cannot trigger migration or auth resolution.
         return [];
       }
     });
-    const builtIn = kunpoRuntimeProvider();
-    const kunpo = configured.find(provider => provider.id === KUNPO_PROVIDER_ID);
-    if (!kunpo) return [builtIn, ...configured];
-    // Older local installs can have a saved catalog for the official gateway. Preserve unrelated entries and endpoints.
-    if ([KUNPO_BASE_URL, "https://llm.ziy.cc"].includes(kunpo.config.baseUrl ?? "")) {
-      const fable = builtIn.config.models!.find(model => model.id === KUNPO_FABLE_MODEL_ID)!;
-      kunpo.config.models = [...(kunpo.config.models ?? []).filter(model => model.id !== fable.id), fable];
+    return configured.some(provider => provider.id === KUNPO_PROVIDER_ID) ? configured : [kunpoRuntimeProvider(), ...configured];
+  }
+
+  // Apply reviewed agent protocol updates to the official gateway at read time, including saved catalogs.
+  #updatedKunpoModels(id: string, baseUrl: string, models: CustomProviderModel[]): CustomProviderModel[] {
+    const official = (url: string) => [KUNPO_BASE_URL, "https://llm.ziy.cc"].includes(url.replace(/\/+$/, ""));
+    if (id !== KUNPO_PROVIDER_ID || !official(baseUrl)) return models;
+    const merged = new Map(models.map(model => [model.id, model]));
+    for (const update of kunpoProviderDetails().models) {
+      if (update.id !== KUNPO_FABLE_MODEL_ID && update.id !== KUNPO_ASTRA_MODEL_ID) continue;
+      const saved = merged.get(update.id);
+      const preference = this.#customProviders[id]?.models?.find(model => model.id === update.id);
+      if ((preference && !modelUsages(preference).language) || (saved && !official(saved.baseUrl ?? baseUrl))) continue;
+      merged.set(update.id, saved ? { ...saved, api: update.api, baseUrl: update.baseUrl, supportsImages: update.supportsImages,
+        reasoning: update.reasoning, thinkingLevelMap: update.thinkingLevelMap } : update);
     }
-    return configured;
+    return [...merged.values()];
   }
 
   #customProvider(id: string, config: JsonObject, catalog: CustomModelCatalog): CustomProviderDetails {
@@ -261,10 +262,11 @@ export class ProviderModelSettingsStore {
       }
       return normalized;
     });
+    const effectiveModels = this.#updatedKunpoModels(id, baseUrl, models);
     return {
       id, name: String(entry.name), api, baseUrl, authentication: registry.authentication,
       ...(registry.preset ? { preset: registry.preset } : {}), ...(registry.modelConfigurationVersion ? { modelConfigurationVersion: registry.modelConfigurationVersion } : {}),
-      models, hiddenModelIds: models.filter((model) => !this.isVisible({ provider: id, id: model.id })).map((model) => model.id),
+      models: effectiveModels, hiddenModelIds: effectiveModels.filter((model) => !this.isVisible({ provider: id, id: model.id })).map((model) => model.id),
     };
   }
 
@@ -488,15 +490,18 @@ export class ProviderModelSettingsStore {
 export function kunpoRuntimeProvider(): LocalRuntimeProvider {
   const provider = kunpoProviderDetails();
   return { id: provider.id, config: { name: provider.name, api: "openai-completions", baseUrl: provider.baseUrl,
-    models: provider.models.filter((model) => model.usages?.language).map((model) => ({
-      id: model.id, name: model.name, api: model.api as "openai-completions" | "openai-responses" | "anthropic-messages",
-      ...(model.baseUrl ? { baseUrl: model.baseUrl } : {}),
-      input: model.supportsImages ? ["text" as const, "image" as const] : ["text" as const],
-      reasoning: model.reasoning, contextWindow: model.contextWindow, maxTokens: model.maxTokens,
-      ...(model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap } : {}),
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    })),
+    models: provider.models.filter((model) => model.usages?.language).map(runtimeModelDefinition),
   } };
+}
+
+function runtimeModelDefinition(model: CustomProviderModel) {
+  return { id: model.id, name: model.name, api: model.api as "openai-completions" | "openai-responses" | "anthropic-messages",
+    ...(model.baseUrl ? { baseUrl: model.baseUrl } : {}),
+    input: model.supportsImages ? ["text" as const, "image" as const] : ["text" as const],
+    reasoning: model.reasoning, contextWindow: model.contextWindow, maxTokens: model.maxTokens,
+    ...(model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap } : {}),
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  };
 }
 
 function modifyFormattedJsonc(text: string, jsonPath: JSONPath, value: unknown): string {

@@ -10,10 +10,14 @@ export class ConversationImageStore {
   readonly #references = new WeakMap<PromptImage, Map<string, PromptImage>>();
   readonly #writes = new Map<string, Promise<void>>();
 
-  constructor(private readonly directory: string) {}
+  constructor(
+    private readonly directory: string,
+    private readonly canWrite: (projectId: string) => boolean = () => true,
+  ) {}
 
   project(projectId: string, image: PromptImage): PromptImage {
     if (!image.data) return image;
+    if (!this.canWrite(projectId)) return { ...image, data: "", url: undefined };
     const cached = this.#references.get(image)?.get(projectId);
     if (cached) return cached;
     const id = `${createHash("sha256").update(image.data).digest("hex")}.${EXTENSIONS[image.mediaType]}`;

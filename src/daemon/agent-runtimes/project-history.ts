@@ -1,5 +1,6 @@
-import { createReadStream } from "node:fs";
-import { lstat, open, readFile, readdir, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { constants, createReadStream } from "node:fs";
+import { lstat, mkdir, open, readFile, readdir, rm } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
@@ -8,6 +9,7 @@ import { sessionDirectory } from "../conversations.js";
 
 export const NATIVE_PRIVATE_SESSION_ENTRY = "ohmygame-native-private-session";
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+const CODEX_HISTORY_FILES = ["state_5.sqlite", "thread_history_1.sqlite", "logs_2.sqlite"];
 type Runtime = "codex-cli" | "qoder-cli";
 
 // Qoder 1.1.83's transcript-paths sanitizePath format, including long private paths.
@@ -70,6 +72,76 @@ async function directories(root: string, directory: string): Promise<string[]> {
     .map((entry) => path.join(directory, entry.name));
 }
 
+function codexCompactionMarker(directory: string, name: string): string {
+  return path.join(directory, `.ohmygame-vacuum-${name}`);
+}
+
+/** Remember the cleanup even if native deletion or app shutdown is interrupted. */
+async function markCodexCompaction(root: string): Promise<void> {
+  const directory = path.join(root, "codex-home");
+  await ordinary(root, directory);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  for (const name of CODEX_HISTORY_FILES) {
+    const marker = codexCompactionMarker(directory, name);
+    const handle = await open(marker, "wx", 0o600).catch((cause: NodeJS.ErrnoException) => {
+      if (cause.code !== "EEXIST") throw cause;
+    });
+    if (handle) {
+      try { await handle.sync(); } finally { await handle.close(); }
+    } else if (!(await ordinary(root, marker)) || !(await lstat(marker)).isFile()) {
+      throw new Error("Invalid Codex history cleanup marker");
+    }
+  }
+  if (process.platform !== "win32") {
+    const handle = await open(directory, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try { await handle.sync(); } finally { await handle.close(); }
+  }
+}
+
+/** Checkpoint the private stores and rewrite pages after native project deletion. */
+export async function compactCodexHistory(root: string): Promise<void> {
+  root = path.resolve(root);
+  const directory = path.join(root, "codex-home");
+  for (const name of CODEX_HISTORY_FILES) {
+    const file = path.join(directory, name);
+    const marker = codexCompactionMarker(directory, name);
+    try {
+      const pending = await ordinary(root, marker);
+      if (pending && !(await lstat(marker)).isFile()) continue;
+      let hasSidecars = false;
+      // SQLite can open or remove adjacent files while recovering or checkpointing.
+      for (const suffix of ["-wal", "-shm", "-journal"]) {
+        const sidecar = file + suffix;
+        if (await ordinary(root, sidecar)) {
+          if (!(await lstat(sidecar)).isFile()) throw new Error("Invalid SQLite sidecar");
+          hasSidecars = true;
+        }
+      }
+      if (!(await ordinary(root, file))) {
+        if (pending && !hasSidecars) await rm(marker, { force: true });
+        continue;
+      }
+      if (!(await lstat(file)).isFile()) continue;
+      const database = new DatabaseSync(file);
+      try {
+        database.exec("PRAGMA busy_timeout = 0");
+        const checkpoint = database.prepare("PRAGMA wal_checkpoint(TRUNCATE)");
+        if (checkpoint.get()?.busy !== 0) continue;
+        // A row deleted from a page still in use does not add to the freelist.
+        if (pending || Number(database.prepare("PRAGMA freelist_count").get()?.freelist_count) > 0) {
+          database.exec("VACUUM");
+          if (checkpoint.get()?.busy !== 0) continue;
+        }
+      } finally {
+        database.close();
+      }
+      if (pending) await rm(marker, { force: true });
+    } catch {
+      // An unavailable, busy or unfamiliar store can be left for a later shutdown.
+    }
+  }
+}
+
 async function firstRecord(file: string): Promise<Record<string, unknown>> {
   const handle = await open(file, "r");
   try {
@@ -82,6 +154,43 @@ async function firstRecord(file: string): Promise<Record<string, unknown>> {
   } finally {
     await handle.close();
   }
+}
+
+async function qoderResultFiles(root: string, sessions: ReadonlySet<string>) {
+  if (!sessions.size) return [];
+  const directory = path.join(root, "qoder", "config", "host-actions", "result-index");
+  if (!(await ordinary(root, directory))) return [];
+  const owners = new Map([...sessions].map((id) => [createHash("sha256").update(id).digest("hex"), id]));
+  const files: Array<{ file: string; device: number; inode: number; changed: number }> = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const match = /^([a-f0-9]{64})-(.+)\.json$/.exec(entry.name);
+    if (!entry.isFile() || !match || !UUID.test(match[2]!)) continue;
+    const sessionId = owners.get(match[1]!);
+    if (!sessionId) continue;
+    const file = path.join(directory, entry.name);
+    // The SDK's basename binds both the native session and the result UUID.
+    const handle = await open(file, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW)
+      .catch((cause: NodeJS.ErrnoException) => {
+        if (cause.code === "ENOENT" || cause.code === "ELOOP") return undefined;
+        throw cause;
+      });
+    if (!handle) continue;
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.nlink !== 1 || stat.size > 4096) continue;
+      const bytes = Buffer.alloc(4097);
+      const { bytesRead } = await handle.read(bytes);
+      if (bytesRead !== stat.size) continue;
+      const record = JSON.parse(bytes.subarray(0, bytesRead).toString());
+      if (record?.schemaVersion === 1 && record.sessionId === sessionId && record.resultUuid === match[2])
+        files.push({ file, device: stat.dev, inode: stat.ino, changed: stat.ctimeMs });
+    } catch (cause) {
+      if (!(cause instanceof SyntaxError)) throw cause;
+    } finally {
+      await handle.close();
+    }
+  }
+  return files;
 }
 
 /** Run after the project's sessions have stopped, before removing its canonical history. */
@@ -142,6 +251,7 @@ export async function removeProjectNativeHistory(
 
   const qoderProjects = path.join(root, "qoder", "config", "projects");
   const qoderLogs = path.join(root, "qoder", "config", "logs", "sessions");
+  const qoderResultOwners = new Set(ids["qoder-cli"]);
   const qoderRuns = new Map<string, string>();
   for (const directory of await directories(
     root,
@@ -157,13 +267,12 @@ export async function removeProjectNativeHistory(
   for (const directory of await directories(root, qoderProjects)) {
     const name = path.basename(directory),
       prefix = `${encodedRoot}-qoder-cli-`;
+    const nativeIds = (await readdir(directory, { withFileTypes: true }))
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+      .map((entry) => entry.name.slice(0, -6))
+      .filter((id) => UUID.test(id));
     // Older releases recorded the native ID but not their disposable cwd.
-    if (
-      (await readdir(directory)).some(
-        (file) =>
-          file.endsWith(".jsonl") && ids["qoder-cli"].has(file.slice(0, -6)),
-      )
-    ) {
+    if (nativeIds.some((id) => ids["qoder-cli"].has(id))) {
       const cwd =
         [...owned.keys(), ...qoderRuns.values()].find(
           (cwd) => qoderProjectName(cwd) === name,
@@ -179,7 +288,10 @@ export async function removeProjectNativeHistory(
         throw new Error("Qoder history ownership format could not be verified");
       owned.set(cwd, "qoder-cli");
     }
+    if ([...owned].some(([cwd, runtime]) => runtime === "qoder-cli" && qoderProjectName(cwd) === name))
+      for (const id of nativeIds) qoderResultOwners.add(id);
   }
+  const qoderResults = await qoderResultFiles(root, qoderResultOwners);
 
   const codexFiles: string[] = [];
   const pending = [
@@ -221,7 +333,8 @@ export async function removeProjectNativeHistory(
   }
 
   // The native API owns conversation state; never edit its tables directly.
-  if (ids["codex-cli"].size)
+  if (ids["codex-cli"].size) {
+    await markCodexCompaction(root);
     await deleteCodexThreads(
       [...ids["codex-cli"]],
       new Set(
@@ -230,6 +343,7 @@ export async function removeProjectNativeHistory(
           .map(([cwd]) => cwd),
       ),
     );
+  }
   // Codex's thread/delete removes thread state, but retains per-thread diagnostic content.
   const logs = path.join(root, "codex-home", "logs_2.sqlite");
   if (ids["codex-cli"].size && (await ordinary(root, logs))) {
@@ -262,6 +376,16 @@ export async function removeProjectNativeHistory(
     }
   }
   for (const file of codexFiles) if (await ordinary(root, file)) await rm(file);
+  for (const { file, device, inode, changed } of qoderResults) {
+    if (!(await ordinary(root, file))) continue;
+    const current = await lstat(file).catch((cause: NodeJS.ErrnoException) => {
+      if (cause.code !== "ENOENT") throw cause;
+    });
+    if (!current) continue;
+    if (!current.isFile() || current.nlink !== 1 || current.dev !== device || current.ino !== inode || current.ctimeMs !== changed)
+      throw new Error("Qoder result index changed during project deletion; retry with the project history retained");
+    await rm(file, { force: true });
+  }
   for (const [directory, cwd] of qoderRuns)
     if (owned.get(cwd) === "qoder-cli" && (await ordinary(root, directory)))
       await rm(directory, { recursive: true });

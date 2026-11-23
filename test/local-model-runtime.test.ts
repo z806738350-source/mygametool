@@ -37,6 +37,7 @@ const testRoutes = [
   { providerId: "kunpo", id: "gpt-5.6-sol" },
   { providerId: "kunpo", id: "claude-opus-5-5" },
   { providerId: "kunpo", id: "claude-fable-5-2" },
+  { providerId: "kunpo", id: "gpt-6.2-astra" },
   { providerId: provider.id, id: "fixture-model" },
 ];
 const responsesSse = (...events: unknown[]) => new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
@@ -251,6 +252,7 @@ describe("local literal API key storage and model runtime", () => {
       ["gpt-5.6-sol", "openai-completions", "https://llm.ziy.cc/v1"],
       ["claude-opus-5-5", "anthropic-messages", "https://llm.ziy.cc"],
       ["claude-fable-5-2", "anthropic-messages", "https://llm.ziy.cc"],
+      ["gpt-6.2-astra", "openai-responses", "https://llm.ziy.cc/v1"],
     ]);
     expect(await runtime.getAuth("kunpo")).toBeUndefined();
     await runtime.login("kunpo", "api_key", { prompt: async () => "CANARY_KUNPO_TEST_ONLY", notify: () => {} });
@@ -336,29 +338,6 @@ describe("local literal API key storage and model runtime", () => {
     expect(request).toHaveBeenCalledTimes(3);
   });
 
-  it("rejects tools, tool history and images before sending a Fable text request", async () => {
-    const root = await directory();
-    const runtime = await createLocalModelRuntime(path.join(root, "keys.json"), async () => [kunpoRuntimeProvider()]);
-    await runtime.login("kunpo", "api_key", { prompt: async () => "FABLE_TEST_FIXTURE", notify: () => {} });
-    const model = runtime.getModel("kunpo", "claude-fable-5-2")!;
-    const request = vi.fn<typeof fetch>();
-    const guarded = localModelFetch(model, request);
-    const contexts: Context[] = [
-      { messages: [{ role: "user", timestamp: 1, content: "Use a tool" }], tools: [{ name: "inspect", description: "Inspect the fixture", parameters: { type: "object", properties: {} } }] },
-      { messages: [{ role: "assistant", api: model.api, provider: model.provider, model: model.id, stopReason: "toolUse", timestamp: 1,
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-        content: [{ type: "toolCall", id: "call_fixture", name: "inspect", arguments: {} }] }] },
-      { messages: [{ role: "toolResult", toolCallId: "call_fixture", toolName: "inspect", timestamp: 1, isError: false, content: [{ type: "text", text: "Fixture inspected" }] }] },
-    ];
-    for (const context of contexts) {
-      const reply = await runtime.completeSimple(model, context, { fetch: guarded });
-      expect(reply).toMatchObject({ stopReason: "error", errorMessage: expect.stringContaining("tool-enabled model") });
-    }
-    const image = await runtime.complete(model, { messages: [{ role: "user", timestamp: 1, content: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }] }] }, { fetch: guarded });
-    expect(image).toMatchObject({ stopReason: "error", errorMessage: expect.stringContaining("image input") });
-    expect(request).not.toHaveBeenCalled();
-  });
-
   it.each(testRoutes)("cancels $id pending SDK stream and its upstream body without retrying", async ({ providerId, id }) => {
     const log = vi.spyOn(console, "info").mockImplementation(() => {});
     const root = await directory();
@@ -435,6 +414,7 @@ describe("local literal API key storage and model runtime", () => {
     expect(request.mock.calls.every(([input]) => String(input) === "https://llm.ziy.cc/v1/responses")).toBe(true);
     const firstBody = JSON.parse(String(request.mock.calls[0]![1]?.body));
     expect(firstBody).toMatchObject({ model: "fixture-model", stream: true, reasoning: { effort: "high" }, max_output_tokens: 512, tools: [{ type: "function", name: "inspect" }] });
+    expect(firstBody.tools[0]).not.toHaveProperty("strict");
     expect(firstBody.temperature).toBeUndefined();
     const secondBody = JSON.parse(String(request.mock.calls[1]![1]?.body));
     expect(secondBody.input).toContainEqual(expect.objectContaining({ type: "function_call", id: "fc_fixture_item", call_id: "call_fixture", name: "inspect", arguments: '{"label":"fixture"}' }));
@@ -537,7 +517,10 @@ describe("local literal API key storage and model runtime", () => {
     });
   });
 
-  it("uses Opus native URL sources through signed thinking and image tool-result continuation without rewriting history", async () => {
+  it.each([
+    { id: "claude-opus-5-5", useImageUrl: true, thinking: "adaptive", effort: "medium" },
+    { id: "claude-fable-5-2", useImageUrl: false, thinking: undefined, effort: undefined },
+  ])("sends $id images and tools and replays signed thinking with an image tool result", async ({ id, useImageUrl, thinking, effort }) => {
     const root = await directory();
     const library = new AssetLibrary(root); await library.load();
     const bytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==", "base64"), generated = { bytes };
@@ -545,8 +528,10 @@ describe("local literal API key storage and model runtime", () => {
     const asset = await library.add("opus.png", bytes, { origin: "generated" }); await library.bindGeneratedImageSource(asset.id, generated);
     const runtime = await createLocalModelRuntime(path.join(root, "local-api-keys.json"), async () => [kunpoRuntimeProvider()], library);
     await runtime.login("kunpo", "api_key", { prompt: async () => "CANARY_KUNPO_TEST_ONLY", notify: () => {} });
+    const model = runtime.getModel("kunpo", id)!;
+    const messageStart = `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "fixture", type: "message", role: "assistant", model: id, content: [], usage: { input_tokens: 1, output_tokens: 0 } } })}`;
     const endResponse = [
-      'event: message_start\ndata: {"type":"message_start","message":{"id":"fixture","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}',
+      messageStart,
       'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
       'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Ready"}}',
       'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}',
@@ -554,33 +539,38 @@ describe("local literal API key storage and model runtime", () => {
       'event: message_stop\ndata: {"type":"message_stop"}', "",
     ].join("\n\n");
     const toolResponse = [
-      'event: message_start\ndata: {"type":"message_start","message":{"id":"fixture","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}',
+      messageStart,
       'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}',
       'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Inspect the fixture"}}',
       'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"fixture_signature"}}',
       'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}',
       'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_fixture","name":"inspect","input":{}}}',
-      'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}',
+      `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"label":"fixture"}' } })}`,
       'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}',
       'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":1}}',
       'event: message_stop\ndata: {"type":"message_stop"}', "",
     ].join("\n\n");
     const request = vi.fn<typeof fetch>().mockImplementationOnce(async () => new Response(toolResponse, { headers: { "content-type": "text/event-stream" } }))
       .mockImplementationOnce(async () => new Response(endResponse, { headers: { "content-type": "text/event-stream" } }));
-    const model = runtime.getModel("kunpo", "claude-opus-5-5")!;
     const known = { type: "image" as const, mimeType: "image/png", data: bytes.toString("base64"), libraryAssetId: asset.id }, uploaded = { type: "image" as const, mimeType: "image/png", data: bytes.toString("base64") };
     const user = { role: "user" as const, timestamp: 1, content: [{ type: "text" as const, text: "Inspect the fixture" }, known, uploaded] };
-    const tools = [{ name: "inspect", description: "Inspect the fixture", parameters: { type: "object", properties: {} } }];
+    const parameters = { type: "object", properties: { label: { type: "string" } }, required: ["label"] };
+    const tools = [{ name: "inspect", description: "Inspect the fixture", parameters }];
     const guarded = localModelFetch(model, request);
     const result = await runtime.completeSimple(model, { messages: [user], tools }, { fetch: guarded, maxRetries: 0 });
     expect(result.stopReason).toBe("toolUse");
+    expect(result.content).toContainEqual(expect.objectContaining({ type: "toolCall", id: "call_fixture", name: "inspect", arguments: { label: "fixture" } }));
     expect(request).toHaveBeenCalledOnce();
     expect(new URL(String(request.mock.calls[0]![0])).pathname).toBe("/v1/messages");
     const body = JSON.parse(String(request.mock.calls[0]![1]?.body));
-    expect(body.thinking.type).toBe("adaptive");
-    expect(body.output_config.effort).toBe("medium");
+    expect(body.model).toBe(id);
+    expect(body.tools).toContainEqual(expect.objectContaining({ name: "inspect", input_schema: expect.objectContaining(parameters) }));
+    expect(body.thinking?.type).toBe(thinking);
+    expect(body.output_config?.effort).toBe(effort);
     expect(body.temperature).toBeUndefined();
-    expect(body.messages[0].content.filter((part: any) => part.type === "image").map((part: any) => part.source)).toEqual([{ type: "url", url }, { type: "base64", media_type: "image/png", data: uploaded.data }]);
+    const inline = { type: "base64", media_type: "image/png", data: uploaded.data };
+    const expectedSources = [useImageUrl ? { type: "url", url } : inline, inline];
+    expect(body.messages[0].content.filter((part: any) => part.type === "image").map((part: any) => part.source)).toEqual(expectedSources);
     const completed = await runtime.completeSimple(model, { messages: [user, result, {
       role: "toolResult", toolCallId: "call_fixture", toolName: "inspect", content: [{ type: "text", text: "Fixture inspected" }, known, uploaded], isError: false, timestamp: 2,
     }], tools }, { fetch: guarded, maxRetries: 0 });
@@ -588,8 +578,9 @@ describe("local literal API key storage and model runtime", () => {
     expect(request).toHaveBeenCalledTimes(2);
     const continued = JSON.parse(String(request.mock.calls[1]![1]?.body));
     expect(continued.messages.find((message: { role: string }) => message.role === "assistant").content).toContainEqual({ type: "thinking", thinking: "Inspect the fixture", signature: "fixture_signature" });
+    expect(continued.messages.at(-1).content).toContainEqual(expect.objectContaining({ type: "tool_result", tool_use_id: "call_fixture" }));
     const returned = continued.messages.flatMap((message: any) => message.content.filter((part: any) => part.type === "tool_result")).flatMap((part: any) => part.content).filter((part: any) => part.type === "image");
-    expect(returned.map((part: any) => part.source)).toEqual([{ type: "url", url }, { type: "base64", media_type: "image/png", data: uploaded.data }]);
+    expect(returned.map((part: any) => part.source)).toEqual(expectedSources);
     expect(JSON.stringify(user) + JSON.stringify(result)).not.toContain("fake-opus-source");
     expect(JSON.stringify(continued)).not.toContain("libraryAssetId");
   });

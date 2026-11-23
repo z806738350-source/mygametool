@@ -38,7 +38,7 @@ import { PromptContextIcon } from "./chat-reference.js";
 import { GodotIcon } from "./godot-icon.js";
 import { MarkdownContent } from "./markdown-content.js";
 import { LazyDetails } from "./lazy-details.js";
-import { agentErrorDiagnosticRows, agentErrorDiagnosticText, agentErrorPresentation } from "./agent-error-presentation.js";
+import { agentErrorDiagnosticRows, agentErrorDiagnosticText, agentErrorPresentation, isConnectionError } from "./agent-error-presentation.js";
 import { language, t } from "./i18n.js";
 import { TurnChangesFooter, TurnChangesViews, type TurnChangesControls } from "./turn-changes.js";
 
@@ -647,7 +647,7 @@ function AgentErrorActivity({ error, retry, active = false }: { error: ThreadIte
   const label = failed ? presentation.title : t("timeline.reconnecting", { attempt: retry.attempt, max: retry.maxAttempts });
   const preview = failed && !error.code ? error.message.replace(/\s+/g, " ").trim() : "";
   const summary = preview ? `${label} — ${preview}` : label;
-  const Icon = failed ? (["dns_error", "connection_refused", "connection_reset", "timeout", "tls_error", "stream_error", "network_error"].includes(error.code ?? "") ? WifiOff : X) : Wifi;
+  const Icon = failed ? (isConnectionError(error.code) || error.code === "stream_error" ? WifiOff : X) : Wifi;
   return (
     <LazyDetails className={`connection-activity-details${failed ? " connection-activity-failed" : ""}`} summary={
       <summary className="tool-activity tool-row timeline-activity connection-activity">
@@ -901,6 +901,7 @@ function toolPresentation(item: Extract<ThreadItem, { type: "dynamicToolCall" | 
     case "run_blender": return { icon: Wrench, label: t("timeline.runningBlender") };
     case "recover_blender_run": return { icon: Wrench, label: t("timeline.recoveringBlender") };
     case "list_media_capabilities": return { icon: Search, label: t("timeline.checkingMediaModels") };
+    case "inspect_3d_views": return { icon: Search, label: t("timeline.readingTurnaround") };
     case "list_animation_actions": return { icon: Search, label: t("timeline.checkingAnimationActions") };
     case "recover_media":
     case "recover_canvas_media": return { icon: Wrench, label: t("timeline.recoveringMedia") };
@@ -933,6 +934,7 @@ function completedToolPresentation(item: Extract<ThreadItem, { type: "dynamicToo
     case "run_blender": return { icon: Wrench, label: t("timeline.ranBlender") };
     case "recover_blender_run": return { icon: Wrench, label: t("timeline.recoveredBlender") };
     case "list_media_capabilities": return { icon: Search, label: t("timeline.checkedMediaModels") };
+    case "inspect_3d_views": return { icon: Search, label: t("timeline.readTurnaround") };
     case "list_animation_actions": return { icon: Search, label: t("timeline.checkedAnimationActions") };
     case "recover_media":
     case "recover_canvas_media": return { icon: Wrench, label: t("timeline.recoveredMedia") };

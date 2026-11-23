@@ -14,6 +14,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ApprovalRequestDetails } from "../src/shared/agent-runtimes.js";
 import { ClaudeCodeDriver } from "../src/daemon/agent-runtimes/claude-code.js";
 import * as controlledCodex from "../src/daemon/agent-runtimes/controlled-codex.js";
+import * as codexIsolation from "../src/daemon/agent-runtimes/codex-isolation-check.js";
 import { CODEX_CONTROLLED_CONFIG, CODEX_TOOL_NAMESPACE, controlledCodexEnvironment } from "../src/daemon/agent-runtimes/controlled-codex.js";
 import { createLocalAgentFileTools } from "../src/daemon/agent-local-files.js";
 import { controlledQoderEnvironment } from "../src/daemon/agent-runtimes/controlled-qoder.js";
@@ -2500,6 +2501,31 @@ describe("controlled Codex adapter", () => {
     for (const method of ["item/started", "item/completed"]) cli.send({ method, params: { threadId: "controlled-thread", turnId: "controlled-turn", item: { type: "userMessage", id: "native-item", clientId: id, content: [{ type: "text", text: "New instruction" }] } } });
   };
 
+  it.each([true, false])("validates the retained planning profile before starting the next turn (owned=%s)", async owned => {
+    let previousProfile: string | undefined;
+    const f = await setup((child, params) => {
+      previousProfile = params.permissions;
+      done(child);
+    }, (message, child) => {
+      if (message.method !== "thread/resume") return false;
+      child.send({ id: message.id, result: { thread: { id: "controlled-thread" },
+        activePermissionProfile: { id: owned ? previousProfile : "unrelated-profile" } } });
+      return true;
+    });
+    const driver = new CodexDriver(f.c);
+    cleanup.push(() => driver.dispose());
+    const run = (readOnly: boolean) => driver.runTurn({ text: "Check the project", images: [], readOnly }, recordingSink().sink, new AbortController().signal);
+    expect(await run(true)).toEqual({ status: "completed" });
+    const planProfile = previousProfile;
+    if (owned) {
+      expect(await run(false)).toEqual({ status: "completed" });
+      expect(previousProfile).not.toBe(planProfile);
+    } else {
+      expect(await run(false)).toMatchObject({ status: "failed", error: expect.stringContaining("filesystem permissions") });
+      expect(f.calls.filter(call => call.method === "turn/start")).toHaveLength(1);
+    }
+  });
+
   it("delivers startup-time steering to the same active Codex turn and waits for its user item", async () => {
     let cli!: FakeCli;
     const f = await setup(child => { cli = child; }, (message, child) => {
@@ -2718,6 +2744,7 @@ describe("controlled Codex adapter", () => {
     vi.spyOn(discovery, "probeVersion").mockResolvedValue(controlledCodex.CONTROLLED_CODEX_VERSION);
     vi.spyOn(discovery, "probeAuth").mockResolvedValue({ status: "signed-in", billing: "subscription" });
     vi.spyOn(controlledCodex, "verifyControlledCodexBinary").mockResolvedValue();
+    vi.spyOn(codexIsolation, "checkCodexIsolation").mockResolvedValue();
     service = new AgentRuntimeService(f.c.privateDirectory, () => undefined);
     await service.load(); cleanup.push(() => service.close());
     await service.update("codex-cli", { enabled: true });
@@ -2904,6 +2931,7 @@ describe("controlled Codex adapter", () => {
     vi.spyOn(discovery, "probeVersion").mockResolvedValue(controlledCodex.CONTROLLED_CODEX_VERSION);
     const auth = vi.spyOn(discovery, "probeAuth").mockResolvedValue({ status: "signed-out", billing: "unknown" });
     vi.spyOn(controlledCodex, "verifyControlledCodexBinary").mockResolvedValue();
+    vi.spyOn(codexIsolation, "checkCodexIsolation").mockResolvedValue();
     const service = new AgentRuntimeService(f.c.privateDirectory, () => undefined);
     await service.load(); cleanup.push(() => service.close());
     expect(await service.models()).toEqual({ models: [], loading: [] });
@@ -2937,7 +2965,7 @@ describe("controlled Codex adapter", () => {
     expect(JSON.stringify(recovery.inputSchema)).toContain('"const":"capacity"');
     expect(recovery.inputSchema.properties).toHaveProperty("reviewId");
     expect(recovery.inputSchema.properties).not.toHaveProperty("approved");
-    expect(manager.getBranch().some(e => e.type === "custom" && e.customType === "ohmygame-native-session" && (e.data as any).contextVersion === "controlled-codex-v15")).toBe(true);
+    expect(manager.getBranch().some(e => e.type === "custom" && e.customType === "ohmygame-native-session" && (e.data as any).contextVersion === "controlled-codex-v16")).toBe(true);
     expect(f.calls.find(m => m.method === "turn/start").params.input[0].text).toContain("Preserve the existing game and artwork");
     expect(manager.getBranch().some(e => e.type === "message" && e.message.role === "assistant")).toBe(true);
     const launches = f.children.map(c => c.env);
@@ -2948,8 +2976,8 @@ describe("controlled Codex adapter", () => {
 
 describe("native capacity context contract", () => {
   it.each([
-    { runtime: "codex-cli" as const, old: "controlled-codex-v14", current: "controlled-codex-v15" },
-    { runtime: "qoder-cli" as const, old: "controlled-qoder-v13", current: "controlled-qoder-v14" },
+    { runtime: "codex-cli" as const, old: "controlled-codex-v15", current: "controlled-codex-v16" },
+    { runtime: "qoder-cli" as const, old: "controlled-qoder-v14", current: "controlled-qoder-v15" },
   ])("rebuilds $runtime's previous tool schema and retains only capacity's read-only arguments", async ({ runtime, old, current }) => {
     const manager = SessionManager.inMemory("/tmp/native-capacity-context");
     manager.appendMessage({ role: "user", content: "Preserve the existing retained work", timestamp: 1 });
@@ -3452,6 +3480,7 @@ describe("Qoder SDK host controlled bridge", () => {
   };
   const initialize = {
     binaryPath: "/audited/qoder",
+    runtimeVersion: "1.1.83",
     privateDirectory: "/tmp/qoder-fixture-session",
     configurationRoot: "/tmp/qoder-fixture-persistent",
     env: {
@@ -3835,6 +3864,7 @@ describe("Qoder SDK host controlled bridge", () => {
         launchMode: "process",
         pathToQoderCLIExecutable: initialize.binaryPath,
         auth: { type: "qodercli" },
+        debugFile: path.join(initialize.privateDirectory, "tmp", "qoder-sdk.log"),
         env: initialize.env,
       }),
     );
@@ -4555,6 +4585,19 @@ describe("Qoder SDK host controlled bridge", () => {
       expect(f.toolCalls()).toEqual([]);
     },
   );
+
+  it("stops a newer compatible Qoder turn when a later snapshot reports a different native version", async () => {
+    const f = fixture({ init: { qodercli_version: "1.1.84" } });
+    await f.initializeHost({ ...initialize, runtimeVersion: "1.1.84" });
+    expect(await f.start()).toHaveProperty("result.sessionId", "qoder-fixture-session-1");
+    await vi.waitFor(() => expect(f.prompts).toHaveLength(1));
+    f.queries[0].emit({ type: "system", subtype: "init", session_id: "qoder-fixture-session-1", qodercli_version: "1.1.85" });
+    await vi.waitFor(() => expect(f.sent.find(message => message.method === "sdk/error")).toMatchObject({
+      params: { code: "QODER_RUNTIME_INVENTORY", boundary: "runtime-version" },
+    }));
+    expect(await f.call("read")).toMatchObject({ isError: true });
+    expect(f.toolCalls()).toEqual([]);
+  });
 });
 
 const installedQoderSdk = fileURLToPath(new URL("../.runtime/qoder-sdk/1.0.59/node_modules/@qoder-ai/qoder-agent-sdk/dist/index.js", import.meta.url));
@@ -4619,7 +4662,7 @@ describe.skipIf(!existsSync(installedQoderSdk) || !!process.versions.bun || proc
           child.stdin.write(JSON.stringify({ id, method, params }) + "\n");
         });
       };
-      expect(await request("initialize", { binaryPath: fake, privateDirectory: directory, configurationRoot: path.dirname(env.QODER_CONFIG_DIR!), env: privateEnv }), stderr).toMatchObject({ result: { sdkVersion: "1.0.59", runtimeVersion: "1.1.83" } });
+      expect(await request("initialize", { binaryPath: fake, runtimeVersion: "1.1.83", privateDirectory: directory, configurationRoot: path.dirname(env.QODER_CONFIG_DIR!), env: privateEnv }), stderr).toMatchObject({ result: { sdkVersion: "1.0.59", runtimeVersion: "1.1.83" } });
       expect(await request("account/read")).toMatchObject({ result: account });
       expect(await request("models/list")).toMatchObject({ result: models });
       expect(await request("models/list", { live: true })).toMatchObject({ result: models });
@@ -4646,7 +4689,7 @@ describe.skipIf(!existsSync(installedQoderSdk) || !!process.versions.bun || proc
     await expect(access(path.join(env.QODER_CONFIG_DIR!, ".auth", "user"))).rejects.toMatchObject({ code: "ENOENT" });
   }, 15000);
 
-  it.each(["safe", "unsafe-inventory", "ignored-skills", "ignored-meta-deny", "malformed-control", "changed-snapshot-tools", "changed-snapshot-session", "snapshot-after-hook", "vision-initial", "vision-tool", "vision-resume", "vision-false", "vision-missing", "vision-drift", "vision-tool-false", "vision-resume-missing", "vision-tool-gif", "vision-tool-malformed", "result-turn-limit", "result-turn-limit-recover", "edit-preflight-recover", "steering", "steering-timeout"] as const)("checks actual SDK startup, control frames and tools with %s output", async (scenario) => {
+  it.each(["safe", "newer-compatible", "unsafe-inventory", "ignored-skills", "ignored-meta-deny", "malformed-control", "changed-snapshot-tools", "changed-snapshot-session", "snapshot-after-hook", "vision-initial", "vision-tool", "vision-resume", "vision-false", "vision-missing", "vision-drift", "vision-tool-false", "vision-resume-missing", "vision-tool-gif", "vision-tool-malformed", "result-turn-limit", "result-turn-limit-recover", "edit-preflight-recover", "steering", "steering-timeout"] as const)("checks actual SDK startup, control frames and tools with %s output", async (scenario) => {
     const steering = scenario.startsWith("steering");
     const steeringTimeout = scenario === "steering-timeout";
     const preflightRecovery = scenario === "edit-preflight-recover";
@@ -4654,7 +4697,7 @@ describe.skipIf(!existsSync(installedQoderSdk) || !!process.versions.bun || proc
     const toolName = preflightRecovery ? "edit" : "write";
     const invalidToolImage = scenario === "vision-tool-gif" || scenario === "vision-tool-malformed";
     const structuredFailure = scenario === "result-turn-limit";
-    const usesSession = scenario === "safe" || scenario === "snapshot-after-hook" || scenario === "vision-initial" || scenario === "vision-tool" || invalidToolImage || structuredFailure || recovers;
+    const usesSession = scenario === "safe" || scenario === "newer-compatible" || scenario === "snapshot-after-hook" || scenario === "vision-initial" || scenario === "vision-tool" || invalidToolImage || structuredFailure || recovers;
     const visual = scenario.startsWith("vision-");
     const completes = steering && !steeringTimeout || usesSession && !invalidToolImage && !structuredFailure || ["vision-initial", "vision-tool", "vision-resume"].includes(scenario);
     const afterToolFailure = scenario === "vision-drift" || scenario === "vision-tool-false" || invalidToolImage;
@@ -4739,9 +4782,10 @@ await runQoderSdkHost(process.stdin, process.stdout, async () => {
         child.stdin.write(JSON.stringify({ id, method, params }) + "\n");
       });
     };
-    const initialized = await request("initialize", { binaryPath: fake, privateDirectory: directory, configurationRoot: path.dirname(env.QODER_CONFIG_DIR!), env: privateEnv });
+    const runtimeVersion = scenario === "newer-compatible" ? "1.1.84" : "1.1.83";
+    const initialized = await request("initialize", { binaryPath: fake, runtimeVersion, privateDirectory: directory, configurationRoot: path.dirname(env.QODER_CONFIG_DIR!), env: privateEnv });
     const startupDiagnostics = initialized.error ? `${stderr}\n${await readFile(path.join(root, "guard.jsonl"), "utf8").catch(() => "No guard events")}\n${await readFile(path.join(env.QODER_CONFIG_DIR!, "fixture-frames.jsonl"), "utf8").catch(() => "No daemon frames")}` : "";
-    expect(initialized, startupDiagnostics).toMatchObject({ result: { sdkVersion: "1.0.59", runtimeVersion: "1.1.83" } });
+    expect(initialized, startupDiagnostics).toMatchObject({ result: { sdkVersion: "1.0.59", runtimeVersion } });
     let started!: Frame;
     if (usesSession) {
       const workspace = path.join(root, "project");

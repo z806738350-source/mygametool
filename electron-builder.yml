@@ -40,6 +40,8 @@ files:
 extraResources:
   - from: plugins
     to: plugins
+    filter:
+      - "!**/__pycache__/**"
   - from: integrations/skills
     to: integrations/skills
   # Match from the parent so electron-builder retains Node's root node_modules.

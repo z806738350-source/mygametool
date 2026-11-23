@@ -190,6 +190,23 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
+it("sends the active board and current selection as compact chat context", async () => {
+  const context = vi.fn();
+  boardDisk.board.nodes[0] = { id: "n", type: "document", position: { x: 0, y: 0 }, data: { documentId: "rules" } };
+  await act(async () => root.render(<CanvasWorkspace project={{ id: "p", name: "Sky", type: "asset-canvas" } as ProjectState} onContextChange={context} />));
+  const board = "Current canvas board: canvas/boards/b.json\nSelected nodes: ";
+  expect(context).toHaveBeenLastCalledWith({ kind: "canvas-board", label: "Sky", text: board + "none" });
+
+  await act(async () => captured.props!.onNodesChange!([{ id: "n", type: "select", selected: true }]));
+  const selected = context.mock.lastCall![0].text;
+  expect(selected.startsWith(board)).toBe(true);
+  expect(JSON.parse(selected.slice(board.length))).toEqual({
+    total: 1, nodes: [{ id: "n", name: "Rules", type: "document", source: "canvas/documents/rules.md" }],
+  });
+  await act(async () => captured.props!.onNodesChange!([{ id: "n", type: "select", selected: false }]));
+  expect(context).toHaveBeenLastCalledWith({ kind: "canvas-board", label: "Sky", text: board + "none" });
+});
+
 it("saves through the desktop handshake before the debounce and pauses Canvas polling", async () => {
   await act(async () => root.render(<CanvasWorkspace project={{ id: "p", type: "asset-canvas" } as ProjectState} />));
   expect(captured.props?.nodes[0]?.title).toBe("Original");

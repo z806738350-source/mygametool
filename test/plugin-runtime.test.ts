@@ -23,7 +23,7 @@ describe("plugin runtime", () => {
     const store = new BundledPluginStore(path.resolve("plugins"));
     await store.load();
     const settings = await settingsStore();
-    const tool = workflowGuideTools("web-game", store, settings)[0]!;
+    const tool = workflowGuideTools({ type: "web-game" }, store, settings)[0]!;
     const read = async (guide: string, reference?: string) => {
       const result = await tool.execute("read", { guide, reference }, undefined, undefined, {} as never);
       return result.content.map(block => block.type === "text" ? block.text : "").join("\n");
@@ -65,6 +65,14 @@ describe("plugin runtime", () => {
     const staged = await stageSkills(pluginSkillFolders(skills), target);
     expect(staged).toHaveLength(skills.length);
     expect(staged).toEqual(expect.arrayContaining(["taptap-maker", "game-studio", "blender-assets"]));
+    const blender = path.join(target, "blender-assets");
+    const entry = await readFile(path.join(blender, "SKILL.md"), "utf8");
+    const references = new Set(Array.from(entry.matchAll(/\]\((references\/[\w-]+\.md)\)/g), match => match[1]));
+    expect(references.size).toBeGreaterThan(0);
+    for (const reference of references) {
+      expect(await readFile(path.join(blender, reference), "utf8"), reference)
+        .toEqual(await readFile(path.join("plugins/blender/skills/blender-assets", reference), "utf8"));
+    }
   });
 
   it("keeps Game Studio isolated from Web Game skills and honors its disabled setting", async () => {

@@ -23,7 +23,8 @@ type ModelViewerProgress = CustomEvent<{
   totalProgress?: number;
 }>;
 
-export function ModelPreview({ source, label, minHeight = 320, interactive = true, autoRotate = false, animate = interactive, rotationPerSecond, clipPicker = true, playback, onPlaybackChange, onError }: { source: string; label: string; minHeight?: number; interactive?: boolean; autoRotate?: boolean; animate?: boolean; rotationPerSecond?: string; clipPicker?: boolean; playback?: ModelPlaybackState; onPlaybackChange?: (state: ModelPlaybackState) => void; onError?: () => void }) {
+export function ModelPreview({ source, label, minHeight = 320, interactive = true, autoRotate = false, animate = interactive, rotationPerSecond, clipPicker = true, playback, onPlaybackChange, onLoad, onError }: { source: string; label: string; minHeight?: number; interactive?: boolean; autoRotate?: boolean; animate?: boolean; rotationPerSecond?: string; clipPicker?: boolean; playback?: ModelPlaybackState; onPlaybackChange?: (state: ModelPlaybackState) => void; onLoad?: () => void; onError?: () => void }) {
+  const loadCallback = useRef(onLoad); loadCallback.current = onLoad;
   const errorCallback = useRef(onError); errorCallback.current = onError;
   const containerRef = useRef<HTMLDivElement | null>(null);
   const viewerRef = useRef<ModelViewerElement | null>(null);
@@ -109,6 +110,7 @@ export function ModelPreview({ source, label, minHeight = 320, interactive = tru
     const handleLoad = () => {
       setProgress(1);
       setLoaded(true);
+      loadCallback.current?.();
       // Rigged models carry one clip per move; model-viewer only autoplays the first unless one is named.
       setClips([...(viewer.availableAnimations ?? [])]);
       const saved = playbackRef.current;

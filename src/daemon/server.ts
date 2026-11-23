@@ -73,6 +73,7 @@ try {
   }
   app = createApp({
     projectExecution: await IsolatedProjectExecution.load(dataDirectory),
+    compactProjectBrowserStorageOnExit: desktopOwned && Boolean(process.env.OHMYGAME_LOCAL_LAUNCH_ID),
     dataDirectory,
     networkSettings,
     piAgentDirectory,

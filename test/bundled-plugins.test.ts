@@ -8,30 +8,90 @@ import { PluginSettingsStore } from "../src/daemon/plugin-settings.js";
 import { workflowGuideTools } from "../src/daemon/workflow-guide.js";
 
 describe("bundled plugins", () => {
-  it("delivers the complete controlled Blender guide and reference while respecting disabled skills", async () => {
+  it("serves only the requested operating reference when no studio plugins are installed", async () => {
+    const directory = await temporaryTestDirectory("ohmygame-built-in-guides-");
+    const store = new BundledPluginStore(directory);
+    await store.load();
+    const settings = new PluginSettingsStore(directory);
+    await settings.load();
+    const tool = workflowGuideTools({ type: "web-game", startupDirectory: "client", previewMode: "static" }, store, settings)[0]!;
+    const read = async (guide: string, reference?: string) => {
+      const result = await tool.execute("guide", { guide, reference }, undefined, undefined, {} as never);
+      return result.content.map(item => item.type === "text" ? item.text : "").join("\n");
+    };
+    expect(await read("ohmygame")).toContain("images.md");
+    const project = await read("ohmygame", "project.md");
+    expect(project).toContain("Static files preview serves index.html and its relative assets from the client/ folder");
+    expect(project).not.toContain("gl.getParameter");
+    expect(await read("ohmygame", "textures.md")).toContain("gl.getParameter");
+    await expect(read("ohmygame", "../secret.md")).rejects.toThrow("Unknown");
+    await expect(read("blender-assets")).rejects.toThrow("unavailable");
+  });
+
+  it("routes Blender tasks to the applicable stage references through the enabled workflow guide", async () => {
     const store = new BundledPluginStore(path.resolve("plugins"));
     await store.load();
     const settings = new PluginSettingsStore(await temporaryTestDirectory("ohmygame-blender-guide-"));
     await settings.load();
-    const tool = workflowGuideTools("web-game", store, settings)[0]!;
-    const read = (reference?: string) => tool.execute("guide", { guide: "blender-assets", reference }, undefined, undefined, {} as never);
-    const guide = (await read()).content.find(item => item.type === "text")?.text;
-    expect(guide).toContain("## Deliver to the game");
-    expect(guide).toContain("recover_blender_run");
-    expect(guide).toContain("the main Agent reviews intermediate stages");
-    expect(guide).toContain("see progress, show it and keep working.");
-    expect(guide).toContain("additional spending the user has not authorized");
-    expect(guide?.replace(/\s+/g, " ")).toContain("Wait for the user's answer before taking the dependent step.");
-    const reference = (await read("pipeline.md")).content.find(item => item.type === "text")?.text;
-    expect(reference).toContain("contactPoint");
+    const tool = workflowGuideTools({ type: "web-game" }, store, settings)[0]!;
+    const read = async (reference?: string) => {
+      const result = await tool.execute("guide", { guide: "blender-assets", reference }, undefined, undefined, {} as never);
+      return result.content.map(item => item.type === "text" ? item.text : "").join("\n");
+    };
+    const guide = await read();
+    const introduction = guide.split(/^## /m)[0];
+    expect(introduction).toMatch(/every Blender stage headlessly with `run_blender`[\s\S]*run report, saved model and rendered images/i);
+    expect(introduction).toMatch(/without waiting for a Blender window/i);
+    expect(introduction).toMatch(/open the saved `scene\.blend` manually/i);
+    expect(introduction).toContain("review card");
+    expect(introduction).toMatch(/wait for the user's approval/i);
+    expect(introduction).toMatch(/wait for the user to accept/i);
+    expect(introduction).toMatch(/main Agent reviews intermediate/i);
+    const routes = guide.split("\n").filter(line => line.startsWith("|"));
+    expect(routes).toEqual(expect.arrayContaining([
+      expect.stringMatching(/concept art.*before generating the first view.*references\/turnaround\.md/i),
+      expect.stringMatching(/existing model.*preserve.*original.*inspect.*references\/pipeline\.md/i),
+      expect.stringMatching(/dimensioned prop.*measured parts.*export.*references\/pipeline\.md/i),
+    ]));
+    const dimensions = routes.find(line => /dimensioned prop/i.test(line))!;
+    expect(dimensions).not.toMatch(/references\/(turnaround|rig-animation)\.md/);
+    expect(guide).toMatch(/rig.*references\/rig-animation\.md/i);
+    expect(guide).toMatch(/legless[^\n]*multi-legged[^\n]*`custom`/i);
+    expect(guide).toMatch(/custom.*references\/custom-python\.md/i);
+    expect(guide).toContain("references/optimization.md");
+    expect(routes.find(line => /concept art/i.test(line))).toContain("references/design-proofs.md");
+    const design = await read("design-proofs.md");
+    expect(design).toMatch(/capability: "image"[\s\S]*custom-python.md[\s\S]*Open each run's relevant images[\s\S]*complete ordered set and original/);
+    expect(design).not.toContain("## Clean a static copy");
+
+    const [views, pipeline, rig, custom, optimization] = await Promise.all(
+      ["turnaround.md", "pipeline.md", "rig-animation.md", "custom-python.md", "optimization.md"].map(read),
+    );
+    const optimizationTopics = optimization.split("\n").filter(line => line.startsWith("## ")).join("\n");
+    for (const topic of [/geometry/i, /texture/i, /material/i, /bak(?:e|ing)/i, /animation/i])
+      expect(optimizationTopics).toMatch(topic);
+    expect(views).toMatch(/left shoulder[\s\S]*waist anchor[\s\S]*wrist and thumb[\s\S]*heel and toes/i);
+    expect(views).toMatch(/inspect_3d_views[\s\S]*originalPath[\s\S]*per view in chat[\s\S]*turnaround review card[\s\S]*complete set for a new review/);
+    expect(views).toMatch(/sourceAssetId[\s\S]*brief\.route: "tripo"/);
+    expect(rig).toContain("contactPoint");
+    expect(rig).toContain("contactFootBones");
+    expect(custom).toContain("--input-dir");
+    expect(custom).toContain("--output-dir");
+    expect(custom).toContain("compress=False");
+    expect(custom).toMatch(/background\s+mode[\s\S]*no window or active viewport/i);
+    expect(pipeline).toMatch(/Canvas checkpoint presents the saved outputs of a completed background run/i);
     for (const mode of ["internal", "checkpoint", "final"]) {
-      expect(guide).toContain(`reviewPresentation: "${mode}"`);
+      expect(pipeline).toContain(`reviewPresentation: "${mode}"`);
     }
-    expect(reference).toContain("Ask for final user acceptance on the exact candidate presented.");
-    expect(reference).toContain("for a choice only the user can make.");
+    expect(pipeline).toMatch(/progress or evidence\s+for a choice only the user can make/);
+    expect(pipeline).toMatch(/unapproved spending/);
+    expect(pipeline).toContain("visualReview");
+    expect(pipeline).toContain("final user acceptance on the exact candidate");
+    expect(guide).toMatch(/wait for the user's decision/i);
     await expect(read("../scripts/pipeline.py")).rejects.toThrow();
     await settings.update(store.read("ohmygame:blender")!, { enabled: false, components: {} });
     await expect(read()).rejects.toThrow("unavailable");
+    await expect(read("turnaround.md")).rejects.toThrow("unavailable");
   });
 
   it("loads beta plugins with their native skills and connections", async () => {

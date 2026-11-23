@@ -40,6 +40,7 @@ import {
   cliProbeError,
 } from "./compatibility.js";
 import { OpenCodeDriver } from "./opencode.js";
+import { codexInstallationIdentity } from "./controlled-codex.js";
 
 const PROBE_TIMEOUT_MS = 15_000;
 
@@ -82,19 +83,19 @@ export async function resolveBinary(
     for (const key of versionCache.keys())
       if (key.startsWith(`${id}:`)) versionCache.delete(key);
   const definition = AGENT_RUNTIME_DEFINITIONS[id];
+  const bundled = (definition.bundledPaths?.[process.platform] ?? []).map(
+    (candidate) => ({
+      ...candidate,
+      path: candidate.path.startsWith("~/")
+        ? path.join(os.homedir(), candidate.path.slice(2))
+        : candidate.path,
+    }),
+  );
   const candidates = override
     ? [{ path: override, source: "manual" as const }]
-    : [
-        ...(await searchCandidates(definition.binaries, id !== "codex-cli")),
-        ...(definition.bundledPaths?.[process.platform] ?? []).map(
-          (candidate) => ({
-            ...candidate,
-            path: candidate.path.startsWith("~/")
-              ? path.join(os.homedir(), candidate.path.slice(2))
-              : candidate.path,
-          }),
-        ),
-      ];
+    : id === "codex-cli" && process.platform === "darwin"
+      ? [...bundled, ...(await searchCandidates(definition.binaries, false))]
+      : [...(await searchCandidates(definition.binaries, id !== "codex-cli")), ...bundled];
   // npm exposes a shell shim on Windows, but ships the native CLI inside the
   // package. Resolve that known layout without running the shim through cmd.
   if (id === "codex-cli" && process.platform === "win32") {
@@ -146,7 +147,9 @@ export async function resolveBinary(
       seen.add(target);
       found.push({
         ...candidate,
-        signature: `${candidate.path}:${info.size}:${info.mtimeMs}`,
+        signature: id === "codex-cli"
+          ? await codexInstallationIdentity(candidate.path)
+          : `${candidate.path}:${info.size}:${info.mtimeMs}`,
       });
     } catch {
       continue;

@@ -21,6 +21,12 @@ describe("offline canvas migration", () => {
     const file = path.join(directory, "canvas/AGENTS.md");
     const current = await readFile(file, "utf8");
     expect(current).toContain("Keep internal Blender runs off the board");
+    const oldFileRules = current
+      .replace(/Consult the relevant README[^\n]+/, "Read README.md and schemas/ before changing a contract. Run canvas_check after editing.")
+      .replace(/Use the current contents of referenced files[^\n]+/, "Read the referenced files before editing, and preserve other user changes.");
+    await writeFile(file, oldFileRules);
+    await ensureCanvasContract(directory);
+    expect(await readFile(file, "utf8")).toBe(current);
     for (const previous of [
       "Before submitting new project media, save its generation node on the board, then call generate_canvas_media. It records history, assets and results on that node. Only register a result manually when it already exists outside the board.",
       "After each media result is saved, register its path in assets.json and add or update its board node before the next long-running step. Do not defer board writes until the final response.",

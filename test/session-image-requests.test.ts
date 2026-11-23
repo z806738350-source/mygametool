@@ -15,6 +15,7 @@ import type { ResponsesTransportMode } from "../src/shared/contracts.js";
 import { AssetLibrary } from "../src/daemon/asset-library.js";
 import { rememberKunpoImageSource } from "../src/daemon/provider-image-source.js";
 import { AgentManager, type CodingSession } from "../src/daemon/agent.js";
+import { createLocalAgentFileTools } from "../src/daemon/agent-local-files.js";
 import { RuntimeEventBus } from "../src/shared/events.js";
 import { ProjectManager } from "../src/daemon/projects.js";
 import { ConversationManager } from "../src/daemon/conversations.js";
@@ -41,17 +42,19 @@ async function fixture(options: {
   onStream?: (options: Parameters<AgentSession["agent"]["streamFunction"]>[2]) => void;
   imageLibrary?: AssetLibrary;
   chat?: boolean;
+  astra?: boolean;
   sessionManager?: SessionManager;
 } = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), "ohmygame-image-requests-"));
   cleanup.push(() => rm(dir, { recursive: true, force: true }));
   const credentials = path.join(dir, "literal-api-keys.json");
-  await new LocalApiKeyStore(credentials).modify("session-fixture", async () => ({ type: "api_key", key: "sk-SESSION_IMAGE_FAKE_CANARY" }));
-  const runtime = await createLocalModelRuntime(credentials, async () => [{ id: "session-fixture", config: {
-    api: options.chat ? "openai-completions" : "openai-responses", baseUrl: options.chat ? "https://llm.ziy.cc/v1" : BASE_URL, models: [{ id: "vision-fixture", name: "Local vision fixture", input: ["text", "image"], reasoning: false,
+  const provider = options.astra ? "kunpo" : "session-fixture", modelId = options.astra ? "gpt-6.2-astra" : "vision-fixture";
+  await new LocalApiKeyStore(credentials).modify(provider, async () => ({ type: "api_key", key: "sk-SESSION_IMAGE_FAKE_CANARY" }));
+  const runtime = await createLocalModelRuntime(credentials, async () => [{ id: provider, config: {
+    api: options.chat ? "openai-completions" : "openai-responses", baseUrl: options.chat || options.astra ? "https://llm.ziy.cc/v1" : BASE_URL, models: [{ id: modelId, name: "Local vision fixture", input: ["text", "image"], reasoning: false,
       contextWindow: 128_000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
   } }], options.imageLibrary);
-  const model = runtime.getModel("session-fixture", "vision-fixture")!;
+  const model = runtime.getModel(provider, modelId)!;
   const manager = options.sessionManager ?? SessionManager.inMemory(dir);
   const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } }, cacheWarming: "idle" });
   const loader = new DefaultResourceLoader({ cwd: dir, agentDir: dir, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, agentsFilesOverride: () => ({ agentsFiles: [] }) });
@@ -66,8 +69,8 @@ async function fixture(options: {
   installSessionImageRequests(session, images, dir, { transport, transportMode: options.transportMode });
   return { session, manager, settings, socketFactory, images };
 }
-async function image() {
-  const bytes = await sharp({ create: { width: 16, height: 16, channels: 3, background: "red" } }).png().toBuffer();
+async function image(background = "red") {
+  const bytes = await sharp({ create: { width: 16, height: 16, channels: 3, background } }).png().toBuffer();
   return { type: "image" as const, mimeType: "image/png", data: bytes.toString("base64") };
 }
 function capture(requests: Json[], respond: () => Response = () => answer(requests.length)) {
@@ -78,6 +81,28 @@ function capture(requests: Json[], respond: () => Response = () => answer(reques
 const lastAssistant = (session: AgentSession) => session.messages.findLast((message) => message.role === "assistant");
 
 describe("Pi session image request integration", () => {
+  it("sends pixels for visual review, releases them on a real write, and sends the recalled original over SSE", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "ohmygame-reviewed-write-")); cleanup.push(() => rm(root, { recursive: true, force: true }));
+    const tools = createLocalAgentFileTools(root).filter(tool => tool.name === "write");
+    const { session } = await fixture({ tools });
+    const original = await image(), requests: Json[] = [];
+    capture(requests, () => {
+      const step = requests.length;
+      if (step > 2) return answer(step);
+      const name = step === 1 ? "write" : "recall_image";
+      const args = step === 1 ? { path: "review.txt", content: "Reviewed", releaseReviewedImages: true } : { imageId: wireImages(requests[0])[0]!.id };
+      const call = { type: "function_call", id: `fc-${step}`, call_id: `review-${step}`, name, arguments: JSON.stringify(args), status: "completed" };
+      return sse({ type: "response.created", response: { id: `resp-${step}`, status: "in_progress" } },
+        { type: "response.output_item.added", output_index: 0, item: { ...call, arguments: "" } },
+        { type: "response.function_call_arguments.delta", output_index: 0, delta: call.arguments },
+        { type: "response.output_item.done", output_index: 0, item: call }, completed([call], `resp-${step}`));
+    });
+    await session.prompt("Review the picture, save the finding, then inspect the source again.", { images: [original] });
+    expect(await readFile(path.join(root, "review.txt"), "utf8")).toBe("Reviewed");
+    expect(requests.map(request => wireImages(request).map(view => view.data))).toEqual([[original.data], [], [original.data]]);
+    expect(JSON.stringify(requests[1].input)).toContain(`Image omitted from model context. Session image: ${wireImages(requests[0])[0]!.id}`);
+  });
+
   it("binds application Agent turns before SDK persistence and restores the correct image origins after restart", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "ohmygame-agent-origin-history-")); cleanup.push(() => rm(root, { recursive: true, force: true }));
     const library = new AssetLibrary(root); await library.load(); const original = await image(), bytes = Buffer.from(original.data, "base64");
@@ -101,7 +126,10 @@ describe("Pi session image request integration", () => {
     const restored = await fixture({ chat: true, imageLibrary: library, sessionManager: SessionManager.open(conversation.sessionPath, path.dirname(conversation.sessionPath), project.workspacePath) });
     const nextAgents = new AgentManager(new RuntimeEventBus(), { createSession: async () => Object.assign(restored.session, { emitsInitialUserMessage: true }) as unknown as CodingSession }); cleanup.push(() => nextAgents.close());
     await nextAgents.prompt(project, conversation, "Continue the previous images").result;
-    expect(network).toHaveBeenCalledTimes(2); expect(urls(requests[1]!)).toEqual(expected);
+    expect(network).toHaveBeenCalledTimes(2); expect(urls(requests[1]!)).toEqual([]);
+    const prior = restored.manager.getBranch().find(entry => entry.type === "message" && entry.message.role === "user")!;
+    const recalled = await restored.images.recallTool.execute("inspect-origin", { imageId: `${prior.id}:0` }, undefined, undefined, {} as never);
+    expect(recalled.content[1]).toMatchObject({ ...original, libraryAssetId: asset.id });
     expect(await readFile(conversation.sessionPath, "utf8")).not.toContain("fake-agent-origin");
     const secondGenerated = { bytes }, secondUrl = "https://kunpoapiimg.ziy.cc/agent-b.png?signature=fake-agent-b-origin";
     rememberKunpoImageSource(secondGenerated, secondUrl, "https://llm.ziy.cc/v1"); const assetB = await library.add("agent-b.png", bytes, { origin: "generated" }); await library.bindGeneratedImageSource(assetB.id, secondGenerated);
@@ -117,7 +145,8 @@ describe("Pi session image request integration", () => {
       expect(await nextAgents.steerPending(project.id, conversation.summary.id, queued.turnId)).toBe(true);
     } finally { release(); }
     await running.result; expect(network).toHaveBeenCalledTimes(4);
-    expect(urls(requests[3]!)).toEqual([...expected, url, secondUrl]);
+    expect(urls(requests[2]!)).toEqual([url]);
+    expect(urls(requests[3]!)).toEqual([secondUrl]);
     expect(restored.manager.getBranch().filter(entry => entry.type === "custom" && entry.customType === IMAGE_ORIGINS_ENTRY)).toHaveLength(3);
     const revised = await nextAgents.reviseLast(project, conversation, "Revised prompt, same image", async reference => reference); await revised.result;
     expect(network).toHaveBeenCalledTimes(5); expect(urls(requests[4]!).at(-1)).toBe(secondUrl);
@@ -137,15 +166,14 @@ describe("Pi session image request integration", () => {
     ].join("\n\n"), { headers: { "content-type": "text/event-stream" } }));
     await session.prompt("Inspect", { images: [{ ...reference, libraryAssetId: asset.id } as typeof reference, reference] });
     await session.prompt("Continue from the same images"); expect(network).toHaveBeenCalledTimes(2);
-    for (const request of requests) {
-      const urls = (request.messages as any[]).flatMap(message => Array.isArray(message.content) ? message.content.filter((part: any) => part.type === "image_url").map((part: any) => part.image_url.url) : []);
-      expect(urls).toEqual([`data:image/png;base64,${reference.data}`, `data:image/png;base64,${reference.data}`]);
-    }
+    expect(wireImages(requests[0]).map(part => part.data)).toEqual([reference.data, reference.data]);
+    expect(wireImages(requests[1])).toHaveLength(0);
+    expect(JSON.stringify(requests)).not.toContain("fake-session-source");
     expect(JSON.stringify(manager.getBranch())).not.toContain("fake-session-source");
     expect(JSON.stringify(manager.getBranch())).not.toContain("libraryAssetId");
   });
 
-  it("sends complete canonical history over SSE and retains originals without Files or WebSocket requests", async () => {
+  it("sends conversation text and recallable references over SSE without replaying previous-turn pixels", async () => {
     const { session, manager, settings, socketFactory } = await fixture();
     const requests: Json[] = [], network = capture(requests), original = await image();
     await session.prompt("Inspect this", { images: [original] }); await session.prompt("Inspect it again");
@@ -153,7 +181,9 @@ describe("Pi session image request integration", () => {
     expect(network.mock.calls.every(([input, init]) => new Request(input, init).url === `${BASE_URL}/responses`)).toBe(true);
     expect(requests.every((request) => !Object.hasOwn(request, "previous_response_id"))).toBe(true);
     expect(JSON.stringify(requests[1].input)).toContain("Inspect this"); expect(JSON.stringify(requests[1].input)).toContain("Inspect it again");
-    expect(JSON.stringify(requests[1].input)).toContain(original.data);
+    expect(wireImages(requests[0]).map(part => part.data)).toEqual([original.data]);
+    expect(wireImages(requests[1])).toHaveLength(0);
+    expect(JSON.stringify(requests[1].input)).toContain("Image omitted from model context. Session image:");
     expect(session.messages.filter((message) => message.role === "assistant")).toHaveLength(2);
     expect(manager.getBranch().find((entry) => entry.type === "message" && entry.message.role === "user")).toMatchObject({ message: { content: expect.arrayContaining([original]) } });
     expect(settings.getCacheWarmingMode()).toBe("off"); expect(socketFactory).not.toHaveBeenCalled();
@@ -353,33 +383,68 @@ describe("Pi session image request integration", () => {
     expect(JSON.stringify(requests[1].input)).not.toContain("failed-call"); expect(requests[1]).not.toHaveProperty("previous_response_id"); expect(lastAssistant(session)).toMatchObject({ stopReason: "error" });
   });
 
-  it("shrinks HTTP 413 once and persists omission while keeping canonical originals", async () => {
-    const log = vi.spyOn(console, "info").mockImplementation(() => {});
-    const { session, manager, images } = await fixture(), budget = vi.spyOn(images, "budget"), requests: Json[] = [];
-    const network = capture(requests, () => requests.length === 2 ? new Response("too large", { status: 413 }) : answer(requests.length));
-    const original = await image(); await session.prompt("First", { images: [original, original, original, original] }); await session.prompt("Second"); await session.prompt("Third");
-    const count = (request: Json) => JSON.stringify(request).match(/data:image\/png;base64,/g)?.length ?? 0;
-    expect(requests.map(count)).toEqual([4, 4, 3, 3]); expect(network).toHaveBeenCalledTimes(4); expect(budget).toHaveBeenCalledTimes(4);
-    const records = log.mock.calls.map(([line]) => JSON.parse(String(line))).filter(entry => entry.event === "finished");
-    expect(records.map(entry => entry.outcome)).toEqual(["completed", "http_error", "completed", "completed"]);
-    expect(records[2].modelRequestId).toBe(records[1].localRequestId);
-    expect(new Set(records.map(entry => entry.localRequestId)).size).toBe(4);
-    expect(manager.getBranch().filter((entry) => entry.type === "custom")).toHaveLength(1);
-    expect(manager.getBranch().find((entry) => entry.type === "message" && entry.message.role === "user")).toMatchObject({ message: { content: expect.arrayContaining([original, original, original, original]) } });
-    const firstUser = session.messages.find((message) => message.role === "user");
-    expect(Array.isArray(firstUser?.content) ? firstUser.content.filter((block) => block.type === "image") : []).toEqual([original, original, original, original]);
+  it("drops only optional Astra history on HTTP 413 and keeps the full current comparison", async () => {
+    const pictures = await Promise.all(["red", "green", "blue"].map(color => image(color)));
+    let next = 0;
+    const { session } = await fixture({ astra:true, tools:[{ name:"observe", label:"Observe", description:"Read the next view",
+      parameters:Type.Object({}), execute:async () => ({ content:[pictures[next++]!], details:{} }) }] });
+    const requests: Json[] = [];
+    capture(requests, () => {
+      const n = requests.length;
+      if (n === 4) return new Response("too large", { status:413 });
+      if (n > 4) return answer(n);
+      const item = { type:"function_call", id:`fc-${n}`, call_id:`observe-${n}`, name:"observe", arguments:"{}", status:"completed" };
+      return sse({ type:"response.created", response:{ id:`resp-${n}`, status:"in_progress" } },
+        { type:"response.output_item.added", output_index:0, item:{ ...item, arguments:"" } },
+        { type:"response.function_call_arguments.delta", output_index:0, delta:"{}" },
+        { type:"response.output_item.done", output_index:0, item }, completed([item], `resp-${n}`));
+    });
+    await session.prompt("Inspect the three successive visual results");
+    const [red, green, blue] = pictures.map(p => p.data);
+    expect(requests.map(request => wireImages(request).map(p => p.data))).toEqual([[], [red], [red, green], [red, green, blue], [green, blue]]);
+    expect(next).toBe(3);
+    expect(lastAssistant(session)?.stopReason).toBe("stop");
   });
 
-  it("stops after the single reduced request also receives HTTP 413", async () => {
-    const { session, manager } = await fixture(), requests: Json[] = [];
-    const network = capture(requests, () => requests.length === 1 ? answer() : new Response("too large", { status: 413 }));
-    const original = await image();
-    await session.prompt("First", { images: [original, original, original, original] });
-    await session.prompt("Second");
-    expect(network).toHaveBeenCalledTimes(3);
-    expect(requests.map((request) => JSON.stringify(request).match(/data:image\/png;base64,/g)?.length ?? 0)).toEqual([4, 4, 3]);
-    expect(lastAssistant(session)).toMatchObject({ stopReason: "error" });
-    expect(manager.getBranch().filter((entry) => entry.type === "custom")).toHaveLength(1);
+  it.each([200, 413])("shrinks HTTP 413 once using the older observation and respects retry status %i", async retryStatus => {
+    const log = vi.spyOn(console, "info").mockImplementation(() => {});
+    const observations = [await image("red"), await image("blue")] as const;
+    let next = 0;
+    const observe = vi.fn(async () => ({ content: [observations[next++]!], details: {} }));
+    const { session, manager, images } = await fixture({ tools: [
+      { name: "observe", label: "Observe", description: "Read the next view", parameters: Type.Object({}), execute: observe },
+    ] });
+    const budget = vi.spyOn(images, "budget"), requests: Json[] = [];
+    const network = capture(requests, () => {
+      const n = requests.length;
+      if (n <= 2) {
+        const call = { type: "function_call", id: `fc-${n}`, call_id: `observe-${n}`, name: "observe", arguments: "{}", status: "completed" };
+        return sse({ type: "response.created", response: { id: `resp-${n}`, status: "in_progress" } },
+          { type: "response.output_item.added", output_index: 0, item: { ...call, arguments: "" } },
+          { type: "response.function_call_arguments.delta", output_index: 0, delta: "{}" },
+          { type: "response.output_item.done", output_index: 0, item: call }, completed([call], `resp-${n}`));
+      }
+      return n === 3 || retryStatus === 413 ? new Response("too large", { status: 413 }) : answer(n);
+    });
+    await session.prompt("Compare two observations");
+    expect(observe).toHaveBeenCalledTimes(2);
+    expect(network).toHaveBeenCalledTimes(4);
+    const [red, blue] = observations;
+    expect(requests.map(request => wireImages(request).map(part => part.data))).toEqual([[], [red.data], [red.data, blue.data], [blue.data]]);
+    expect(budget).toHaveBeenCalledTimes(4);
+    const records = log.mock.calls.map(([line]) => JSON.parse(String(line))).filter(entry => entry.event === "finished");
+    expect(records.map(entry => entry.outcome)).toEqual(["completed", "completed", "http_error", retryStatus === 200 ? "completed" : "http_error"]);
+    expect(records[3].modelRequestId).toBe(records[2].localRequestId);
+    expect(new Set(records.map(entry => entry.localRequestId)).size).toBe(4);
+    expect(lastAssistant(session)?.stopReason).toBe(retryStatus === 200 ? "stop" : "error");
+    const results = manager.getBranch().filter(entry => entry.type === "message" && entry.message.role === "toolResult");
+    expect(results).toHaveLength(2);
+    for (const [index, entry] of results.entries()) {
+      expect(entry).toMatchObject({ message: { content: expect.arrayContaining([observations[index]]) } });
+    }
+    expect(manager.getBranch().filter(entry => entry.type === "custom" && entry.customType === IMAGE_OFFLOAD_ENTRY)).toMatchObject([
+      { data: { images: [`${results[0]!.id}:0`] } },
+    ]);
   });
 
   it("does not resubmit HTTP 413 when every image belongs to the protected current turn", async () => {

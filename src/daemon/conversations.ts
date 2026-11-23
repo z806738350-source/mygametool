@@ -26,6 +26,11 @@ export function hasImageHistory(messages: ContextMessages): boolean {
   return messages.some(message => "content" in message && Array.isArray(message.content) && message.content.some(block => block.type === "image"));
 }
 
+export function sessionReasoningLevel(manager: SessionManager): AgentReasoningLevel | undefined {
+  const entry = manager.getBranch().findLast(candidate => candidate.type === "thinking_level_change");
+  return entry ? parseReasoningLevel(entry.thinkingLevel) : undefined;
+}
+
 export class ConversationManager {
   readonly #pending = new Map<string, { stored: StoredConversation; manager: SessionManager; titled: boolean }>();
   readonly #cache: ConversationCache;
@@ -162,8 +167,7 @@ export class ConversationManager {
   }
 
   async reasoningLevel(project: ProjectState, stored: StoredConversation): Promise<AgentReasoningLevel | undefined> {
-    const entry = (await this.view(project, stored)).getBranch().findLast((candidate) => candidate.type === "thinking_level_change");
-    return entry?.type === "thinking_level_change" ? parseReasoningLevel(entry.thinkingLevel) : undefined;
+    return sessionReasoningLevel(await this.view(project, stored));
   }
 
   async hasImageHistory(project: ProjectState, stored: StoredConversation): Promise<boolean> {

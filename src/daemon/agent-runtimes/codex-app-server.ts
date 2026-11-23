@@ -37,14 +37,15 @@ export async function checkCodexCompatibility(
   server: CodexAppServer,
   directory: string,
   timeoutMs = REQUEST_TIMEOUT_MS,
-): Promise<void> {
+  audit = false,
+): Promise<string> {
   const profile = "ohmygame-compatibility-probe";
   const read = await server.request<{ config?: Record<string, unknown> }>(
     "config/read",
     { cwd: directory },
     timeoutMs,
   );
-  requireControlledCodexConfig(read.config);
+  requireControlledCodexConfig(read.config, audit);
   // Windows' sandbox requires `:root` read access; `:minimal` is rejected.
   // The regular conversation applies the same Windows adjustment.
   const filesystemPermissions: Record<string, unknown> =
@@ -55,7 +56,7 @@ export async function checkCodexCompatibility(
     default_permissions: profile,
     project_root_markers: [],
     notify: [],
-    "features.request_permissions_tool": true,
+    "features.request_permissions_tool": !audit,
     "features.shell_snapshot": false,
     permissions: {
       [profile]: {
@@ -99,6 +100,7 @@ export async function checkCodexCompatibility(
   requireCodexPermissionProfile(response, profile);
   if (!response.thread?.id)
     throw new Error("Codex did not start a probe thread");
+  return response.thread.id;
 }
 
 const REQUEST_TIMEOUT_MS = 60_000;
@@ -134,6 +136,7 @@ export class CodexAppServer {
         params: Record<string, unknown>,
       ) => Promise<unknown>;
       exit?: (failure: string) => void;
+      localIsolationAudit?: boolean;
     } = {},
   ) {
     this.process = new AgentProcess(
@@ -154,7 +157,7 @@ export class CodexAppServer {
           this.#pending.clear();
           handlers.exit?.(this.#closed.message);
         },
-      }),
+      }, handlers.localIsolationAudit),
     );
   }
 

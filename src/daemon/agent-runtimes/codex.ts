@@ -201,6 +201,8 @@ export class CodexDriver implements NativeDriver {
 
   async #start(): Promise<CodexAppServer> {
     if (this.#disposed) throw new Error("The agent session was closed");
+    await this.context.verifyCodexInstallation?.();
+    if (this.#disposed) throw new Error("The agent session was closed");
     if (this.#lease?.server.process.running) return this.#lease.server;
     return (this.#starting ??= (async () => {
       try {
@@ -264,7 +266,10 @@ export class CodexDriver implements NativeDriver {
           thread?: { id?: string };
           activePermissionProfile?: { id?: string };
         }>("thread/resume", { threadId: this.#threadId, ...settings });
-        requireCodexPermissionProfile(resumed, this.#writeProfile);
+        // A loaded thread can still report its planning profile. Both profiles
+        // use the same read-only native permissions and turn/start selects the next one.
+        if (resumed.activePermissionProfile?.id !== this.#readProfile)
+          requireCodexPermissionProfile(resumed, this.#writeProfile);
         const id = resumed.thread?.id ?? this.#threadId;
         this.#threadId = id;
         this.#lease?.bind(id);

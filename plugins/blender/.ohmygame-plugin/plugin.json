@@ -1,20 +1,21 @@
 {
   "name": "blender",
-  "version": "0.1.0",
-  "description": "Create game assets in Blender and export GLB files into the project.",
+  "version": "0.2.1",
+  "description": "Build game models in the background with Blender and review them on the Canvas.",
   "skills": "./skills/",
   "interface": {
     "beta": true,
     "displayName": "Blender",
-    "shortDescription": "Make game assets and export project-ready GLB files.",
-    "longDescription": "The main Agent uses local Blender to create models and animations, check each stage and repair defects. Rotate the finished model and play its animations on the Canvas, then accept it or request changes. You can also ask to review an intermediate stage. The workflow preserves editable Blender files and exports GLB for the target project.",
+    "shortDescription": "Build game models in the background with Blender and review them on the Canvas.",
+    "longDescription": "The Agent runs local Blender headlessly to refine a model or build a prop to size. For a new character, Tripo can generate the starting mesh after you approve the turnaround views. The Agent saves an editable .blend file and checks the exported GLB. On the Canvas, rotate the model, play any animations and approve it or request changes.",
     "icon": {
       "type": "asset",
       "path": "./assets/icon.png"
     },
     "defaultPrompt": [
-      "Create a low-poly game prop in Blender and export it as GLB into this project.",
-      "Prepare this Blender asset for the project and verify its GLB export."
+      "Build a character from the selected references. If Tripo is available, show me the turnaround views for approval before generating the mesh. Refine it in Blender and show me the verified GLB on the Canvas.",
+      "Refine the selected 3D model in Blender. Preserve its source, inspect its geometry and materials, and verify the exported GLB.",
+      "Create a static game prop from my dimensions using procedural geometry in Blender. Check its scale and silhouette, then export a GLB."
     ],
     "projectTypes": ["general", "web-game", "godot-game", "asset-canvas"]
   }

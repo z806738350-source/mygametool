@@ -11,9 +11,9 @@ import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import { convertMessages as convertCompletionsMessages } from "@earendil-works/pi-ai/api/openai-completions";
 import { convertMessages as convertGoogleMessages } from "@earendil-works/pi-ai/api/google-shared";
-import type { ImageContent, Message } from "@earendil-works/pi-ai";
+import type { ImageContent, Message, ToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import { IMAGE_OFFLOAD_ENTRY, IMAGE_ORIGINS_ENTRY, ImageBudgetError, SessionImages, prepareSessionImageDisplay, wireImages, recordSessionImageOrigins, sessionImageOrigins, sessionImageReferences, sessionImageReferenceContext } from "../src/daemon/session-images.js";
+import { IMAGE_OFFLOAD_ENTRY, IMAGE_ORIGINS_ENTRY, ImageBudgetError, SessionImages, inlineImageScope, prepareSessionImageDisplay, wireImages, recordSessionImageOrigins, sessionImageOrigins, sessionImageReferences, sessionImageReferenceContext } from "../src/daemon/session-images.js";
 
 const dirs: string[] = [];
 afterEach(async () => { await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))); });
@@ -25,14 +25,160 @@ async function fixture() {
   return { dir, manager, images: new SessionImages(manager, dir) };
 }
 const context = (manager: SessionManager) => normalizeContext({ messages: convertToLlm(manager.buildSessionContext().messages) });
-async function payload(images: SessionImages, manager: SessionManager) {
-  return { model: model.id, input: convertResponsesMessages(model, await images.prepare(context(manager), model), new Set(["openai"])) };
+// Exercise wire-side limits independently from the default per-turn visual projection.
+async function budgetPayload(images: SessionImages, manager: SessionManager, selected = model) {
+  return { model: selected.id, input: convertResponsesMessages(selected, await images.annotate(context(manager)), new Set(["openai"])) };
+}
+const astra = { ...model, id: "gpt-6.2-astra", provider: "kunpo", api: "openai-responses" as const, baseUrl: "https://llm.ziy.cc/v1" };
+async function projectedPayload(images: SessionImages, manager: SessionManager, selected = model) {
+  return { model: selected.id, input: convertResponsesMessages(selected, await images.prepare(context(manager), selected), new Set(["openai"])) };
 }
 function screenshot(manager: SessionManager, timestamp: number, content = image): string {
   return manager.appendMessage({ role: "toolResult", toolCallId: `call-${timestamp}`, toolName: "game_use", content: [content], isError: false, timestamp });
 }
 
+function visualCall(manager: SessionManager, timestamp: number, calls: Omit<ToolCall, "type">[]) {
+  manager.appendMessage({ role: "assistant", timestamp, model: astra.id, provider: astra.provider, api: astra.api, stopReason: "toolUse",
+    content: calls.map(call => ({ type: "toolCall", ...call })),
+    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+}
+async function activeImagePayload(manager: SessionManager, images: SessionImages, canRecall = true) {
+  const ctx = normalizeContext({ messages: context(manager).messages, tools: canRecall ? [images.recallTool] : [] });
+  const result = { input: convertResponsesMessages(astra, await images.prepare(ctx, astra), new Set(["openai"])) };
+  images.budget(result, inlineImageScope(astra));
+  return result;
+}
+
 describe("session image projection", () => {
+  it.each(["within limit", "over limit", "unaccepted", "changed text", "duplicate ID", "offloaded", "new branch", "model switch", "inspection", "retry"] as const)(
+    "only carries authentic, accepted Astra tool pictures in the same small visual task (%s)", async scenario => {
+      const { manager, images } = await fixture();
+      manager.appendMessage({ role: "user", timestamp: 1, content: "Review the work" });
+      function observe(n: number, toolName = "read") {
+        const toolCallId = `tool-${n}`;
+        visualCall(manager, 2*n, [{ id:toolCallId, name:toolName, arguments:{} }]);
+        const pixels = Buffer.alloc(scenario === "over limit" ? 3_300_000 : 20, n).toString("base64");
+        return manager.appendMessage({ role:"toolResult", toolCallId, toolName, timestamp:2*n+1, isError:false,
+          content:[{ type:"text", text:`Result ${n}` }, { ...image, data:pixels }] });
+      }
+      const scope = inlineImageScope(astra);
+      const first = observe(1);
+      const second = observe(2);
+      const before = await projectedPayload(images, manager, astra);
+      images.budget(before, scope);
+      const sent = images.withPreviousToolImages(before, scope);
+      if (scenario !== "unaccepted") sent.commit();
+      if (scenario === "new branch") { manager.branch(first); observe(4); }
+      if (scenario === "model switch") await projectedPayload(images, manager, model);
+      if (scenario === "offloaded") manager.appendCustomEntry(IMAGE_OFFLOAD_ENTRY, { scope, images:[`${first}:0`] });
+      const last = observe(3, scenario === "inspection" ? "inspect_3d_views" : "read");
+      const base = await projectedPayload(images, manager, astra);
+      images.budget(base, scope);
+      if (scenario === "changed text" || scenario === "duplicate ID") {
+        const item = base.input.find(item => item.type === "function_call_output" && item.call_id === "tool-1");
+        if (item?.type !== "function_call_output" || typeof item.output !== "string") throw new Error("Missing original result");
+        if (scenario === "duplicate ID") base.input.push({ ...item }); else item.output += " Revised evidence";
+      }
+      const full = images.withPreviousToolImages(base, scope);
+      if (scenario === "within limit" || scenario === "retry") {
+        expect(wireImages(full.payload).map(p => p.id)).toEqual([first,second,last].map(id => `${id}:0`));
+        const original = before.input.find(item => item.type === "function_call_output" && item.call_id === "tool-1");
+        expect(full.payload.input.find(item => item.type === "function_call_output" && item.call_id === "tool-1")).toEqual(original);
+        if (scenario === "retry") {
+          full.discard();
+          expect(images.withPreviousToolImages(base, scope).payload).toBe(base);
+        }
+      } else {
+        expect(full.payload).toBe(base);
+        expect(wireImages(full.payload).map(p => p.id)).not.toContain(`${first}:0`);
+      }
+    });
+
+  it("keeps an accepted render in place when its paired feedback image is still active", async () => {
+    const { manager, images } = await fixture();
+    const user = manager.appendMessage({ role: "user", timestamp: 1, content: [image] });
+    visualCall(manager, 2, [{ id: "release", name: "recall_image", arguments: { releaseReviewedImages: true } }]);
+    manager.appendMessage({ role: "toolResult", timestamp: 3, toolCallId: "release", toolName: "recall_image", isError: false, content: [] });
+    function observe(n: number, size: number) {
+      const toolCallId = `observation-${n}`;
+      visualCall(manager, n, [{ id: toolCallId, name: "read", arguments: {} }]);
+      return manager.appendMessage({ role: "toolResult", toolCallId, toolName: "read", timestamp: n + 1, isError: false,
+        content: [{ ...image, data: Buffer.alloc(size, n).toString("base64") }] });
+    }
+    const scope = inlineImageScope(astra);
+    const first = observe(4, 1_100_000);
+    const second = observe(6, 2_400_000);
+    const previous = images.withPreviousToolImages(await activeImagePayload(manager, images), scope);
+    previous.commit();
+    const fresh = observe(8, 2_400_000);
+    const base = await activeImagePayload(manager, images);
+    expect(wireImages(base).map(p => p.id)).toEqual([`${user}:0`, `${second}:0`, `${fresh}:0`]);
+    const expanded = images.withPreviousToolImages(base, scope);
+    expect(expanded.payload.input.slice(0, previous.payload.input.length)).toEqual(previous.payload.input);
+    expect(wireImages(expanded.payload).map(p => p.id)).toEqual([`${first}:0`, `${user}:0`, `${second}:0`, `${fresh}:0`]);
+  });
+
+  it("keeps complete visual comparisons until a successful explicit handoff, then recalls original bytes on the same branch", async () => {
+    const { manager, images, dir } = await fixture();
+    const makeImage = (label: string) => ({ ...image, data: Buffer.from(label).toString("base64") });
+    const original = makeImage("design");
+    const views = ["front", "left", "back"].map(makeImage);
+    const user = manager.appendMessage({ role: "user", timestamp: 1, content: [original] });
+    visualCall(manager, 2, [{ id: "views", name: "inspect_3d_views", arguments: {} }]);
+    const inspected = manager.appendMessage({ role: "toolResult", timestamp: 3, toolCallId: "views", toolName: "inspect_3d_views", isError: false, content: [original, ...views] });
+    visualCall(manager, 4, [{ id: "place-nodes", name: "edit", arguments: { path: "canvas/boards/scene.json" } }]);
+    const beforeRelease = manager.appendMessage({ role: "toolResult", timestamp: 5, toolCallId: "place-nodes", toolName: "edit", isError: false, content: [] });
+    const pixels = (payload: unknown) => wireImages(payload).map(item => item.data);
+    expect(pixels(await activeImagePayload(manager, images))).toEqual([original, ...views].map(item => item.data));
+    visualCall(manager, 6, [{ id: "save", name: "write", arguments: { path: "canvas/assets.json", releaseReviewedImages: true } }]);
+    manager.appendMessage({ role: "toolResult", timestamp: 7, toolCallId: "save", toolName: "write", isError: false, content: [] });
+    const released = await activeImagePayload(manager, images);
+    expect(pixels(released)).toEqual([]);
+    for (const id of [`${user}:0`, ...[0, 1, 2, 3].map(i => `${inspected}:${i}`)]) expect(JSON.stringify(released)).toContain(`Session image: ${id}`);
+    const reopened = SessionManager.inMemory(dir, undefined, JSON.parse(JSON.stringify([manager.getHeader(), ...manager.getEntries()])));
+    expect(await activeImagePayload(reopened, new SessionImages(reopened, dir))).toEqual(released);
+    const args = { imageId: `${inspected}:2` };
+    visualCall(manager, 8, [{ id: "recheck", name: "recall_image", arguments: args }]);
+    const recalled = await images.recallTool.execute("recheck", args, undefined, undefined, {} as never);
+    manager.appendMessage({ role: "toolResult", timestamp: 9, toolCallId: "recheck", toolName: "recall_image", isError: false, content: recalled.content });
+    const nextReview = await activeImagePayload(manager, images);
+    expect(nextReview.input.find(item => "role" in item && item.role === "user")).toEqual(released.input.find(item => "role" in item && item.role === "user"));
+    expect(pixels(nextReview)).toEqual([views[1]!.data, original.data]);
+    for (const [i, view] of [[10, views[0]!], [12, views[2]!]] as const) {
+      visualCall(manager, i, [{ id: `view-${i}`, name: "read", arguments: {} }]);
+      manager.appendMessage({ role: "toolResult", timestamp: i + 1, toolCallId: `view-${i}`, toolName: "read", isError: false, content: [view] });
+    }
+    const latestReview = await activeImagePayload(manager, images);
+    expect(latestReview.input.find(item => "role" in item && item.role === "user")).toEqual(released.input.find(item => "role" in item && item.role === "user"));
+    expect(pixels(latestReview)).toEqual([original.data, views[0]!.data, views[2]!.data]);
+    manager.appendMessage({ role: "user", timestamp: 14, content: [makeImage("new reference")] });
+    expect(pixels(await activeImagePayload(manager, images))).toEqual([makeImage("new reference").data]);
+    manager.branch(beforeRelease);
+    expect(pixels(await activeImagePayload(manager, images))).toEqual([original, ...views].map(item => item.data));
+  });
+
+  it.each(["failed sibling", "pending sibling", "new image", "mismatched receipt", "unavailable recall", "ordinary edit", "standalone release", "Blender save and run", "Blender failure without saved recipe", "Blender failure after verified save"])("respects the image handoff boundary for %s", async scenario => {
+    const { manager, images } = await fixture();
+    manager.appendMessage({ role: "user", timestamp: 1, content: [image] });
+    const standalone = scenario === "standalone release";
+    const blender = scenario.startsWith("Blender");
+    const saved = scenario === "Blender failure after verified save";
+    const failed = saved || scenario === "Blender failure without saved recipe";
+    const handoff: Omit<ToolCall, "type"> = { id: "handoff", name: standalone ? "recall_image" : blender ? "run_blender" : "edit",
+      arguments: scenario === "ordinary edit" ? {} : { releaseReviewedImages: true, ...(blender ? { save: { content: "pass" } } : {}) } };
+    const peer = { id: "check", name: "read", arguments: { path: "scene" } };
+    visualCall(manager, 2, standalone ? [handoff] : [handoff, peer]);
+    manager.appendMessage({ role: "toolResult", timestamp: 3, toolCallId: "handoff", toolName: handoff.name, isError: failed,
+      content: standalone ? (await images.recallTool.execute("handoff", { releaseReviewedImages: true }, undefined, undefined, {} as never)).content : [],
+      ...(failed ? { details: { blender: { status: "failed" }, ...(saved ? { projectFileVersion: { path: "stage.py", sha256: "a".repeat(64) } } : {}) } } : {}) });
+    const extra = { ...image, data: Buffer.from("new review").toString("base64") };
+    if (!standalone && scenario !== "pending sibling") manager.appendMessage({ role: "toolResult", timestamp: 4,
+      toolCallId: scenario === "mismatched receipt" ? "other" : peer.id, toolName: peer.name, isError: scenario === "failed sibling", content: scenario === "new image" ? [extra] : [] });
+    const actual = wireImages(await activeImagePayload(manager, images, scenario !== "unavailable recall")).map(item => item.data);
+    expect(actual).toEqual(standalone || saved || scenario === "Blender save and run" ? [] : scenario === "new image" ? [image.data, extra.data] : [image.data]);
+    if (standalone) await expect(images.recallTool.execute("conflict", { releaseReviewedImages: true, imageId: "abc:0" }, undefined, undefined, {} as never)).rejects.toThrow("separately");
+  });
+
   it("lists canonical image occurrences without sending pixels, provenance or descriptions", async () => {
     const { manager, images } = await fixture();
     const user = manager.appendMessage({ role: "user", timestamp: 1, content: [{ type: "text", text: "PRIVATE_REFERENCE_DESCRIPTION" }, image, image] });
@@ -66,10 +212,17 @@ describe("session image projection", () => {
     expect(sessionImageReferences(manager.getBranch())).toHaveLength(70);
     expect(listed).toEqual(ids.slice(-64).map(id => ({ imageId: `${id}:0`, mimeType: image.mimeType })));
     expect(manifest).toContain("6 older image references are omitted from this list.");
+    const list = async (offset?: number) => (await images.recallTool.execute("list", { offset }, undefined, undefined, {} as never)).content;
+    expect(await list()).toEqual([{ type: "text", text: manifest }]);
+    const older = await list(64);
+    expect(older).toEqual([{ type: "text", text: expect.stringContaining(`${ids[0]}:0`) }]);
+    expect(older[0]).toMatchObject({ text: expect.not.stringContaining(`${ids[6]}:0`) });
+    expect(await list(70)).toEqual([{ type: "text", text: "No retained image references on this page." }]);
     manager.branch(before);
     const branch = manager.getBranch();
     expect(sessionImageReferences(branch)).toEqual([]);
     expect(sessionImageReferenceContext(branch)).toBeUndefined();
+    expect(await list()).toEqual([{ type: "text", text: "No retained image references on this page." }]);
     await expect(images.recallTool.execute("recall", { imageId: `${ids[0]}:0` }, undefined, undefined, {} as never)).rejects.toThrow("branch");
     expect(sessionImageReferences(SessionManager.inMemory(dir).getBranch())).toEqual([]);
   });
@@ -102,7 +255,7 @@ describe("session image projection", () => {
     }
     const entries = structuredClone(manager.getBranch()), origins = sessionImageOrigins(entries);
     expect(origins.has(legacy)).toBe(false); expect(origins.get(ids[0]!)).toEqual([assetA]); expect(origins.get(ids[1]!)).toEqual([assetB]);
-    const prepared = await images.prepare(context(manager), model);
+    const prepared = await images.annotate(context(manager));
     const actual = prepared.messages.flatMap(message => Array.isArray(message.content) ? message.content.filter(block => block.type === "image") : []);
     expect(actual.map(block => (block as typeof block & { libraryAssetId?: string }).libraryAssetId)).toEqual([undefined, assetA, assetB]);
     expect(manager.getBranch()).toEqual(entries);
@@ -140,7 +293,7 @@ describe("session image projection", () => {
     manager.appendMessage({ role: "user", content: "Play", timestamp: 1 });
     const ids = Array.from({ length: 70 }, (_, index) => screenshot(manager, index + 2));
     const original = structuredClone(manager.getEntries());
-    const outgoing = await payload(images, manager);
+    const outgoing = await budgetPayload(images, manager);
     expect(wireImages(outgoing)).toHaveLength(70);
     expect(images.budget(outgoing, "inline")).toBe(true);
     expect(wireImages(outgoing)).toHaveLength(32);
@@ -148,16 +301,104 @@ describe("session image projection", () => {
     const offload = manager.getBranch().findLast((entry) => entry.type === "custom" && entry.customType === IMAGE_OFFLOAD_ENTRY);
     expect(offload).toMatchObject({ data: { scope: "inline", images: ids.slice(0, 38).map((id) => `${id}:0`) } });
     const replayed = new SessionImages(manager, dir);
-    const again = await payload(replayed, manager);
+    const again = await budgetPayload(replayed, manager);
     replayed.budget(again, "inline");
     expect(again).toEqual(outgoing);
     expect(manager.getEntries()).toHaveLength(original.length + 1);
     const recall = await replayed.recallTool.execute("recall", { imageId: `${ids[0]}:0` }, undefined, undefined, {} as never);
     expect(recall.content[1]).toEqual(image);
     const reread = manager.appendMessage({ role: "toolResult", toolCallId: "recall", toolName: "recall_image", content: recall.content, isError: false, timestamp: 100 });
-    const recalled = await payload(replayed, manager); replayed.budget(recalled, "inline");
+    const recalled = await budgetPayload(replayed, manager); replayed.budget(recalled, "inline");
     expect(wireImages(recalled).at(-1)?.id).toBe(`${reread}:0`);
     expect(wireImages(recalled)).toHaveLength(33);
+  });
+
+  it("reduces Astra's 53-image replay and retains every view from the current parallel read batch", async () => {
+    const { manager, images, dir } = await fixture();
+    const historyId = manager.appendMessage({ role: "user", timestamp: 1, content: Array(36).fill(image) });
+    const current = manager.appendMessage({ role: "user", timestamp: 2, content: Array(13).fill(image) });
+    const calls = Array.from({ length: 4 }, (_, i) => ({ type: "toolCall" as const, id: `call_view_${i}`, name: "read", arguments: { path: `view-${i}.png` } }));
+    manager.appendMessage({ role: "assistant", content: calls, model: astra.id, provider: astra.provider, api: astra.api, timestamp: 3, stopReason: "toolUse",
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+    const batchIds = calls.map((call, i) => manager.appendMessage({ role: "toolResult", timestamp: 4 + i, toolCallId: call.id, toolName: call.name, content: [{ ...image, data: Buffer.from(call.id).toString("base64") }], isError: false }));
+    const outgoing = await projectedPayload(images, manager, astra);
+    expect(wireImages(outgoing)).toHaveLength(17);
+    const scope = inlineImageScope(astra);
+    expect(images.budget(outgoing, scope)).toBe(false);
+    const retained = [...Array.from({ length: 13 }, (_, i) => `${current}:${i}`), ...batchIds.map(id => `${id}:0`)];
+    expect(wireImages(outgoing).map(view => view.id)).toEqual(retained);
+    const fresh = new SessionImages(manager, dir);
+    const replay = await projectedPayload(fresh, manager, astra); fresh.budget(replay, scope);
+    expect(wireImages(replay).map(view => view.id)).toEqual(retained);
+    const recalled = await fresh.recallTool.execute("recall", { imageId: `${historyId}:0` }, undefined, undefined, {} as never);
+    expect(recalled.content[1]).toEqual(image);
+    for (const other of [{ ...astra, provider: "custom" }, { ...astra, id: "other" }, { ...astra, api: "openai-completions" as const }, { ...astra, baseUrl: "https://example.com/v1" }]) {
+      expect(inlineImageScope(other)).toBe("inline");
+    }
+    const other = await projectedPayload(fresh, manager, model);
+    expect(fresh.budget(other, inlineImageScope(model))).toBe(false);
+    expect(wireImages(other).map(view => view.id)).toEqual(retained);
+  });
+
+  it("trims bulky Astra image history before the count watermark and still enforces the hard limit for current references", async () => {
+    const { manager, images } = await fixture();
+    const scope = inlineImageScope(astra);
+    const picture = { ...image, data: "A".repeat(1024 * 1024) };
+    for (let i = 0; i < 9; i++) manager.appendMessage({ role: "user", timestamp: i, content: [picture] });
+    const outgoing = await budgetPayload(images, manager, astra);
+    expect(images.budget(outgoing, scope)).toBe(true);
+    expect(wireImages(outgoing)).toHaveLength(4);
+    manager.appendMessage({ role: "user", timestamp: 10, content: Array(65).fill(image) });
+    const oversized = await budgetPayload(images, manager, astra);
+    expect(() => images.budget(oversized, scope)).toThrow(ImageBudgetError);
+  });
+
+  it("keeps both large visual observations below the shared hard limit and can reduce the older one after an explicit 413", async () => {
+    const { images, manager } = await fixture();
+    const size = 5 * 1024 * 1024;
+    const first = screenshot(manager, 1, { ...image, data: "A".repeat(size) });
+    const second = screenshot(manager, 2, { ...image, data: "B".repeat(size) });
+    const outgoing = await projectedPayload(images, manager, astra), scope = inlineImageScope(astra);
+    expect(images.budget(outgoing, scope)).toBe(false);
+    expect(wireImages(outgoing).map(view => view.id)).toEqual([`${first}:0`, `${second}:0`]);
+    expect(images.budget(outgoing, scope, true)).toBe(true);
+    expect(wireImages(outgoing).map(view => view.id)).toEqual([`${second}:0`]);
+    expect(() => images.budget(outgoing, scope, true)).toThrow(ImageBudgetError);
+  });
+
+  it("sends the current request and two visual observations below all watermarks, with originals available for later recall", async () => {
+    const { images, manager } = await fixture();
+    const picture = (label: string): ImageContent => ({ ...image, data: Buffer.from(label).toString("base64") });
+    const user = manager.appendMessage({ role: "user", timestamp: 1, content: [picture("design")] });
+    const first = screenshot(manager, 2, picture("front"));
+    const second = screenshot(manager, 3, picture("side"));
+    const third = screenshot(manager, 4, picture("back"));
+    manager.appendMessage({ role: "toolResult", timestamp: 5, toolName: "canvas_check", toolCallId: "check", isError: false, content: [{ type: "text", text: "OK" }] });
+    // Pi normalizes this host instruction to role:user alongside the pictures.
+    const host = manager.appendCustomMessageEntry("continuation", "Continue checking.", false);
+    const before = await projectedPayload(images, manager);
+    expect(wireImages(before).map(item => item.id)).toEqual([user, second, third].map(id => `${id}:0`));
+    expect(JSON.stringify(before)).toContain(`Session image: ${first}:0`);
+    const timestamp = Date.parse(manager.getEntry(host)!.timestamp);
+    manager.appendMessage({ role: "user", timestamp, content: "Compare the earlier front in a new task" });
+    expect(wireImages(await projectedPayload(images, manager))).toHaveLength(0);
+    const recalled = await images.recallTool.execute("recall", { imageId: `${first}:0` }, undefined, undefined, {} as never);
+    manager.appendMessage({ role: "toolResult", timestamp: timestamp + 1, toolName: "recall_image", toolCallId: "recall", isError: false, content: recalled.content });
+    expect(wireImages(await projectedPayload(images, manager)).map(item => item.data)).toEqual([picture("front").data]);
+    expect(manager.getEntries().some(entry => entry.type === "custom" && entry.customType === IMAGE_OFFLOAD_ENTRY)).toBe(false);
+  });
+
+  it("refers to identical pixels across active observations, keeps the latest comparison intact and preserves unknown image sources", async () => {
+    const { images, manager } = await fixture();
+    screenshot(manager, 1);
+    const latest = manager.appendMessage({ role: "toolResult", timestamp: 2, toolName: "inspect_3d_views", toolCallId: "angles", isError: false,
+      content: [image, { ...image, data: "c2lkZQ==" }, { ...image, data: "YmFjaw==" }] });
+    const outgoing = await projectedPayload(images, manager);
+    expect(wireImages(outgoing).map(item => item.id)).toEqual([0, 1, 2].map(i => `${latest}:${i}`));
+    expect(JSON.stringify(outgoing)).toContain(`Identical pixels are included under session image ${latest}:0`);
+    const external: Message = { role: "user", timestamp: 0, content: [{ ...image, data: "ZXh0ZXJuYWw=" }] };
+    const prepared = await images.prepare(normalizeContext({ messages: [external, ...context(manager).messages, { role: "user", timestamp: 3, content: "Next" }] }), model);
+    expect(wireImages({ input: convertResponsesMessages(model, prepared, new Set(["openai"])) }).map(item => item.data)).toEqual(["ZXh0ZXJuYWw="]);
   });
 
   it("uses byte thresholds as well as count and protects the latest user attachment and observations", async () => {
@@ -165,7 +406,7 @@ describe("session image projection", () => {
     const large = { ...image, data: "a".repeat(3 * 1024 * 1024) };
     for (let index = 1; index <= 8; index++) screenshot(manager, index, large);
     const user = manager.appendMessage({ role: "user", timestamp: 20, content: [large] });
-    const outgoing = await payload(images, manager);
+    const outgoing = await budgetPayload(images, manager);
     images.budget(outgoing, "inline");
     expect(wireImages(outgoing)).toHaveLength(3);
     expect(wireImages(outgoing).at(-1)?.id).toBe(`${user}:0`);
@@ -176,7 +417,7 @@ describe("session image projection", () => {
     const old = manager.appendMessage({ role: "toolResult", toolCallId: "multi", toolName: "game_use",
       timestamp: 1, isError: false, content: Array.from({ length: 70 }, () => ({ ...image })) });
     screenshot(manager, 2); screenshot(manager, 3);
-    const outgoing = await payload(images, manager);
+    const outgoing = await budgetPayload(images, manager);
     expect(wireImages(outgoing).slice(0, 70).map((image) => image.id)).toEqual(Array.from({ length: 70 }, (_, index) => `${old}:${index}`));
     images.budget(outgoing, "inline");
     expect(wireImages(outgoing)).toHaveLength(32);
@@ -190,7 +431,7 @@ describe("session image projection", () => {
     const old = manager.appendMessage({ role: "toolResult", toolCallId: "multi", toolName: "game_use",
       timestamp: 1, isError: false, content: Array.from({ length: 70 }, () => ({ ...image })) });
     screenshot(manager, 2); screenshot(manager, 3);
-    const prepared = await images.prepare(context(manager), model);
+    const prepared = await images.annotate(context(manager));
     const outgoing = api === "completions"
       ? { messages: convertCompletionsMessages({ ...model, api: "openai-completions" }, prepared, {} as Parameters<typeof convertCompletionsMessages>[2]) }
       : { contents: convertGoogleMessages({ ...model, api: "google-generative-ai", compat: undefined, id: `${api}-pro` }, prepared) };
@@ -213,7 +454,7 @@ describe("session image projection", () => {
     const { manager, images } = await fixture();
     manager.appendMessage({ role: "user", timestamp: 1, content: [image] });
     const current = manager.appendMessage({ role: "user", timestamp: 2, content: [{ ...image, data: "a".repeat(12 * 1024 * 1024) }] });
-    const outgoing = await payload(images, manager);
+    const outgoing = await budgetPayload(images, manager);
     expect(images.budget(outgoing, "inline")).toBe(false);
     expect(images.budget(outgoing, "inline", true)).toBe(true);
     expect(wireImages(outgoing).map((image) => image.id)).toEqual([`${current}:0`]);
@@ -224,7 +465,7 @@ describe("session image projection", () => {
     const { manager, images } = await fixture();
     manager.appendMessage({ role: "user", timestamp: 1, content: [{ ...image, data: "a".repeat(21 * 1024 * 1024) }] });
     expect(() => images.budget({ input: [] , text: "x".repeat(33 * 1024 * 1024) }, "inline")).toThrow(ImageBudgetError);
-    const outgoing = await payload(images, manager);
+    const outgoing = await budgetPayload(images, manager);
     expect(() => images.budget(outgoing, "inline")).toThrow(ImageBudgetError);
     expect(manager.getEntries()).toHaveLength(1);
   });
@@ -233,12 +474,12 @@ describe("session image projection", () => {
     const { manager, images } = await fixture();
     const root = manager.appendMessage({ role: "user", content: "Play", timestamp: 1 });
     Array.from({ length: 70 }, (_, index) => screenshot(manager, index + 2));
-    const outgoing = await payload(images, manager); images.budget(outgoing, "inline");
-    const otherPolicy = await payload(images, manager); images.applyOmissions(otherPolicy, "openai-inline");
+    const outgoing = await budgetPayload(images, manager); images.budget(outgoing, "inline");
+    const otherPolicy = await budgetPayload(images, manager); images.applyOmissions(otherPolicy, "openai-inline");
     expect(wireImages(otherPolicy)).toHaveLength(70);
     manager.branch(root);
     const newImage = screenshot(manager, 200);
-    const branch = await payload(images, manager); images.budget(branch, "inline");
+    const branch = await budgetPayload(images, manager); images.budget(branch, "inline");
     expect(wireImages(branch)).toHaveLength(1);
     expect(wireImages(branch)[0].id).toBe(`${newImage}:0`);
     await expect(images.recallTool.execute("call", { imageId: `${wireImages(otherPolicy)[0].id}` }, undefined, undefined, {} as never)).rejects.toThrow("branch");
@@ -261,7 +502,7 @@ describe("session image projection", () => {
     const second = manager.appendMessage({ role: "user", timestamp: 1, content: [other] });
     const third = manager.appendMessage({ role: "user", timestamp: 1, content: [image] });
     const ctx = context(manager);
-    const prepared = await images.prepare({ ...ctx, messages: [ctx.messages[1], ctx.messages[0], ctx.messages[2]] }, model);
+    const prepared = await images.annotate({ ...ctx, messages: [ctx.messages[1], ctx.messages[0], ctx.messages[2]] });
     const outgoing = { input: convertResponsesMessages(model, prepared, new Set(["openai"])) };
     expect(wireImages(outgoing).map((image) => image.id)).toEqual([`${second}:0`, `${first}:0`, `${third}:0`]);
   });
@@ -270,13 +511,13 @@ describe("session image projection", () => {
     const { manager, images, dir } = await fixture();
     manager.appendMessage({ role: "user", content: "Play", timestamp: 1 });
     const ids = Array.from({ length: 70 }, (_, index) => screenshot(manager, index + 2));
-    const outgoing = await payload(images, manager); images.budget(outgoing, "inline");
+    const outgoing = await budgetPayload(images, manager); images.budget(outgoing, "inline");
     const reopened = SessionManager.inMemory(dir, undefined, JSON.parse(JSON.stringify([manager.getHeader(), ...manager.getEntries()])));
     const fresh = new SessionImages(reopened, dir);
-    const replay = await payload(fresh, reopened); fresh.budget(replay, "inline");
+    const replay = await budgetPayload(fresh, reopened); fresh.budget(replay, "inline");
     expect(replay).toEqual(outgoing);
     reopened.appendCompaction("Older playtest observations were summarized", ids[30], 10000);
-    const compacted = await payload(fresh, reopened); fresh.budget(compacted, "inline");
+    const compacted = await budgetPayload(fresh, reopened); fresh.budget(compacted, "inline");
     expect(wireImages(compacted)).toHaveLength(32);
     expect(wireImages(compacted)[0].id).toBe(`${ids[38]}:0`);
     const recall = await fresh.recallTool.execute("recall", { imageId: `${ids[0]}:0` }, undefined, undefined, {} as never);
@@ -310,7 +551,7 @@ describe("session image projection", () => {
     const original = { ...image, mimeType: "image/png", data: png.toString("base64") };
     const id = manager.appendMessage({ role: "toolResult", toolCallId: "read", toolName: "read", timestamp: 1, isError: false,
       content: [{ type: "text", text: "Read image file [image/png]" }, original] });
-    manager.appendMessage({ role: "user", timestamp: 2, content: "Continue" });
+    manager.appendMessage({ role: "toolResult", toolName: "canvas_check", toolCallId: "checked", timestamp: 2, content: [{ type: "text", text: "OK" }], isError: false });
     const entries = structuredClone(manager.getEntries());
     const prepared = await images.prepare(context(manager), model);
     const read = prepared.messages[0] as Extract<Message, { role: "toolResult" }>;
@@ -326,7 +567,8 @@ describe("session image projection", () => {
     const recalled = await images.prepare(context(manager), model);
     expect((recalled.messages.at(-1) as Extract<Message, { role: "toolResult" }>).content.at(-1)).toEqual(original);
     const disabled = await images.prepare(context(manager), model, false);
-    expect((disabled.messages[0] as Extract<Message, { role: "toolResult" }>).content.at(-1)).toEqual(original);
+    const retained = wireImages({ input: convertResponsesMessages(model, disabled, new Set(["openai"])) });
+    expect(retained).toHaveLength(1); expect(retained[0]?.data === original.data).toBe(true);
   });
 
   it.each([false, true])("keeps transparent read PNGs, including palette transparency (%s)", async (palette) => {
@@ -368,7 +610,7 @@ describe("session image projection", () => {
     const { manager, images } = await fixture();
     const large = { ...image, data: Buffer.alloc(3 * 1024 * 1024, 97).toString("base64") };
     for (let index = 1; index <= 8; index++) screenshot(manager, index, large);
-    const prepared = await images.prepare(context(manager), model);
+    const prepared = await images.annotate(context(manager));
     const outgoing = { messages: prepared.messages.map((message) => ({ role: "user", content: Array.isArray(message.content)
       ? message.content.map((block) => block.type === "image"
         ? { image: { format: "jpeg", source: { bytes: new Uint8Array(Buffer.from(block.data, "base64")) } } }

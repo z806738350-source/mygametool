@@ -4,14 +4,14 @@ import { chmod, lstat, mkdir, open, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { createProvider, getCurrentTools, type ApiKeyCredential, type Credential, type CredentialStore, type Provider, type ProviderStreams, type AuthOperationOptions } from "@earendil-works/pi-ai";
+import { createProvider, type ApiKeyCredential, type Credential, type CredentialStore, type Provider, type ProviderStreams, type AuthOperationOptions } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { assertLocalModelTransport, assertModelImageInput, kunpoImagePayload } from "./model-network-policy.js";
 import type { AssetLibrary } from "./asset-library.js";
 import type { RuntimeModel } from "./agent.js";
-import { isRemovedKunpoAgent, KUNPO_FABLE_MODEL_ID, KUNPO_PROVIDER_ID } from "../shared/kunpo-models.js";
+import { isRemovedKunpoAgent, KUNPO_ASTRA_MODEL_ID, KUNPO_FABLE_MODEL_ID, KUNPO_PROVIDER_ID } from "../shared/kunpo-models.js";
 import { monitorModelRequest } from "./provider-request-monitor.js";
 import { isMeshyEndpoint, isMeshyModelReference, isMeshyProviderConfiguration, MESHY_DISABLED_MESSAGE } from "../shared/disabled-media-providers.js";
 
@@ -117,16 +117,18 @@ const literalAuth: Provider["auth"] = { apiKey: {
 function withoutAutomaticRetries(api: ProviderStreams, library?: Pick<AssetLibrary, "attachImageSource">): ProviderStreams {
   const requestOptions = (model: Parameters<ProviderStreams["stream"]>[0], context: Parameters<ProviderStreams["stream"]>[1], options: Parameters<ProviderStreams["stream"]>[2]) => {
     const fable = model.api === "anthropic-messages" && model.provider === KUNPO_PROVIDER_ID && model.id === KUNPO_FABLE_MODEL_ID;
-    if (fable && (getCurrentTools(context.messages).length || context.messages.some(message => message.role === "toolResult"
-      || message.role === "assistant" && message.content.some(block => block.type === "toolCall")))) {
-      throw new Error("Kunpo Fable supports text only. Choose a tool-enabled model for this conversation or start a new text conversation.");
-    }
     return { ...options, maxRetries: 0, onPayload: async (payload: unknown, current: typeof model) => {
       const prepared = await options?.onPayload?.(payload, current) ?? payload;
       if (!fable) return kunpoImagePayload(model, context, prepared, options?.signal, library);
       // Kunpo enables adaptive thinking by default and documents only low as an explicit Messages effort.
-      const { model: id, messages, system, max_tokens, stream, output_config } = prepared as Record<string, unknown> & { output_config?: { effort?: string } };
-      return { model: id, messages, max_tokens, stream, ...(system ? { system } : {}), ...(output_config?.effort === "low" ? { output_config: { effort: "low" } } : {}) };
+      const { model: id, messages, system, max_tokens, stream, output_config, tools, tool_choice } = prepared as Record<string, unknown> & { output_config?: { effort?: string } };
+      return {
+        model: id, messages, max_tokens, stream,
+        ...(system ? { system } : {}),
+        ...(tools ? { tools } : {}),
+        ...(tool_choice ? { tool_choice } : {}),
+        ...(output_config?.effort === "low" ? { output_config: { effort: "low" } } : {}),
+      };
     } };
   };
   return { ...api,
@@ -163,6 +165,9 @@ function localProvider(id: string, config: ProviderConfig, previous?: Provider, 
       // Only this reviewed adapter policy is copied; user-provided compat never enters the runtime.
       ...(id === KUNPO_PROVIDER_ID && (model.id === "claude-opus-5-5" || model.id === KUNPO_FABLE_MODEL_ID) && api === "anthropic-messages"
         ? { compat: { forceAdaptiveThinking: true, supportsTemperature: false, ...(model.id === KUNPO_FABLE_MODEL_ID ? { supportsLongCacheRetention: false } : {}) } } : {}),
+      // The SDK then emits strict:false for ordinary tools. Omitting it lets Responses normalize optional inputs to required.
+      ...(id === KUNPO_PROVIDER_ID && model.id === KUNPO_ASTRA_MODEL_ID && api === "openai-responses"
+        ? { compat: { supportsStrictMode: true } } : {}),
     } as RuntimeModel];
   });
   return createProvider({ id, name: config.name ?? previous?.name ?? id, baseUrl: config.baseUrl ?? previous?.baseUrl,

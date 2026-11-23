@@ -85,29 +85,39 @@ describe("game design prompt context", () => {
     expect(prompt.mock.calls[0]![0]).toContain("A bright garden");
     expect(prompt.mock.calls[0]![0]).toContain(detail.revision);
     expect(prompt.mock.calls[0]![0]).not.toContain(other.document.markdown);
+    expect(prompt.mock.calls[0]![0]).not.toContain(other.document.id);
     expect(prompt.mock.calls[0]![0]).toContain("production references");
   });
-  it("refreshes compact metadata on each turn and keeps it out of visible messages", async () => {
+  it("refreshes the main design pointer without loading or listing unrelated files", async () => {
     const { app, project, prompt, url, idle, items } = await runtime();
     const document = createCanvasDocument("Sky garden");
     document.markdown = "A long design body";
     const first = await writeCanvasDocument(project.workspacePath, document);
     expect((await app.inject({ method: "POST", url, payload: { prompt: "Build movement" } })).statusCode).toBe(202);
     await idle();
-    expect(prompt.mock.calls[0]![0]).toContain(first.revision);
-    expect(prompt.mock.calls[0]![0]).not.toContain("A long design body");
+    const initial = prompt.mock.calls[0]![0];
+    expect(initial).toContain(canvasDocumentPath(document.id));
+    expect(initial).toContain("Sky garden");
+    expect(initial).not.toContain(first.revision);
+    expect(initial).not.toContain("A long design body");
     expect(items()).toMatchObject([{ type: "userMessage", text: "Build movement" }]);
     expect(items()[0]).not.toHaveProperty("contexts");
 
-    const second = await writeCanvasDocument(project.workspacePath, { ...document, title: "Revised garden" });
+    const other = await writeCanvasDocument(project.workspacePath, createCanvasDocument("Unrelated reference"), false);
+    await rm(path.join(project.workspacePath, canvasDocumentPath(other.document.id)));
+    await app.inject({ method: "POST", url, payload: { prompt: "Build movement" } });
+    await idle();
+    expect(prompt.mock.calls[1]![0]).toBe(initial);
+
+    await writeCanvasDocument(project.workspacePath, { ...document, title: "Revised garden" });
     await app.inject({ method: "POST", url, payload: { prompt: "Adjust movement" } });
     await idle();
-    expect(prompt.mock.calls[1]![0]).toContain(second.revision);
-    expect(prompt.mock.calls[1]![0]).not.toContain(first.revision);
+    expect(prompt.mock.calls[2]![0]).toContain("Revised garden");
+    expect(prompt.mock.calls[2]![0]).not.toContain("Sky garden");
     await rm(path.join(project.workspacePath, "canvas", "index.json"));
     await app.inject({ method: "POST", url, payload: { prompt: "Discuss movement" } });
     await idle();
-    expect(prompt.mock.calls[2]![0]).toContain("currently has no saved main game design");
+    expect(prompt.mock.calls[3]![0]).toContain("currently has no saved main game design");
   });
 
   it("captures the saved document on submission instead of trusting a stale client context", async () => {
@@ -161,7 +171,8 @@ describe("game design prompt context", () => {
       expect(queued.json().queued).toBe(true);
       expect(followUp.mock.calls[0]![0]).toContain(next.revision);
       expect(followUp.mock.calls[0]![0]).toContain("Document snapshot");
-      expect(prompt.mock.calls[0]![0]).toContain(first.revision);
+      expect(prompt.mock.calls[0]![0]).toContain("First garden");
+      expect(prompt.mock.calls[0]![0]).toContain(canvasDocumentPath(first.document.id));
       expect(prompt.mock.calls[0]![0]).not.toContain(next.revision);
     } finally {
       finish();

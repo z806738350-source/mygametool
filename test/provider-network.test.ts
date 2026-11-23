@@ -64,20 +64,60 @@ describe("passive provider request monitoring", () => {
   it.each([
     ["ENOTFOUND", "transport_error", "dns", undefined],
     ["ECONNRESET", "transport_error", "connection", undefined],
+    ["CERT_HAS_EXPIRED", "transport_error", "connection", undefined],
     ["UND_ERR_HEADERS_TIMEOUT", "timeout", "timeout", "headers"],
   ])("classifies %s without retaining the transport cause", async (code, outcome, errorCategory, timeoutKind) => {
     const request = vi.fn<typeof fetch>(async () => { throw Object.assign(new Error(`PRIVATE_CAUSE ${canary}`), { cause: { code } }); });
-    await expect(guardedProviderFetch(request)(endpoint)).rejects.toThrow("Could not reach");
+    await expect(guardedProviderFetch(request)(endpoint)).rejects.toMatchObject({ message: "Could not reach the configured provider", category: errorCategory, code });
     expect(request).toHaveBeenCalledOnce();
-    expect(records().at(-1)).toMatchObject({ outcome, errorCategory, ...(timeoutKind ? { timeoutKind } : {}) });
+    expect(records().at(-1)).toMatchObject({ outcome, errorCategory, errorCode: code, ...(timeoutKind ? { timeoutKind } : {}) });
     expect(JSON.stringify(records())).not.toMatch(/PRIVATE_|sk-security/);
+  });
+
+  it("extracts an allowlisted code from native fetch address failures without exposing unknown properties", async () => {
+    const failure = new AggregateError([{ code: canary }, { code: "ECONNREFUSED", address: canary }], canary);
+    const request = vi.fn<typeof fetch>().mockRejectedValue(new TypeError("fetch failed", { cause: failure }));
+    const error = await guardedProviderFetch(request)(endpoint).catch(cause => cause);
+    expect(error).toMatchObject({ category: "connection", code: "ECONNREFUSED" });
+    expect(error.cause).toBeUndefined();
+    expect(records().at(-1)).toMatchObject({ errorCode: "ECONNREFUSED" });
+    const unknown = vi.fn<typeof fetch>().mockRejectedValue(Object.assign(new Error(canary), { code: canary }));
+    const other = await guardedProviderFetch(unknown)(endpoint).catch(cause => cause);
+    expect(other.code).toBeUndefined();
+    expect(records().at(-1)).not.toHaveProperty("errorCode");
+    expect(JSON.stringify([error, other, records()])).not.toContain(canary);
+  });
+
+  it("distinguishes local response validation after HTTP 200 from a failure to connect", async () => {
+    const response = new Response("private", { headers: { "content-type": "text/event-stream" } });
+    const locked = response.body!.getReader();
+    try {
+      const request = vi.fn<typeof fetch>().mockResolvedValue(response);
+      await expect(guardedProviderFetch(request)(endpoint, { headers: { "x-api-key": canary } })).rejects.toMatchObject({
+        message: "Provider response could not be safely verified", category: "local-policy", code: "PROVIDER_RESPONSE_VALIDATION_FAILED",
+      });
+      expect(records().at(-1)).toMatchObject({ statusCode: 200, outcome: "validation_error", errorCode: "PROVIDER_RESPONSE_VALIDATION_FAILED" });
+      expect(request).toHaveBeenCalledOnce();
+      expect(request.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    } finally { locked.releaseLock(); }
+  });
+
+  it("retains a transport reset while reading an accepted response", async () => {
+    const stream = new ReadableStream<Uint8Array>({ pull(controller) {
+      controller.error(Object.assign(new Error(canary), { code: "ECONNRESET" }));
+    } });
+    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(stream));
+    const response = await guardedProviderFetch(request)(endpoint);
+    await expect(response.text()).rejects.toMatchObject({ code: "ECONNRESET", category: "connection" });
+    expect(records().at(-1)).toMatchObject({ statusCode: 200, outcome: "stream_interrupted", errorCode: "ECONNRESET" });
+    expect(JSON.stringify(records())).not.toContain(canary);
   });
 
   it("records local validation and original caller cancellation with no extra submission or leftover timers", async () => {
     vi.useFakeTimers();
     const request = vi.fn<typeof fetch>();
     await expect(guardedProviderFetch(request)(endpoint, { method: "POST", headers: { "x-api-key": canary }, body: canary })).rejects.toThrow("credential data");
-    expect(records().at(-1)).toMatchObject({ outcome: "validation_error", receivedBytes: 0 });
+    expect(records().at(-1)).toMatchObject({ outcome: "validation_error", receivedBytes: 0, errorCode: "PROVIDER_REQUEST_VALIDATION_FAILED" });
     expect(request).not.toHaveBeenCalled();
     const abort = new AbortController();
     const pendingFetch = vi.fn<typeof fetch>(async (_input, init) => new Promise((_resolve, reject) => init!.signal!.addEventListener("abort", () => reject(new DOMException("PRIVATE_ABORT", "AbortError")), { once: true })));
@@ -426,7 +466,7 @@ describe("local secure provider networking", () => {
 
   it("rejects clear credential bytes in binary results and inline base64 images before saving", async () => {
     const binary = await redactProviderResponse(new Response(encode.encode(`ID3${canary}`), { headers: { "content-type": "audio/mpeg" } }), [canary]);
-    await expect(binary.arrayBuffer()).rejects.toThrow("Provider response interrupted");
+    await expect(binary.arrayBuffer()).rejects.toMatchObject({ category: "local-policy", code: "PROVIDER_RESPONSE_VALIDATION_FAILED" });
     const transport = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ data: [{ b64_json: Buffer.from(canary).toString("base64") }] }));
     await expect(new OpenAIImageGenerator(canary, "https://llm.ziy.cc/v1", transport).generate({ prompt: "icon", size: "1024x1024" })).rejects.toThrow("credential data");
   });
@@ -780,7 +820,7 @@ describe("local secure provider networking", () => {
     const response = await fetchProviderArtifact(transport, "https://llm.ziy.cc/v1/tasks/task_1/artifacts/model/content", "https://llm.ziy.cc/v1", { apiKey: canary });
     expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
     const unsafe = await fetchProviderArtifact(transport, "https://llm.ziy.cc/v1/tasks/task_2/artifacts/model/content", "https://llm.ziy.cc/v1", { apiKey: canary });
-    await expect(unsafe.arrayBuffer()).rejects.toThrow("Provider response interrupted");
+    await expect(unsafe.arrayBuffer()).rejects.toMatchObject({ category: "local-policy", code: "PROVIDER_RESPONSE_VALIDATION_FAILED" });
   });
 
   it("passes caller cancellation to the artifact transport without replay", async () => {

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -11,6 +11,167 @@ const run = promisify(execFile);
 const blender = process.env.BLENDER_EXECUTABLE;
 
 describe("Blender GLB export", () => {
+  it.skipIf(!blender)(
+    "replays custom skin, morph and rigid clips and reports absent or stationary requests",
+    async () => {
+      const root = await mkdtemp(
+        path.join(tmpdir(), "ohmygame-blender-clips-"),
+      );
+      try {
+        const source = path.join(root, "source.blend");
+        const args = [
+          "--background",
+          "--factory-startup",
+          "--disable-autoexec",
+          "--python-exit-code",
+          "1",
+        ];
+        await run(blender!, [
+          ...args,
+          "--python",
+          path.resolve("test/fixtures/blender-assets.py"),
+          "--",
+          source,
+          "--stalled",
+        ]);
+        const config = path.join(root, "export.json");
+        const stage = async (
+          input: string,
+          outputName: string,
+          requiredClips: string[],
+          operation: "export" | "inspect" = "export",
+          motionReviewClips: string[] = [],
+        ) => {
+          const output = path.join(root, outputName);
+          await writeFile(
+            config,
+            JSON.stringify({ requiredClips, motionReviewClips, previewSize: 96, topologyPolicy: "watertight" }),
+          );
+          const command = [
+            ...args,
+            "--python",
+            path.resolve(
+              "plugins/blender/skills/blender-assets/scripts/pipeline.py",
+            ),
+            "--",
+            "--stage",
+            operation,
+            "--input-dir",
+            root,
+            "--config",
+            config,
+            "--input",
+            input,
+            "--output-dir",
+            output,
+          ];
+          if (operation === "export") {
+            const temporary = path.join(root, "tmp");
+            await mkdir(temporary, { recursive: true });
+            const state = path.join(temporary, `${outputName}-state.json`);
+            const runPhase = (phase: "prepare" | "verify") =>
+              run(blender!, [...command, "--export-phase", phase, "--export-state", state]);
+            await runPhase("prepare");
+            await expect(readFile(path.join(output, "report.json"))).rejects.toMatchObject({
+              code: "ENOENT",
+            });
+            const outputHash = async () => {
+              const glb = await readFile(path.join(output, "model.glb"));
+              return createHash("sha256").update(glb).digest("hex");
+            };
+            const prepared = await outputHash();
+            await runPhase("verify");
+            expect(await outputHash()).toBe(prepared);
+          } else {
+            await run(blender!, command);
+          }
+          return JSON.parse(
+            await readFile(path.join(output, "report.json"), "utf8"),
+          );
+        };
+        const clips = ["Stretch", "Sway", "Trigger"];
+        const original = await readFile(source);
+        const intake = await stage(source, "intake", [], "inspect");
+        expect(intake.sourceInventory).toMatchObject({
+          actions: clips, armatures: [{ name: "PropRig", bones: 2 }],
+          parts: expect.arrayContaining([expect.objectContaining({ name: "TexturedProp", parent: "AssetRoot" })]),
+          materials: expect.arrayContaining([{ name: "CheckerMaterial", usesImageTexture: true }]),
+        });
+        expect(intake.previews).toEqual(expect.arrayContaining(["review-front.png", "review-side.png", "review-back.png", "review-three-quarter.png"]));
+        expect(intake.sourceInventory.parts.map((part: { name: string }) => part.name)).not.toContain("HiddenCollectionHelper");
+        expect(await readFile(source)).toEqual(original);
+        const final = await stage(path.join(root, "intake", "scene.blend"), "complete", clips, "export", ["Trigger"]);
+        expect(final.checks.topology).toMatchObject({ policy: "watertight", boundaryEdges: 0, passed: true });
+        expect(final.geometry.meshes.map((mesh: { name: string }) => mesh.name)).not.toContain("HiddenCollectionHelper");
+        const delivered = (await new NodeIO().read(path.join(root, "complete", "model.glb"))).getRoot();
+        expect(delivered.listNodes().map(node => node.getName())).not.toContain("HiddenCollectionHelper");
+        const complete = final.checks.roundtrip;
+        for (const [inventory, file] of [
+          [intake.checks.previewRoundtrip.glb, path.join(root, "intake", "review.glb")],
+          [complete.glb, path.join(root, "complete", "model.glb")],
+        ] as const) {
+          expect(inventory).toMatchObject({
+            bytes: (await stat(file)).size, meshPrimitives: 3, embeddedImages: 1, textures: 1,
+            textureSources: [{ source: 0 }],
+          });
+          expect(inventory.materialTextureSlots).toContainEqual({
+            name: "CheckerMaterial", slots: { baseColorTexture: 0 },
+          });
+        }
+        expect(complete, JSON.stringify(complete)).toMatchObject({
+          passed: true,
+          requiredClips: clips,
+          expectedClips: clips,
+          exportedClips: clips,
+          missingMaterials: [],
+          missingTexturedMaterials: [],
+          missingRequiredClips: [],
+        });
+        expect(complete.playback).toHaveLength(3);
+        expect(Math.max(...complete.sizeError, complete.boundsError)).toBeLessThan(complete.boundsTolerance);
+        expect(complete.previews).toEqual(
+          expect.arrayContaining(["review-front.png", "review-side.png"]),
+        );
+        const view = await readFile(
+          path.join(root, "complete", "review-front.png"),
+        );
+        expect(view.subarray(1, 4).toString("ascii")).toBe("PNG");
+        for (const clip of complete.playback) {
+          expect(clip.passed).toBe(true);
+          expect(clip.sampledVertexDisplacement).toBeGreaterThan(0.001);
+          if (clip.name !== "Trigger") expect(clip.motionReview).toBeUndefined();
+        }
+        const phases: { frame: number; file: string }[] = complete.playback.find((clip: { name: string }) => clip.name === "Trigger").motionReview;
+        expect(phases.map(phase => phase.file)).toEqual([1, 2, 3].map(i => `motion-01-0${i}-three-quarter.png`));
+        expect(phases[0]!.frame).toBeLessThan(phases[1]!.frame);
+        expect(phases[1]!.frame).toBeLessThan(phases[2]!.frame);
+        const { default: sharp } = await import("sharp");
+        const alpha = await Promise.all(phases.map(phase => sharp(path.join(root, "complete", phase.file)).extractChannel(3).raw().toBuffer()));
+        expect(alpha.slice(1).some(data => data.some((value, i) => Math.abs(value - alpha[0]![i]!) > 64))).toBe(true);
+        const incomplete = (await stage(
+          path.join(root, "stalled.blend"),
+          "incomplete",
+          ["Sway", "Jammed", "Attack"],
+          "export", ["UnknownClip"],
+        )).checks.roundtrip;
+        expect(incomplete.passed).toBe(false);
+        expect(incomplete.missingRequiredClips).toContain("Attack");
+        expect(incomplete.missingMotionReviewClips).toEqual(["UnknownClip"]);
+        // Depending on the exporter, a constant action is dropped or delivered as a stationary clip.
+        expect(
+          incomplete.missingRequiredClips.includes("Jammed") ||
+            incomplete.playback.some(
+              (clip: { name: string; passed: boolean }) =>
+                clip.name === "Jammed" && !clip.passed,
+            ),
+        ).toBe(true);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    120_000,
+  );
+
   it.skipIf(!blender)(
     "preserves packed textures, hierarchy, skin animation and morph targets in delivered GLBs",
     async () => {
@@ -57,6 +218,7 @@ describe("Blender GLB export", () => {
           return new NodeIO().read(output);
         };
 
+        await expect(exported("Backups")).rejects.toMatchObject({ code: 1 });
         const staticRoot = (await exported("StaticAsset")).getRoot();
         const prop = staticRoot
           .listNodes()
@@ -86,6 +248,7 @@ describe("Blender GLB export", () => {
         expect(staticRoot.listCameras()).toHaveLength(0);
         const excluded = new Set([
           "HiddenProp",
+          "HiddenCollectionHelper",
           "AnimatedProp",
           "PresentationCamera",
           "PresentationLight",

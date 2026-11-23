@@ -243,6 +243,41 @@ async function click(name: string) {
   await settle();
 }
 
+it("keeps a failed 3D review decision above the actions and lets the user retry without a raw route notice", async () => {
+  const conversation = detail("turn");
+  const turn = conversation.turns[0];
+  turn.status = "inProgress";
+  turn.items = [{
+    type: "approvalRequest", status: "inProgress", id: "approval", turnId: turn.id, requestId: "review",
+    request: { kind: "turnaroundReview", tool: "generate_3d_from_views", canAllowSession: false,
+      turnaroundReview: { reviewId: "immutable-review", views: (["front", "left", "back"] as const).map((angle, index) => ({
+        angle, path: angle + ".png", url: "/projects/project/conversation-images/" + String(index).repeat(64) + ".png",
+      })) } },
+  }];
+  let attempts = 0;
+  const rawError = "No route matched /projects/project/conversations/conversation/approvals/private-id";
+  vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:review-image");
+  vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+  await openProject((route, init) => {
+    if (route.includes("/conversation-images/")) return new Response("preview");
+    if (init.method === "POST" && route.includes("/approvals")) {
+      attempts++;
+      return attempts === 1 ? Response.json({ error: rawError }, { status: 503 }) : Response.json({});
+    }
+  }, conversation);
+  const card = container.querySelector<HTMLElement>(".approval-card")!;
+  await act(async () => card.querySelectorAll("img").forEach(image => image.dispatchEvent(new Event("load"))));
+  await click("Approve and generate");
+  const alert = card.querySelector('[role="alert"]');
+  expect(alert?.textContent).toBe("Your decision could not be saved. Try again.");
+  expect(alert?.nextElementSibling?.tagName).toBe("FOOTER");
+  expect([...card.querySelectorAll("footer button")].map(button => button.textContent)).toEqual(["Request changes", "Approve and generate"]);
+  expect(container.textContent).not.toContain(rawError);
+  await click("Approve and generate");
+  expect(attempts).toBe(2);
+  expect(card.querySelector('[role="alert"]')).toBeNull();
+});
+
 describe("checkpoints in the project shell", () => {
   it("opens a project with a retired Agent and no chats without explicitly requesting the removed model", async () => {
     const empty = detail("unused");

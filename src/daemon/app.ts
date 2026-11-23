@@ -8,6 +8,7 @@ import { CodexImageProvider } from "./agent-runtimes/codex-image-provider.js";
 import { inspectPreviewConfiguration } from "./preview-configuration.js";
 import { CheckpointStore } from "./checkpoints.js";
 import { ProjectWrites } from "./project-writes.js";
+import { TripoModelReviews } from "./tripo-model-review.js";
 import { ProjectLifecycle, ProjectLifecycleError } from "./project-lifecycle.js";
 import type { ExecutionStorageOverview } from "../shared/execution-storage.js";
 import { registerCheckpointRoutes } from "./checkpoint-routes.js";
@@ -49,7 +50,7 @@ import { EXAMPLE_ID_PATTERN } from "../shared/examples.js";
 import { PUBLISH_GAME_TITLE_MAX_LENGTH } from "../shared/publish-v1.js";
 import { clampReasoningLevel, parseReasoningLevel, supportedReasoningLevels } from "../shared/reasoning.js";
 import { matchesBearerToken } from "./access.js";
-import { AgentManager, authorizeConversationAttachment, conversationItems, createPiSession, loadPiSkillCatalog, type RuntimeModel, type SessionFactory } from "./agent.js";
+import { AgentManager, authorizeConversationAttachment, conversationItems, createPiSession, loadPiSkillCatalog, MAX_APPROVAL_REQUEST_ID_LENGTH, type RuntimeModel, type SessionFactory } from "./agent.js";
 import { CHECKPOINT_UNDONE_ENTRY, TURN_END_ENTRY, referencedSnapshots } from "./checkpoint-extension.js";
 import { createAgentTools, projectPiToolNames } from "./agent-tools.js";
 import { createAgentAttachmentReadTool, createLocalAgentFileTools, createProjectFileReadTool } from "./agent-local-files.js";
@@ -57,7 +58,7 @@ import { AgentRuntimeService } from "./agent-runtimes/service.js";
 import { neverTouchPaths } from "./agent-runtimes/policy.js";
 import { skillFolders } from "./agent-runtimes/skills.js";
 import { appendSystemPromptForProject } from "./agent-prompts.js";
-import { isAgentRuntimeId, nativeEffort, type AgentRuntimeId, type AnswerApprovalRequest, type UpdateAgentRuntimeRequest } from "../shared/agent-runtimes.js";
+import { isAgentRuntimeId, nativeEffort, type AgentRuntimeId, type AnswerApprovalRequest, type TurnaroundReview, type UpdateAgentRuntimeRequest } from "../shared/agent-runtimes.js";
 import { ConversationManager, sessionDirectory, type StoredConversation } from "./conversations.js";
 import { ConversationImageStore } from "./conversation-images.js";
 import { OwnedPlaytestDriver } from "./owned-playtest.js";
@@ -108,7 +109,7 @@ import { ProviderImages } from "./provider-images.js";
 import { ProviderModels3D } from "./provider-models3d.js";
 import { modelUsageList, modelUsages } from "../shared/custom-models.js";
 import { assertSafeGenerationInput, ToolRunner, ToolRunError } from "./tools.js";
-import { inheritToolPreflightFailure } from "./agent-tool-errors.js";
+import { inheritToolPreflightFailure, toolPreflightError } from "./agent-tool-errors.js";
 import type { VideoGenerator } from "./video-generation.js";
 import { ProviderVideos } from "./provider-videos.js";
 import { ProviderAudio, type AudioGenerator } from "./audio-generation.js";
@@ -125,6 +126,7 @@ import { MinimaxSettingsStore } from "./minimax-settings.js";
 import { BundledPluginAdapter, LocalPluginAdapter, PluginCatalogService, pluginSummary } from "./plugin-catalog.js";
 import { BundledPluginStore } from "./bundled-plugins.js";
 import { workflowGuideTools } from "./workflow-guide.js";
+import { createTurnaroundInspection, hasTurnaroundAssessment } from "./turnaround-inspection.js";
 import { BlenderRunner } from "./blender-runner.js";
 import { BlenderWorkflow } from "./blender-tools.js";
 import { LocalPluginError, LocalPluginStore } from "./local-plugins.js";
@@ -151,7 +153,7 @@ import { assertSourcePublicationSettled, pendingSourcePublications } from "./iso
 import { MAX_PROJECT_COVER_BYTES } from "./project-covers.js";
 import { PROJECT_ARCHIVE_CONTENT_TYPE, PROJECT_ARCHIVE_MAX_BYTES } from "../shared/project-archive.js";
 import { MAX_ORIGINAL_TURN_BYTES, SessionImages } from "./session-images.js";
-import { AgentAttachmentError, AgentAttachmentStore, resolveAgentAttachment, MAX_AGENT_ATTACHMENT_BYTES, MAX_AGENT_ATTACHMENTS_PER_TURN } from "./agent-attachments.js";
+import { AgentAttachmentError, AgentAttachmentStore, resolveAgentAttachment, MAX_AGENT_ATTACHMENT_BYTES, MAX_AGENT_ATTACHMENTS_PER_TURN, type AuthorizeAgentAttachment } from "./agent-attachments.js";
 import { WEB_GAME_USE_CAPABILITIES, type GameRuntimeAdapter, type GameUseOpenTarget } from "../shared/playtest.js";
 import { EXTERNAL_AGENT_CLIENT_IDS, EXTERNAL_MCP_PATH, EXTERNAL_MCP_ROOTS_HEADER, type ExternalAgentClientId, type ExternalAgentSettings, type ExternalMcpLauncher, type UpdateExternalAgentSettings } from "../shared/external-mcp.js";
 import { WebSearchSettingsStore } from "./web-search-settings.js";
@@ -180,6 +182,7 @@ export interface AppOptions {
   /** Daemon-only credential profile selected by an explicit local environment file. */
   localApiKeyFile?: string;
   projectExecution?: import("./isolated-project-execution.js").IsolatedProjectExecution;
+  compactProjectBrowserStorageOnExit?: boolean;
   cloudApiUrl?: string;
   cloudFetch?: typeof fetch;
   dataDirectory?: string;
@@ -428,6 +431,10 @@ const externalAgentSettingsSchema = {
 } as const;
 
 const answerApprovalSchema = {
+  params: {
+    type: "object",
+    properties: { "*": { type: "string", minLength: 1, maxLength: MAX_APPROVAL_REQUEST_ID_LENGTH } },
+  },
   body: {
     type: "object",
     additionalProperties: false,
@@ -685,8 +692,6 @@ export function createApp(options: AppOptions = {}) {
   const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
   const dataDirectory = options.dataDirectory ?? path.join(repositoryRoot, ".data");
   const piAgentDirectory = options.piAgentDirectory ?? process.env.PI_CODING_AGENT_DIR ?? path.join(dataDirectory, "pi-agent");
-  const conversationImages = new ConversationImageStore(path.join(dataDirectory, "cache", "conversation-images"));
-  const events = new RuntimeEventBus(1_000, (event) => conversationImages.event(event));
   const mediaSnapshots = new CheckedMediaSnapshotStore(path.join(dataDirectory, "cache", "checked-media"));
   const library = new AssetLibrary(dataDirectory, mediaSnapshots);
   const projects = new ProjectManager(dataDirectory, library, [piAgentDirectory], async project => {
@@ -697,6 +702,12 @@ export function createApp(options: AppOptions = {}) {
     const entry = overview.snapshot.projects.find(item => item.namespace === options.projectExecution!.namespace && item.projectId === project.id);
     return (entry?.volumeProfileVersion === 2 && entry.sourceProfileId === "capacity-128-v2") || (entry?.volumeProfileVersion === 3 && entry.sourceProfileId === "capacity-128-media64-v3") ? entry.sourceProfileId : undefined;
   });
+  const projectLifecycle = new ProjectLifecycle(dataDirectory);
+  const conversationImages = new ConversationImageStore(
+    path.join(dataDirectory, "cache", "conversation-images"),
+    (id) => projects.get(id) !== undefined && !projectLifecycle.deletingHost(id),
+  );
+  const events = new RuntimeEventBus(1_000, (event) => conversationImages.event(event));
   const attachments = new AgentAttachmentStore();
   const conversations = new ConversationManager(conversationImages);
   let closing = false;
@@ -722,7 +733,6 @@ export function createApp(options: AppOptions = {}) {
   // The local edition has no product account, visitor identity, cloud transport or remote publication.
   const cloudModels = new CloudModelsClient();
   const publisher = new RemotePublisher();
-  const projectLifecycle = new ProjectLifecycle(dataDirectory);
   options.projectExecution?.setAdmission((id) => projectLifecycle.assertAvailable(id));
   const previews = new PreviewManager(events, { execution: options.projectExecution, assertAvailable: (id) => projectLifecycle.assertAvailable(id), mediaSnapshots });
   const buildGame = (project: ProjectState, signal?: AbortSignal) =>
@@ -1120,6 +1130,7 @@ export function createApp(options: AppOptions = {}) {
     return operation();
   });
   const blenderWorkflows = new Map<string, BlenderWorkflow>();
+  const tripoModelReviews = new TripoModelReviews(path.join(dataDirectory, "blender-jobs"), projects, library);
   const blenderTools = (project: ProjectState) => {
     const key = `${project.id}:${project.workspacePath}`;
     let workflow = blenderWorkflows.get(key);
@@ -1129,6 +1140,9 @@ export function createApp(options: AppOptions = {}) {
         workspace: project.workspacePath, privateRoot,
         bundledScriptsDirectory: path.join(options.bundledPluginsDirectory ?? path.join(repositoryRoot, "plugins"), "blender", "skills", "blender-assets", "scripts"),
         runner: new BlenderRunner(privateRoot),
+        resolveSourceAsset: (assetId, signal) => projects.blenderModelSource(project.id, assetId, signal),
+        requireTripoApproval: (assetId, sha256) => tripoModelReviews.requireApproval(project.id, assetId, sha256),
+        checkTripoInputPaths: (paths, signal) => tripoModelReviews.checkDeclaredPaths(project.id, paths, signal),
         enabled: () => {
           const bundled = bundledPlugins.read("ohmygame:blender");
           const plugin = bundled && pluginSettings.decorate(bundled);
@@ -1155,7 +1169,12 @@ export function createApp(options: AppOptions = {}) {
       playtest = new OwnedPlaytestDriver(options.playtestDriver);
       agentPlaytests.set(playtestKey, playtest);
     }
-    return [...fileTools, ...workflowGuideTools(project.type, bundledPlugins, pluginSettings), ...blenderTools(project), createProjectMediaCapabilitiesTool(() => projects.get(project.id), {
+    const authorizeAttachment: AuthorizeAgentAttachment = (reference, signal) => {
+      signal?.throwIfAborted();
+      return authorizeConversationAttachment(conversations.open(project, conversation), reference);
+    };
+    const inspection = createTurnaroundInspection(project, authorizeAttachment);
+    return [...fileTools, inspection.tool, ...workflowGuideTools(project, bundledPlugins, pluginSettings), ...blenderTools(project), createProjectMediaCapabilitiesTool(() => projects.get(project.id), {
       images: providerImages, videos: providerVideos, models3D: providerModels3D, audio: providerAudio, defaultModel: mediaDefaultModel,
     }), ...(options.projectExecution && project.workspaceLocation !== "external" ? [createIsolatedShellTool(async (command, timeout, signal) => {
       signal?.throwIfAborted();
@@ -1249,16 +1268,40 @@ export function createApp(options: AppOptions = {}) {
       canvasStore,
       conversation.summary.id,
       enabledMediaTools,
-      (reference, signal) => {
+      authorizeAttachment,
+      async (toolCallId, images, paths, signal, branch) => {
         signal?.throwIfAborted();
-        return authorizeConversationAttachment(conversations.open(project, conversation), reference);
+        const inspected = inspection.match(paths, images);
+        if (!inspected || !hasTurnaroundAssessment(branch, inspected.inspectionCallId, toolCallId))
+          throw toolPreflightError("Call inspect_3d_views on these exact ordered images first, supplying the original design when available. Compare the returned pixels and report your findings before requesting user review.", "invalid_model_reference");
+        const angles = ["front", "left", "back", "right"] as const;
+        if (images.length < 3 || images.length !== paths.length) throw new Error("Incomplete turnaround for review");
+        const review: TurnaroundReview = {
+          reviewId: randomUUID(),
+          ...(inspected.original && inspected.originalPath ? { original: { path: inspected.originalPath, url: conversationImages.project(project.id, inspected.original).url! } } : {}),
+          views: images.map((image, index) => {
+            // The renderer and provider use the same captured bytes, including any WebP conversion.
+            const url = conversationImages.project(project.id, image).url;
+            if (!url || !image.data) throw new Error("The turnaround image is unavailable for review");
+            return { angle: angles[index] ?? "additional", path: paths[index]!, url };
+          }),
+        };
+        const decision = await agents.askApproval(project.id, conversation.summary.id, review.reviewId, {
+          kind: "turnaroundReview", tool: "image-to-3d", canAllowSession: false, turnaroundReview: review,
+        }, signal);
+        if (decision !== "allow") throw toolPreflightError("The user has not approved these views for 3D generation. Stop and wait for their requested changes.", "authorization_denied");
+        signal?.throwIfAborted();
       },
+      (assetId, signal) => tripoModelReviews.review(project.id, assetId, review =>
+        agents.askApproval(project.id, conversation.summary.id, review.reviewId, {
+          kind: "tripoModelReview", tool: "review_tripo_model", canAllowSession: false, tripoModelReview: review,
+        }, signal), signal),
     )].map(tool => {
       if (tool.name === "recover_isolated_changes") return tool;
       const execute = (tool as ToolDefinition).execute;
       const assertAllowed = async () => {
         await assertSourcePublicationSettled(project.workspacePath);
-        if (!["read", "read_project_file", "ls", "find", "grep", "read_attachment", "recall_image", "read_workflow_guide", "blender_status", "list_media_capabilities", "canvas_check", "playable_check", "questionnaire", "update_plan"].includes(tool.name))
+        if (!["read", "read_project_file", "ls", "find", "grep", "read_attachment", "recall_image", "read_workflow_guide", "inspect_3d_views", "blender_status", "list_media_capabilities", "canvas_check", "playable_check", "questionnaire", "update_plan"].includes(tool.name))
           await options.projectExecution?.assertSourceReviewSettled?.(project);
       };
       const recover = (tool as ToolDefinition & { recoverAfterHttp500?: ToolDefinition["execute"] }).recoverAfterHttp500;
@@ -1589,6 +1632,9 @@ export function createApp(options: AppOptions = {}) {
   app.addHook("onRequest", async (request, reply) => {
     if (closing) return reply.header("connection", "close").code(503).send({ error: "The local service is shutting down" });
     if (!isLoopbackHostHeader(request.headers.host)) return reply.code(403).send({ error: "Invalid local host" });
+    // Deleting a project must also invalidate reads from the renderer. A
+    // browser disk cache otherwise retains conversation and Canvas responses.
+    if (/^\/projects(?:[/?]|$)/.test(request.url)) reply.header("cache-control", "no-store");
     const origin = request.headers.origin;
     if (!isAllowedLocalOrigin(origin, request.headers.host, allowedOrigins)) return reply.code(403).send({ error: "Origin is not allowed" });
     if (origin && allowedOrigins.has(origin)) {
@@ -2414,6 +2460,7 @@ export function createApp(options: AppOptions = {}) {
           await conversationImages.removeProject(project.id);
           await library.removeProjectCopies(project.id, async assetId =>
             (await projects.referencesLibraryAsset(assetId, project.id)).map(owner => owner.id));
+          if (options.compactProjectBrowserStorageOnExit) await projectLifecycle.scheduleBrowserCleanup(project.id);
           await projects.delete(project.id);
           conversations.forget(project);
         });
@@ -3600,8 +3647,7 @@ export function createApp(options: AppOptions = {}) {
     if (!projects.get(request.params.projectId)) return reply.code(404).send({ error: "Project not found" });
     const image = await conversationImages.read(request.params.projectId, request.params.imageId);
     if (!image) return reply.code(404).send({ error: "Image not found" });
-    return reply.header("content-type", image.mediaType)
-      .header("cache-control", "private, max-age=86400, immutable").send(image.data);
+    return reply.header("content-type", image.mediaType).send(image.data);
   });
 
   app.get<{ Params: { projectId: string; conversationId: string }; Querystring: { reset?: string } }>(
@@ -4127,8 +4173,10 @@ export function createApp(options: AppOptions = {}) {
     },
   );
 
-  app.post<{ Params: { projectId: string; conversationId: string; requestId: string }; Body: AnswerApprovalRequest }>(
-    "/projects/:projectId/conversations/:conversationId/approvals/:requestId",
+  // Existing cards can carry a compound provider call ID longer than the router's 100-character parameter limit.
+  // Capture only this suffix as a wildcard and validate its decoded length in the route schema.
+  app.post<{ Params: { projectId: string; conversationId: string; "*": string }; Body: AnswerApprovalRequest }>(
+    "/projects/:projectId/conversations/:conversationId/approvals/*",
     { schema: answerApprovalSchema },
     async (request, reply) => {
       const project = projects.get(request.params.projectId);
@@ -4136,7 +4184,7 @@ export function createApp(options: AppOptions = {}) {
       const conversation = await conversations.get(project, request.params.conversationId);
       if (!conversation) return reply.code(404).send({ error: "Conversation not found" });
       try {
-        agents.answerApproval(project.id, conversation.summary.id, request.params.requestId, request.body.decision, request.body.sourceConfirmation, request.body.volumeMigrationConfirmation);
+        await agents.answerApproval(project.id, conversation.summary.id, request.params["*"], request.body.decision, request.body.sourceConfirmation, request.body.volumeMigrationConfirmation);
         return reply.code(204).send();
       } catch (cause) {
         return reply.code(409).send({ error: cause instanceof Error ? cause.message : String(cause) });
@@ -4366,7 +4414,7 @@ export function createApp(options: AppOptions = {}) {
     reply.hijack();
     reply.raw.writeHead(200, {
       "content-type": "text/event-stream",
-      "cache-control": "no-cache",
+      "cache-control": "no-store",
       connection: "keep-alive",
     });
     reply.raw.write(": connected\n\n");

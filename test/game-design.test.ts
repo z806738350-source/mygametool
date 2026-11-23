@@ -549,6 +549,46 @@ describe("Markdown design workspace", () => {
     expect((await store.board(project.id, boardId)).board.nodes.find(entry => entry.id === node.id)).toEqual(node);
   });
 
+  it("leaves a rejected turnaround on the Canvas without a job and invalidates a saved node's review when its slots change", async () => {
+    const { directory, store, tools, projects, project, boardId } = await runtime();
+    const imagePaths = ["front.png", "left.png", "back.png"];
+    await Promise.all(imagePaths.map(async (file, index) => {
+      const bytes = await sharp({ create: { width: 8, height: 8, channels: 3, background: ["red", "green", "blue"][index]! } }).png().toBuffer();
+      await writeFile(path.join(project.workspacePath, file), bytes);
+    }));
+    const run = vi.spyOn(tools, "runPrepared");
+    const review = vi.fn<NonNullable<Parameters<typeof createAgentTools>[9]>>().mockImplementationOnce(async () => {
+      const reopened = new ToolRunner(directory, { generate: vi.fn() });
+      const [ownership] = await reopened.agentMedia.projectRecords(project.id);
+      expect(await reopened.agentMedia.scopeRecords(ownership!.scopes[0]!)).toEqual([]);
+      throw new Error("The user requested changes to the left view.");
+    });
+    const registered = createAgentTools(project, tools, projects, undefined, undefined, store, undefined, undefined, undefined, review);
+    const direct = registered.find(tool => tool.name === "generate_3d_from_views")!;
+    const ctx = { model: { input: ["text", "image"] } } as never;
+    const denied = await direct.execute("drawn-views", { imagePaths }, undefined, undefined, ctx).catch(cause => cause);
+    expect(denied.message).toContain("requested changes");
+    expect(getToolPreflightFailure(denied)?.reason).toBe("approval_required");
+    expect(await store.jobs(project.id)).toEqual([]);
+    const current = await store.board(project.id, boardId);
+    const node = current.board.nodes.find(node => node.type === "model-3d")!;
+    if (node.type !== "model-3d") throw new Error("Expected saved modeling node");
+    node.data.options = { ...node.data.options, referenceMode: "provided-views" };
+    await store.saveBoard(project.id, current.board, current.revision);
+    review.mockImplementationOnce(async () => {
+      const latest = await store.board(project.id, boardId);
+      const model = latest.board.nodes.find(candidate => candidate.id === node.id);
+      if (model?.type !== "model-3d") throw new Error("Expected saved modeling node");
+      model.data.images.reverse();
+      await store.saveBoard(project.id, latest.board, latest.revision);
+    });
+    const saved = registered.find(tool => tool.name === "generate_canvas_media")!;
+    await expect(saved.execute("saved-views", { boardId, nodeId: node.id }, undefined, undefined, ctx)).rejects.toThrow("changed during review");
+    expect(review).toHaveBeenCalledTimes(2);
+    expect(run).not.toHaveBeenCalled();
+    expect(await store.jobs(project.id)).toEqual([]);
+  });
+
   it.each([
     ["generate_image", "image", { prompt: "A visible gardener", background: "transparent", outputFormat: "png" }],
     ["generate_image", "image", { prompt: "Edit the gardener", imagePaths: ["front.png"], maskPath: "mask.png", resolution: "1K", aspectRatio: "1:1" }],
@@ -581,10 +621,11 @@ describe("Markdown design workspace", () => {
       await gate;
       const model = type === "model-3d" || type === "animate-3d";
       const audio = ["speech", "voice", "sound-effect", "music"].includes(type);
-      const asset = await library.add(model ? "result.glb" : audio ? "result.wav" : type === "video" ? "result.mp4" : "result.png", model ? TEST_GLB : audio ? referenceWav() : type === "video" ? Buffer.from("\0\0\0\x18ftypisom") : fixturePng);
+      const asset = await library.add(model ? "result.glb" : audio ? "result.wav" : type === "video" ? "result.mp4" : "result.png", model ? TEST_GLB : audio ? referenceWav() : type === "video" ? Buffer.from("\0\0\0\x18ftypisom") : fixturePng, model ? { origin: "generated", generation: { protocol: "tripo-v3", parameters: {} } } : {});
       return { id: randomUUID(), toolId: toolId as ToolRun["toolId"], createdAt: new Date().toISOString(), files: [{ name: asset.name, mediaType: asset.contentType as ToolRun["files"][number]["mediaType"], assetId: asset.id }] };
     });
-    const tool = createAgentTools(project, tools, projects, undefined, undefined, store).find(tool => tool.name === name)!;
+    const review = vi.fn<NonNullable<Parameters<typeof createAgentTools>[9]>>().mockResolvedValue(undefined);
+    const tool = createAgentTools(project, tools, projects, undefined, undefined, store, undefined, undefined, undefined, review).find(tool => tool.name === name)!;
     const pending = tool.execute("visible", input, undefined, undefined, {} as never);
     try {
       await expect.poll(() => run.mock.calls.length).toBe(1);
@@ -607,6 +648,16 @@ describe("Markdown design workspace", () => {
       const completed = (await store.jobs(project.id)).find(candidate => candidate.id === job.id)!;
       const assetId = completed.run!.files[0]!.assetId!;
       const entry = (await readCanvasAssets(project.workspacePath)).assets[assetId]!;
+      if (type === "model-3d" || type === "animate-3d") {
+        expect(result.details).toMatchObject({ sourceAssetId: entry.libraryAssetId, canvasAssets: [{ sourceAssetId: entry.libraryAssetId }] });
+        expect(message).toContain(`sourceAssetId with the original project model: ${entry.libraryAssetId}`);
+        const bound = await projects.blenderModelSource(project.id, (result.details as { sourceAssetId: string }).sourceAssetId);
+        expect(bound.bytes.equals(TEST_GLB)).toBe(true);
+        expect(bound.tripo).toBe(true);
+      } else {
+        expect(result.details).not.toHaveProperty("sourceAssetId");
+        expect(message).not.toContain("For Blender");
+      }
       const destination = `public/media/${path.basename(entry.path)}`;
       const adopt = createAgentTools(project, tools, projects, undefined, undefined, store).find(candidate => candidate.name === "use_canvas_asset")!;
       expect((await adopt.execute("adopt", { assetId, destination }, undefined, undefined, {} as never)).details).toEqual({ assetId, path: destination });
@@ -615,6 +666,18 @@ describe("Markdown design workspace", () => {
       expect(source.some(file => file.path === entry.path)).toBe(false);
       expect(media.some(file => file.path === destination)).toBe(true);
       await tool.execute("visible", input, undefined, undefined, {} as never);
+      expect(review).toHaveBeenCalledTimes(name === "generate_3d_from_views" ? 1 : 0);
+      if (name === "generate_3d_from_views") {
+        const manifest = await readCanvasAssets(project.workspacePath);
+        manifest.assets["local-model-alias"] = entry;
+        delete manifest.assets[assetId];
+        await writeFile(path.join(project.workspacePath, "canvas/assets.json"), JSON.stringify(manifest));
+        const saved = createAgentTools(project, tools, projects, undefined, undefined, store)
+          .find(candidate => candidate.name === "generate_canvas_media")! as RecoverableTool;
+        const recovered = await saved.recoverAfterHttp500!("visible", { boardId, nodeId: node.id }, new AbortController().signal, undefined, {} as never);
+        expect(recovered.details).toMatchObject({ sourceAssetId: assetId, canvasAssets: [{ assetId: "local-model-alias", sourceAssetId: assetId }] });
+        expect((await projects.blenderModelSource(project.id, assetId)).bytes.equals(TEST_GLB)).toBe(true);
+      }
       expect(run).toHaveBeenCalledTimes(1);
     } finally { release(); await pending.catch(() => {}); }
   });
@@ -1832,7 +1895,8 @@ describe("Markdown design workspace", () => {
   it("blocks an Agent's single concept image and uses its corrected three-view Canvas node once", async () => {
     const generate = vi.fn().mockResolvedValue({ bytes: TEST_GLB, mediaType: "model/gltf-binary" });
     const { project, store, projects, tools, library, boardId } = await runtime(fakeGenerator, "web-game", undefined, undefined, { generate });
-    const tool = createAgentTools(project, tools, projects, undefined, undefined, store).find(tool => tool.name === "generate_canvas_media")!;
+    const review = vi.fn<NonNullable<Parameters<typeof createAgentTools>[9]>>().mockResolvedValue(undefined);
+    const tool = createAgentTools(project, tools, projects, undefined, undefined, store, undefined, undefined, undefined, review).find(tool => tool.name === "generate_canvas_media")!;
     const model = createAssetGenerationNode("model-3d", { x: 0, y: 0 });
     if (model.type !== "model-3d") throw new Error("Expected 3D model node");
     const views = await Promise.all(["red", "green", "blue"].map(async background => {
@@ -1859,8 +1923,10 @@ describe("Markdown design workspace", () => {
     await expect(tool.execute("text-only", args, undefined, undefined, { model: { input: ["text"] } } as never)).rejects.toThrow("vision-capable main Agent");
     expect(await store.jobs(project.id)).toHaveLength(jobCount);
     expect(generate).not.toHaveBeenCalled();
+    expect(review).not.toHaveBeenCalled();
     const result = await tool.execute("corrected", args, undefined, undefined, { model: { input: ["text", "image"] } } as never);
     expect(result.details).toMatchObject({ canvasGeneration: { status: "succeeded" } });
+    expect(review).toHaveBeenCalledOnce();
     expect(generate).toHaveBeenCalledOnce();
     expect(generate.mock.calls[0]![0].images).toHaveLength(3);
     expect(generate.mock.calls[0]![0].prompt).toBeUndefined();

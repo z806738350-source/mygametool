@@ -126,7 +126,21 @@ export interface AgentRuntimeLoginResponse {
 }
 
 /** What an agent asks to be allowed to do. */
-export type ApprovalKind = "command" | "file" | "tool" | "other" | "volumeMigration";
+export type ApprovalKind = "command" | "file" | "tool" | "other" | "volumeMigration" | "turnaroundReview" | "tripoModelReview";
+
+export interface TurnaroundReview {
+  reviewId: string;
+  original?: { path: string; url: string };
+  views: Array<{ angle: "front" | "left" | "back" | "right" | "additional"; path: string; url: string }>;
+}
+
+export interface TripoModelReview {
+  reviewId: string;
+  assetId: string;
+  name: string;
+  fbx: boolean;
+  previewSha256: string;
+}
 
 export type ApprovalDecision = "allow" | "allow-session" | "deny";
 
@@ -143,6 +157,8 @@ export interface ApprovalRequestDetails {
   /** Whether "allow for this conversation" can be offered. */
   canAllowSession: boolean;
   isolatedSourceReview?: IsolatedSourceReview;
+  turnaroundReview?: TurnaroundReview;
+  tripoModelReview?: TripoModelReview;
   volumeMigration?: import("./volume-migration.js").VolumeMigrationReview;
   /**
    * What "allow for this conversation" covers when that is broader than this

@@ -10,6 +10,7 @@ import type { ProviderModels3D } from "./provider-models3d.js";
 import type { ProviderVideos } from "./provider-videos.js";
 
 type Usage = "image" | "video" | "3d";
+const capabilities = ["image", "video", "3d-generation", "3d-processing", "speech", "sound-effect", "music"] as const;
 
 export function projectMediaPreference(project: ProjectState | undefined, usage: Usage) {
   return project?.modelSelections?.[usage === "3d" ? "3d-generation" : usage] ?? project?.mediaModelDefaults?.[usage];
@@ -69,35 +70,51 @@ export function createProjectMediaCapabilitiesTool(project: () => ProjectState |
   return defineTool({
     name: "list_media_capabilities",
     label: "Check project media models",
-    description: "Read the current project's configured models, effective defaults and locally listed candidates for image, video, 3D, animation, voice, sound and music. Use this before generation or to correct a model selection. No provider requests, generation or billing checks are made.",
-    parameters: Type.Object({}, { additionalProperties: false }),
-    execute: async (_id, _input, signal) => {
+    description: "Read configured models, defaults and all model options for the current stage. Pass capability for one media type; omit for a project-wide inventory. Local query only.",
+    parameters: Type.Object({ capability: Type.Optional(Type.Union(capabilities.map(name => Type.Literal(name)))) }, { additionalProperties: false }),
+    execute: async (_id, { capability }, signal) => {
       signal?.throwIfAborted();
       const current = project();
       if (!current) throw new Error("Project not found");
-      const deferredImages = new Set<string>(), deferredVideos = new Set<string>();
-      const [images, videos, models3D, connections] = await Promise.all([
-        catalogs.images.catalog(signal, deferredImages), catalogs.videos.catalog(signal, deferredVideos),
-        catalogs.models3D.catalog(), catalogs.models3D.operationModels(),
-      ]);
-      const models = catalogs.audio.catalog().models;
-      const audio = (operation: "speech" | "sound-effect" | "music") => selection(models.filter((model) => model.capabilities.operations.includes(operation))
-        .map((model) => ({ ...ref(model), capabilities: model.capabilities })), current.modelSelections?.[operation], undefined, undefined, operation === "music");
-      const geometry = projectMediaPreference(current, "3d");
-      const animation = await catalogs.models3D.resolveOperationModel(geometry, "animate");
-      const snapshot = {
-        image: selection(images.models.map(imageCandidate), projectMediaPreference(current, "image"), catalogs.defaultModel("image"), deferredImages),
-        video: selection(videos.models.map(videoCandidate), projectMediaPreference(current, "video"), catalogs.defaultModel("video"), deferredVideos),
-        "3d-generation": { ...selection(models3D.models.map(model3DCandidate), geometry, catalogs.defaultModel("3d")),
-          turnaroundTool: "generate_3d_from_views" },
-        "3d-processing": { connections: connections.map(model3DCandidate),
-          projectRig: current.modelSelections?.["3d-rig"] ? ref(current.modelSelections["3d-rig"]) : null,
-          projectTexture: current.modelSelections?.["3d-texture"] ? ref(current.modelSelections["3d-texture"]) : null,
-          projectRemesh: current.modelSelections?.["3d-remesh"] ? ref(current.modelSelections["3d-remesh"]) : null,
-          animationConnection: animation ? ref(animation) : null,
-          hint: "A processing version is not a geometry model. With the Tripo animation connection, the rig version is the rigModel argument." },
-        speech: audio("speech"), "sound-effect": audio("sound-effect"), music: audio("music"),
-      };
+      if (capability !== undefined && !capabilities.includes(capability)) throw new Error("Unknown media capability");
+      let audioModels: ReturnType<ProviderAudio["catalog"]>["models"] | undefined;
+      async function read(name: typeof capabilities[number]) {
+        switch (name) {
+          case "image": {
+            const deferred = new Set<string>();
+            const catalog = await catalogs.images.catalog(signal, deferred);
+            return selection(catalog.models.map(imageCandidate), projectMediaPreference(current, name), catalogs.defaultModel(name), deferred);
+          }
+          case "video": {
+            const deferred = new Set<string>();
+            const catalog = await catalogs.videos.catalog(signal, deferred);
+            return selection(catalog.models.map(videoCandidate), projectMediaPreference(current, name), catalogs.defaultModel(name), deferred);
+          }
+          case "3d-generation": {
+            const catalog = await catalogs.models3D.catalog();
+            return { ...selection(catalog.models.map(model3DCandidate), projectMediaPreference(current, "3d"), catalogs.defaultModel("3d")),
+              turnaroundTool: "generate_3d_from_views" };
+          }
+          case "3d-processing": {
+            const [connections, animation] = await Promise.all([catalogs.models3D.operationModels(),
+              catalogs.models3D.resolveOperationModel(projectMediaPreference(current, "3d"), "animate")]);
+            const selected = current?.modelSelections;
+            return { connections: connections.map(model3DCandidate),
+              projectRig: selected?.["3d-rig"] ? ref(selected["3d-rig"]) : null,
+              projectTexture: selected?.["3d-texture"] ? ref(selected["3d-texture"]) : null,
+              projectRemesh: selected?.["3d-remesh"] ? ref(selected["3d-remesh"]) : null,
+              animationConnection: animation ? ref(animation) : null,
+              hint: "A processing version is not a geometry model. With the Tripo animation connection, the rig version is the rigModel argument." };
+          }
+          default:
+            audioModels ??= catalogs.audio.catalog().models;
+            return selection(audioModels.filter(model => model.capabilities.operations.includes(name))
+              .map(model => ({ ...ref(model), capabilities: model.capabilities })), current?.modelSelections?.[name], undefined, undefined, name === "music");
+        }
+      }
+      const names = capability === undefined ? capabilities : [capability];
+      const snapshot = Object.fromEntries(await Promise.all(names.map(async name => [name, await read(name)] as const)));
+      signal?.throwIfAborted();
       // Only model references and capability fields are projected. Protect even a credential accidentally saved as a model ID.
       const text = JSON.stringify(snapshot, (_key, value) => typeof value === "string" ? redactKnownSensitiveValues(value) : value);
       return { content: [{ type: "text", text }], details: { mediaCapabilities: JSON.parse(text) } };

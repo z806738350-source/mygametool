@@ -46,7 +46,6 @@ export function ModelSelector({ models, status = "ready", value, reasoningLevel,
   const currentName = value && isRemovedKunpoAgent(value) ? t("mediaDefaults.modelUnavailable", { id: value.id }) : current?.name ?? value?.id;
   const textOnly = agentModelImageInput(current ?? value) === false;
   const incompatible = (model: AgentModel) => hasImageHistory && agentModelImageInput(model) === false;
-  const imageHelp = (model: AgentModelRef) => kunpoModelOption("agent", model)?.capabilities.tools === false ? t("kunpoModels.textOnlyHelp") : t("modelSelector.imageInputDisabled");
   const visibleModels = status === "ready" ? filterModels(models, query) : [];
   const providerGroups = groupModelsByProvider(visibleModels);
   const effectiveReasoning = clampReasoningLevel(reasoningLevel ?? "medium", current?.reasoningLevels ?? []);
@@ -150,7 +149,7 @@ export function ModelSelector({ models, status = "ready", value, reasoningLevel,
         aria-haspopup="menu"
         disabled={disabled || (!canvas && !canSelect)}
         onClick={toggle}
-        title={`${current ? `${t("modelSelector.textModelTitle", { provider: current.providerName, name: current.name })}${supportsReasoning ? ` · ${reasoningText}` : ""}` : unavailableLabel}${textOnly && value ? ` · ${imageHelp(value)}` : ""}`}
+        title={`${current ? `${t("modelSelector.textModelTitle", { provider: current.providerName, name: current.name })}${supportsReasoning ? ` · ${reasoningText}` : ""}` : unavailableLabel}${textOnly ? ` · ${t("modelSelector.imageInputDisabled")}` : ""}`}
       >
         {native ? <AgentIcon provider={current?.provider} /> : null}
         <span className="model-selector-name">{currentName ?? unavailableLabel}</span>
@@ -202,7 +201,7 @@ export function ModelSelector({ models, status = "ready", value, reasoningLevel,
                           aria-checked={selected}
                           key={modelKey(model)}
                           onClick={() => select(model)}
-                          title={incompatible(model) ? t("modelSelector.imageHistoryIncompatible") : agentModelImageInput(model) === false ? imageHelp(model) : kunpoModelOption("agent", model) ? t("kunpoModels.unverifiedHelp") : `${model.provider}/${model.id}`}
+                          title={incompatible(model) ? t("modelSelector.imageHistoryIncompatible") : agentModelImageInput(model) === false ? t("modelSelector.imageInputDisabled") : kunpoModelOption("agent", model)?.capabilities.tools ? t("kunpoModels.agentHelp") : `${model.provider}/${model.id}`}
                         >
                           <span className="model-selector-name">{model.name}</span>
                           {selected ? <Check aria-hidden="true" size={12} /> : null}

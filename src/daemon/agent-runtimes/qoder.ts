@@ -175,6 +175,7 @@ export class QoderConnection {
     try {
       await this.request("initialize", {
         binaryPath: binary.path,
+        runtimeVersion: binary.version,
         privateDirectory: this.context.privateDirectory,
         configurationRoot: path.dirname(env.QODER_CONFIG_DIR!),
         env,

@@ -141,6 +141,8 @@ export interface AutoContinueToolOptions {
 }
 export type RecoverableTool = ToolDefinition & {
   recoverAfterHttp500?: (...call: Call) => Promise<Result>;
+  /** A new call with identical arguments may depend on a newly saved input file. */
+  canReuseResult?: (previous: Result, ...call: Call) => boolean;
 };
 const READ_ONLY = new Set([
   "read",
@@ -150,7 +152,9 @@ const READ_ONLY = new Set([
   "find",
   "grep",
   "recall_image",
+  "recall_tool_text",
   "read_workflow_guide",
+  "inspect_3d_views",
   "blender_status",
   "list_media_capabilities",
   "list_animation_actions",
@@ -159,7 +163,7 @@ const READ_ONLY = new Set([
   "recover_media",
   "recover_canvas_media",
 ]);
-const REPAIR_READS = new Set(["read", "read_project_file", "read_attachment", "ls", "find", "grep", "recall_image", "read_workflow_guide", "blender_status", "list_media_capabilities", "list_animation_actions", "canvas_check", "playable_check"]);
+const REPAIR_READS = new Set(["read", "read_project_file", "read_attachment", "ls", "find", "grep", "recall_image", "recall_tool_text", "read_workflow_guide", "inspect_3d_views", "blender_status", "list_media_capabilities", "list_animation_actions", "canvas_check", "playable_check"]);
 const REPAIR_ACTIONS = new Set(["inspect", "capacity", "plan_capacity", "plan_first_allocation", "inspect_capacity_migration", "review", "read_image", "prepare-review", "optimize", "adopt", "recover", "verify"]);
 const OBSERVATION_ACTIONS = new Set(["inspect", "capacity", "plan_capacity", "plan_first_allocation", "inspect_capacity_migration", "read_image"]);
 const BLENDER_TOOLS = new Set(["run_blender", "recover_blender_run"]);
@@ -592,8 +596,10 @@ export class AutoContinueTools {
           return result;
         }
         const key = tool.name + ":" + identity(input);
-        const staleLocalResult = (attempt: Attempt) => !!task.publicationEpoch && attempt.publicationEpoch !== task.publicationEpoch &&
-          (tool.name === "build_game" || tool.name === "game_use" && input.operation === "open");
+        const reusable = (attempt: Attempt) => attempt.key === key && attempt.result &&
+          !(task.publicationEpoch && attempt.publicationEpoch !== task.publicationEpoch &&
+            (tool.name === "build_game" || tool.name === "game_use" && input.operation === "open")) &&
+          ((tool as RecoverableTool).canReuseResult?.(attempt.result, ...call) ?? true);
         const sameId = task.attempts.get(call[0]);
         if (sameId) {
           if (sameId.key !== key)
@@ -612,9 +618,7 @@ export class AutoContinueTools {
         if (recovered) throw new Error("The original failed command has recovered effects. Do not replay it under a new call ID; inspect current files and correct the requested operation");
         if (task.needsRead && !repairAction) throw new Error("Read the current project files after the controlled recovery publication before making another change");
         if (task.continuing && !repairAction) {
-          const previous = [...task.attempts.values()].findLast(
-            (attempt) => attempt.key === key && attempt.result && !staleLocalResult(attempt),
-          );
+          const previous = [...task.attempts.values()].findLast(reusable);
           if (previous?.result)
             return originalResult(previous.result, previous);
           // Native Code Mode can dispatch several independent effects at once.
@@ -638,9 +642,7 @@ export class AutoContinueTools {
                 "A tool call ID was reused with different arguments",
               );
             if (known) return this.#reuse(task, known);
-            const completed = [...task.attempts.values()].findLast(
-              (attempt) => attempt.key === key && attempt.result && !staleLocalResult(attempt),
-            );
+            const completed = [...task.attempts.values()].findLast(reusable);
             if (completed?.result)
               return originalResult(completed.result, completed);
           }

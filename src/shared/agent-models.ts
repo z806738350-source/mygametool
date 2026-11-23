@@ -1,7 +1,7 @@
 import type { AgentModelRef } from "./contracts.js";
 import { kunpoModelOption } from "./kunpo-models.js";
 
-/** A text-only Kunpo route cannot accept images even if saved runtime metadata says otherwise. */
+/** Use the connection’s image setting when present, subject to the reviewed route capabilities. */
 export function agentModelImageInput(model?: AgentModelRef & { supportsImages?: boolean }): boolean | undefined {
   const images = kunpoModelOption("agent", model)?.capabilities.images;
   return images === false ? false : model?.supportsImages ?? images;

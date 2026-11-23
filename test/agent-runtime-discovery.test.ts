@@ -1,5 +1,7 @@
 // Legacy execution is retained for future OS-isolated support; agent-local-files.test.ts covers current refusal.
-import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import * as fs from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
@@ -10,11 +12,16 @@ import { setAgentProcessSpawner } from "../src/daemon/agent-runtimes/process.js"
 import * as discovery from "../src/daemon/agent-runtimes/discovery.js";
 import * as environment from "../src/daemon/agent-runtimes/environment.js";
 import * as controlledQoder from "../src/daemon/agent-runtimes/controlled-qoder.js";
+import * as nativeSignature from "../src/daemon/agent-runtimes/native-signature.js";
 import { QoderConnection } from "../src/daemon/agent-runtimes/qoder.js";
 import * as codexProtocol from "../src/daemon/agent-runtimes/codex-app-server.js";
 import * as controlledCodex from "../src/daemon/agent-runtimes/controlled-codex.js";
+import * as codexIsolation from "../src/daemon/agent-runtimes/codex-isolation-check.js";
+import { AgentRuntimeCompatibilityError } from "../src/daemon/agent-runtimes/compatibility.js";
 import type { ProjectState } from "../src/shared/contracts.js";
 import { NATIVE_PRIVATE_SESSION_ENTRY } from "../src/daemon/agent-runtimes/project-history.js";
+
+vi.mock("node:fs/promises", async original => ({ ...(await original<typeof import("node:fs/promises")>()) }));
 
 const cleanup: Array<() => unknown | Promise<unknown>> = [];
 
@@ -30,7 +37,7 @@ it("preserves Codex model/list image capability instead of dropping it during ca
   vi.spyOn(codexProtocol, "CodexAppServer").mockImplementation(function () {
     return { initialize: async () => {}, request, stop } as never;
   });
-  const compatibility = vi.spyOn(codexProtocol, "checkCodexCompatibility").mockResolvedValue(undefined);
+  const compatibility = vi.spyOn(codexProtocol, "checkCodexCompatibility").mockResolvedValue("compatibility-thread");
   const spawn = vi.fn(() => { throw new Error("No process or provider request in the catalog fixture"); });
   setAgentProcessSpawner(spawn as never);
   const result = await probeModels("/audited/codex", "codex-cli", { HOME: "/tmp/codex-catalog-fixture", CODEX_HOME: "/tmp/codex-catalog-fixture" }, "/tmp/codex-catalog-fixture");
@@ -63,6 +70,70 @@ function qoderInstallation() {
   });
 }
 
+it.skipIf(process.platform !== "darwin" || process.arch !== "arm64" || !existsSync(".runtime/qoder-sdk/1.0.59"))(
+  "rechecks an updated Qoder CLI before probing its version in a fresh offline environment",
+  async () => {
+    const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), "ohmygame-qoder-update-")));
+    cleanup.push(() => rm(directory, { recursive: true, force: true }));
+    const binary = path.join(directory, "qoder");
+    await writeFile(binary, "Fixture bytes only", { mode: 0o700 });
+    const signature = vi.spyOn(nativeSignature, "verifyNativeDeveloperId").mockResolvedValue();
+    const probe = vi.spyOn(discovery, "runCli").mockResolvedValue({ code: 0, stdout: "qodercli 1.1.84\n", stderr: "" });
+
+    const verified = await controlledQoder.resolveControlledQoder(binary);
+    expect(verified).toMatchObject({ path: binary, version: "1.1.84" });
+    expect(signature).toHaveBeenCalledWith(binary, "qodercli", "T27K5A5ZWD");
+    expect(signature.mock.invocationCallOrder[0]).toBeLessThan(probe.mock.invocationCallOrder[0]!);
+    const [executable, args, env, cwd] = probe.mock.calls[0]!;
+    expect(executable).toBe("/usr/bin/sandbox-exec");
+    expect(args).toEqual(["-p", expect.stringContaining("(deny network*)"), binary, "--version"]);
+    expect(env.HOME).toContain("ohmygame-qoder-version-");
+    expect(env.QODER_CONFIG_DIR).toContain("ohmygame-qoder-version-");
+    expect(cwd).toBe(env.TMPDIR);
+    expect(await controlledQoder.resolveControlledQoder(binary)).toEqual(verified);
+
+    await writeFile(binary, "Replacement fixture bytes");
+    signature.mockRejectedValueOnce(new Error("Invalid issuer"));
+    await expect(controlledQoder.resolveControlledQoder(binary)).rejects.toThrow(/publisher signature/i);
+    expect(signature).toHaveBeenCalledTimes(2);
+    expect(probe).toHaveBeenCalledTimes(1);
+  },
+);
+
+it.skipIf(process.platform !== "darwin" || process.arch !== "arm64" || !existsSync(".runtime/qoder-sdk/1.0.59"))(
+  "falls back from an unaudited managed Qoder update but still rejects that path when explicitly selected",
+  async () => {
+    const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), "ohmygame-qoder-managed-")));
+    cleanup.push(() => rm(directory, { recursive: true, force: true }));
+    for (const version of ["1.1.84", "1.1.85"]) {
+      await mkdir(path.join(directory, version));
+      await writeFile(path.join(directory, version, "qoder"), version, { mode: 0o700 });
+    }
+    const nativeRoot = path.resolve(".runtime/qoder-cli");
+    const remap = {
+      apply(target: Function, receiver: unknown, [file, ...args]: unknown[]) {
+        const mapped = typeof file === "string" && (file === nativeRoot || file.startsWith(`${nativeRoot}/`))
+          ? path.join(directory, path.relative(nativeRoot, file)) : file;
+        return Reflect.apply(target, receiver, [mapped, ...args]);
+      },
+    };
+    const actual = { readdir: fs.readdir, lstat: fs.lstat, open: fs.open };
+    vi.spyOn(fs, "readdir").mockImplementation(new Proxy<typeof fs.readdir>(actual.readdir, remap));
+    vi.spyOn(fs, "lstat").mockImplementation(new Proxy<typeof fs.lstat>(actual.lstat, remap));
+    vi.spyOn(fs, "open").mockImplementation(new Proxy<typeof fs.open>(actual.open, remap));
+    const newer = path.join(nativeRoot, "1.1.85", "qoder");
+    const previous = path.join(nativeRoot, "1.1.84", "qoder");
+    const signature = vi.spyOn(nativeSignature, "verifyNativeDeveloperId").mockImplementation(async binary => {
+      if (binary === newer) throw new Error("Invalid issuer");
+    });
+    const probe = vi.spyOn(discovery, "runCli").mockResolvedValue({ code: 0, stdout: "qodercli 1.1.84\n", stderr: "" });
+    expect(await controlledQoder.resolveControlledQoder()).toMatchObject({ path: previous, version: "1.1.84" });
+    expect(signature.mock.calls.map(([binary]) => binary)).toEqual([newer, previous]);
+    await expect(controlledQoder.resolveControlledQoder(newer)).rejects.toThrow(/publisher signature/i);
+    expect(probe).toHaveBeenCalledTimes(1);
+  },
+);
+
 function qoderSessionRequest(root: string, model = "auto"): NativeSessionRequest {
   return { runtime: "qoder-cli", model, workspacePath: root, sessionManager: SessionManager.inMemory(root), tools: [], skillDirectories: [], instructions: "Offline session admission fixture", policy: { workspacePath: root, neverTouch: [] }, requestApproval: async () => "deny" };
 }
@@ -73,6 +144,48 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+it.each(["controlled Codex executable", "controlled Codex Code Mode runner"])("preserves the %s audit failure without starting Codex", async capability => {
+  const { service } = await fixture();
+  vi.spyOn(discovery, "resolveBinary").mockResolvedValue({ path: "/candidate/codex", signature: "fixture", source: "manual" });
+  const auditError = new AgentRuntimeCompatibilityError("This installation has not passed the audit.", capability);
+  vi.spyOn(controlledCodex, "verifyControlledCodexBinary").mockRejectedValue(auditError);
+  const version = vi.spyOn(discovery, "probeVersion");
+  const auth = vi.spyOn(discovery, "probeAuth");
+  const spawn = vi.fn(() => { throw new Error("An unaudited executable must not start"); });
+  setAgentProcessSpawner(spawn as never);
+
+  const status = await service.update("codex-cli", { enabled: true });
+  expect(status).not.toHaveProperty("version");
+  expect(status.auth.status).toBe("unknown");
+  expect(status.diagnostics).toEqual([{ code: "runtime-incompatible", capability, message: auditError.message }]);
+  await expect(service.login("codex-cli")).rejects.toBe(auditError);
+  expect(version).not.toHaveBeenCalled();
+  expect(auth).not.toHaveBeenCalled();
+  expect(spawn).not.toHaveBeenCalled();
+});
+
+it("accepts a newer Codex only after testing its installation and rechecks a changed runner", async () => {
+  const { service } = await fixture();
+  const binary = { path: "/candidate/codex", signature: "initial-runner", source: "manual" as const };
+  const resolve = vi.spyOn(discovery, "resolveBinary").mockResolvedValue(binary);
+  vi.spyOn(controlledCodex, "verifyControlledCodexBinary").mockResolvedValue();
+  vi.spyOn(discovery, "probeVersion").mockResolvedValue("0.187.2");
+  const audit = vi.spyOn(codexIsolation, "checkCodexIsolation").mockResolvedValue();
+  const auth = vi.spyOn(discovery, "probeAuth").mockResolvedValue({ status: "signed-out", billing: "unknown" });
+  expect(await service.status("codex-cli")).toMatchObject({ version: "0.187.2", auth: { status: "signed-out" } });
+  expect(await service.status("codex-cli")).toMatchObject({ version: "0.187.2" });
+  expect(audit).toHaveBeenCalledOnce();
+  expect(auth).toHaveBeenCalledOnce();
+
+  resolve.mockResolvedValue({ ...binary, signature: "changed-runner" });
+  const failure = new AgentRuntimeCompatibilityError("Unexpected native tool", "controlled Codex tool isolation");
+  audit.mockRejectedValue(failure);
+  expect(await service.status("codex-cli")).toMatchObject({ auth: { status: "unknown" },
+    diagnostics: [expect.objectContaining({ message: failure.message })] });
+  expect(audit).toHaveBeenCalledTimes(2);
+  expect(auth).toHaveBeenCalledOnce();
+});
+
 it("deletes native Codex history without sign-in, model discovery or turns and retries a confirmed prior deletion", async () => {
   const { root, service } = await fixture();
   const project = { id: "history-project", storagePath: path.join(root, "project"), workspacePath: path.join(root, "project/workspace") } as ProjectState;
@@ -81,6 +194,8 @@ it("deletes native Codex history without sign-in, model discovery or turns and r
   await writeFile(session, JSON.stringify({ type: "custom", customType: "ohmygame-native-session", data: { runtime: "codex-cli", sessionId: id } }) + "\n");
   vi.spyOn(discovery, "resolveBinary").mockResolvedValue({ path: "/audited/codex", signature: "fixture", source: "manual" });
   const verify = vi.spyOn(controlledCodex, "verifyControlledCodexBinary").mockResolvedValue();
+  vi.spyOn(discovery, "probeVersion").mockResolvedValue(controlledCodex.CONTROLLED_CODEX_VERSION);
+  vi.spyOn(codexIsolation, "checkCodexIsolation").mockResolvedValue();
   const probe = vi.spyOn(discovery, "probeAuth").mockRejectedValue(new Error("No account check"));
   const models = vi.spyOn(discovery, "probeModels").mockRejectedValue(new Error("No model discovery"));
   const initialize = vi.fn(async () => {}), stop = vi.fn(async () => {});
@@ -91,7 +206,7 @@ it("deletes native Codex history without sign-in, model discovery or turns and r
   request.mockRejectedValue(Object.assign(new Error(`no rollout found for thread id ${id}`), { rpcCode: -32600 }));
   await service.removeProjectHistory(project);
   expect(request.mock.calls).toEqual([["thread/delete", { threadId: id }], ["thread/delete", { threadId: id }]]);
-  expect(initialize).toHaveBeenCalledTimes(2); expect(stop).toHaveBeenCalledTimes(2); expect(verify).toHaveBeenCalledTimes(2);
+  expect(initialize).toHaveBeenCalledTimes(2); expect(stop).toHaveBeenCalledTimes(2); expect(verify).toHaveBeenCalledOnce();
   expect(probe).not.toHaveBeenCalled(); expect(models).not.toHaveBeenCalled();
 });
 

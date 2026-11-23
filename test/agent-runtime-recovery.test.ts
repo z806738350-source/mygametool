@@ -7,8 +7,10 @@ import {
   readdir,
   readFile,
   link,
+  stat,
 } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import os from "node:os";
 import path from "node:path";
@@ -16,6 +18,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import type { ProjectState } from "../src/shared/contracts.js";
 import { NATIVE_PRIVATE_SESSION_ENTRY, removeProjectNativeHistory } from "../src/daemon/agent-runtimes/project-history.js";
+import { AgentRuntimeService } from "../src/daemon/agent-runtimes/service.js";
 import {
   approvalScope,
   canonicalPath,
@@ -57,7 +60,10 @@ async function historyFixture() {
     return Promise.all(["projects", "logs/sessions"].map(section => put(path.join(runtimes, "qoder/config", section, encoded, `${id}.jsonl`))));
   };
   const codex = (id: string) => put(path.join(runtimes, "codex-home/sessions/2026/11/12", `rollout-${id}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id, cwd: cwd("codex-cli", id) } }) + "\n");
-  return { root, runtimes, project, conversation, codexId, qoderId, put, cwd, marker, qoder, codex };
+  const qoderResult = (sessionId: string, resultUuid: string, metadata: Record<string, unknown> = {}) =>
+    put(path.join(runtimes, "qoder/config/host-actions/result-index", `${createHash("sha256").update(sessionId).digest("hex")}-${resultUuid}.json`),
+      JSON.stringify({ schemaVersion: 1, resultUuid, sessionId, ...metadata }));
+  return { root, runtimes, project, conversation, codexId, qoderId, put, cwd, marker, qoder, codex, qoderResult };
 }
 
 it("deletes only the project's native transcripts and content logs while preserving other projects and sign-in", async () => {
@@ -67,7 +73,11 @@ it("deletes only the project's native transcripts and content logs while preserv
   const qoderRun = await f.put(path.join(f.runtimes, "qoder/config/logs/runs/own-run/manifest.json"), JSON.stringify({ cwd: f.cwd("qoder-cli", f.qoderId) }));
   await f.put(path.join(path.dirname(qoderRun), "qodercli.log"), "target tool response");
   const otherId = "33333333-3333-4333-8333-333333333333";
-  const retained = [await f.codex(otherId), ...await f.qoder(otherId), await f.put(path.join(f.runtimes, "qoder/config/logs/runs/other-run/manifest.json"), JSON.stringify({ cwd: f.cwd("qoder-cli", otherId) })), await f.put(path.join(f.runtimes, "qoder/config/.auth")), await f.put(path.join(f.runtimes, "codex-home/auth.json"))];
+  const qoderResult = await f.qoderResult(f.qoderId, f.qoderId);
+  const retained = [await f.codex(otherId), ...await f.qoder(otherId), await f.qoderResult(otherId, otherId),
+    await f.qoderResult(f.qoderId, f.codexId, { sessionId: otherId }),
+    await f.qoderResult(f.qoderId, otherId, { schemaVersion: 2 }),
+    await f.put(path.join(f.runtimes, "qoder/config/logs/runs/other-run/manifest.json"), JSON.stringify({ cwd: f.cwd("qoder-cli", otherId) })), await f.put(path.join(f.runtimes, "qoder/config/.auth")), await f.put(path.join(f.runtimes, "codex-home/auth.json"))];
   const dbFile = path.join(f.runtimes, "codex-home/logs_2.sqlite");
   const db = new DatabaseSync(dbFile);
   db.exec("CREATE TABLE logs(thread_id TEXT, process_uuid TEXT, feedback_log_body TEXT)");
@@ -78,10 +88,99 @@ it("deletes only the project's native transcripts and content logs while preserv
   const remove = vi.fn(async () => {});
   await removeProjectNativeHistory(f.runtimes, f.project, remove);
   expect(remove).toHaveBeenCalledExactlyOnceWith([f.codexId], new Set([f.cwd("codex-cli", f.codexId)]));
-  for (const file of [codex, ...qoder, qoderRun]) await expect(readFile(file)).rejects.toMatchObject({ code: "ENOENT" });
+  for (const file of [codex, ...qoder, qoderRun, qoderResult]) await expect(readFile(file)).rejects.toMatchObject({ code: "ENOENT" });
   for (const file of retained) expect(await readFile(file, "utf8")).toBeTruthy();
   const result = new DatabaseSync(dbFile); expect(result.prepare("SELECT feedback_log_body FROM logs ORDER BY rowid").all()).toEqual([{ feedback_log_body: "other content" }, { feedback_log_body: "mixed diagnostic" }, { feedback_log_body: "global diagnostic" }]); result.close();
   expect(await readFile(f.conversation, "utf8")).toContain(NATIVE_PRIVATE_SESSION_ENTRY);
+});
+
+it("reclaims idle private Codex history on shutdown without losing active rows, sign-in or unrelated stores", async () => {
+  const f = await historyFixture(), home = path.join(f.runtimes, "codex-home");
+  const auth = await f.put(path.join(home, "auth.json"), "local auth fixture");
+  const create = (name: string) => {
+    const file = path.join(home, name), db = new DatabaseSync(file);
+    db.exec("PRAGMA journal_mode=WAL; CREATE TABLE history(id INTEGER PRIMARY KEY, body); INSERT INTO history VALUES(1, 'keep'), (2, zeroblob(256000)); DELETE FROM history WHERE id = 2");
+    return { file, db };
+  };
+  const history = create("thread_history_1.sqlite");
+  const busy = create("state_5.sqlite");
+  const unrelated = create("other.sqlite");
+  history.db.close();
+  busy.db.close();
+  unrelated.db.close();
+  const linked = path.join(home, "logs_2.sqlite");
+  await symlink(unrelated.file, linked);
+  const before = (await stat(history.file)).size, unrelatedBefore = await readFile(unrelated.file);
+  const busyBefore = await readFile(busy.file);
+  const writer = new DatabaseSync(busy.file);
+  try {
+    writer.exec("BEGIN IMMEDIATE");
+    await new AgentRuntimeService(f.root, () => undefined).close();
+  } finally { writer.close(); }
+  expect((await stat(history.file)).size).toBeLessThan(before);
+  const retained = new DatabaseSync(history.file, { readOnly: true });
+  try {
+    expect(retained.prepare("SELECT body FROM history").all()).toEqual([{ body: "keep" }]);
+    expect(retained.prepare("PRAGMA freelist_count").get()?.freelist_count).toBe(0);
+  } finally { retained.close(); }
+  expect(await readFile(busy.file)).toEqual(busyBefore);
+  expect(await readFile(linked)).toEqual(unrelatedBefore);
+  expect(await readFile(auth, "utf8")).toBe("local auth fixture");
+});
+
+it("rewrites deleted row bytes on used Codex pages and retries a busy database on a later shutdown", async () => {
+  const f = await historyFixture();
+  const home = path.join(f.runtimes, "codex-home");
+  await f.put(f.conversation, JSON.stringify(f.marker("codex-cli", f.codexId)));
+  await f.codex(f.codexId);
+  const state = path.join(home, "state_5.sqlite");
+  const history = path.join(home, "thread_history_1.sqlite");
+  const files = [state, history];
+  const deleted = "project-owned content on a live page";
+  for (const file of files) {
+    const db = new DatabaseSync(file);
+    try {
+      db.exec("PRAGMA journal_mode = WAL; CREATE TABLE history(id INTEGER PRIMARY KEY, body TEXT)");
+      const insert = db.prepare("INSERT INTO history (body) VALUES (?)");
+      insert.run("other project");
+      insert.run(deleted);
+    } finally {
+      db.close();
+    }
+  }
+  // Simulate the vendor's thread/delete committing and the app restarting before compaction.
+  await removeProjectNativeHistory(f.runtimes, f.project, async () => {
+    for (const file of files) {
+      const db = new DatabaseSync(file);
+      try {
+        db.exec("PRAGMA secure_delete = OFF; DELETE FROM history WHERE id = 2");
+        expect(db.prepare("PRAGMA freelist_count").get()?.freelist_count).toBe(0);
+      } finally {
+        db.close();
+      }
+      expect((await readFile(file)).includes(deleted)).toBe(true);
+    }
+  });
+  const writer = new DatabaseSync(state);
+  try {
+    writer.exec("BEGIN IMMEDIATE");
+    await new AgentRuntimeService(f.root, () => undefined).close();
+    expect((await readFile(state)).includes(deleted)).toBe(true);
+    expect((await readFile(history)).includes(deleted)).toBe(false);
+  } finally {
+    writer.close();
+  }
+  await new AgentRuntimeService(f.root, () => undefined).close();
+  for (const file of files) {
+    expect((await readFile(file)).includes(deleted)).toBe(false);
+    const db = new DatabaseSync(file, { readOnly: true });
+    try {
+      expect(db.prepare("SELECT body FROM history").all()).toEqual([{ body: "other project" }]);
+    } finally {
+      db.close();
+    }
+  }
+  expect((await readdir(home)).filter((name) => name.startsWith(".ohmygame-vacuum-"))).toEqual([]);
 });
 
 it("keeps native history on an API failure and retries without changing canonical conversation ownership", async () => {
@@ -99,10 +198,10 @@ it("finds legacy native histories by exact canonical session ID, including archi
   const f = await historyFixture();
   await f.put(f.conversation, ["codex-cli", "qoder-cli"].map(runtime => JSON.stringify({ type: "custom", customType: "ohmygame-native-session", data: { runtime, sessionId: runtime === "codex-cli" ? f.codexId : f.qoderId } })).join("\n"));
   const archived = await f.put(path.join(f.runtimes, "codex-home/archived_sessions", `rollout-${f.codexId}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id: f.codexId, cwd: f.cwd("codex-cli", f.codexId) } }) + "\n");
-  const qoder = await f.qoder(f.qoderId), remove = vi.fn(async () => {});
+  const qoder = await f.qoder(f.qoderId), result = await f.qoderResult(f.qoderId, f.codexId), remove = vi.fn(async () => {});
   await removeProjectNativeHistory(f.runtimes, f.project, remove);
   expect(remove).toHaveBeenCalledOnce();
-  for (const file of [archived, ...qoder]) await expect(readFile(file)).rejects.toMatchObject({ code: "ENOENT" });
+  for (const file of [archived, ...qoder, result]) await expect(readFile(file)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 it("refuses foreign ownership and linked native history without deleting unrelated data", async () => {

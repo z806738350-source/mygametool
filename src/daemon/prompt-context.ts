@@ -6,17 +6,33 @@ import type { PromptContext, PromptContextLabel } from "../shared/contracts.js";
  */
 const OPENING = "\n\n<editor-context>\n";
 const CLOSING = "\n</editor-context>";
-const INSTRUCTION = "The user sent this message from the editor with the context below. Treat it as what the message refers to.";
+const INSTRUCTION = "Use editor references when relevant to the user's request.";
 
 export function promptContextBlock(contexts: readonly PromptContext[], projectDesign?: string): string {
   if (!contexts.length && !projectDesign) return "";
-  return `${OPENING}${JSON.stringify({ instruction: INSTRUCTION, items: contexts, ...(projectDesign ? { projectDesign } : {}) })}${CLOSING}`;
+  return `${OPENING}${JSON.stringify({ ...(contexts.length ? { instruction: INSTRUCTION } : {}), items: contexts, ...(projectDesign ? { projectDesign } : {}) })}${CLOSING}`;
 }
 
 export function withProjectDesignContext(privateContext: string, projectDesign?: string): string {
   const { rest, block } = splitPromptContext(privateContext);
   const items: PromptContext[] = block ? JSON.parse(block.slice(OPENING.length, -CLOSING.length)).items : [];
   return `${rest}${promptContextBlock(items, projectDesign)}`;
+}
+
+/** Old versions listed every board and document on each turn. Keep that turn's main design pointer. */
+export function compactHistoricalDesignContext(privateContext: string): string {
+  const { rest, block } = splitPromptContext(privateContext);
+  const inventory = "\nCanvas workspace: canvas/AGENTS.md; index: canvas/index.json; assets: canvas/assets.json. Boards: ";
+  if (!block.includes("Canvas workspace: canvas/AGENTS.md")) return privateContext;
+  try {
+    const data = JSON.parse(block.slice(OPENING.length, -CLOSING.length));
+    if (!Array.isArray(data?.items) || typeof data.projectDesign !== "string") return privateContext;
+    const start = data.projectDesign.indexOf(inventory);
+    if (start < 0) return privateContext;
+    return `${rest}${OPENING}${JSON.stringify({ ...data, projectDesign: data.projectDesign.slice(0, start) })}${CLOSING}`;
+  } catch {
+    return privateContext;
+  }
 }
 
 /** Separates a trailing editor context block from the rest of a prompt. */

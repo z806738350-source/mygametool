@@ -1227,11 +1227,20 @@ describe("agent tools", () => {
   it("submits three WebP project views as separate PNGs and preserves all original files", async () => {
     const directory = await temporaryTestDirectory("ohmygame-agent-model-webp-");
     try {
-      const projects = new ProjectManager(directory), project = await projects.create("Turnaround", "web-game");
-      const generate = vi.fn<import("../src/daemon/model3d.js").Model3DGenerator["generate"]>().mockResolvedValue({ bytes: TEST_GLB, mediaType: "model/gltf-binary" });
-      const runner = new ToolRunner(directory, { generate: vi.fn() }, { generate });
+      const library = new AssetLibrary(directory);
+      await library.load();
+      const projects = new ProjectManager(directory, library), project = await projects.create("Turnaround", "web-game");
+      const generate = vi.fn<import("../src/daemon/model3d.js").Model3DGenerator["generate"]>().mockResolvedValue({ bytes: TEST_GLB, mediaType: "model/gltf-binary", metadata: { generation: { protocol: "tripo-v3", parameters: {} } } });
+      const runner = new ToolRunner(directory, { generate: vi.fn() }, { generate }, undefined, library);
       await runner.load();
-      const model = createAgentTools(project, runner, projects).find(tool => tool.name === "generate_3d_asset")!;
+      const review = vi.fn<NonNullable<Parameters<typeof createAgentTools>[9]>>().mockResolvedValue(undefined);
+      const reviewModel = vi.fn<NonNullable<Parameters<typeof createAgentTools>[10]>>(async assetId => {
+        const bound = await projects.blenderModelSource(project.id, assetId);
+        expect(bound.tripo).toBe(true);
+        expect(bound.bytes).toEqual(TEST_GLB);
+        return "approved";
+      });
+      const model = createAgentTools(project, runner, projects, undefined, undefined, undefined, undefined, undefined, undefined, review, reviewModel).find(tool => tool.name === "generate_3d_asset")!;
       const paths = ["front.webp", "left.webp", "back.webp"];
       const originals = await Promise.all(paths.map(async (file, index) => {
         const bytes = await sharp(referencePng({ width: 20 + index, height: 24 })).webp({ lossless: true }).toBuffer();
@@ -1239,12 +1248,23 @@ describe("agent tools", () => {
         return bytes;
       }));
       const originalCall = { imagePaths: paths, imagePath: "", sourcePath: "", options: { smartUv: false }, model: { provider: "tripo", id: "P1-20260311" } };
+      const noReviewer = createAgentTools(project, runner, projects).find(tool => tool.name === "generate_3d_asset")!;
+      await expect(noReviewer.execute("unavailable", { imagePaths: paths, options: { referenceMode: "provided-views" } }, undefined, undefined, {} as never)).rejects.toThrow("User review");
+      review.mockImplementationOnce(async () => {
+        await writeFile(path.join(project.workspacePath, paths[0]!), originals[1]!);
+      });
+      await expect(model.execute("edited-in-place", originalCall, undefined, undefined, {} as never)).rejects.toThrow("changed during review");
+      await writeFile(path.join(project.workspacePath, paths[0]!), originals[0]!);
+      expect(generate).not.toHaveBeenCalled();
       expect(model.prepareArguments!(originalCall)).toEqual({ imagePaths: paths, options: {}, model: originalCall.model });
-      await model.execute("three-webp-views", originalCall, undefined, undefined, {} as never);
+      const result = await model.execute("three-webp-views", originalCall, undefined, undefined, {} as never);
+      expect(result.details).toMatchObject({ tripoModelReview: "approved", sourceAssetId: expect.any(String), artifact: { path: expect.stringMatching(/^assets\/generated\/model-.*\.glb$/) } });
+      expect(reviewModel).toHaveBeenCalledExactlyOnceWith((result.details as { sourceAssetId: string }).sourceAssetId, undefined);
       expect(originalCall).toMatchObject({ imagePath: "", sourcePath: "", options: { smartUv: false } });
       expect(generate).toHaveBeenCalledOnce();
       const { images } = generate.mock.calls[0]![0];
       expect(images).toHaveLength(3);
+      expect(review).toHaveBeenLastCalledWith("three-webp-views", images, paths, undefined, undefined);
       for (const [index, image] of images.entries()) {
         const bytes = Buffer.from(image.data, "base64");
         expect(image.mediaType).toBe("image/png");

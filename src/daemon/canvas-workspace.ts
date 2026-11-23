@@ -6,6 +6,7 @@ import { applyCanvasNodeLayout, canvasNodeContent, canvasNodeLayout, contentNode
 import { resolveVideoMentions } from "../shared/video-references.js";
 import { chmod, lstat, readFile, rm } from "node:fs/promises";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { readWebpModelReference } from "./image-working-assets.js";
 import type { AssetCanvasNode, AssetCanvasReference, Model3DOptions, PromptImage, RunToolRequest, ToolJob, ToolId } from "../shared/contracts.js";
 import { createCanvasBoard, fitCanvasLayout, isCanvasBoard, isCanvasIndex, CANVAS_INDEX_SCHEMA, CANVAS_BOARD_SCHEMA, CANVAS_LAYOUT_SCHEMA, type CanvasBoard, type CanvasBoardDetail, type CanvasWorkspaceDetail, type CanvasWorkspaceIndex } from "../shared/canvas-workspace.js";
@@ -43,11 +44,17 @@ const PREVIOUS_CANVAS_MEDIA_WORKFLOWS = [
   "Before submitting new project media, save its generation node on the board, then call generate_canvas_media. It records history, assets and results on that node. Only register a result manually when it already exists outside the board.",
   "After each media result is saved, register its path in assets.json and add or update its board node before the next long-running step. Do not defer board writes until the final response.",
 ];
+const CANVAS_EDIT_RULE = "Consult the relevant README and schema sections when their contract is needed; read adjacent sections in one range. Batch independent replacements in one file in a single edit with edits[]. Submit independent file calls together. Run canvas_check on the completed group before using its result.";
+const PREVIOUS_CANVAS_EDIT_RULES = [
+  "Read README.md and schemas/ before changing a contract. Batch independent replacements in one file in a single edit with edits[]. Submit independent file calls together. Run canvas_check on the completed group before using its result.",
+  "Read README.md and schemas/ before changing a contract. Run canvas_check after editing.",
+];
+const CANVAS_FILE_CONTEXT = "Use the current contents of referenced files when editing. Reuse the exact relevant text visible from this turn while the file is unchanged.";
 const CANVAS_INSTRUCTIONS = `# Canvas workspace
 
 Canvas files are the source of truth in both Design and Asset Canvas. Use normal read, edit, and write tools to create and change boards, nodes, documents, and references.
 
-- Read README.md and schemas/ before changing a contract. Run canvas_check after editing.
+- ${CANVAS_EDIT_RULE}
 - index.json lists boards, documents, optional tables, and the main document. Keep IDs stable; names and titles may change.
 - boards/<id>.json contains nodes and their content. Every node may have a title and a description of its purpose. Document bodies live in documents/<id>.md, referenced by documentId. Table data lives in tables/<id>.json, referenced by tableId; register tables in index.json. Keep row/column IDs stable and match cells to their column types.
 - Publish progress incrementally: add a document node as soon as its document is created; an index entry alone does not display a node. ${CANVAS_MEDIA_WORKFLOW} Reuse existing node and asset IDs and preserve user edits.
@@ -67,7 +74,7 @@ Canvas files are the source of truth in both Design and Asset Canvas. Use normal
 - A failed or cancelled node without output does not block unrelated work. Preserve its job history and valid assets, and continue with available results. An empty preview does not prove that the provider never accepted or billed the original request. Unavailable recovery cannot authorize a replacement. Leave application-managed jobs.json and private recovery inputs unchanged.
 - If legacy jobs.json is too large to read or transfer, call canvas_initialize to compact its metadata while preserving original retry inputs. Do not truncate the history or raise source limits.
 - Removing a node or board keeps its documents, tables, and assets. Remove references to a deleted node from the same board.
-- An editor-context block identifies the current board and selected nodes. Read the referenced files before editing, and preserve other user changes.
+- An editor-context block identifies the current board and selected nodes. ${CANVAS_FILE_CONTEXT}
 `;
 const CANVAS_README = `# Canvas workspace
 
@@ -92,7 +99,10 @@ export async function ensureCanvasContract(workspace: string, replaceReadme = fa
     if (await readCanvasFile(workspace, file) !== text) await writeAtomic(workspace, file, text);
   }
   const previous = await readCanvasFile(workspace, "AGENTS.md");
-  if (previous === undefined || PREVIOUS_CANVAS_MEDIA_WORKFLOWS.some((workflow) => previous === CANVAS_INSTRUCTIONS.replace(CANVAS_MEDIA_WORKFLOW, workflow)))
+  let updated = previous?.replace("Read the referenced files before editing, and preserve other user changes.", CANVAS_FILE_CONTEXT);
+  for (const rule of PREVIOUS_CANVAS_EDIT_RULES) updated = updated?.replace(rule, CANVAS_EDIT_RULE);
+  for (const rule of PREVIOUS_CANVAS_MEDIA_WORKFLOWS) updated = updated?.replace(rule, CANVAS_MEDIA_WORKFLOW);
+  if (previous === undefined || previous !== CANVAS_INSTRUCTIONS && updated === CANVAS_INSTRUCTIONS)
     await writeAtomic(workspace, "AGENTS.md", CANVAS_INSTRUCTIONS);
   if (replaceReadme || await readCanvasFile(workspace, "README.md") === undefined)
     await writeAtomic(workspace, "README.md", CANVAS_README);
@@ -205,14 +215,15 @@ export async function inspectCanvasBoard(workspace: string, id: string): Promise
   if (board.id !== id) throw new CanvasError(`canvas/${name}: board ID does not match its file name`);
   return { detail: { board, revision: revision([text, layoutText ?? ""]) }, issues };
 }
+function canvasBoardContent({ editorLayout: _, nodes, ...content }: CanvasBoard) {
+  return { ...content, nodes: nodes.map(canvasNodeContent) };
+}
 async function writeCanvasBoard(workspace: string, board: CanvasBoard): Promise<CanvasBoardDetail> {
   if (!isCanvasBoard(board)) throw new CanvasError("Invalid canvas board");
-  const { editorLayout, ...content } = board;
-  const persisted = { ...content, nodes: board.nodes.map(canvasNodeContent) };
-  const text = `${JSON.stringify(persisted, null, 2)}\n`;
+  const text = `${JSON.stringify(canvasBoardContent(board), null, 2)}\n`;
   if (Buffer.byteLength(text) > 4 * 1024 * 1024) throw new CanvasError("Canvas board is too large");
   await writeAtomic(workspace, `boards/${validId(board.id)}.json`, text);
-  await writeJson(workspace, `editor/${board.id}.json`, editorLayout);
+  await writeJson(workspace, `editor/${board.id}.json`, board.editorLayout);
   return (await readCanvasBoard(workspace, board.id))!;
 }
 export async function canvasReferencesAsset(workspace: string, id: string, localPaths: readonly string[] = []): Promise<boolean> {
@@ -706,12 +717,13 @@ export class CanvasStore {
   async jobs(id: string): Promise<ToolJob[]> {
     return withCanvasLock(this.#project(id).workspacePath, async () => Promise.all((await this.#loadJobs(id)).map((job) => this.#publicJob(job))));
   }
-  async start(id: string, boardId: string, nodeId: string, toolId: ToolId, input: RunToolRequest, expectedRevision?: string, recoveryId?: string, imageRecoveryOnly = false, videoRecoveryOnly = false, model3DRecoveryOnly = false, confirmedAudioJobId?: string, retryJobId?: string, agentCanInspectImages?: boolean): Promise<ToolJob> {
+  async start(id: string, boardId: string, nodeId: string, toolId: ToolId, input: RunToolRequest, expectedBoard?: string | ((current: CanvasBoard) => Promise<void>), recoveryId?: string, imageRecoveryOnly = false, videoRecoveryOnly = false, model3DRecoveryOnly = false, confirmedAudioJobId?: string, retryJobId?: string, agentCanInspectImages?: boolean): Promise<ToolJob> {
     const workspace = this.#project(id).workspacePath;
     const { job, prepared } = await withCanvasLock(workspace, async () => {
       if (this.#closed) throw new CanvasError("Generation is shutting down", 503);
       const detail = await this.board(id, boardId);
-      if (expectedRevision && detail.revision !== expectedRevision) throw new CanvasError("The node settings changed before generation. Read the current board and try again.", 409);
+      if (typeof expectedBoard === "function") await expectedBoard(detail.board);
+      else if (expectedBoard && detail.revision !== expectedBoard) throw new CanvasError("The node settings changed before generation. Read the current board and try again.", 409);
       const node = detail.board.nodes.find((node) => node.id === nodeId);
       const expectedNodeType = toolId === "generate-speech" && "voiceDesign" in input && input.voiceDesign ? "voice" : ({ "generate-image": "image", "generate-video": "video", "image-to-3d": "model-3d", "animate-3d": "animate-3d", "generate-speech": "speech", "generate-sound-effect": "sound-effect", "generate-music": "music" } as Partial<Record<ToolId, string>>)[toolId];
       if (!node || !expectedNodeType || expectedNodeType !== node.type) throw new CanvasError("Generation node not found", 404);
@@ -766,13 +778,23 @@ export class CanvasStore {
     });
     const { input: _input, recoveryId: _recoveryId, ...publicJob } = job; return structuredClone(publicJob);
   }
-  async generateNode(id: string, boardId: string, nodeId: string, confirmedAudioJobId?: string, defaultReferenceMode?: Model3DOptions["referenceMode"], agentCanInspectImages?: boolean): Promise<ToolJob> {
+  async generateNode(id: string, boardId: string, nodeId: string, confirmedAudioJobId?: string, defaultReferenceMode?: Model3DOptions["referenceMode"], agentCanInspectImages?: boolean,
+    expectedToolId?: ToolId): Promise<ToolJob> {
+    const submit = await this.prepareNode(id, boardId, nodeId, confirmedAudioJobId, defaultReferenceMode, agentCanInspectImages, undefined, expectedToolId);
+    return submit();
+  }
+  /** Capture the inputs and board revision without creating a job or submitting to a provider. */
+  async prepareNode(id: string, boardId: string, nodeId: string, confirmedAudioJobId?: string, defaultReferenceMode?: Model3DOptions["referenceMode"], agentCanInspectImages?: boolean,
+    reviewViews?: (images: readonly PromptImage[], paths: readonly string[]) => Promise<void>, expectedToolId?: ToolId): Promise<() => Promise<ToolJob>> {
     const project = this.#project(id), { board, revision } = await this.board(id, boardId);
     const node = board.nodes.find((node) => node.id === nodeId);
-    const start = (toolId: ToolId, input: RunToolRequest) => this.start(id, boardId, nodeId, toolId, input, revision, undefined, false, false, false, confirmedAudioJobId, undefined, agentCanInspectImages);
+    const start = (toolId: ToolId, input: RunToolRequest, checkBoard?: (current: CanvasBoard) => Promise<void>) => {
+      if (expectedToolId && toolId !== expectedToolId) throw new CanvasError("The generation node changed type. Read the current board before generating.", 409);
+      return () => this.start(id, boardId, nodeId, toolId, input, checkBoard ?? revision, undefined, false, false, false, confirmedAudioJobId, undefined, agentCanInspectImages);
+    };
     if (!node || !["image", "video", "model-3d", "animate-3d", "speech", "voice", "sound-effect", "music"].includes(node.type)) throw new CanvasError("Choose a media generation node");
     const latest = await withCanvasLock(project.workspacePath, async () => (await this.#loadJobs(id)).find((job) => job.context?.boardId === boardId && job.context.nodeId === nodeId));
-    if (latest?.run && (latest.status === "failed" || latest.status === "cancelled")) return this.retry(id, latest.id);
+    if (latest?.run && (latest.status === "failed" || latest.status === "cancelled")) return () => this.retry(id, latest.id);
     const manifest = await readCanvasAssets(project.workspacePath);
     const assetId = (reference: Parameters<typeof resolveAssetCanvasAssetId>[1]): string => {
       const id = resolveAssetCanvasAssetId(board.nodes, reference);
@@ -806,7 +828,20 @@ export class CanvasStore {
       const images: PromptImage[] = [];
       for (const reference of node.data.images) images.push(await image(reference));
       const options = operation === "image" && defaultReferenceMode ? { referenceMode: defaultReferenceMode, ...node.data.options } : node.data.options;
-      return start("image-to-3d", { ...buildModel3DToolRequest(node.data, images, operation), operation, ...(prompt ? { prompt } : {}), ...(node.data.source ? { sourceAssetId: assetId(node.data.source) } : {}), ...(options ? { options } : {}) });
+      const request = { ...buildModel3DToolRequest(node.data, images, operation), operation, ...(prompt ? { prompt } : {}), ...(node.data.source ? { sourceAssetId: assetId(node.data.source) } : {}), ...(options ? { options } : {}) };
+      if (reviewViews && operation === "image" && images.length >= 3) {
+        await this.tools.assertMediaInputOptions("image-to-3d", await this.tools.prepare("image-to-3d", request, id, agentCanInspectImages));
+        const sourceIds = node.data.images.map(assetId);
+        const paths = sourceIds.map(sourceId => manifest.assets[sourceId]!.path);
+        await reviewViews(images, paths);
+        return start("image-to-3d", request, async current => {
+          const currentAssets = await readCanvasAssets(project.workspacePath);
+          if (!isDeepStrictEqual(canvasBoardContent(board), canvasBoardContent(current)) ||
+            sourceIds.some((sourceId, index) => currentAssets.assets[sourceId]?.path !== paths[index]))
+            throw toolPreflightError("Canvas settings or references changed during review. Show the current views and request approval again. No generation was submitted.", "approval_required");
+        });
+      }
+      return start("image-to-3d", request);
     }
     if (node.type === "voice") {
       if (!node.data.description.trim() || !node.data.sampleText.trim()) throw new CanvasError("Describe the voice and add sample text before generating", 400);

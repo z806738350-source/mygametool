@@ -10,8 +10,9 @@ import { createLocalModelRuntime, LocalApiKeyStore } from "../src/daemon/local-m
 import { kunpoRuntimeProvider } from "../src/daemon/provider-model-settings.js";
 import { createApp } from "../src/daemon/app.js";
 import { CheckpointStore, checkpointDirectory } from "../src/daemon/checkpoints.js";
+import { ConversationImageStore } from "../src/daemon/conversation-images.js";
 import { ProjectManager } from "../src/daemon/projects.js";
-import type { ProjectState } from "../src/shared/contracts.js";
+import type { ConversationDetail, ProjectState } from "../src/shared/contracts.js";
 import { durablePublicationDirectory, savePublicationManifest } from "../src/daemon/isolated-publication-journal.js";
 import type { IsolatedSourceReview } from "../src/shared/execution-storage.js";
 import type { ExecutionCapacityReport } from "../src/daemon/execution-capacity.js";
@@ -466,6 +467,35 @@ it("keeps an unconfigured local project deletion independent of a VM", async () 
   expect(execution.storageOverview).not.toHaveBeenCalled();
 });
 
+it("keeps project responses out of the browser disk cache and removes their conversation images", async () => {
+  const { app, project, directory } = await fixture(undefined, false);
+  const cache = path.join(directory, "cache", "conversation-images");
+  const images = new ConversationImageStore(cache);
+  const data = await sharp({ create: { width: 2, height: 2, channels: 3, background: "orange" } }).png().toBuffer();
+  const reference = images.project(project.id, { mediaType: "image/png", data: data.toString("base64") });
+  await images.flush();
+  for (const url of ["/projects", `/projects/${project.id}`, `/projects/${project.id}/conversations`, reference.url!]) {
+    const response = await app.inject({ method: "GET", url });
+    expect(response.statusCode, url).toBe(200);
+    expect(response.headers["cache-control"], url).toBe("no-store");
+    if (url === reference.url) expect(response.rawPayload).toEqual(data);
+  }
+  const remove = ConversationImageStore.prototype.removeProject;
+  const whileDeleting = vi.spyOn(ConversationImageStore.prototype, "removeProject").mockImplementation(async function (this: ConversationImageStore, id) {
+    await remove.call(this, id);
+    // A conversation read can still be projecting images after deletion drains its writes.
+    expect(this.project(id, { mediaType: "image/png", data: data.toString("base64") }).url).toBeUndefined();
+    await this.flush(id);
+  });
+  cleanups.push(async () => { whileDeleting.mockRestore(); });
+  expect((await app.inject({ method: "DELETE", url: `/projects/${project.id}` })).statusCode).toBe(204);
+  expect(whileDeleting).toHaveBeenCalledOnce();
+  expect(await readdir(cache)).toEqual([]);
+  const deleted = await app.inject({ method: "GET", url: reference.url! });
+  expect(deleted.statusCode).toBe(404);
+  expect(deleted.headers["cache-control"]).toBe("no-store");
+});
+
 it.each([
   ["RECOVERY_REQUIRED", false],
   ["DELETE_UNCERTAIN", true],
@@ -740,6 +770,8 @@ it("lets the main Agent request preparation and a trusted v2 approval without pu
 
 it.each(["allow", "deny"] as const)("uses trusted UI %s for a legacy batch and never accepts an Agent assertion instead of code confirmation", async decision => {
   let finished = false, outcome: unknown;
+  const legacyRequestId = `call_${"a".repeat(24)}|fc_${"b".repeat(48)}:12345678-0000-4000-8000-123456789abc`;
+  const providerCallId = decision === "allow" ? legacyRequestId : "c".repeat(1_025);
   const session = vi.spyOn(agentRuntime, "createPiSession").mockImplementation(async (_project, _manager, registered, _runtime, _model, _agentDir, _mcp, _transport, _snapshot, mutate) => ({
     messages: [], abort: async () => {}, dispose: () => {}, subscribe: () => () => {},
     getAllTools: () => registered!.map(tool => ({ name: tool.name })),
@@ -752,7 +784,7 @@ it.each(["allow", "deny"] as const)("uses trusted UI %s for a legacy batch and n
       await expect(generation.execute("blocked-preparation", {} as never, undefined, undefined, {} as never)).rejects.toThrow("awaits trusted user confirmation");
       const canvasGeneration = registered!.find(tool => tool.name === "generate_canvas_media")! as import("../src/daemon/agent-auto-continue.js").RecoverableTool;
       await expect(canvasGeneration.recoverAfterHttp500!("blocked-continuation", {} as never, undefined, undefined, {} as never)).rejects.toThrow("awaits trusted user confirmation");
-      try { outcome = await tool.execute("adopt-call", { action: "adopt", reviewId: "a".repeat(64) }, undefined, undefined, {} as never); }
+      try { outcome = await tool.execute(providerCallId, { action: "adopt", reviewId: "a".repeat(64) }, undefined, undefined, {} as never); }
       catch (error) { outcome = error; }
       finished = true;
     },
@@ -771,7 +803,20 @@ it.each(["allow", "deny"] as const)("uses trusted UI %s for a legacy batch and n
   execution.inspectSource.mockRejectedValue(new Error("The existing source workspace is unavailable; no volume was mounted"));
   const conversation = (await app.inject({ method: "POST", url: `/projects/${project.id}/conversations`, payload: {} })).json();
   expect((await app.inject({ method: "POST", url: `/projects/${project.id}/conversations/${conversation.id}/turns`, payload: { prompt: "Review retained changes without assuming approval" } })).statusCode).toBe(202);
-  const url = `/projects/${project.id}/conversations/${conversation.id}/approvals/adopt-call`;
+  const chat = `/projects/${project.id}/conversations/${conversation.id}`;
+  const requestId = await vi.waitFor(async () => {
+    const { turns } = (await app.inject({ url: chat })).json<ConversationDetail>();
+    const card = turns.flatMap(turn => turn.items).find(item => item.type === "approvalRequest" && item.status === "inProgress");
+    if (card?.type !== "approvalRequest") throw new Error("Waiting for retained source review");
+    return card.requestId;
+  });
+  if (decision === "allow") expect(requestId).toBe(providerCallId);
+  else expect(requestId).toMatch(/^[a-f0-9-]{36}$/);
+  const suffix = `/approvals/${encodeURIComponent(requestId)}`, url = chat + suffix;
+  const other = (await app.inject({ method: "POST", url: `/projects/${project.id}/conversations`, payload: {} })).json();
+  expect((await app.inject({ method: "POST", url: `/projects/${project.id}/conversations/${other.id}${suffix}`, payload: { decision: "deny" } })).statusCode).toBe(409);
+  for (const [length, status] of [[1_024, 409], [1_025, 400]] as const)
+    expect((await app.inject({ method: "POST", url: `${chat}/approvals/${"x".repeat(length)}`, payload: { decision } })).statusCode).toBe(status);
   await vi.waitFor(async () => {
     const refused = await app.inject({ method: "POST", url, payload: { decision: "allow" } });
     expect(refused.statusCode).toBe(409);
@@ -786,6 +831,7 @@ it.each(["allow", "deny"] as const)("uses trusted UI %s for a legacy batch and n
   expect(execution.recoverSource).not.toHaveBeenCalled();
   const response = await app.inject({ method: "POST", url, payload: { decision, ...(decision === "allow" ? { sourceConfirmation: { reviewId: review.reviewId, filesReviewed: true, codeReviewed: true } } : {}) } });
   expect(response.statusCode, response.body).toBe(204);
+  expect((await app.inject({ method: "POST", url, payload: { decision: "deny" } })).statusCode).toBe(409);
   await vi.waitFor(() => expect(finished).toBe(true));
   if (decision === "allow") {
     expect(legacy.approveSourceReview).toHaveBeenCalledOnce();

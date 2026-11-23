@@ -29,8 +29,9 @@ let spawnProcess: typeof spawn = spawn;
 /** Every CLI process the daemon has running, so shutting down can wait for all of them to stop. */
 const live = new Set<AgentProcess>();
 
-export async function stopAgentProcesses(): Promise<void> {
+export async function stopAgentProcesses(): Promise<boolean> {
   await Promise.allSettled([...live].map((child) => child.stop()));
+  return live.size === 0;
 }
 
 /** Tests replace the spawner with a fake CLI. */

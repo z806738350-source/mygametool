@@ -209,6 +209,7 @@ export class AgentMediaRecovery {
     operation: (receipt: Receipt, save: (update: Partial<Receipt>) => Promise<void>) => Promise<T>,
     dismissOnError: (cause: unknown) => boolean | Promise<boolean> = () => false,
     additionalPaidRequest?: string,
+    beforeNewSubmission?: () => Promise<void>,
   ): Promise<T> {
     const directory = await this.directory(call, recoveryId);
     const file = path.join(directory, recoveryId + ".json");
@@ -241,9 +242,14 @@ export class AgentMediaRecovery {
               : previous ? `Use recover_media with the original tool and recoverCallId ${JSON.stringify(previous.callId)}` : "Check the original Canvas job before authorizing a replacement";
           throw new Error(`A previous media request may already have been billed. ${action}. No new generation was sent.`);
         }
-        if (approved.size) {
+        // While the user reviews artwork, the in-memory call lock prevents reentry.
+        // A crash here must not leave a durable claim that a paid task was attempted.
+        await beforeNewSubmission?.();
+        if (approved.size || beforeNewSubmission) {
           const stillPending = new Set(await readdir(directory));
           if ([...approved.keys()].some((prior) => !stillPending.has(path.basename(prior)) || this.active.has(prior))) throw new Error("The previous media request changed during confirmation. Check the existing result before starting another generation.");
+          if (beforeNewSubmission && [...stillPending].some(name => name.endsWith(".json") && !this.creating.has(path.join(directory, name)) && !approved.has(path.join(directory, name))))
+            throw new Error("A new unresolved media request appeared during review. Check its outcome before starting another generation.");
         }
       }
       const receipt: Receipt = existing ? await this.read(target) : { callId: call.callId };

@@ -277,7 +277,7 @@ async function initialized(frame) {
     type: "system",
     subtype: "init",
     apiKeySource: "none",
-    qodercli_version: "1.1.83",
+    qodercli_version: model === "fixture-newer-compatible" ? "1.1.84" : "1.1.83",
     protocol_version: "1.5.0",
     cwd,
     tools: mode,

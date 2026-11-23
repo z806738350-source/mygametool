@@ -115,15 +115,16 @@ describe("ModelSelector interaction", () => {
     expect(trigger.textContent).not.toContain("gpt-5.6-sol");
   });
 
-  it("explains the Kunpo Fable text-only and project tools restrictions", async () => {
-    const textOnly = { ...model, provider: "kunpo", providerName: "KunpoAPI", id: "claude-fable-5-2", name: "claude-fable-5-2" };
-    await act(async () => root.render(<ModelSelector models={[textOnly]} value={textOnly} onChange={() => {}} onReasoningChange={() => {}} />));
-    const trigger = container.querySelector<HTMLButtonElement>(".model-selector-trigger")!;
-    expect(trigger.title).toContain("supports text chat only");
-    await act(async () => trigger.click());
+  it.each(["claude-fable-5-2", "gpt-6.2-astra"])("offers %s in a chat with image history and project tools", async (id) => {
+    const vision = { ...model, provider: "kunpo", providerName: "KunpoAPI", id, name: id };
+    const onChange = vi.fn();
+    await act(async () => root.render(<ModelSelector models={[vision]} hasImageHistory onChange={onChange} onReasoningChange={() => {}} />));
+    await act(async () => container.querySelector<HTMLButtonElement>(".model-selector-trigger")!.click());
+    expect(document.querySelector('[role="status"]')).toBeNull();
     const option = document.querySelector<HTMLButtonElement>('[role="menuitemradio"]')!;
-    expect(option.title).toContain("run project tools");
-    expect(option.disabled).toBe(false);
+    expect(option.title).toContain("project tools enabled for this chat");
+    await act(async () => option.click());
+    expect(onChange).toHaveBeenCalledWith(vision, "medium");
   });
 
   it("warns about image history before delegating the model change to the server preflight", async () => {
@@ -164,7 +165,7 @@ describe("ModelSelector interaction", () => {
     expect(onChange).toHaveBeenCalledExactlyOnceWith("ready");
   });
 
-  it("offers Fable and keeps a previously saved retired project choice unavailable", async () => {
+  it("offers Fable and Astra and keeps a previously saved retired project choice unavailable", async () => {
     const project = { id: "project", modelSelections: { agent: { provider: "kunpo", id: "gemini-3.8-flash" } } } as ProjectState;
     const saved = vi.fn();
     await act(async () => root.render(<ProjectMediaModelSettings project={project} onSaved={saved} />));
@@ -177,7 +178,11 @@ describe("ModelSelector interaction", () => {
     expect(pending.disabled).toBe(true);
     expect(pending.textContent).toContain("Unavailable");
     const options = [...document.querySelectorAll<HTMLButtonElement>('[role="option"]')];
-    expect(options.find(button => button.textContent?.includes("claude-fable-5-2"))?.title).toContain("supports text chat only");
+    for (const id of ["claude-fable-5-2", "gpt-6.2-astra"]) {
+      const option = options.find(button => button.textContent === id)!;
+      expect(option.disabled).toBe(false);
+      expect(option.title).toContain("project tools enabled for this chat");
+    }
     await act(async () => pending.click());
     expect(saved).not.toHaveBeenCalled();
     expect(agent.textContent).toContain("gemini-3.8-flash");

@@ -103,6 +103,8 @@ defaults.
 | `POST /agent-runtimes/:id/login`                          | Return the CLI's login URL or terminal command                                 |
 | `POST /projects/:p/conversations/:c/approvals/:requestId` | Answer a pending approval                                                      |
 
+Submit the opaque `requestId` from the active approval card, URL-encoded. The approval endpoint accepts up to 1,024 decoded characters to accommodate existing compound provider IDs. The daemon issues a local UUID for longer IDs and for every new turnaround review. A decision applies once in its originating project and conversation.
+
 Discovery is lazy; Pi requests do not wait for it. An explicit executable wins.
 Otherwise choose the newest installed SemVer among PATH, login-shell PATH,
 common install directories, and known bundled copies. Resolve the executable
@@ -111,6 +113,55 @@ bounded, expire failed results, honor Recheck, and discard in-flight catalog
 results after configuration changes. Paginated native catalogs must be read
 completely. A successful model listing is not proof of account entitlement;
 billing/auth sources that cannot be established remain unknown.
+
+## What a follow-up sends
+
+The built-in Agent uses Pi. Each question keeps the user's conversation and
+explicit references. OhMyGame supplies short project instructions, with
+specialized directions available through `read_workflow_guide`. Pi sends a stable
+catalog of currently authorized tools, with compact parameter schemas for
+specialist tools. Including these schemas costs extra input on the first request.
+An exact `tool_search` query returns one tool's full instructions in the result.
+Searches preserve the catalog across calls and follow-ups. Changing permissions
+or entering planning mode updates which tools are available.
+
+After a completed Pi turn, the host uses Pi's branch-local `context_edit`
+entries for long text from successful reads and other selected observations.
+Unsigned file writes and edits can also use excerpts for their long text
+arguments. Each excerpt carries a reference for `recall_tool_text`, which
+pages through the original on the same branch. Raw messages remain available
+for the timeline and recovery. Existing conversations receive the same policy
+when reopened with a tool-capable Pi model. Ongoing work, signed content,
+mixed image results, errors, approvals and paid operation receipts keep their
+original representation. Pi's standard context compaction still handles its
+model window. Excerpt creation makes no model call.
+
+On a later user turn, Pi can shorten successful project file reads from completed
+work and group the references for successful, unsigned file saves whose paths
+remain visible. The references stay in an earlier tool result. Use
+`recall_tool_text` for the original file contents or saved arguments in the active
+branch projection, and `read` for the current file on disk. The full timeline,
+visual evidence, production receipts and the current turn remain intact.
+
+After a checked Blender export is presented on the Canvas and the user starts a
+new turn, Kunpo Astra carries forward the user messages, final answers, source
+inspection and delivery receipts. That includes source measurements used to
+answer factual follow-ups about the retained model. Completed local Blender
+steps from preparation through production are available through a paged
+`recall_tool_text` index on the delivery receipt. It links to retained tool
+arguments, text results and `recall_image` IDs. The handoff also shortens
+local preparation from an earlier interrupted three-view review, preserving
+the inspection and failure records. The active turn uses its own visual
+evidence, and the original session records stay available on the same branch.
+
+To measure these changes against a recorded Kunpo Astra task, see the
+[offline replay guide](diagnostics.md#offline-comparison-with-a-kunpo-usage-export).
+
+Codex and Qoder use their own model sessions. On a live continuation the host
+supplies newly available image IDs. After a context rebuild it supplies a bounded
+handoff and the recent image references. The Agent can also use `recall_image`
+without an ID to list references. Native history and provider caching still
+affect the input usage reported for those sessions.
 
 ## Shared transcript and native context
 
@@ -121,6 +172,12 @@ An optional interface property for Pi test doubles does not make production
 native persistence optional.
 
 Native messages/tool results are display and recovery records in that file.
+Project deletion also removes the matching Qoder result index and private
+session files. Qoder SDK logs follow their private session or probe directory.
+After a project-owned Codex thread is deleted and the controlled CLI has
+stopped, normal shutdown checkpoints and rewrites its private history stores.
+This also clears deleted records from pages that still hold live rows. If a
+store is busy, shutdown leaves the cleanup pending for the next normal exit.
 Adapters must not reconstruct native hidden context or promise lossless replay
 into another runtime. Native compaction and terminal approval decisions use
 versioned custom entries when ordinary messages do not represent them.

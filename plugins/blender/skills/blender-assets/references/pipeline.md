@@ -1,28 +1,89 @@
-# Repeatable Blender stages
+# Blender stages and delivery
 
-The bundled pipeline builds measured primitive props and explicitly described
-humanoid rigs. The main Agent authors and revises the JSON and any custom
-Blender Python needed for anatomy, garment separation, topology or animation.
-Keep the original references, Tripo GLB, stage sources, the Agent's observations
-and any user decisions. Existing models do not require another Tripo request.
+Use this reference to configure source intake, measured parts, mesh cleanup
+and final export. Keep the source identity, stage files, observations and user
+decisions in the project's asset document.
+
+## Review the initial Tripo model
+
+Once the generated model is saved, let the user inspect and rotate it on the
+initial-model review card. Continue to the first Blender stage only after their
+approval of that exact original. If the result was already saved or the review
+was interrupted, reopen it with `review_tripo_model` and its `sourceAssetId`.
+For an unavailable FBX preview, use `get_model_asset` with `rebuildPreview`
+and reopen the review. The original remains saved.
+
+When the user requests changes, wait for their feedback and adjust the proposal
+or source views. If a revision requires a new paid Tripo submission, obtain the
+user's authorization. Present the revised initial model for its own approval.
+Use the approved original for Blender and keep the later matched static and
+final reviews.
+
+## Production brief and source
+
+Supply `brief` on the first production `run_blender` call. Set `goal` to the
+intended use and `visualCriteria` to features that can actually be checked.
+Select `route: "tripo"` with the already generated project's `sourceAssetId`,
+`"existing"` with the selected project-bound asset or a supported project
+source file, or `"procedural"` for fresh construction with `parts` or `custom`.
+For a Tripo original use the bundled `inspect`, `clean` or `export` as its
+first stage. The retained scene is then available for custom refinement.
+Save the returned run ID. The next stage inherits the brief through the
+unchanged `scene.blend` returned by the previous run in the same workflow.
+The returned `sourceOriginal` identifies a bound original by asset ID, file
+format and SHA-256 digest throughout those stages. Record these with the
+candidate so a later revision can be traced back to the same original.
+Keep diagnostics separate from production candidates.
+
+For example, a static prop's brief might be:
+
+```json
+{
+  "goal": "Prepare the selected ceramic lantern for an overhead game camera.",
+  "route": "tripo",
+  "visualCriteria": [
+    "The arched handle stays clear of the neck in the front and oblique views.",
+    "The painted blue band wraps around the body with a continuous seam."
+  ],
+  "requireTextures": true
+}
+```
+
+Set `requireTextures` for an actual texture-map requirement, and `maxTriangles`
+for an agreed triangle budget. Set `brief.topologyPolicy: "watertight"` when
+the final mesh must be closed. Set `topologyPolicy: "watertight"` in the stage
+configuration to measure boundaries as you work. The brief's requirement also
+applies at final presentation. A flat-color asset can use material factors.
+Set `requireRig` for a requested skin, and `requiredClips` to the exact
+case-sensitive action names called for in the brief. A door rotating around
+an object pivot can require an action without requiring a skinned mesh.
+The host checks brief requirements against the actual GLB. Optionally list extra
+case-sensitive `requiredClips` in the export configuration to verify those as
+well (for example `{"requiredClips":["Open","Close"]}`).
 
 ## Invocation and outputs
 
 Use the registered `blender_status`, `run_blender` and `recover_blender_run`
-tools. A stage takes `configPath`, a prior `sourcePath` except for `parts`, and
-explicit additional `inputs` if required. These paths are project-relative.
+tools. Bundled stages take `configPath`. Select the initial source as described
+above and use the retained `sourcePath` for later stages. Declare extra project
+files in `inputs`. Custom stages use `scriptPath` and may also take a configuration.
 The host stages them into a private task directory and starts its bundled
 `scripts/pipeline.py`. Do not copy an executable or install a plugin.
+The runner allows 64 MiB per file and 128 MiB each for total inputs and total
+outputs. For an oversized source, retain the original and report the measured
+size and limit. A paid regeneration does not repair a local staging failure.
 
 The underlying script accepts:
 
 ```text
---stage parts|clean|joints|rig|animate|export
+--stage inspect|parts|clean|joints|rig|animate|export
 --config config.json
-[--input source.glb|source.blend]
+[--input source.glb|source.fbx|source.blend]
 --input-dir INPUT_DIRECTORY
 --output-dir EMPTY_OUTPUT_DIRECTORY
 ```
+
+Bundled `animate` is for upright bipeds. To author legless or multi-legged locomotion, use `run_blender` with `stage: "custom"`.
 
 Paths after `--config`/`--input` are relative to the input directory. Inputs are
 never saved over. The output directory must be empty. Every successful stage
@@ -31,113 +92,50 @@ saves `scene.blend` and `report.json`. Modeling stages add a roundtrip-checked
 come from the saved scene, excluding temporary joint markers and render helpers.
 Animation previews include the clips for actual playback. Keep using the returned
 source path, not a guessed filename.
-An interrupted stage is not permission to discard its earlier outputs.
 
-`report.technicalChecksPassed` describes only the checks actually recorded.
-The report's `humanReview: "pending"` means the script has recorded no human
-approval. The Agent continues intermediate work after inspecting the evidence.
-A process can finish successfully with failed technical checks. Read them before continuing.
-Missing information or unsupported data produces an error report. Set
-`previews:false` only for a repeat of an already inspected technical check;
-visual checks need actual images. `run_blender` retains stage outputs internally
-by default. The Agent reads the reports, joint overlays, stress poses and motion
-evidence at the returned paths and repairs defects before proceeding.
-To show the checked candidate, call `recover_blender_run` on its `runId` with
-`reviewPresentation: "final"` and the current `boardId` when known. Use
-`reviewPresentation: "checkpoint"` to show progress on request or show the evidence
-for a choice only the user can make. A progress request allows work to continue.
-Wait if the user explicitly requests approval before proceeding, or if proceeding
-would settle an open design choice, visibly change the reference, require an
-unauthorized additional charge, or trade an unresolved defect for a design change.
-For example, show the walking pose where the boot still passes through the coat.
-Explain the options and ask “Would you like to keep this version, or shorten the
-coat so the boot clears it?” Wait before changing the coat. Fix ordinary defects
-and check the result independently.
-Reuse the returned nodes. The model viewer supports rotation, zoom, play/pause and
-clip selection. Ask for final user acceptance on the exact candidate presented.
+Recover an interrupted stage with `recover_blender_run` and its original `runId`.
+The host retains authoring runs under `assets/blender/<workflow>/runs/<runId>/`,
+outside the isolated Linux command workspace. Use `read` or `read_project_file`
+for `report.json`, `rig.json`, recipes and renders. For computed checks, declare
+the evidence files in a diagnostic `run_blender` call's `inputs`.
 
-When `blender_status.liveWorkWindow` is true, the desktop opens a movable,
-resizable Blender work window for each running task and closes it automatically
-on completion or cancellation. A separate observer loads copies of the worker's
-current scene at checkpoints. These are intermediate production scenes, not
-commands executed through that window or a recording played after completion.
-Native operations such as remeshing, weight solving or baking can leave the last
-scene visible until control returns to the script and it reaches a checkpoint.
-Observation warnings do not change the production outcome: retain the run and
-its outputs rather than rerunning or buying a replacement. The user reviews
-the final candidate on the Canvas.
-
-The shipped baseline has been exercised with Blender 5.3. Its ordinary Python
-uses Blender's `bpy`, `bmesh` and `mathutils`, with no external Python packages.
-Preview rendering uses CPU Cycles. Custom scripts must follow the tool's same
-input/output boundary, disable automatic blend-file execution, pack textures,
-and explicitly save their `.blend` with `bpy.ops.wm.save_as_mainfile(filepath=..., compress=False)`
-(the publisher validates an ordinary `BLENDER` file header, not a compressed wrapper).
-Custom scripts can `import pipeline` and `import export_glb` to reuse these helpers;
-the host preserves the exact executed sources in `recipe/` alongside each result.
-Use this argument setup in custom scripts. Blender's `--` separator is present in
-`sys.argv`; passing the whole argument list to `argparse` hides the options.
-Inputs keep their project-relative subdirectories, so use the supplied `--input`
-instead of searching only the root input directory:
-
-```python
-import argparse
-import sys
-from pathlib import Path
-import bpy
-from live_preview import checkpoint
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--input-dir", required=True)
-parser.add_argument("--output-dir", required=True)
-parser.add_argument("--input")
-parser.add_argument("--config")
-args = parser.parse_args(sys.argv[sys.argv.index("--") + 1:])
-inputs = Path(args.input_dir)
-output = Path(args.output_dir)
-if args.input:
-    bpy.ops.wm.open_mainfile(filepath=str(inputs / args.input))  # .blend input
-    checkpoint("Loaded source", force=True)
-# Read only declared inputs. Write results only below output.
-```
-
-Call `checkpoint("Describe the completed operation")` after meaningful scene
-changes such as creating a part, cleaning a mesh, adjusting weights, posing a
-stress test or baking a clip. Use `checkpoint("Finished scene", force=True)`
-after saving the final result. Ordinary calls are limited to once per second;
-`force=True` is for initial and final scenes. Do not sleep to make work look
-longer, start another Blender process, or write observer files yourself. The
-helper does nothing when the host has not enabled observation. It saves a packed
-copy without changing the source filepath; a snapshot error disables further
-updates and reports a warning without stopping production. Live copies are
-temporary observation data, not additional deliverables in `report.outputs`.
-
-A confirmed script failure returns its retained run ID, failure status and log;
-it does not approve or publish partial files. Fix the script/configuration and
-make a new call. Repeating the original call returns its original outcome.
-For an unknown or interrupted delivery, inspect/recover that exact retained run
-before starting new work. Never recreate a Tripo initial model to fix a local error.
-The runner is responsible for process and
-file isolation; Python argument validation is not a sandbox.
+Read `report.technicalChecksPassed` and the individual checks. A completed
+process may report failed checks. `humanReview: "pending"` means the script has
+recorded no human approval. The default `reviewPresentation: "internal"` keeps
+intermediate Blender runs off the board. Set `previews:false` only when repeating
+a previously inspected technical check.
 
 ## Shared settings
 
-Coordinates inside `.blend` and the configuration are **meters, +Z up, -Y
-forward, +X toward the character's left**. glTF export performs its own axis
-conversion. Do not add another export rotation.
+The bundled views use Blender world coordinates, with +Z up and a front camera
+on −Y. Inspect the actual facing and dimensions after import. Configuration
+distances are in meters. glTF export performs its own axis conversion.
 
 | Setting                           | Meaning                                                               |
 | --------------------------------- | --------------------------------------------------------------------- |
 | `triangleBudget`                  | Positive triangle count; reports failure when exceeded.               |
-| `previews`                        | Default `true`; saves stage-specific front/side PNGs.                 |
+| `previews`                        | Default `true`. Asset views cover front, side, back and three-quarter angles. Joint, region, stress and walk views use front and side. |
 | `previewSize`                     | Square PNG size, default 384, allowed 64–1024.                        |
+| `topologyPolicy`                  | `inspect` (default) reports boundary edges. Use `watertight` when zero boundaries are required or `allow-open` for intentionally open edges. |
 | `allowedNonManifoldInteriorEdges` | Default 0. Only raise for a specifically reviewed topology exception. |
 | `allowedDegenerateFaces`          | Default 0. Prefer repairing these faces.                              |
 
-Boundary edges are reported separately: open garment borders and glTF UV/normal
-seams can be intentional. A count alone cannot tell a hole from a seam. Interior
+Boundary edges include open garment borders and split glTF UV/normal seams.
+Compare source and output before deciding whether a hole needs repair. Interior
 nonmanifold edges and degenerate faces fail the default check. Do not raise a
 threshold merely to make a check green.
+
+## Inspect the original
+
+Use `inspect` with an empty configuration to inventory imported geometry and
+capture the asset from four angles. The report records part parents and world
+pivots, armatures and bone counts, actions and material texture use. It preserves
+the incoming scene and produces an editable `scene.blend`, a `review.glb` and
+review evidence. Inspect pivots or object hierarchies in the scene where relevant.
+Continue from that saved scene to repair selected features, including when the
+asset is already rigged. A completed intake can record a failed roundtrip or
+topology check. Use the recorded defect and saved scene to guide the repair.
+A source that already meets the brief can go to export.
 
 ## Parts: dimensions before geometry
 
@@ -177,12 +175,16 @@ The report measures the assembled bounds, triangle counts, materials and
 topology. It does not infer whether the pieces are mechanically attached.
 Inspect the renders and compare them with the dimensions and reference.
 
-## Clean: preserve the original, normalize a copy
+## Clean a static copy
 
-`clean` accepts a static self-contained GLB or unrigged `.blend`. It refuses
+`clean` accepts a static GLB, FBX or unrigged `.blend`. It refuses
 existing armatures or animation because normalization could invalidate them.
 Shape keys and unapplied modifiers also need explicit handling on a separate
-copy. Shared mesh instances become single-user before their transforms are baked.
+copy. By default it keeps coordinates, hierarchy, pivots, shared mesh data and
+authored normals. It records incoming geometry in `report.sourceGeometry` and
+companion source and candidate images in `report.sourcePreviews` and
+`report.previews`. Compare `source-front.png` with `review-front.png` and do
+the same for `side`, `back` and `three-quarter`.
 Linked Blender libraries and external textures outside declared inputs are
 rejected. A `.blend` output packs its images.
 
@@ -197,14 +199,16 @@ rejected. A `.blend` output packs its images.
 }
 ```
 
-`yawDegrees` rotates around Blender Z before normalization. Inspect semantic
-front; do not infer it from a bounding box. The default 0 leaves facing as-is.
-`height` scales uniformly, centers horizontal bounds, and puts the lowest mesh
-point at Z=0. The feet may still need a different floor if a cape extends below
-them. `mergeDistance` merges nearby vertices within each object, default
-0.00001 m; set 0 to disable it. UVs and material assignments are retained.
-The routine recalculates normals and reports topology; it does not fill holes,
-separate fused clothing, or repair all connectivity defects.
+Supplying `height` or `yawDegrees` enables normalization. The stage optionally
+rotates around Blender Z, optionally scales uniformly to the target height, then
+centers horizontal bounds and puts the lowest mesh point at Z=0. It transforms
+each asset root while preserving its hierarchy. Inspect semantic front in the
+references and decide whether the lowest point is the intended contact point.
+Omit both settings to keep coordinates and origins in place. Welding uses an
+explicit world-space `mergeDistance` in meters (default 0). Use
+`recalculateNormals:true` when surface normals need repair. Topology-changing
+operations can make an instance's mesh single-user. Verify UVs, material
+assignments and documented seams on the revised asset.
 
 `decimate:true` explicitly enables proportional collapse reduction toward the
 triangle budget. It can distort UVs and silhouette; inspect the result and never
@@ -212,213 +216,145 @@ treat retaining texture images as proof of visual parity. Texture baking and
 retopology need a dedicated custom script. With `decimate:false`, exceeding the
 budget fails the check and leaves a recoverable copy.
 
-## Joints and regions: explicit anatomical input
+Compare the original and candidate with matched framing at game-camera scale.
+Check silhouette, negative space, material boundaries, seam continuity, texel
+density and shading in neutral light. Inspect wireframe where topology or
+deformation matters. Check pivots, seams between modules or moving-part
+clearance where the brief calls for them. Repeat the affected views or
+measurements after each repair.
 
-Run `joints` on the normalized `scene.blend`. `joints` is a dictionary of named
-XYZ positions. Each bone names its head/tail joints and optional parent; parents
-must form a valid acyclic hierarchy. Optional `rollDegrees` controls its local
-axes. Optional `deform:false` is for control bones. Coordinate estimates must
-be corrected against the actual front/side render, not copied blindly.
+### Static comparison for Tripo assets
 
-This minimal skeleton illustrates naming and structure; it is **not** a fitted
-human template. Add the actual clavicles, arms, hands, fingers, neck and garment
-bones required by the model before rigging it.
+After retopology or reduction, run bundled `static-review` on the retained
+editable scene using the same Tripo workflow. Keep this comparison internal.
+The stage compares the editable scene with the bound original before the asset
+needs to export or have clips. The final bundled `export` repeats the
+comparison against the reimported GLB.
 
-```json
-{
-  "joints": {
-    "hips": [0, 0, 0.9],
-    "spine": [0, 0, 1.1],
-    "chest": [0, 0, 1.4],
-    "neck": [0, 0, 1.5],
-    "head": [0, 0, 1.75],
-    "hip.L": [0.11, 0, 0.9],
-    "knee.L": [0.11, -0.035, 0.48],
-    "ankle.L": [0.11, 0, 0.09],
-    "toe.L": [0.11, -0.18, 0.06],
-    "hip.R": [-0.11, 0, 0.9],
-    "knee.R": [-0.11, -0.035, 0.48],
-    "ankle.R": [-0.11, 0, 0.09],
-    "toe.R": [-0.11, -0.18, 0.06]
-  },
-  "bones": [
-    { "name": "hips", "head": "hips", "tail": "spine" },
-    { "name": "spine", "head": "spine", "tail": "chest", "parent": "hips" },
-    { "name": "head", "head": "neck", "tail": "head", "parent": "spine" },
-    { "name": "thigh.L", "head": "hip.L", "tail": "knee.L", "parent": "hips" },
-    {
-      "name": "shin.L",
-      "head": "knee.L",
-      "tail": "ankle.L",
-      "parent": "thigh.L"
-    },
-    {
-      "name": "foot.L",
-      "head": "ankle.L",
-      "tail": "toe.L",
-      "parent": "shin.L"
-    },
-    { "name": "thigh.R", "head": "hip.R", "tail": "knee.R", "parent": "hips" },
-    {
-      "name": "shin.R",
-      "head": "knee.R",
-      "tail": "ankle.R",
-      "parent": "thigh.R"
-    },
-    { "name": "foot.R", "head": "ankle.R", "tail": "toe.R", "parent": "shin.R" }
-  ],
-  "weighting": "automatic",
-  "regions": [
-    {
-      "name": "belt",
-      "object": "Character",
-      "bounds": [
-        [-0.25, -0.2, 0.85],
-        [0.25, 0.2, 0.95]
-      ],
-      "weights": { "hips": 1 }
-    }
-  ],
-  "stressPoses": [
-    { "name": "head-turn", "rotations": { "head": [0, 35, 0] } },
-    {
-      "name": "step",
-      "rotations": { "thigh.L": [30, 0, 0], "shin.L": [-40, 0, 0] }
-    }
-  ]
-}
-```
+Both models are grounded and aligned to the same body height for comparison in
+rest pose, under the same orthographic camera and lighting. Set
+`staticReview.sourceYawDegrees` or `staticReview.candidateYawDegrees` in the
+configuration for either `static-review` or `export` if an asset's semantic front
+differs from Blender's −Y convention.
+Map the visible front correctly before judging quality. Use
+`staticReview.excludeCandidateMeshes` to list the exact names of independently
+made props, such as the separately counted weapon. Keep all original body,
+outfit and worn parts in the comparison.
 
-Replace `Character` with the actual name from the geometry report. A region
-matches that object, optionally an inclusive XYZ `bounds` box and/or explicit
-`vertices` indices. Without either, it covers the whole object. `weights` names
-1–4 deform bones with nonnegative weights, normalized by the script. Later
-matching rules override earlier ones. Vertex indices refer to the current
-normalized mesh and must be reconsidered after any topology change.
+Open all four `static-review-*.png` paired views and read `static-review.json`.
+Use the neutral material row to check shape, smooth shading and defined hard
+edges, and the textured row to check color, UV seams and surface detail. Use
+the report to investigate lost authored normals, sharp edge markings and
+changed texture maps. Check feature outlines and negative spaces where the
+model's overall silhouette can hide local damage. If a change is visibly worse,
+go back to the affected modeling or material step, retain the original, repair
+the candidate locally and compare the new run. A passing triangle budget does
+not settle visual quality.
 
-The joints stage produces projected joint markers on front/side images plus
-`regions-front.png` / `regions-side.png`. The report maps region names to colors
-and counts uncovered vertices. Gray means unspecified. Face colors use the
-majority of their vertices; inspect boundary triangles separately when needed.
-These colors visualize the supplied rules, **not** an automatically correct
-body/clothes classification. No regions produces an incomplete check.
+Restore geometry locally where the comparison shows a loss, and recover budget
+from flatter or hidden areas when the game view and animation permit it. Treat
+an estimated triangle target as adjustable by the smallest useful amount.
+Honor an explicit maximum. If targeted repair still cannot meet both that cap
+and the visual brief, retain the best candidates and show the trade-off with
+their measured counts so the user can decide whether to raise the maximum.
+If a repair adds triangles, give the before and after counts, the affected
+areas and the reason in the delivery message. Count independently modeled
+props separately.
 
-## Rig: inspect deformation, not just bone count
+## Checkpoints and early decisions
 
-Use the same reviewed joint/region configuration with `rig`.
-
-- `weighting:"regions"` (default) requires explicit rules to cover every vertex.
-- `weighting:"automatic"` first uses Blender bone heat, then applies the rules.
-  Bone heat can fail on disconnected or fused geometry. Failure is not permission
-  to use a new paid rigging service or claim a partial binding is complete.
-- Actual deform influences are pruned to four per vertex and renormalized.
-  The report counts unweighted and non-normalized vertices.
-- `stressPoses` maps bone names to local Euler rotations in degrees. Include
-  arm-up, arm-forward, step and head-turn poses for a humanoid, with the actual
-  bone names/axes. Each pose produces its own front/side render and worst edge
-  stretch ratio/mesh/vertex indices. `maximumEdgeStretch` defaults to 2.
-- Missing stress poses marks rig checks incomplete. A pass does not prove the
-  silhouette, clothing separation, joint collapse or anatomy are acceptable.
-
-Fused sleeves/capes may need mesh separation, retopology and explicit garment
-bones before they can deform well. Those are model-specific custom edits.
-Preserve the previous stage and compare the changed mesh and stress images with it.
-
-## Animate: a measured two-leg baseline
-
-`animate` accepts exactly one unanimated armature from the rig stage. It refuses
-to overwrite clips. It adds `Idle` and `Walk`, uses two-bone leg IK with knee
-poles, bakes the result to ordinary pose/object channels, removes the constraints,
-and stashes each action separately. All clips share the same rest skeleton.
-It is an editable baseline for an upright biped facing -Y, not a general motion
-generator. Creatures, finger animation, combat and cloth motion need custom code.
-
-Add this to the same configuration, using the actual bone names:
-
-```json
-{
-  "locomotion": {
-    "hips": "hips",
-    "left": {
-      "upper": "thigh.L",
-      "lower": "shin.L",
-      "foot": "foot.L",
-      "poleAngleDegrees": -90,
-      "contactPoint": [0.11, -0.07, 0]
-    },
-    "right": {
-      "upper": "thigh.R",
-      "lower": "shin.R",
-      "foot": "foot.R",
-      "poleAngleDegrees": -90,
-      "contactPoint": [-0.11, -0.07, 0]
-    },
-    "frames": 32,
-    "fps": 24,
-    "stride": 0.24,
-    "lift": 0.07,
-    "rootMotion": false,
-    "floorZ": 0,
-    "maximumSlip": 0.015,
-    "maximumPenetration": 0.01
-  }
-}
-```
-
-Each leg must be an upper → lower → foot hierarchy. `contactPoint` is required:
-choose an actual sole point in the normalized rest coordinates, not the ankle.
-The test transforms this point by the foot's deformation matrix. The script
-also samples the lowest **deformed mesh vertex** against `floorZ`; this catches
-toe, cloth or other geometry passing below the floor. This is not a mesh/mesh
-self-intersection test. Inspect foot orientation; custom bone rolls can require
-a different `poleAngleDegrees`.
-
-The baseline uses a 60% stance phase and 40% swing, opposite legs half a cycle
-apart. `stride` is each foot's stance travel and `lift` is swing height, in meters.
-For a T-pose source, provide `locomotion.poseRotations` as a map of bone names to
-local XYZ Euler degrees for the candidate neutral posture. An optional
-`locomotion.swingRotations` map adds those angular amplitudes sinusoidally during
-Walk only. For example, a specifically checked arm axis may use
-`"poseRotations":{"upper_arm.L":[-60,0,0],"upper_arm.R":[-60,0,0]}` and
-`"swingRotations":{"upper_arm.L":[0,0,7],"upper_arm.R":[0,0,-7]}`.
-These numbers are model-specific; verify actual local bone axes and cloak
-deformation. Without these maps, the baseline leaves arms in the source rest pose.
-The report gives `travelDistance = stride / 0.6` for the full walk cycle.
-With `rootMotion:true`, the armature translates that distance along -Y. With
-`false`, it stays in place and contact slip is measured **after adding the
-declared virtual root travel**. The game must move the character at
-`travelDistance / durationSeconds` or its feet will slide relative to the world.
-Do not describe in-place raw world-foot coordinates as planted.
-
-Reports include contact slip, sole and mesh penetration, pose-loop position and
-rotation mismatch, and the expected root travel. Loop error compares poses in
-armature space so intentional root translation does not count as an error.
-Preview output shows four Walk phases from front and side. Inspect those samples
-and verify actual playback before presenting the motion for final user review.
+Each Canvas checkpoint presents the saved outputs of a completed background run.
+Use `recover_blender_run` with the retained `runId`, the current `boardId` when
+known, and `reviewPresentation: "checkpoint"` to show progress or evidence
+for a choice only the user can make. Reuse the returned nodes. Seek a decision
+before a visible departure from the reference or unapproved spending, or when a
+persistent defect calls for a design change. For example, show the walking pose
+where the boot passes through the coat and ask whether to keep its length or
+shorten it. Continue independent work while the decision is pending.
 
 ## Export and actual game delivery
 
-Run `export` with the final `.blend`. The stage saves an editable source,
+Before choosing the scene for the game, compare the working copy against the source
+at the closest intended gameplay view using the [optimization guide](optimization.md).
+Run bundled `export` with the final `.blend` from the same workflow. Use its run
+ID for final presentation, including after custom modeling or animation. The
+stage saves an editable source and
 reuses `export_glb.py` for atomic GLB export, then imports it into an empty scene.
-It compares triangle count, height, deform bone names and exact clip names.
+The default four `review-*.png` views depict that reimported candidate.
+Leave previews enabled on a run intended for final presentation.
+It compares triangle count, dimensions and world-space bounds on all three axes, deform bone names, authored actions and the
+required clip names. It also checks that used material names and their connected
+image textures survive reimport. Inspect the rendered result for UV alignment,
+correct color, roughness and normals; structural preservation cannot establish
+that the maps look right.
 Clips are shifted to begin at zero seconds so a frame-1 start does not introduce
 an extra engine pre-roll interval or change the declared locomotion speed.
-It samples imported animations and measures actual deformed-vertex movement;
-a named but static clip fails the baseline check. Blender bone-display helper
+It samples imported animation for vertex movement, including deformation, rigid
+object motion and shape-key animation. A named but static clip fails the baseline check. Blender bone-display helper
 meshes are excluded from geometry metrics.
 
-`roundtrip.runtimeReview` remains pending. Use the project's registered model
-asset tools, resolve the runtime path and load the GLB in the actual engine.
-Play every action, check texture/scale/pivot, transition between clips and test
-the configured locomotion speed. Keep the original `.blend` and reports.
+For visual evidence from arbitrary clips, add up to four unique, exact action
+names to the export configuration, for example
+`{"motionReviewClips":["Open","Close"]}`. Keep previews enabled. Every
+requested clip must exist. Check `checks.roundtrip.missingMotionReviewClips`
+and the pass result. In `checks.roundtrip.playback`, the selected clip's
+`motionReview` lists three chronological `{frame, file}` entries from the
+reimported animation. Open the returned three-quarter PNGs, which use numeric
+filenames such as `motion-01-01-three-quarter.png`. `report.previews` still
+lists the four asset views. Use the sampled poses to inspect clearance,
+silhouette or deformation. Check timing, transitions and in-between motion
+during playback. For a multi-legged gait, inspect each foot through stance,
+swing and the loop seam as described in [rigging and animation](rig-animation.md#locomotion-on-four-six-or-eight-legs).
+For an authored [weapon action](rig-animation.md#weapon-actions), inspect the
+intended contact or release interval on this GLB. Use a custom check for those
+frames when the generic samples miss them. Include the relevant frames and
+observed orientation in the final review.
+The export's vertex-displacement check can pass when only one limb moves.
+
+`roundtrip.runtimeReview` remains pending until the candidate is tested in the
+game. Resolve `get_model_asset` and its `runtimePath` for game integration.
+Check orientation, scale, pivots, materials, clip transitions and locomotion
+speed in the target engine using `game_use` when available. For an asset-only
+project, identify which checks still require a game scene. Keep the editable
+`.blend` and reports.
 
 This workflow's primary runtime output is GLB. Additional FBX export is possible
 through custom Blender code, but the project's static FBX preview converter
 does not validate rigged FBX. Do not replace the GLB roundtrip/game check with
 an FBX file-exists check.
 
+Read the technical report and open the images from this export run. If the
+model cannot see their pixels, leave the visual criteria unverified and
+present a checkpoint for human review. Final presentation needs one GLB, its
+editable scene, passing checks and the requested deliverables. Use
+`recover_blender_run` with this `runId`, the current `boardId` when known,
+`reviewPresentation: "final"` and a `visualReview` containing the filenames seen
+and one observation string. The lantern example might produce the following
+observations.
+
+```json
+{
+  "views": ["review-front.png", "review-three-quarter.png", "review-back.png"],
+  "observations": "The handle clears the neck in the front and oblique views. The blue band meets under the hinge in the back view."
+}
+```
+
+Use the actual filenames and findings from this run. In the user's language,
+invite them to rotate the Canvas model and play any requested clips. Ask for final user acceptance on the exact candidate presented.
+
+For a Tripo-derived export, include the four paired images in `visualReview.views`
+along with the relevant final stills and motion frames. Add
+`visualReview.staticReview` with `silhouette`, `normals`, `sharpEdges` and
+`textures`. Each entry has a `verdict` of `"pass"` or `"regressed"` and
+`notes` on the features you compared. Open the paired images with `read` or
+`read_project_file`, inspect the returned pixels, and request final presentation
+in a later response. A regressed verdict or an unresolved measured loss in the
+report keeps the result in internal review. Repair the affected step and open
+the new comparison before requesting final presentation.
+
 ## References
 
+- [Original workflow shared by 0xKense1](https://x.com/0xKense1/status/2118717647357395170)
 - [Blender command-line options](https://docs.blender.org/manual/en/latest/advanced/command_line/arguments.html)
 - [Blender glTF animation/export behavior](https://docs.blender.org/manual/en/5.2/addons/scene_gltf2.html)
 

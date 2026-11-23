@@ -28,6 +28,7 @@ import { CheckpointFileTooLargeError } from "../src/daemon/checkpoint-objects.js
 import {
   turnRange,
   CHECKPOINT_ENTRY,
+  TURN_END_ENTRY,
   parseStoredCheckpoint,
 } from "../src/daemon/checkpoint-extension.js";
 import { ProjectWrites } from "../src/daemon/project-writes.js";
@@ -313,6 +314,55 @@ async function fixture(
     runtime,
   };
 }
+
+it("answers a verified model count locally and preserves the answer for the next Pi turn", async () => {
+  const { project, conversation, manager, sessionManager, runtime, events, snapshot } = await fixture();
+  const runId = "c0000000-0000-4000-8000-000000000001";
+  const directory = `assets/blender/hero/runs/${runId}`;
+  const reportPath = `${directory}/report.json`, modelPath = `${directory}/model.glb`;
+  const triangles = 15_636;
+  const checkpoint = await snapshot(project);
+  const checkpointId = sessionManager.appendCustomEntry(CHECKPOINT_ENTRY, { version: 1, commit: checkpoint });
+  sessionManager.appendMessage({ role: "user", content: "Deliver the reviewed hero", timestamp: 1 });
+  sessionManager.appendMessage(assistant([{ type: "toolCall", id: "verified-delivery", name: "recover_blender_run",
+    arguments: { runId, reviewPresentation: "final" } }], "toolUse"));
+  sessionManager.appendMessage({ role: "toolResult", toolCallId: "verified-delivery", toolName: "recover_blender_run",
+    content: [], isError: false, timestamp: 2, details: { blender: { runId, workflow: "hero", stage: "export",
+      files: [reportPath, modelPath], directory, reviewPresentation: "final", presentedOnCanvas: true, technicalChecksPassed: true,
+      canvas: { boardId: "hero", nodeIds: ["delivered-model"] },
+      models: [{ assetId: "c0000000-0000-4000-8000-000000000002", originalPath: modelPath, model: { triangles } }],
+    } } });
+  sessionManager.appendMessage(assistant([{ type: "text", text: "The review candidate is ready." }]));
+  await mkdir(path.join(project.workspacePath, directory), { recursive: true });
+  const reportFile = path.join(project.workspacePath, reportPath);
+  await writeFile(reportFile, JSON.stringify({ stage: "export", geometry: { triangles }, technicalChecksPassed: true,
+    checks: { roundtrip: { passed: true, trianglesAfter: triangles } } }));
+  sessionManager.appendCustomEntry(TURN_END_ENTRY, { version: 1, checkpoint: checkpointId, commit: await snapshot(project), files: 1 });
+
+  const request = vi.fn<typeof runtime.streamSimple>(() => stream(assistant([{ type: "text", text: "Normal agent path" }])));
+  runtime.streamSimple = request;
+  const question = "最终交付的 GLB 有多少个三角面？";
+  const local = manager.prompt(project, conversation, question);
+  await expect(local.result).resolves.toBe("completed");
+  expect(request).not.toHaveBeenCalled();
+  expect(events.since(project.id).filter(event => event.turnId === local.turnId).map(event => event.type))
+    .toEqual(expect.arrayContaining(["checkpoint.created", "item.completed", "agent.completed"]));
+  const reloaded = SessionManager.open(sessionManager.getSessionFile()!);
+  expect(conversationItems(reloaded.getBranch())).toEqual(expect.arrayContaining([
+    expect.objectContaining({ type: "agentMessage", phase: "final_answer", text: expect.stringContaining("15,636") }),
+  ]));
+
+  // A changed report falls through while the saved local answer stays in the model's normal history.
+  await writeFile(reportFile, "{}");
+  await expect(manager.prompt(project, conversation, question).result).resolves.toBe("completed");
+  expect(request).toHaveBeenCalledOnce();
+  expect(request.mock.calls[0]?.[1].messages).toEqual(expect.arrayContaining([
+    expect.objectContaining({ role: "assistant", content: [expect.objectContaining({ text: expect.stringContaining("15,636") })] }),
+  ]));
+
+  await expect(manager.prompt(project, conversation, "Revise the rig and inspect its new renders.").result).resolves.toBe("completed");
+  expect(request).toHaveBeenCalledTimes(2);
+});
 
 describe("Manager interruption continuation", () => {
   async function setup(runtime: "qoder" | "codex" = "qoder", withCheckpoints = false) {

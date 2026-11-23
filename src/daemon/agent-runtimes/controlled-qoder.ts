@@ -1,11 +1,14 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, realpath } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readdir, realpath, rm } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { AgentRuntimeCompatibilityError } from "./compatibility.js";
-import type { ResolvedBinary } from "./discovery.js";
+import { compareVersions, parseVersion, versionAtLeast } from "./definitions.js";
+import { runCli, type ResolvedBinary } from "./discovery.js";
+import { verifyNativeDeveloperId } from "./native-signature.js";
 import type { AgentProcessOptions } from "./process.js";
 
 export const CONTROLLED_QODER_VERSION = "1.1.83";
@@ -29,13 +32,7 @@ const sdkRoot = path.join(
   "qoder-agent-sdk",
 );
 const sdkEntry = path.join(sdkRoot, "dist", "index.js");
-const nativeBinary = path.join(
-  repositoryRoot,
-  ".runtime",
-  "qoder-cli",
-  CONTROLLED_QODER_VERSION,
-  "qoder",
-);
+const nativeRoot = path.join(repositoryRoot, ".runtime", "qoder-cli");
 const helperEntry = path.join(
   repositoryRoot,
   "dist",
@@ -288,18 +285,71 @@ async function installationJson(
 
 export interface ControlledQoderBinary extends ResolvedBinary {
   sdkEntry: string;
-  version: typeof CONTROLLED_QODER_VERSION;
+  version: string;
 }
 
-/** Static inspection only: never run candidates, login shells, SDK imports or model requests. */
+async function managedQoderBinaries(): Promise<string[]> {
+  const directories = await readdir(nativeRoot, { withFileTypes: true }).catch(cause => {
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw cause;
+  });
+  return directories
+    .filter(entry => entry.isDirectory() && parseVersion(entry.name) === entry.name && versionAtLeast(entry.name, CONTROLLED_QODER_VERSION))
+    .sort((left, right) => compareVersions(right.name, left.name))
+    .map(release => path.join(nativeRoot, release.name, "qoder"));
+}
+
+let checkedNative: { binary: string; sha256: string; version: string } | undefined;
+
+async function qoderNativeVersion(binary: string, sha256: string): Promise<string> {
+  if (sha256 === QODER_BINARY_SHA256) return CONTROLLED_QODER_VERSION;
+  if (checkedNative?.binary === binary && checkedNative.sha256 === sha256) return checkedNative.version;
+  try {
+    await verifyNativeDeveloperId(binary, "qodercli", "T27K5A5ZWD");
+  } catch {
+    throw incompatible("The Qoder CLI publisher signature could not be verified; no CLI was started");
+  }
+  const directory = await mkdtemp(path.join(os.tmpdir(), "ohmygame-qoder-version-"));
+  try {
+    const env = await controlledQoderEnvironment(directory);
+    const { code, stdout } = await runCli("/usr/bin/sandbox-exec", [
+      "-p", "(version 1) (allow default) (deny network*)", binary, "--version",
+    ], { ...env, TMPDIR: directory }, directory);
+    const version = code === 0 ? parseVersion(stdout) : undefined;
+    if (!version || !versionAtLeast(version, CONTROLLED_QODER_VERSION))
+      throw incompatible("The signed Qoder CLI did not report a supported version in its isolated check");
+    if ((await ordinaryFile(binary, 256 * 1024 * 1024)).sha256 !== sha256)
+      throw incompatible("The signed Qoder CLI changed during its version check");
+    checkedNative = { binary, sha256, version };
+    return version;
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+/** Checks the fixed SDK and verifies the native executable before any version probe. */
 export async function resolveControlledQoder(
   override?: string,
 ): Promise<ControlledQoderBinary | undefined> {
   if (process.platform !== "darwin" || process.arch !== "arm64")
     throw incompatible(
-      "The controlled Qoder connection currently requires the audited macOS arm64 installation",
+      "The controlled Qoder connection currently requires macOS arm64",
     );
-  const binary = override || nativeBinary;
+  if (override) return resolveQoderCandidate(override, "manual");
+  let diagnostic: unknown;
+  for (const candidate of await managedQoderBinaries()) {
+    try {
+      const resolved = await resolveQoderCandidate(candidate, "common-directory");
+      if (resolved) return resolved;
+    } catch (cause) {
+      diagnostic ??= cause;
+    }
+  }
+  if (diagnostic) throw diagnostic;
+  return undefined;
+}
+
+async function resolveQoderCandidate(binary: string, source: ControlledQoderBinary["source"]): Promise<ControlledQoderBinary | undefined> {
   if (!path.isAbsolute(binary))
     throw incompatible("Qoder requires an absolute native executable path");
   try {
@@ -310,13 +360,8 @@ export async function resolveControlledQoder(
   }
   try {
     const executable = await ordinaryFile(binary, 256 * 1024 * 1024);
-    if (
-      executable.sha256 !== QODER_BINARY_SHA256 ||
-      ((await lstat(binary)).mode & 0o111) === 0
-    )
-      throw incompatible(
-        "This native Qoder executable has not passed OhMyGame's controlled-tool audit; no CLI was started",
-      );
+    if (((await lstat(binary)).mode & 0o111) === 0)
+      throw incompatible("Choose an executable native Qoder CLI");
     const manifest = await installationJson(path.join(sdkRoot, "package.json"));
     if (
       manifest.name !== "@qoder-ai/qoder-agent-sdk" ||
@@ -341,12 +386,15 @@ export async function resolveControlledQoder(
       throw incompatible(
         "The Qoder SDK entry has not passed OhMyGame's controlled-tool audit",
       );
+    const version = await qoderNativeVersion(binary, executable.sha256);
+    if (source === "common-directory" && path.basename(path.dirname(binary)) !== version)
+      throw incompatible("The managed Qoder directory does not match the verified CLI version");
     return {
       path: binary,
-      source: override ? "manual" : "common-directory",
+      source,
       signature: `${binary}:${executable.sha256}:${entry.sha256}`,
       sdkEntry,
-      version: CONTROLLED_QODER_VERSION,
+      version,
     };
   } catch (cause) {
     if (cause instanceof AgentRuntimeCompatibilityError) throw cause;

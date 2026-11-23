@@ -53,6 +53,7 @@
     "@gltf-transform/extensions": "4.5.1",
     "@silvia-odwyer/photon-node": "0.3.4",
     "@xmldom/xmldom": "0.9.12",
+    "classic-level": "3.0.0",
     "esbuild": "0.28.2",
     "fastify": "^5.12.5",
     "ignore": "7.0.8",

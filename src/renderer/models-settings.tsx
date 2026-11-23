@@ -283,7 +283,6 @@ function KunpoProviderDetail({ provider, onBack, onCompleted }: { provider: Prov
         {KUNPO_MODEL_OPTIONS.filter((model) => model.role === role).map((model) => <div className="provider-model-row" role="listitem" key={`${model.provider}/${model.id}`} aria-disabled={model.status === "pending"} title={kunpoModelHelp(model)}>
           <div className="provider-model-readonly"><span className="provider-model-copy"><strong>{model.name}</strong></span></div>
           {model.status === "pending" ? <small className="provider-model-custom">{t("kunpoModels.status.pending")}</small> : null}
-          {model.capabilities.tools === false ? <small className="provider-model-custom">{t("kunpoModels.textOnlyLabel")}</small> : null}
         </div>)}
       </div>
     </section>)}

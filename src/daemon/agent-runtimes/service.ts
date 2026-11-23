@@ -36,6 +36,7 @@ import {
   probeVersion,
   resolveBinary,
   type AuthProbe,
+  type ResolvedBinary,
 } from "./discovery.js";
 import { agentEnvironment, loginShellPath } from "./environment.js";
 import { AgentProcess, stopAgentProcesses } from "./process.js";
@@ -52,11 +53,12 @@ import { stagedSkillsRoot } from "./skills.js";
 import { ClaudeCodeDriver } from "./claude-code.js";
 import { CodexAppServer } from "./codex-app-server.js";
 import { CodexDriver } from "./codex.js";
-import { controlledCodexEnvironment, requireControlledCodexVersion, verifyControlledCodexBinary, CONTROLLED_CODEX_VERSION } from "./controlled-codex.js";
+import { codexInstallationIdentity, controlledCodexEnvironment, requireControlledCodexVersion, verifyControlledCodexBinary, CONTROLLED_CODEX_VERSION } from "./controlled-codex.js";
+import { checkCodexIsolation } from "./codex-isolation-check.js";
 import { OpenCodeDriver } from "./opencode.js";
 import { QoderConnection, QoderDriver } from "./qoder.js";
 import { controlledQoderEnvironment, resolveControlledQoder, CONTROLLED_QODER_VERSION } from "./controlled-qoder.js";
-import { NATIVE_PRIVATE_SESSION_ENTRY, removeProjectNativeHistory } from "./project-history.js";
+import { compactCodexHistory, NATIVE_PRIVATE_SESSION_ENTRY, removeProjectNativeHistory } from "./project-history.js";
 
 const STATUS_TTL_MS = 60_000;
 
@@ -127,6 +129,7 @@ export class AgentRuntimeService {
   #configurationRevisions = new Map<AgentRuntimeId, number>();
   #probes = new Map<AgentRuntimeId, ProbeCache>();
   #probing = new Map<AgentRuntimeId, Promise<ProbeCache | undefined>>();
+  #codexAudit?: { signature: string; version: Promise<string> };
   #qoderProbe?: QoderAccountProbe;
   #closed = false;
   #models = new Map<
@@ -570,7 +573,7 @@ export class AgentRuntimeService {
     await removeProjectNativeHistory(this.#root, project, async (ids) => {
       const binary = await resolveBinary("codex-cli", this.settings.get("codex-cli").binaryPath);
       if (!binary) throw new Error("The controlled Codex runtime is required to finish deleting this project's history");
-      await verifyControlledCodexBinary(binary.path);
+      await this.#verifyCodexInstallation(binary);
       const server = new CodexAppServer(binary.path, this.#root, await this.#environment("codex-cli", binary.path), {
         processDirectory: path.join(this.#root, "processes"),
       });
@@ -702,6 +705,10 @@ export class AgentRuntimeService {
       reasoningLevel: string | undefined,
     ): DriverContext => ({
       binaryPath: binary.path,
+      ...(request.runtime === "codex-cli" ? { verifyCodexInstallation: async () => {
+        const signature = await codexInstallationIdentity(binary.path);
+        await this.#verifyCodexInstallation({ ...binary, signature });
+      } } : {}),
       workspacePath: request.workspacePath,
       env,
       privateDirectory: folder.path,
@@ -765,9 +772,9 @@ export class AgentRuntimeService {
     nativeSession = new NativeCodingSession({
       runtime: request.runtime,
       // Native tool schemas and image-preparation instructions are fixed at session creation.
-      ...(request.runtime === "codex-cli" ? { contextVersion: "controlled-codex-v15" } : {}),
+      ...(request.runtime === "codex-cli" ? { contextVersion: "controlled-codex-v16" } : {}),
       // Retain the existing Skill restrictions while rebuilding older image/tool contracts.
-      ...(request.runtime === "qoder-cli" ? { contextVersion: "controlled-qoder-v14" } : {}),
+      ...(request.runtime === "qoder-cli" ? { contextVersion: "controlled-qoder-v15" } : {}),
       model: request.model,
       supportsImages,
       ...(request.reasoningLevel
@@ -854,8 +861,10 @@ export class AgentRuntimeService {
     this.#closed = true;
     this.#cancelQoderProbe();
     this.#bridges.clear();
-    await stopAgentProcesses();
+    const cliStopped = await stopAgentProcesses();
     await this.#probing.get("qoder-cli");
+    if (cliStopped && !this.#probing.has("codex-cli") && !this.#modelLoads.has("codex-cli"))
+      await compactCodexHistory(this.#root);
   }
 
   #registerBridge(
@@ -932,7 +941,7 @@ export class AgentRuntimeService {
 
   async #probe(
     id: AgentRuntimeId,
-    binary: { path: string; signature: string },
+    binary: ResolvedBinary,
     recheck: boolean,
   ): Promise<ProbeCache | undefined> {
     const cached = this.#probes.get(id);
@@ -943,7 +952,10 @@ export class AgentRuntimeService {
     )
       return cached;
     const running = this.#probing.get(id);
-    if (running) return running;
+    if (running) {
+      const result = await running;
+      return result?.signature === binary.signature ? result : this.#probe(id, binary, recheck);
+    }
     const revision = this.#revisions.get(id);
     const work = (async () => {
       const definition = AGENT_RUNTIME_DEFINITIONS[id];
@@ -951,21 +963,17 @@ export class AgentRuntimeService {
       const diagnostics: AgentRuntimeDiagnostic[] = [];
       let version: string | undefined;
       let auth: AuthProbe = { status: "unknown", billing: "unknown" };
-      try {
-        if (id === "codex-cli") await verifyControlledCodexBinary(binary.path);
-        [version, auth] = await Promise.all([
-          probeVersion(binary.path, id, env),
-          probeAuth(binary.path, id, env),
-        ]);
-      } catch (cause) {
-        diagnostics.push({
-          code: "probe-failed",
-          message: cause instanceof Error ? cause.message : String(cause),
-        });
-      }
       let requirementError: Error | undefined;
       try {
-        if (id === "codex-cli") requireControlledCodexVersion(version);
+        if (id === "codex-cli") {
+          version = await this.#verifyCodexInstallation(binary);
+          auth = await probeAuth(binary.path, id, env);
+        } else {
+          [version, auth] = await Promise.all([
+            probeVersion(binary.path, id, env),
+            probeAuth(binary.path, id, env),
+          ]);
+        }
         checkRuntimeVersionRequirement(
           id,
           version,
@@ -986,7 +994,7 @@ export class AgentRuntimeService {
             : {}),
         });
       }
-      if (!version && !diagnostics.some((item) => item.code === "probe-failed"))
+      if (!version && !requirementError)
         diagnostics.push({
           code: "probe-failed",
           message: `${definition.name} did not return a readable version`,
@@ -1012,6 +1020,34 @@ export class AgentRuntimeService {
     });
     this.#probing.set(id, work);
     return work;
+  }
+
+  #verifyCodexInstallation(binary: ResolvedBinary): Promise<string> {
+    if (this.#codexAudit?.signature === binary.signature) return this.#codexAudit.version;
+    const version = (async () => {
+      const before = await codexInstallationIdentity(binary.path);
+      await verifyControlledCodexBinary(binary.path);
+      const probes = path.join(this.#root, "probes");
+      await mkdir(probes, { recursive: true, mode: 0o700 });
+      const folder = await privateFolder(probes, "codex-cli");
+      try {
+        // The version and isolation checks use only disposable configuration.
+        const result = await probeVersion(binary.path, "codex-cli", await controlledCodexEnvironment(folder.path));
+        if (!result) throw new AgentRuntimeProbeError("Codex did not return a readable version.");
+        requireControlledCodexVersion(result);
+        await checkCodexIsolation(binary.path, folder.path);
+        if (before !== await codexInstallationIdentity(binary.path))
+          throw new AgentRuntimeCompatibilityError("The Codex installation changed during its isolation check. Check again.");
+        return result;
+      } finally {
+        await folder.remove();
+      }
+    })().catch(cause => {
+      if (this.#codexAudit?.version === version) this.#codexAudit = undefined;
+      throw cause;
+    });
+    this.#codexAudit = { signature: binary.signature, version };
+    return version;
   }
 
   #loadModels(id: AgentRuntimeId): Promise<AgentModel[]> {

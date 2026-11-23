@@ -163,6 +163,24 @@ async function ensureBuild(paths, environment, signal) {
   await writePrivateJson(path.join(paths.control, "build.json"), { version: 1, fingerprint });
 }
 
+async function compactBrowserStorage(paths) {
+  if (!(await lstat(path.join(paths.data, "project-browser-cleanup")).catch(() => undefined))) return;
+  try {
+    const { compactProjectBrowserStorage } = await import("../dist/desktop/project-browser-storage.js");
+    await compactProjectBrowserStorage(paths.data);
+  } catch {
+    console.warn("旧项目的浏览器存储清理尚未完成，原数据仍受保护，下次启动或退出将重试。");
+  }
+}
+
+export async function assertBrowserStorageRestored(paths) {
+  const live = path.join(paths.profile, "browser", "Local Storage", "leveldb");
+  const existing = (file) => lstat(file).catch((error) => { if (error.code !== "ENOENT") throw error; });
+  if (!(await existing(live + ".project-cleanup-previous"))) return;
+  if ((await existing(live))?.isDirectory() && (await existing(path.join(live, "CURRENT")))?.isFile()) return;
+  throw new Error("浏览器设置库还未恢复。已保留原数据，暂不启动新的设置库。");
+}
+
 function alive(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 1) return false;
   try { process.kill(pid, 0); return true; } catch (error) { return error.code !== "ESRCH"; }
@@ -272,9 +290,11 @@ export async function startLocal(root, action = "start") {
     await protectEnvMetadata(paths.envFile);
     const environment = launchEnvironment(paths);
     await ensureBuild(paths, environment, buildAbort.signal);
+    await compactBrowserStorage(paths);
     await writePrivateJson(path.join(paths.data, "isolated-execution.json"), { version: 1, projectsDirectory: path.join(paths.data, "projects") });
     let reuse = false, restarts = 0;
     while (!stopping) {
+      await assertBrowserStorageRestored(paths);
       const args = [paths.root, "--built-renderer", "--disable-background-networking", "--disable-component-update", "--disable-sync", "--disable-domain-reliability", "--disable-breakpad", "--no-default-browser-check", "--local-profile", paths.profile, "--local-launch-id", owner.launchId,
         ...(reuse ? ["--reuse-local-env"] : ["--local-env", paths.envFile])];
       child = spawn(path.join(paths.tools, "electron/Electron.app/Contents/MacOS/Electron"), args, { cwd: paths.root, env: environment, stdio: "ignore", detached: true });
@@ -289,6 +309,7 @@ export async function startLocal(root, action = "start") {
       const code = await childCompletion;
       state = "closing";
       await recoverOwnedVm(paths, owner);
+      await compactBrowserStorage(paths);
       if (code === 75 && !stopping && ++restarts <= 5) { reuse = true; console.log("按用户请求重启，复用本次凭据快照…"); continue; }
       if (code !== 0 && !stopping) throw new Error(`OhMyGame 已退出（代码 ${code ?? "未知"}）；没有自动重试模型请求。`);
       break;

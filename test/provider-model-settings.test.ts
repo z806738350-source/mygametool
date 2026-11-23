@@ -174,7 +174,7 @@ describe("provider model settings", () => {
     await expect(store.addCustomModel("kunpo", { ...model, id: "meshy-7.1" })).rejects.toThrow("Meshy is disabled");
     const configured = await store.localRuntimeProviders();
     expect(configured.some(item => item.id === "old")).toBe(false);
-    expect(configured.find(item => item.id === "kunpo")?.config.models?.map(item => item.id)).toEqual(["good", "claude-fable-5-2"]);
+    expect(configured.find(item => item.id === "kunpo")?.config.models?.map(item => item.id)).toEqual(["good", "claude-fable-5-2", "gpt-6.2-astra"]);
     expect(await readFile(path.join(directory, "models.json"), "utf8")).toBe(models);
     expect(await readFile(path.join(directory, "model-visibility.json"), "utf8")).toBe(preferences);
   });
@@ -201,21 +201,45 @@ describe("provider model settings", () => {
     expect(store.isBuiltIn("kunpo")).toBe(true);
     expect((await store.customProviderCatalog()).find((provider) => provider.id === "kunpo")?.models.map((model) => model.id)).toContain("gpt-5.6-sol");
     const providers = await store.localRuntimeProviders();
-    expect(providers.find((provider) => provider.id === "kunpo")?.config.models?.map((model) => model.id)).toEqual(["gpt-5.6-sol", "claude-opus-5-5", "claude-fable-5-2"]);
+    expect(providers.find((provider) => provider.id === "kunpo")?.config.models?.map((model) => model.id)).toEqual(["gpt-5.6-sol", "claude-opus-5-5", "claude-fable-5-2", "gpt-6.2-astra"]);
     await expect(readFile(path.join(directory, "models.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     await expect(store.removeProviderSettings("kunpo", async () => {})).rejects.toThrow("built in");
   });
 
-  it("does not replace pre-existing explicit Kunpo runtime model metadata", async () => {
+  it("updates legacy Fable and Astra routes for both settings and runtime while preserving user choices", async () => {
     const { directory, store } = await fixture();
-    const text = JSON.stringify({ providers: { kunpo: { api: "openai-completions", baseUrl: "https://llm.ziy.cc/v1", models: [{
+    const existing = {
       id: "explicit-existing", name: "Existing", contextWindow: 64_000, maxTokens: 4_000, reasoning: false, input: ["text"],
-    }] } } });
+    };
+    const text = JSON.stringify({ providers: { kunpo: { name: "Kunpo", api: "openai-completions", baseUrl: "https://llm.ziy.cc", models: [
+      existing, { ...existing, id: "claude-fable-5-2", name: "My Fable" }, { ...existing, id: "gpt-6.2-astra", name: "My Astra" },
+    ] } } });
+    const preferences = JSON.stringify({ version: 1, hidden: { kunpo: ["claude-fable-5-2"] }, customProviders: { kunpo: { authentication: "api_key" } } });
+    await writeFile(path.join(directory, "model-visibility.json"), preferences);
     await writeFile(path.join(directory, "models.json"), text);
+    await store.load();
     const configured = (await store.localRuntimeProviders()).filter((provider) => provider.id === "kunpo");
     expect(configured).toHaveLength(1);
-    expect(configured[0]!.config.models?.map((model) => model.id)).toEqual(["explicit-existing", "claude-fable-5-2"]);
+    expect(configured[0]!.config.models).toMatchObject([
+      existing, { id: "claude-fable-5-2", name: "My Fable", contextWindow: 64_000, maxTokens: 4_000, api: "anthropic-messages", baseUrl: "https://llm.ziy.cc", input: ["text", "image"] },
+      { id: "gpt-6.2-astra", name: "My Astra", api: "openai-responses", baseUrl: "https://llm.ziy.cc/v1", input: ["text", "image"] },
+    ]);
+    expect(await store.customProvider("kunpo")).toMatchObject({ hiddenModelIds: ["claude-fable-5-2"], models: [
+      { id: "explicit-existing", supportsImages: false }, { id: "claude-fable-5-2", name: "My Fable", api: "anthropic-messages", supportsImages: true },
+      { id: "gpt-6.2-astra", api: "openai-responses", supportsImages: true },
+    ] });
     expect(await readFile(path.join(directory, "models.json"), "utf8")).toBe(text);
+    expect(await readFile(path.join(directory, "model-visibility.json"), "utf8")).toBe(preferences);
+  });
+
+  it("preserves alternate endpoints explicitly configured for Kunpo agent IDs", async () => {
+    const { directory, store } = await fixture();
+    const customFable = { id: "claude-fable-5-2", name: "Loopback alternative", contextWindow: 8192, maxTokens: 1024,
+      reasoning: false, input: ["text"], baseUrl: "http://127.0.0.1:11434/v1" };
+    await writeFile(path.join(directory, "models.json"), JSON.stringify({ providers: { kunpo: { name: "Kunpo", api: "openai-completions",
+      baseUrl: "https://llm.ziy.cc/v1", models: [customFable] } } }));
+    const [provider] = await store.localRuntimeProviders();
+    expect(provider!.config.models).toMatchObject([{ ...customFable, api: "openai-completions" }, { id: "gpt-6.2-astra" }]);
   });
 
   it("refuses retired Kunpo Agents from legacy models.json and preserves previous conversations", async () => {

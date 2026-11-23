@@ -2,11 +2,11 @@ import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { ResponsesTransportMode } from "../shared/contracts.js";
 import type { OpenAISessionTransport } from "./openai-session-transport.js";
 import { assertModelImageInput, localModelFetch } from "./model-network-policy.js";
-import { SessionImages, localImageError, ImageBudgetError, MODEL_REQUEST_HIGH_BYTES } from "./session-images.js";
+import { SessionImages, inlineImageScope, localImageError, ImageBudgetError, MODEL_REQUEST_HIGH_BYTES } from "./session-images.js";
 import { monitorModelRequest } from "./provider-request-monitor.js";
 
 /** Reapply persisted decisions on HTTP retries and shrink a 413 at most once. */
-function wrapInlineImageFetch(delegate: typeof fetch, images: SessionImages): typeof fetch {
+function wrapInlineImageFetch(delegate: typeof fetch, images: SessionImages, scope: string): typeof fetch {
   return async (input, init) => {
     let request = new Request(input, init);
     if (request.method !== "POST" || !request.headers.get("content-type")?.includes("application/json")) return delegate(request);
@@ -16,15 +16,21 @@ function wrapInlineImageFetch(delegate: typeof fetch, images: SessionImages): ty
     }
     const body = await request.clone().text();
     const payload: unknown = JSON.parse(body);
-    try { images.budget(payload, "inline"); }
+    try { images.budget(payload, scope); }
     catch (error) { if (error instanceof ImageBudgetError) return localImageError(error); throw error; }
+    const outgoing = images.withPreviousToolImages(payload, scope);
     const headers = new Headers(request.headers); headers.delete("content-length");
-    request = new Request(request, { headers, body: JSON.stringify(payload) });
+    request = new Request(request, { headers, body: JSON.stringify(outgoing.payload) });
     const response = await delegate(request);
-    if (response.status !== 413) return response;
+    if (response.status !== 413) {
+      if (response.ok) outgoing.commit();
+      return response;
+    }
     request.signal.throwIfAborted();
     try {
-      images.budget(payload, "inline", true);
+      outgoing.discard();
+      // Retry with the original visual working set if optional history alone can be dropped.
+      if (outgoing.payload === payload) images.budget(payload, scope, true);
       await response.body?.cancel();
       const reduced = await delegate(new Request(request, { body: JSON.stringify(payload), redirect: "error" }));
       if (reduced.status !== 413) return reduced;
@@ -55,7 +61,7 @@ export function installSessionImageRequests(session: AgentSession, images: Sessi
       ...requestOptions,
       transport: "sse",
       signal: requestOptions?.signal ? AbortSignal.any([requestOptions.signal, lifetime.signal]) : lifetime.signal,
-      fetch: wrapInlineImageFetch(delegate, images),
+      fetch: wrapInlineImageFetch(delegate, images, inlineImageScope(model)),
     });
   }, requestOptions?.signal ? AbortSignal.any([requestOptions.signal, lifetime.signal]) : lifetime.signal);
 }

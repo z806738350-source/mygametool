@@ -751,6 +751,10 @@ function diagnosticText(
     case "invalid-executable":
       return t("codingAgents.diagnostic.invalidExecutable");
     case "runtime-incompatible":
+      if (agent.id === "codex-cli" && diagnostic.capability === "controlled Codex executable")
+        return t("codingAgents.diagnostic.codexExecutableUnaudited");
+      if (agent.id === "codex-cli" && diagnostic.capability === "controlled Codex Code Mode runner")
+        return t("codingAgents.diagnostic.codexRunnerUnaudited");
       if (
         agent.id === "codex-cli" &&
         diagnostic.capability === "Windows sandbox filesystem read restrictions"

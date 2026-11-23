@@ -1,17 +1,15 @@
-import { mkdir } from "node:fs/promises";
-import { createReadStream } from "node:fs";
-import { createHash } from "node:crypto";
+import { lstat, mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { AgentProcessOptions } from "./process.js";
 import { AgentRuntimeCompatibilityError } from "./compatibility.js";
+import { verifyNativeDeveloperId } from "./native-signature.js";
+import { versionAtLeast } from "./definitions.js";
 
-// The native tool inventory is version-specific. Re-audit against a mock model before widening this.
-export const CONTROLLED_CODEX_VERSION = "0.167.0-alpha.4.1";
+const MINIMUM_CODEX_VERSION = "0.167.0-alpha.4.1";
+/** Display reference. New signed versions must pass the same runtime checks. */
+export const CONTROLLED_CODEX_VERSION = "0.169.1";
 export const CODEX_TOOL_NAMESPACE = "ohmygame";
-const CONTROLLED_CODEX_SHA256 =
-  "7cb8700a47be3c81bb3c5efbf2d2adc716ce3db4806e9dc992f2925f78b2b194";
-const CONTROLLED_CODEX_HOST_SHA256 =
-  "1cf6ad4fa020d5d7165a62d18b0e1673204a5985b693f22c2b890ac02a6822ba";
+export const CODEX_AUDIT_PROVIDER = "ohmygame_isolation_fixture";
 export const CODEX_CONTROLLED_CONFIG: Record<string, unknown> = {
   model_provider: "openai",
   cli_auth_credentials_store: "file",
@@ -81,49 +79,57 @@ export async function controlledCodexEnvironment(
   };
 }
 
-export function requireControlledCodexVersion(version?: string): void {
-  if (process.platform !== "darwin" || version !== CONTROLLED_CODEX_VERSION)
+export function requireControlledCodexVersion(version: string): void {
+  if (process.platform !== "darwin" || !versionAtLeast(version, MINIMUM_CODEX_VERSION))
     throw new AgentRuntimeCompatibilityError(
-      `The controlled Codex connection currently requires macOS and CLI ${CONTROLLED_CODEX_VERSION}. This installation has not passed its tool-isolation check.`,
+      `The controlled Codex connection requires a macOS CLI with the isolation protocol introduced in ${MINIMUM_CODEX_VERSION}.`,
       "controlled Codex tool isolation",
     );
+}
+
+function codexHost(binary: string) {
+  return path.resolve(path.dirname(binary), "../../../bin/codex-code-mode-host");
+}
+
+/** The runner can update independently of the CLI. Include both in the probe cache identity. */
+export async function codexInstallationIdentity(binary: string): Promise<string> {
+  const files = await Promise.all([binary, codexHost(binary)].map(file =>
+    lstat(file, { bigint: true }).catch(() => undefined)));
+  return JSON.stringify([binary, ...files.map(file => file
+    ? [file.dev, file.ino, file.size, file.mtimeNs, file.ctimeNs].map(String).join(":")
+    : null)]);
 }
 
 export async function verifyControlledCodexBinary(
   binary: string,
 ): Promise<void> {
-  const hash = createHash("sha256");
-  for await (const chunk of createReadStream(binary)) hash.update(chunk);
-  if (
-    process.platform !== "darwin" ||
-    hash.digest("hex") !== CONTROLLED_CODEX_SHA256
-  )
+  const before = await codexInstallationIdentity(binary);
+  try {
+    if (!(await lstat(binary)).isFile()) throw new Error();
+    await verifyNativeDeveloperId(binary, "codex", "2DC432GLL2");
+  } catch {
     throw new AgentRuntimeCompatibilityError(
-      "This executable has not passed OhMyGame's controlled Codex audit. Select the audited native executable from the ChatGPT app; shell launchers and newer binaries require a new isolation check.",
+      "OhMyGame could not verify the Codex executable's OpenAI signature. Select the native CLI from the ChatGPT or Codex app.",
       "controlled Codex executable",
     );
-  // The bundled CLI resolves its separate V8 runner from this fixed package bin directory.
-  const host = path.resolve(
-    path.dirname(binary),
-    "../../../bin/codex-code-mode-host",
-  );
-  const hostHash = createHash("sha256");
-  let hostMatches = false;
-  try {
-    for await (const chunk of createReadStream(host)) hostHash.update(chunk);
-    hostMatches = hostHash.digest("hex") === CONTROLLED_CODEX_HOST_SHA256;
-  } catch {
-    /* Missing or unreadable runners fail the same compatibility check. */
   }
-  if (!hostMatches)
+  const host = codexHost(binary);
+  try {
+    if (!(await lstat(host)).isFile()) throw new Error();
+    await verifyNativeDeveloperId(host, "codex-code-mode-host", "2DC432GLL2");
+  } catch {
     throw new AgentRuntimeCompatibilityError(
-      "This Codex Code Mode runner has not passed OhMyGame's controlled-tool audit. Restore the audited ChatGPT CLI installation before reconnecting.",
+      "OhMyGame could not verify the bundled Codex tool runner's OpenAI signature. Repair the app installation and check again.",
       "controlled Codex Code Mode runner",
     );
+  }
+  if (before !== await codexInstallationIdentity(binary))
+    throw new AgentRuntimeCompatibilityError("The Codex installation changed while it was being checked. Check again.");
 }
 
 export function requireControlledCodexConfig(
   config: Record<string, unknown> | undefined,
+  audit = false,
 ): void {
   // The built-in provider chooses its endpoint from the login mode; an API override breaks ChatGPT sign-in.
   if (config?.openai_base_url != null)
@@ -136,7 +142,7 @@ export function requireControlledCodexConfig(
       "Custom OpenAI routing is unavailable in the controlled Codex connection.",
       "controlled Codex configuration",
     );
-  for (const [key, expected] of Object.entries(CODEX_CONTROLLED_CONFIG)) {
+  for (const [key, expected] of Object.entries(codexConfig(audit))) {
     if (key === "mcp_servers") continue;
     const actual = key
       .split(".")
@@ -155,11 +161,16 @@ export function requireControlledCodexConfig(
   }
 }
 
+function codexConfig(audit: boolean) {
+  return audit ? { ...CODEX_CONTROLLED_CONFIG, model_provider: CODEX_AUDIT_PROVIDER } : CODEX_CONTROLLED_CONFIG;
+}
+
 const launches = new WeakSet<AgentProcessOptions>();
 
 /** Only this fixed app-server launch may cross the disabled arbitrary-process boundary. */
 export function controlledCodexProcess(
   options: Omit<AgentProcessOptions, "args">,
+  audit = false,
 ): AgentProcessOptions {
   if (
     !options.env.CODEX_HOME ||
@@ -171,7 +182,7 @@ export function controlledCodexProcess(
     ...options,
     args: [
       "app-server",
-      ...Object.entries(CODEX_CONTROLLED_CONFIG).flatMap(([key, value]) => [
+      ...Object.entries(codexConfig(audit)).flatMap(([key, value]) => [
         "-c",
         `${key}=${JSON.stringify(value)}`,
       ]),

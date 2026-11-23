@@ -105,6 +105,54 @@ produce four stage lines; early failures produce fewer. There is one unreference
 progress timer per active request, cleared at its terminal outcome. The normal
 log rotation and export rules below still apply.
 
+### Offline comparison with a Kunpo usage export
+
+Run the following from the checkout with its installed Pi SDK, Node and Python 3. Supply one completed, linear Kunpo Astra conversation, the matching daemon log and the provider's Chinese UTF-8 usage CSV. The first replay uses the matching historical daemon build and its dependencies. It produces a small numeric baseline for later runs.
+
+```sh
+node --import tsx scripts/replay-agent-usage.mjs \
+  --session "$SESSION_JSONL" --requests "$DAEMON_LOG" --billing "$USAGE_CSV" \
+  --baseline "$HISTORICAL_DIST" --save-baseline "$NEW_BASELINE_JSON"
+```
+
+The script pairs each bill by model, local completion time and its four token counters. It checks that the reconstructed historical input and tool definitions match each actual request's logged bytes up to a constant JSON envelope. If the provider CSV uses a different timezone, pass its UTC offset with `--billing-offset` (default `+08:00`). The supported CSV amount is USD. A missing or ambiguous match stops the run. The saved baseline contains measurements, request times and local identifiers. It can replace `$HISTORICAL_DIST` in later runs when first-use historical image bytes match the originals in the session.
+
+The candidate run applies the current tool declarations, searches, Pi tool/rule sections and image policy to the recorded decisions. Pass four USD rates per million tokens using `--rates ordinary,read,write,output` for a cost estimate. The rates must first reproduce each original charge to within two millionths of a dollar. The estimate models image pixels, text, tools, reasoning and the common prefix between adjacent requests. The report includes its calibration error on the historical requests. The original CSV gives the measured charge. Candidate cache behavior, response quality and charges require a future real run.
+
+Two options evaluate different model decisions. `--release-after 43,67` is an example using one-based **historical** request numbers. Choose successful Canvas edits where all visual review for that phase was already complete. `--batch-edits` groups compatible adjacent edits only after running the sequential and batched forms against complete source evidence in a temporary directory and comparing the final bytes. The cost model keeps the entire original output budget for combined edits. Each scenario checks first-use images and the complete comparison sets supplied after `inspect_3d_views` for order, media type and byte equality. `--rows` adds step-level numeric results. The script makes no network requests.
+
+With `--batch-edits`, these additional offline scenarios can be compared individually and together:
+
+- `--reuse-reads` tests which recorded text reads were already available in the Pi context, and which adjacent schema pages could have been read together. A visual decision displaced by a text read must still receive the same images.
+- `--diagnostic-guide` models stage-specific Blender instructions for an identified 2D design phase. The full guide remains the reference for 3D work.
+- `--image-capabilities` models requesting the image-model catalog alone during an image-only phase.
+
+The repeat-read scenario also reports a second cost estimate using the original request numbers. The primary estimate carries the cache cost of the first skipped request over to the next retained decision. Both estimates depend on upstream cache behavior.
+
+Add `--save-run` to the combined scenario to compare separate saves and Blender runs with Pi batches on the same production declarations. It runs the current file tools in a temporary workspace, reads the checked-out workflow guides and scopes the recorded image catalog through the production capability tool. It compares each eligible script and input to the files staged by the original job and checks its session, call ID, request and completion record. Keep the original project workspace and its sibling private Blender jobs directory alongside the session for this comparison.
+
+The paired replay retains the original file and Blender receipts, checks every run's next visual inspection and compares the image bytes at the combined decisions. The production file tool supplies the saved version for the host's reuse check. The estimate allocates all recorded output tokens, including those for the separate run decisions, to the retained requests. `--prior-report` adds the previous estimate after matching its original measurements to the same session.
+
+For example, use the following for a two-phase image task. Supply the artifacts from the same session, its billed rates, and the historical decision numbers where visual release is appropriate.
+
+```sh
+node --import tsx scripts/replay-agent-usage.mjs \
+  --session "$SESSION_JSONL" --requests "$DAEMON_LOG" --billing "$USAGE_CSV" \
+  --baseline "$BASELINE_JSON" --prior-report "$PRIOR_REPORT" \
+  --rates "$RATES" --release-after "$REVIEWED_STEPS" --batch-edits --reuse-reads \
+  --diagnostic-guide --image-capabilities --save-run
+```
+
+The report's `currentProduction.separate` and `currentProduction.samePiBatch` fields give the controlled comparison. Cache counts are modeled to the nearest token and USD estimates are reported to six decimal places. The `reproduction` field records the local command arguments and working directory. Keep this report with the private diagnostics.
+
+Add `--cache-audit` to the same command for per-request cache analysis. The `currentProduction.samePiBatch.cacheAudit` section reports the retained request ordinal and original step, bill-matched estimate, first exposure of exact image bytes, repeated images, formal visual comparisons, and the first serialized input item that diverged from the previous request. It separates previously identical text, images and tool schemas outside that shared prefix. The provider does not report cache writes by content. The weighted suffix and signed calibration difference explain how much the reconstruction can assign to sources. A cost for a request containing an image includes its other inputs.
+
+The production comparison uses the same Pi completed-turn projection and bounded-image policy as the runtime. It serializes each request with the installed Pi adapter and locally commits its image state after the recorded successful request. It checks the existing visual evidence in order, compares the complete formal inspection sets byte for byte, and verifies that current user input, completed handoffs and production receipts survive the file-history projection. The original model decisions and output token counts are held fixed.
+
+To compare the implementation with an earlier 4 MiB forecast, add `--cache-audit --compare-4mib "$PREVIOUS_CACHE_AUDIT_JSON"` to the combined replay. Supply the earlier full cache audit containing the role-preserving 4 MiB scenario. The replay matches its billed session and rates, then checks the original sequence, serialized sizes and image counts of the control requests. `deliveredContextComparison` gives the archived control, forecast and current implementation, including cache reads/writes, estimated USD, cumulative/peak request bytes and image-block occurrences. `currentProduction.samePiBatch.deliveredContext` records per-step image retention, verified recovery of the omitted original file data, and where the implementation differs from the forecast.
+
+Optional `--visual-layout` and `--text-layout` measure alternative layouts against the pre-retention control in `layoutExperimentsBeforeRetention`. These experiments use the offline serializer. Review each scenario's image, context, size and handoff checks before interpreting its cost. The report includes sensitivity to the assumed provider cache behavior. Its local identifiers and reproduction paths belong with private evidence.
+
 ## Redaction and rotation
 
 Each line is timestamped and redacted before it is written

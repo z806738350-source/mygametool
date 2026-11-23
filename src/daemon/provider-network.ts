@@ -10,21 +10,49 @@ export const PROVIDER_SSE_IDLE_TIMEOUT_MS = 180_000;
 export const PROVIDER_REQUEST_LIMIT_BYTES = 128 * 1024 * 1024;
 export const PROVIDER_REQUEST_INSPECTION_TIMEOUT_MS = 30_000;
 
-/** Never retain a raw transport cause: it may include credential-bearing URLs. */
+const transportCategories = {
+  ENOTFOUND: "dns", EAI_AGAIN: "dns",
+  ECONNREFUSED: "connection", ECONNRESET: "connection", EPIPE: "connection", UND_ERR_SOCKET: "connection",
+  ENETUNREACH: "connection", EHOSTUNREACH: "connection",
+  CERT_HAS_EXPIRED: "connection", CERT_NOT_YET_VALID: "connection", DEPTH_ZERO_SELF_SIGNED_CERT: "connection",
+  SELF_SIGNED_CERT_IN_CHAIN: "connection", UNABLE_TO_VERIFY_LEAF_SIGNATURE: "connection",
+  UNABLE_TO_GET_ISSUER_CERT_LOCALLY: "connection", ERR_TLS_CERT_ALTNAME_INVALID: "connection",
+  ETIMEDOUT: "timeout", UND_ERR_CONNECT_TIMEOUT: "timeout", UND_ERR_HEADERS_TIMEOUT: "timeout", UND_ERR_BODY_TIMEOUT: "timeout",
+  ABORT_ERR: "cancelled",
+} as const;
+type TransportCode = keyof typeof transportCategories;
+type DiagnosticCode = TransportCode | "PROVIDER_REQUEST_VALIDATION_FAILED" | "PROVIDER_RESPONSE_VALIDATION_FAILED";
+const timeoutKinds: Partial<Record<TransportCode, NonNullable<VideoRequestDiagnostic["timeoutKind"]>>> = {
+  ETIMEDOUT: "unknown", UND_ERR_CONNECT_TIMEOUT: "connect", UND_ERR_HEADERS_TIMEOUT: "headers", UND_ERR_BODY_TIMEOUT: "body",
+};
+
+/** SDKs read code and cause, but a raw transport cause may include credential-bearing URLs. */
 export class ProviderRequestError extends Error {
-  constructor(message: string, readonly category: "timeout" | "dns" | "connection" | "cancelled" | "local-policy" | "unknown", readonly timeoutKind?: VideoRequestDiagnostic["timeoutKind"]) { super(message); }
+  constructor(
+    message: string,
+    readonly category: "timeout" | "dns" | "connection" | "cancelled" | "local-policy" | "unknown",
+    readonly timeoutKind?: VideoRequestDiagnostic["timeoutKind"],
+    readonly code?: DiagnosticCode,
+  ) { super(message); }
 }
 
-function transportDiagnostic(cause: unknown): Pick<ProviderRequestError, "category" | "timeoutKind"> {
-  for (let depth = 0; depth < 3 && cause && typeof cause === "object"; depth++) {
-    if (cause instanceof ProviderRequestError) return { category: cause.category, ...(cause.timeoutKind ? { timeoutKind: cause.timeoutKind } : {}) };
-    const error = cause as { code?: unknown; name?: unknown; cause?: unknown };
-    const timeouts: Record<string, NonNullable<ProviderRequestError["timeoutKind"]>> = { ETIMEDOUT: "unknown", UND_ERR_CONNECT_TIMEOUT: "connect", UND_ERR_HEADERS_TIMEOUT: "headers", UND_ERR_BODY_TIMEOUT: "body" };
-    if (typeof error.code === "string" && Object.hasOwn(timeouts, error.code)) return { category: "timeout", timeoutKind: timeouts[error.code] };
-    if (["ENOTFOUND", "EAI_AGAIN"].includes(String(error.code))) return { category: "dns" };
-    if (["ECONNRESET", "ECONNREFUSED", "EPIPE", "UND_ERR_SOCKET"].includes(String(error.code))) return { category: "connection" };
-    if (error.name === "AbortError" || error.code === "ABORT_ERR") return { category: "cancelled" };
-    cause = error.cause;
+function transportDiagnostic(cause: unknown): Pick<ProviderRequestError, "category" | "timeoutKind" | "code"> {
+  const pending = [cause];
+  const seen = new Set<object>();
+  // Native fetch can nest an AggregateError when several addresses fail to connect.
+  for (let i = 0; i < pending.length && i < 16; i++) {
+    const current = pending[i];
+    if (!current || typeof current !== "object" || seen.has(current)) continue;
+    seen.add(current);
+    if (current instanceof ProviderRequestError) return current;
+    const error = current as { code?: unknown; name?: unknown; cause?: unknown };
+    if (typeof error.code === "string" && Object.hasOwn(transportCategories, error.code)) {
+      const code = error.code as TransportCode;
+      return { code, category: transportCategories[code], timeoutKind: timeoutKinds[code] };
+    }
+    if (error.name === "AbortError") return { category: "cancelled", code: "ABORT_ERR" };
+    if (error.cause) pending.push(error.cause);
+    if (current instanceof AggregateError) pending.push(...current.errors.slice(0, 8));
   }
   return { category: "unknown" };
 }
@@ -42,7 +70,7 @@ export function providerCredentialValues(apiKey = "", values?: HeadersInit): str
 
 export function assertProviderBytes<T extends Uint8Array>(bytes: T, credentials: readonly string[]): T {
   const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  if (credentials.filter(Boolean).some((secret) => buffer.includes(Buffer.from(secret)))) throw new Error("Provider returned credential data");
+  if (credentials.filter(Boolean).some((secret) => buffer.includes(Buffer.from(secret)))) throw new ProviderRequestError("Provider returned credential data", "local-policy", undefined, "PROVIDER_RESPONSE_VALIDATION_FAILED");
   return bytes;
 }
 
@@ -60,7 +88,7 @@ export function guardedProviderFetch(request: typeof fetch = fetch): typeof fetc
         ? headerInput.map(([name, value]): [string, string] => [name, value]) : { ...headerInput };
       const secrets = providerCredentialValues("", headers);
       for (const secret of secrets) registerSensitiveValue(secret);
-      if (containsKnownSensitiveValue(target.href)) throw new Error("Provider request URL contains credential data");
+      if (containsKnownSensitiveValue(target.href)) throw new ProviderRequestError("Provider request URL contains credential data", "local-policy", undefined, "PROVIDER_REQUEST_VALIDATION_FAILED");
       const upstream = new AbortController();
       const signal = callerSignal ? AbortSignal.any([callerSignal, upstream.signal]) : upstream.signal;
       // Inspect before opening the transport. A streaming scan while forwarding
@@ -70,13 +98,21 @@ export function guardedProviderFetch(request: typeof fetch = fetch): typeof fetc
       catch (cause) {
         const message = cause instanceof Error ? cause.message : "";
         throw new ProviderRequestError(callerSignal?.aborted ? "Provider request cancelled" : /^Provider request (?:contains credential data|exceeded the secure (?:size|inspection time) limit|body cannot be safely inspected)$/.test(message)
-          ? message : "Provider request body could not be safely verified", callerSignal?.aborted ? "cancelled" : "local-policy");
+          ? message : "Provider request body could not be safely verified", callerSignal?.aborted ? "cancelled" : "local-policy", undefined,
+          callerSignal?.aborted ? "ABORT_ERR" : "PROVIDER_REQUEST_VALIDATION_FAILED");
       }
       const started = performance.now();
       const requestBytes = typeof body === "string" || body instanceof URLSearchParams ? Buffer.byteLength(String(body)) : ArrayBuffer.isView(body) ? body.byteLength : body instanceof Blob ? body.size : undefined;
       trace.sending(requestBytes);
+      let response: Response;
       try {
-        const response = await request(input instanceof Request ? input : target.href, { ...init, headers: outboundHeaders, ...(body === undefined ? {} : { body }), signal, redirect: "error" });
+        response = await request(input instanceof Request ? input : target.href, { ...init, headers: outboundHeaders, ...(body === undefined ? {} : { body }), signal, redirect: "error" });
+      } catch (cause) {
+        if (callerSignal?.aborted) throw new ProviderRequestError("Provider request cancelled", "cancelled", undefined, "ABORT_ERR");
+        const diagnostic = transportDiagnostic(cause);
+        throw new ProviderRequestError("Could not reach the configured provider", diagnostic.category, diagnostic.timeoutKind, diagnostic.code);
+      }
+      try {
         const responseHeadersMs = Math.round(performance.now() - started);
         trace.headers(response.status, safeProviderRequestId(response.headers.get("x-request-id"), secrets) ?? safeProviderRequestId(response.headers.get("request-id"), secrets));
         const checked = await redactProviderResponse(response, secrets, { signal, abort: () => upstream.abort() }, trace);
@@ -89,14 +125,16 @@ export function guardedProviderFetch(request: typeof fetch = fetch): typeof fetc
             requestBytes, responseHeadersMs })); } catch { /* Logging must not change a request's outcome. */ }
         }
         return checked;
-      }
-      catch (cause) {
-        const diagnostic = callerSignal?.aborted ? { category: "cancelled" as const } : transportDiagnostic(cause);
-        throw new ProviderRequestError(callerSignal?.aborted ? "Provider request cancelled" : "Could not reach the configured provider", diagnostic.category, diagnostic.timeoutKind);
+      } catch (cause) {
+        upstream.abort();
+        if (callerSignal?.aborted) throw new ProviderRequestError("Provider request cancelled", "cancelled", undefined, "ABORT_ERR");
+        const diagnostic = transportDiagnostic(cause);
+        if (diagnostic.code) throw new ProviderRequestError("Provider response interrupted", diagnostic.category, diagnostic.timeoutKind, diagnostic.code);
+        throw new ProviderRequestError("Provider response could not be safely verified", "local-policy", undefined, "PROVIDER_RESPONSE_VALIDATION_FAILED");
       }
     } catch (cause) {
       const diagnostic = transportDiagnostic(cause);
-      trace.finish(callerSignal?.aborted ? "cancelled" : !trace.submitted || diagnostic.category === "local-policy" ? "validation_error" : diagnostic.category === "timeout" ? "timeout" : "transport_error", diagnostic.category, diagnostic.timeoutKind);
+      trace.finish(callerSignal?.aborted || diagnostic.category === "cancelled" ? "cancelled" : !trace.submitted || diagnostic.category === "local-policy" ? "validation_error" : diagnostic.category === "timeout" ? "timeout" : "transport_error", diagnostic.category, diagnostic.timeoutKind, diagnostic.code);
       throw cause;
     }
   };
@@ -332,7 +370,16 @@ function publicProviderBody(body: ReadableStream<Uint8Array>, trace?: ProviderRe
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try { const next = await reader.read(); if (next.done) { if (observeRaw) { trace?.wireEnded(); trace?.validated(); } controller.close(); } else { if (observeRaw) trace?.received(next.value.byteLength); controller.enqueue(next.value); } }
-      catch (cause) { const diagnostic = transportDiagnostic(cause); trace?.finish(cause instanceof Error && cause.message === "Provider returned credential data" ? "validation_error" : diagnostic.category === "timeout" ? "timeout" : diagnostic.category === "cancelled" ? "cancelled" : "stream_interrupted", diagnostic.category, diagnostic.timeoutKind); controller.error(new ProviderRequestError("Provider response interrupted", diagnostic.category, diagnostic.timeoutKind)); }
+      catch (cause) {
+        if (cause instanceof ProviderRequestError && cause.code === "PROVIDER_RESPONSE_VALIDATION_FAILED") {
+          trace?.finish("validation_error", "local-policy", undefined, "PROVIDER_RESPONSE_VALIDATION_FAILED");
+          controller.error(new ProviderRequestError("Provider response could not be safely verified", "local-policy", undefined, "PROVIDER_RESPONSE_VALIDATION_FAILED"));
+          return;
+        }
+        const diagnostic = transportDiagnostic(cause);
+        trace?.finish(diagnostic.category === "timeout" ? "timeout" : diagnostic.category === "cancelled" ? "cancelled" : "stream_interrupted", diagnostic.category, diagnostic.timeoutKind, diagnostic.code);
+        controller.error(new ProviderRequestError("Provider response interrupted", diagnostic.category, diagnostic.timeoutKind, diagnostic.code));
+      }
     },
     cancel() { trace?.bodyCancelled(); return reader.cancel(); },
   });

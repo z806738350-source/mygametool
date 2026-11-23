@@ -8,6 +8,8 @@
 
 规划与执行时，主 Agent 都可以调用只读工具 `list_media_capabilities` 核对当前项目的媒体模型、默认选择和参数。需要联网才能更新的模型目录会标注查询状态；该工具不检查余额、提交生成或更改项目配置。指定的音频模型不可用时，可按提示使用目录里的服务商和模型 ID，或在项目已有适用默认值时省略覆盖项。
 
+制作三视图和武器设计图时传 `capability: "image"`，只查询图像目录并保留各模型的全部图像参数。设计确认后进入 Tripo 建模，再查 `"3d-generation"`。省略 `capability` 可获取原有的完整目录。
+
 Agent 的直接生成工具会在可恢复的失败中给出原调用编号。用 `recover_media` 传入原工具名和 `recoverCallId`，即可在原会话中续办。恢复需要的参考文件或服务商配置有变化时，应先还原对应输入。支持的图片结果只下载原图，视频及 3D 工作流只查询、下载已记录的任务；恢复 3D 动画不会启动未提交的收费阶段。已经下载并保存在本地的完整结果可重新写入项目。
 
 新建画布任务时，`generate_canvas_media` 只接收 `boardId` 和 `nodeId`，生成设置取自已保存的节点。恢复画布任务使用 `recover_canvas_media` 并指定原任务的 `recoverJobId`。空值、字符串 `"null"` 和 `"new"` 都不能充当编号。找不到原记录时先查会话或节点历史，另起收费任务需要用户确认。
@@ -26,7 +28,7 @@ Agent 的直接生成工具会在可恢复的失败中给出原调用编号。�
 
 | 角色 | 新项目首选 | 已提供适配的其他选择 | 当前边界 |
 | --- | --- | --- | --- |
-| Agent | `gpt-5.6-sol` | `claude-opus-5-5`、`claude-fable-5-2` | GPT 与 Opus 可使用项目工具。Fable 通过 Messages 提供流式文字对话 |
+| Agent | `gpt-5.6-sol` | `claude-opus-5-5`、`claude-fable-5-2`、`gpt-6.2-astra` | 四个型号均可接收图片并请求当前会话已启用的项目工具 |
 | 图片 | `gpt-image-2.5-sunburst` | `gpt-image-2.5-flare`、`gpt-image-2.6-sunburst`、`gpt-image-2.6-flare`、`Image-GI2.1` | 2.6 支持静态图片、文字生成 SVG、GIF 动画以及标注编辑 |
 | 视频 | `doubao-seedance-2-5-260628` | `tencent-vod-vs-2.5`、`minimax-video-h3` | Native Seedance 与 Videos API 分开建任务/续查/下载 |
 | 音效 | `seed-audio-1.0` | `seed-audio-1.0-multilingual` | 同步二进制 MP3/WAV，非流式；时长提示不是精确保证 |
@@ -37,7 +39,17 @@ Agent 的直接生成工具会在可恢复的失败中给出原调用编号。�
 | 3D 绑骨 | `v3.0-20260909` | `v2.5-20260210` | 非人形按兼容版本；内置 retarget 用 tripo spec，最多 5 个动作 |
 | 3D 重贴图 | `v3.5-20260815` | `v3.0-20250812`、`v2.5-20250123` | 可选工序；已有贴图合适时无需再次调用 |
 
-Fable 5.2 可在「默认模型 → Agent」和聊天模型菜单中选择。Kunpo 为该型号开放了文本输入和流式文本输出。要在已有工具调用或图片的对话中继续工作，可选 GPT-5.6 Sol 或 Opus 5.5；要使用 Fable，可新建文字对话。[Kunpo Fable 5.2 型号说明](https://docs.ziy.cc/api-reference/claude-fable-52/)
+在项目「默认模型 → Agent」选择日常使用的型号，也可以通过聊天模型菜单切换当前会话。OhMyGame 通过以下接口发送图片、工具定义和对话历史。
+
+| 主 Agent | Kunpo 接口 |
+| --- | --- |
+| `gpt-5.6-sol` | `POST /v1/chat/completions` |
+| `claude-opus-5-5`、`claude-fable-5-2` | `POST /v1/messages` |
+| `gpt-6.2-astra` | `POST /v1/responses`。Kunpo 在 Chat Completions 上返回 `gpt62_responses_required`。 |
+
+工具由 OhMyGame 按项目类型、会话模式和插件启用状态提供。模型返回工具名和参数，OhMyGame 校验调用、执行本地工具并将结果发回原会话。例如，在画布上选中参考图后向 Fable 或 Astra 发送带 `@Blender` 的建模请求。主 Agent 可以读取参考图、调用已启用的 Blender 工具，再根据工具返回的场景信息或预览图继续工作。
+
+2026-11-18 使用真实 Kunpo 账号验证了 Fable 和 Astra 的识图与工具续接。两者分别从 PNG 中读出临时文件名，调用 OhMyGame 的 `read_project_file`，并逐字返回文件中的随机回执。每个型号的两次 SSE 请求均返回 HTTP 200，请求同时携带 `blender_status`、`run_blender` 和 `recover_blender_run` 的工具定义。这次联网验收执行的是本地文件读取。
 
 早期项目或对话保存的已下架型号仍可查看，继续发送前需选择当前可用的 Agent。
 
@@ -75,13 +87,14 @@ Seedance 2.5、H3、VS 2.5 的普通参考、单首帧和首尾帧现在逐张�
 | 画布图片生成文本、Markdown 文档 | 从当前画布文件解析来源，完整字节复核；Chat Completions 在真实 Pi SDK 的 `onPayload` 中替换对应图片字段，按出现顺序区分相同字节但不同来源的图片，不改会话上下文。`canvas-text-references.ts`、`text-generation.ts`、`model-network-policy.ts`、`local-model-runtime.ts`。实际画布→SDK→假上游的两个入口通过。 |
 | 主 Agent 的图片、跟进/排队/历史 | 对应用已知资产 ID，使用 Pi 公开 `appendCustomEntry` 保存紧邻实际用户消息的来源回执，仅含消息摘要与逐图资产 ID；完整核对规范化后 MIME、字节、顺序和数量，重开后再按消息 ID 与当前字节恢复来源。跟进、排队转立即执行、移除排队及修改上一条消息均覆盖；不改 SDK、用户消息或依赖。普通文件选择器/附件仍属于本地上传，不从相同像素猜来源；无回执的旧历史、绕开应用管理的裸 SDK 会话和规范化改变过的图片安全内嵌。`agent.ts`、`session-images.ts`、`app.ts`。 |
 | `game_use` 截图、`recall_image`、图片历史预览/缩小 | 截图保持本地内嵌；`recall_image` 可从原会话消息恢复其已验证资产线索。缩放/转码后字节不匹配、来源记录缺失或 DNS 不安全时仍内嵌。会话历史与预览预算机制继续有效，文字模型的视觉拒绝规则不变。`playtest-tools.ts`、`session-images.ts`、`session-image-requests.ts`。 |
-| Claude Messages | 仅精确型号 `claude-opus-5-5` 的原生 Messages 接通已验证来源的 `source: {type: "url", url}`，包括工具返回中的图片；其余图片仍 Base64。保留思考签名、工具续接和原会话，模拟验证不等于 Kunpo 实际 URL 读取验收。其他未审核 Messages 型号不套用。Fable 当前只接受文字。 |
+| Claude Messages | Fable 与 Opus 使用原生 `image` 内容块传入本地图片，以 `tool_result` 续接工具结果。Opus 的 URL 来源适配也支持工具结果内的图片，按原始字节和来源逐张校验。 |
+| GPT Responses | Astra 通过 `input_image` 传入图片。工具调用使用 `function_call`，本地执行后用同一 `call_id` 的 `function_call_output` 续接。 |
 | 其他图像/视频/3D 协议适配器（Seedream、OpenRouter、Gemini、旧 MiniMax、Hyper3D） | 不能仅因有相似字段就套用 URL；保留其已有 data URL、inlineData 或文件 token 形式。原厂网络入口与未接入候选仍受既有安全/能力策略限制，loopback 协议夹具不是正式支持或真实上游证明。 |
 | Meshy 历史协议／任务 | 已停用全部可识别调用及远程恢复；不套用 URL、不下载或重新提交。本地资产和回执保留，历史协议夹具不代表当前功能可用。 |
 | 原生 CLI 图片/Agent、DeepSeek Files、Cloud/插件旁路 | 维持既有退役/禁用或端点拒绝，不为使用图片 URL 恢复外部执行、原作者服务或未审核文件上传。`agent-runtimes/*`、`deepseek-image-files.ts`、`model-network-policy.ts`。 |
 | 不属于模型图片输入的路径 | 项目封面、缩略图、画布导入/导出、原图查看及本地 PNG/JPEG 处理不因此上传；配音/音效参考为音频，3D 绑骨/动画主体为模型文件，不套图片 URL 策略。纯文本表格/项目命名不会自动抓取图像。 |
 
-来源线索只是本地 `libraryAssetId`；仅带这个字段、`origin: generated`、显示 URL 或相同文件名都不能取得 URL 能力。主 Agent 的私有来源回执不保存图片正文、提示词、URL 或 Key；消息内容、时间、顺序或回执格式发生变化时不恢复旧来源。最终仍须通过私有资产来源记录和完整字节校验。已有任务原样恢复；转换过的 WebP/预览图若不再匹配完整字节，仍走当前本地内容。Responses 视觉、JSON mask 和未审核协议保持原安全限制。若 Opus 历史图片因来源/DNS 不可用而回退内嵌，线上签名/历史接受行为未实测；拒绝后不会自动重发收费请求。
+来源线索只是本地 `libraryAssetId`；仅带这个字段、`origin: generated`、显示 URL 或相同文件名都不能取得 URL 能力。主 Agent 的私有来源回执不保存图片正文、提示词、URL 或 Key；消息内容、时间、顺序或回执格式发生变化时不恢复旧来源。最终仍须通过私有资产来源记录和完整字节校验。已有任务原样恢复；转换过的 WebP/预览图若不再匹配完整字节，仍走当前本地内容。Responses 传图适用上述来源和私有数据保护规则。若 Opus 历史图片因来源/DNS 不可用而回退内嵌，线上签名/历史接受行为未实测；拒绝后不会自动重发收费请求。
 
 契约：[GPT Image 编辑](https://docs.ziy.cc/api-reference/image-generation/models/gpt-image-series/)、[GI2.1 参考图](https://docs.ziy.cc/api-reference/image-generation/models/nano-banana-series/)、[Tripo 单/多图与贴图](https://docs.ziy.cc/api-reference/tripo-3d/)、[Chat 视觉输入](https://docs.ziy.cc/api-reference/text-chat/)。[Kunpo Messages](https://docs.ziy.cc/api-reference/claude-messages/) 声明原生 Anthropic 协议，[Opus 型号页](https://docs.ziy.cc/api-reference/claude-opus-55/) 确认图片输入；[Anthropic 视觉文档](https://platform.claude.com/docs/en/build-with-claude/vision) 明确原生 URL source。后者是接通依据，不是 Kunpo 代理已实测兼容的证明。URL 减少的是上游请求内的图片编码体积，不消除模型自己的图片数量、尺寸、网络可达性与计费限制。
 

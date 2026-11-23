@@ -2,19 +2,22 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { referenceWav } from "./audio-reference-fixture.js";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import sharp from "sharp";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/daemon/app.js";
 import * as agentRuntime from "../src/daemon/agent.js";
+import * as piToolSearch from "../src/daemon/pi-tool-search.js";
+import { promptContextBlock } from "../src/daemon/prompt-context.js";
 import { ProjectManager } from "../src/daemon/projects.js";
 import { AssetLibrary } from "../src/daemon/asset-library.js";
 import { createLocalModelRuntime, LocalApiKeyStore } from "../src/daemon/local-model-runtime.js";
 import { kunpoRuntimeProvider } from "../src/daemon/provider-model-settings.js";
 import { VolcengineSeedAudioSettingsStore } from "../src/daemon/volcengine-seed-audio-settings.js";
 import { MediaProviderKeyStore } from "../src/daemon/media-provider-settings.js";
+import { ProviderVideos } from "../src/daemon/provider-videos.js";
 import { SeedanceSettingsStore } from "../src/daemon/seedance-settings.js";
 import { ModelAuthManager } from "../src/daemon/model-auth.js";
 import { registerSensitiveValue } from "../src/shared/sensitive-values.js";
@@ -27,6 +30,7 @@ import * as jpegPreparation from "../src/daemon/video-reference-jpeg.js";
 import * as canvasFiles from "../src/daemon/canvas-files.js";
 import * as continuation from "../src/daemon/agent-auto-continue.js";
 import { getToolPreflightFailure } from "../src/daemon/agent-tool-errors.js";
+import * as kunpoModels from "../src/shared/kunpo-models.js";
 
 // App wiring and real local credential storage, with no socket or external DNS/HTTP.
 const appArtifactDns = vi.hoisted(() => vi.fn(async () => [{ address: "8.8.8.8", family: 4 }]));
@@ -84,7 +88,7 @@ function transport() {
   });
 }
 
-async function fixture(existingDirectory?: string, answerKey = true) {
+async function fixture(existingDirectory?: string, answerKey = true, provider = kunpoRuntimeProvider()) {
   const directory = existingDirectory ?? await temporary();
   const request = transport();
   vi.stubGlobal("fetch", request);
@@ -93,7 +97,7 @@ async function fixture(existingDirectory?: string, answerKey = true) {
     imageFetch: request, audioFetch: request, videoFetch: request, model3DFetch: request,
     cloudFetch: request, publishFetch: request, modelDiscoveryFetch: request,
     createModelRuntime: async () => {
-      const runtime = await createLocalModelRuntime(path.join(directory, "local-api-keys.json"), async () => [kunpoRuntimeProvider()]);
+      const runtime = await createLocalModelRuntime(path.join(directory, "local-api-keys.json"), async () => [provider]);
       const login = runtime.login.bind(runtime);
       // Answer the local secret prompt inside the fixture; no HTTP listener/SSE approval is needed.
       if (answerKey) runtime.login = (id, method, interaction, options) => login(id, method, {
@@ -174,11 +178,169 @@ function expectClosedPngSummary(summary: any) {
   for (const privateValue of [KEY, "data:", "https:", "synthetic-prompt-not-in-summary"]) expect(JSON.stringify(summary)).not.toContain(privateValue);
 }
 
+// Only the upstream stream is synthetic. Pi parses it and invokes the packaged local guide.
+function kunpoAgentReply(model: string, reply: string | { name: string; arguments: object; id?: string; textBeforeCall?: string }) {
+  const tool = typeof reply === "object";
+  const name = tool ? reply.name : "", args = tool ? JSON.stringify(reply.arguments) : "", id = tool ? reply.id ?? "call_guide" : "call_guide";
+  const text = tool ? "" : reply;
+  let events: Array<{ type: string } & Record<string, unknown>>;
+  if (model.startsWith("claude-")) {
+    const intro = tool && reply.textBeforeCall;
+    const index = intro ? 1 : 0;
+    events = [
+      { type: "message_start", message: { id: "msg_fixture", type: "message", role: "assistant", model, content: [], usage: { input_tokens: 1, output_tokens: 0 } } },
+      ...(intro ? [
+        { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: intro } },
+        { type: "content_block_stop", index: 0 },
+      ] : []),
+      { type: "content_block_start", index, content_block: tool ? { type: "tool_use", id, name, input: {} } : { type: "text", text: "" } },
+      { type: "content_block_delta", index, delta: tool ? { type: "input_json_delta", partial_json: args } : { type: "text_delta", text } },
+      { type: "content_block_stop", index },
+      { type: "message_delta", delta: { stop_reason: tool ? "tool_use" : "end_turn" }, usage: { output_tokens: 1 } },
+      { type: "message_stop" },
+    ];
+  } else {
+    const responseId = tool ? "resp_tool" : "resp_answer";
+    const call = { type: "function_call", id: "fc_guide", call_id: id, name, arguments: args, status: "completed" };
+    const answer = { type: "message", id: "msg_guide", role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] };
+    events = [
+      { type: "response.created", response: { id: responseId, status: "in_progress" } },
+      ...(tool ? [
+        { type: "response.output_item.added", output_index: 0, item: { ...call, status: "in_progress", arguments: "" } },
+        { type: "response.function_call_arguments.delta", output_index: 0, item_id: call.id, delta: args },
+      ] : [
+        { type: "response.output_item.added", output_index: 0, item: { ...answer, status: "in_progress", content: [] } },
+        { type: "response.content_part.added", output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } },
+        { type: "response.output_text.delta", output_index: 0, content_index: 0, item_id: answer.id, delta: text },
+      ]),
+      { type: "response.output_item.done", output_index: 0, item: tool ? call : answer },
+      { type: "response.completed", response: { id: responseId, status: "completed", output: [tool ? call : answer], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } },
+    ];
+  }
+  return new Response(events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
+}
+
 describe("Kunpo app integration", () => {
-  it("refuses an incompatible model change before persistence or any provider request, while allowing a text-only conversation", async () => {
+  it.skipIf(!process.env.BLENDER_EXECUTABLE)("saves and revises a script in Pi batches, inspecting real headless Blender pixels after each run", async () => {
+    const { inject, connect, request } = await fixture(await realpath(await temporary())); await connect();
+    const model = "gpt-6.2-astra";
+    const project = (await inject("POST", "/projects", { type: "asset-canvas", name: "Offline proof test" })).json();
+    const chat = (await inject("POST", `/projects/${project.id}/conversations`, { model: { provider: "kunpo", id: model } })).json();
+    const base = `/projects/${project.id}/conversations/${chat.id}`;
+    const script = [
+      "import bpy, json, sys", "from pathlib import Path",
+      "output = Path(sys.argv[sys.argv.index('--output-dir') + 1])",
+      "shade = 0.25",
+      "img = bpy.data.images.new('proof', width=8, height=8)",
+      "img.pixels[:] = [shade, 0.0, 0.0, 1.0] * 64",
+      "img.filepath_raw = str(output / 'proof.png')", "img.file_format = 'PNG'", "img.save()",
+      "(output / 'report.json').write_text(json.dumps({'headless': bpy.app.background, 'shade': shade}))",
+    ].join("\n");
+    const scriptPath = "proof.py", workflow = "offline-review";
+    const runs = `assets/blender/${workflow}/runs`;
+    const seen = new Set<string>(), evidence: string[] = [];
+    for (const phase of ["create", "revise", "failed-edit"] as const) {
+      const revision = phase !== "create";
+      // Repeating this exact edit after the successful revision must fail, leaving a runnable old file on disk.
+      const save = revision ? { name: "edit", arguments: { path: scriptPath, edits: [{ oldText: "shade = 0.25", newText: "shade = 0.75" }] } }
+        : { name: "write", arguments: { path: scriptPath, content: script } };
+      const output = [save, { name: "run_blender", arguments: { workflow, stage: "custom", scriptPath } }].map((call, i) => ({
+        type: "function_call", id: `fc_${phase}_${i}`, call_id: `call_${phase}_${i}`,
+        status: "completed", name: call.name, arguments: JSON.stringify(call.arguments),
+      }));
+      const events = [
+        { type: "response.created", response: { id: "resp_batch", status: "in_progress" } },
+        ...output.flatMap((item, output_index) => [
+          { type: "response.output_item.added", output_index, item: { ...item, arguments: "", status: "in_progress" } },
+          { type: "response.function_call_arguments.delta", output_index, item_id: item.id, delta: item.arguments },
+          { type: "response.output_item.done", output_index, item },
+        ]),
+        { type: "response.completed", response: { id: "resp_batch", status: "completed", output, usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } },
+      ];
+      request.mockClear().mockResolvedValueOnce(new Response(events.map(e => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } }));
+      if (phase === "failed-edit") request.mockResolvedValueOnce(kunpoAgentReply(model, "Save failed"));
+      else request.mockImplementationOnce(async () => {
+          const directory = path.join(project.workspacePath, runs);
+          const fresh = (await readdir(directory)).filter(id => !seen.has(id));
+          expect(fresh).toHaveLength(1);
+          const id = fresh[0]!; seen.add(id);
+          const recipe = await readFile(path.join(directory, id, "recipe/script.py"), "utf8");
+          expect(recipe).toBe(revision ? script.replace("shade = 0.25", "shade = 0.75") : script);
+          expect(JSON.parse(await readFile(path.join(directory, id, "report.json"), "utf8"))).toEqual({ headless: true, shade: revision ? 0.75 : 0.25 });
+          evidence.push((await readFile(path.join(directory, id, "proof.png"))).toString("base64"));
+          return kunpoAgentReply(model, { name: "read", arguments: { path: `${runs}/${id}/proof.png` }, id: `call_review_${revision}` });
+        })
+        .mockResolvedValueOnce(kunpoAgentReply(model, "Proof received"));
+      const started = await inject("POST", `${base}/turns`, { prompt: revision ? "@Blender Revise the proof and inspect it." : "@Blender Create a local proof and inspect it.",
+        mentions: [{ name: "blender", displayName: "Blender", marketplaceId: "ohmygame" }] });
+      expect(started.statusCode, started.body).toBe(202);
+      const detail = await vi.waitFor(async () => {
+        const detail = (await inject("GET", base)).json<ConversationDetail>();
+        const turn = detail.turns.at(-1);
+        expect(turn?.status).toMatch(/^(completed|failed|interrupted)$/);
+        return detail;
+      }, { interval: 100, timeout: 25_000 });
+      const items = detail.turns.at(-1)?.items;
+      if (phase === "failed-edit") {
+        expect(items).toContainEqual(expect.objectContaining({ type: "dynamicToolCall", tool: "edit", status: "failed" }));
+        expect(items).toContainEqual(expect.objectContaining({ type: "dynamicToolCall", tool: "run_blender", status: "failed", output: expect.stringContaining("Blender did not start") }));
+        expect((await readdir(path.join(project.workspacePath, runs))).sort()).toEqual([...seen].sort());
+        continue;
+      }
+      expect(items, JSON.stringify(items)).toContainEqual(expect.objectContaining({ type: "agentMessage", text: "Proof received", status: "completed" }));
+      expect(request).toHaveBeenCalledTimes(3);
+      const [target, init] = request.mock.calls[2]!;
+      const wire = init?.body ? await new Response(init.body).text() : await (target as Request).clone().text();
+      expect(wire).toContain(`data:image/png;base64,${evidence.at(-1)}`);
+    }
+    expect(evidence[0]).not.toBe(evidence[1]);
+  }, 60_000);
+
+  it("omits a receipt-bound legacy canvas inventory on a resumed chat and keeps user markup, snapshots and image identity", async () => {
     const { inject, connect, request } = await fixture(); await connect();
+    const project = (await inject("POST", "/projects", { name: "Legacy canvas chat" })).json();
+    const id = "gpt-6.2-astra";
+    const session = SessionManager.create(project.workspacePath, path.join(path.dirname(project.workspacePath), "session"));
+    session.appendModelChange("kunpo", id);
+    const header = "Game design: Original design. Source: canvas/documents/game.md. Revision: ab123.";
+    const inventory = (boards: string) => `${header}\nCanvas workspace: canvas/AGENTS.md; index: canvas/index.json; assets: canvas/assets.json. Boards: ${boards}. Documents: []`;
+    const unsigned = promptContextBlock([], inventory("unsigned-user-example"));
+    session.appendMessage({ role: "user", timestamp: 1, content: "An example without a receipt" + unsigned });
+    const prompt = "Here is my own example" + promptContextBlock([], inventory("user-authored-example"));
+    const privateContext = promptContextBlock([
+      { kind: "design-document", label: "Explicit draft", text: "Document snapshot: keep the original bright garden." },
+    ], inventory("obsolete-inventory-".repeat(1500)));
+    const wire = prompt + '\n\n<workspace-file-references>\n["canvas/documents/game.md"]\n</workspace-file-references>' + privateContext;
+    session.appendCustomEntry("ohmygame-user-prompt", {
+      version: 1, wirePromptHash: createHash("sha256").update(wire).digest("hex"), prompt, mentions: [],
+      references: [{ type: "workspace-file", path: "canvas/documents/game.md" }], attachments: [], attachmentContext: privateContext,
+    });
+    const image = referencePng({ width: 16, height: 16, color: 2 }).toString("base64");
+    const imageEntry = session.appendMessage({ role: "user", timestamp: 2, content: [{ type: "text", text: wire }, { type: "image", mimeType: "image/png", data: image }] });
+    session.appendMessage({ role: "assistant", api: "openai-responses", provider: "kunpo", model: id, stopReason: "stop", timestamp: 3,
+      content: [{ type: "text", text: "Original design reviewed" }], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+    const chat = `/projects/${project.id}/conversations/${session.getSessionId()}`;
+    request.mockClear().mockResolvedValueOnce(kunpoAgentReply(id, "Ready"));
+    expect((await inject("POST", `${chat}/turns`, { prompt: "A brief question" })).statusCode).toBe(202);
+    await vi.waitFor(async () => expect((await inject("GET", chat)).json<ConversationDetail>().turns.at(-1)?.items)
+      .toContainEqual(expect.objectContaining({ type: "agentMessage", text: "Ready" })));
+    expect(request).toHaveBeenCalledOnce();
+    const [input, init] = request.mock.calls[0]!;
+    const body = await (init?.body ? new Response(init.body) : (input as Request).clone()).json();
+    const history = JSON.stringify(body.input);
+    expect(history).not.toContain("obsolete-inventory-");
+    for (const required of [header, "unsigned-user-example", "user-authored-example", "Document snapshot: keep the original bright garden.", "<workspace-file-references>", `Session image: ${imageEntry}:0`]) expect(history).toContain(required);
+    expect(history).not.toContain(image);
+    expect(await readFile(session.getSessionFile()!, "utf8")).toContain("obsolete-inventory-");
+  });
+  it("refuses a text-only model for image history and permits switching to each image-enabled Kunpo Agent", async () => {
+    const text = { provider: "kunpo", id: "fixture-text-only" };
+    const provider = kunpoRuntimeProvider();
+    provider.config.models!.push({ ...provider.config.models![0]!, id: text.id, name: text.id, input: ["text"] });
+    const { inject, connect, request } = await fixture(undefined, true, provider); await connect();
     const project = (await inject("POST", "/projects", { name: "Image history preflight" })).json();
-    const model = { provider: "kunpo", id: "gpt-5.6-sol" }, text = { provider: "kunpo", id: "claude-fable-5-2" };
+    const model = DEFAULTS.agent;
     const catalog = (await inject("GET", "/models")).json();
     expect(catalog.models.find((entry: any) => entry.id === text.id)).toMatchObject({ supportsImages: false });
     expect(catalog.models.find((entry: any) => entry.id === model.id)).toMatchObject({ supportsImages: true });
@@ -197,10 +359,12 @@ describe("Kunpo app integration", () => {
     expect((await inject("GET", base)).json().settings.model).toEqual(model);
     const fresh = (await inject("POST", `/projects/${project.id}/conversations`, { model })).json();
     expect((await inject("PUT", `/projects/${project.id}/conversations/${fresh.id}/model`, text)).statusCode).toBe(200);
-    expect((await inject("PUT", `${base}/model`, { provider: "kunpo", id: "claude-opus-5-5" })).statusCode).toBe(200);
+    for (const id of ["claude-opus-5-5", "claude-fable-5-2", "gpt-6.2-astra"]) {
+      expect((await inject("PUT", `${base}/model`, { provider: "kunpo", id })).statusCode).toBe(200);
+    }
     expect(request).not.toHaveBeenCalled();
   });
-  it("keeps conversations with tool history on their original model when switching to Fable", async () => {
+  it("switches existing tool history to Fable and Astra and preserves it when the next model disables tools", async () => {
     const { inject, connect, request } = await fixture(); await connect();
     const project = (await inject("POST", "/projects", { name: "Tool history" })).json();
     const model = DEFAULTS.agent;
@@ -213,12 +377,459 @@ describe("Kunpo app integration", () => {
     session.appendMessage({ role: "toolResult", toolCallId: "call_1", toolName: "read", content: [{ type: "text", text: "Done" }], isError: false, timestamp: 3 });
     const base = `/projects/${project.id}/conversations/${session.getSessionId()}`;
     request.mockClear();
-    const response = await inject("PUT", `${base}/model`, { provider: "kunpo", id: "claude-fable-5-2" });
+    for (const id of ["claude-fable-5-2", "gpt-6.2-astra"]) {
+      const changed = await inject("PUT", `${base}/model`, { provider: "kunpo", id });
+      expect(changed.statusCode, changed.body).toBe(200);
+    }
+    const original = kunpoModels.kunpoModelOption;
+    vi.spyOn(kunpoModels, "kunpoModelOption").mockImplementation((role, ref) => {
+      const entry = original(role, ref);
+      return entry?.id === model.id ? { ...entry, capabilities: { ...entry.capabilities, tools: false } } : entry;
+    });
+    const response = await inject("PUT", `${base}/model`, model);
     expect(response.statusCode).toBe(400);
     expect(response.json().code).toBe("tool_history_incompatible");
-    expect((await inject("GET", base)).json().settings.model).toEqual(model);
+    expect((await inject("GET", base)).json().settings.model).toEqual({ provider: "kunpo", id: "gpt-6.2-astra" });
     expect(request).not.toHaveBeenCalled();
   });
+  it.each(["gpt-6.2-astra", "claude-fable-5-2"])("keeps authorized tool declarations stable while searching and executing with %s", async id => {
+    const { inject, connect, request } = await fixture();
+    await connect();
+    const start = async () => {
+      const project = (await inject("POST", "/projects", { type: "asset-canvas", name: "Tool discovery" })).json();
+      const conversation = (await inject("POST", `/projects/${project.id}/conversations`, { model: { provider: "kunpo", id } })).json();
+      return `/projects/${project.id}/conversations/${conversation.id}`;
+    };
+    const ask = async (base: string, prompt: string, done: string, mode = "normal") => {
+      const result = await inject("POST", `${base}/turns`, { prompt, mode });
+      expect(result.statusCode, result.body).toBe(202);
+      await vi.waitFor(async () => {
+        const detail = (await inject("GET", base)).json<ConversationDetail>();
+        expect(detail.agent.status).toBe("idle");
+        expect(detail.turns.at(-1)?.items).toContainEqual(expect.objectContaining({ type: "agentMessage", text: done }));
+      });
+      return Promise.all(request.mock.calls.map(([target, init]) =>
+        init?.body ? new Response(init.body).json() : (target as Request).clone().json()));
+    };
+    const regular = "What is a texture mipmap?";
+    const baseline = vi.spyOn(piToolSearch, "projectToolSearch").mockImplementation(() => {});
+    let full;
+    try {
+      request.mockClear().mockResolvedValueOnce(kunpoAgentReply(id, "Answer"));
+      [full] = await ask(await start(), regular, "Answer");
+      expect(request).toHaveBeenCalledTimes(1);
+    } finally {
+      baseline.mockRestore();
+    }
+    const base = await start();
+    request.mockClear().mockResolvedValueOnce(kunpoAgentReply(id, "Answer"));
+    const [plain] = await ask(base, regular, "Answer");
+    const names = (body: { tools: Array<{ name: string }> }) => body.tools.map(tool => tool.name);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(names(plain)).toContain("tool_search");
+    expect(names(full)).toContain("generate_3d_asset");
+    expect(names(plain)).toContain("generate_3d_asset");
+    const parameterHelp = "Exact assetId from this project's model bindings";
+    expect(JSON.stringify(full.tools)).toContain(parameterHelp);
+    expect(JSON.stringify(plain.tools)).not.toContain(parameterHelp);
+    const blender = plain.tools.find((tool: { name: string }) => tool.name === "run_blender");
+    const schema = blender.parameters ?? blender.input_schema;
+    expect(schema.required).toEqual(expect.arrayContaining(["workflow", "stage"]));
+    expect(schema.properties.stage.enum).toEqual(["inspect", "parts", "clean", "joints", "rig", "animate", "static-review", "export", "custom"]);
+    expect(Buffer.byteLength(JSON.stringify(plain))).toBeLessThan(Buffer.byteLength(JSON.stringify(full)));
+    request.mockClear()
+      .mockResolvedValueOnce(kunpoAgentReply(id, { name: "tool_search", arguments: { query: "model resources" }, id: "call_search" }))
+      .mockResolvedValueOnce(kunpoAgentReply(id, { name: "tool_search", arguments: { query: "get_model_asset", limit: 1 }, id: "call_details" }))
+      .mockResolvedValueOnce(kunpoAgentReply(id, { name: "get_model_asset", arguments: {}, id: "call_list" }))
+      .mockResolvedValueOnce(kunpoAgentReply(id, "Listed"));
+    const calls = await ask(base, "List the models in this project.", "Listed");
+    expect(request).toHaveBeenCalledTimes(4);
+    expect(JSON.stringify(calls[1])).toContain("Matching tools:");
+    expect(JSON.stringify(calls[1])).not.toContain(parameterHelp);
+    expect(JSON.stringify(calls[2])).toContain(parameterHelp);
+    for (const body of calls) expect(body.tools).toEqual(plain.tools);
+    const detail = (await inject("GET", base)).json<ConversationDetail>();
+    expect(detail.turns.at(-1)?.items).toContainEqual(expect.objectContaining({ type: "dynamicToolCall", tool: "get_model_asset", status: "completed" }));
+    request.mockClear().mockResolvedValueOnce(kunpoAgentReply(id, "Answered again"));
+    const [next] = await ask(base, regular, "Answered again");
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(next.tools).toEqual(plain.tools);
+    request.mockClear()
+      .mockResolvedValueOnce(kunpoAgentReply(id, { name: "tool_search", arguments: { query: "generate_image" }, id: "call_planning" }))
+      .mockResolvedValueOnce(kunpoAgentReply(id, "Planning only"));
+    const planning = await ask(base, "Plan an image.", "Planning only", "planning");
+    for (const body of planning) {
+      expect(names(body)).not.toContain("generate_image");
+      expect(names(body)).not.toContain("tool_search");
+      expect(names(body)).toEqual(expect.arrayContaining(["blender_status", "list_media_capabilities", "read_workflow_guide"]));
+    }
+    const planned = (await inject("GET", base)).json<ConversationDetail>();
+    expect(planned.turns.at(-1)?.items).toContainEqual(expect.objectContaining({ type: "dynamicToolCall", tool: "tool_search", status: "failed" }));
+  });
+
+  it.each(["claude-fable-5-2", "gpt-6.2-astra"])("sends @Blender a reference image, executes the guide locally, and returns its result to %s", async id => {
+    const { inject, connect, request } = await fixture(); await connect();
+    const project = (await inject("POST", "/projects", { type: "asset-canvas", name: "Blender guide test" })).json();
+    const conversation = (await inject("POST", `/projects/${project.id}/conversations`, { model: { provider: "kunpo", id } })).json();
+    const base = `/projects/${project.id}/conversations/${conversation.id}`;
+    const messages = id === "claude-fable-5-2";
+    const level = messages ? "low" : "xhigh";
+    expect((await inject("PUT", `${base}/reasoning`, { level })).json()).toEqual({ level });
+    request.mockClear()
+      .mockResolvedValueOnce(kunpoAgentReply(id, { name: "read_workflow_guide", arguments: { guide: "blender-assets" } }))
+      .mockResolvedValueOnce(kunpoAgentReply(id, "Guide received"));
+    const image = { mediaType: "image/png", data: referencePng({ width: 16, height: 16, color: 2 }).toString("base64") };
+    const started = await inject("POST", `${base}/turns`, { prompt: "Use @Blender to inspect this reference.",
+      mentions: [{ name: "blender", displayName: "Blender", marketplaceId: "ohmygame" }], images: [image] });
+    expect(started.statusCode, started.body).toBe(202);
+    await vi.waitFor(async () => {
+      const detail = (await inject("GET", base)).json<ConversationDetail>();
+      expect(detail.agent.status, JSON.stringify(detail.agent)).toBe("idle");
+      expect(detail.settings.reasoningLevel).toBe(level);
+      expect(detail.turns.flatMap(turn => turn.items)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "dynamicToolCall", status: "completed", tool: "read_workflow_guide", arguments: { guide: "blender-assets" } }),
+        expect.objectContaining({ type: "agentMessage", status: "completed", text: "Guide received" }),
+      ]));
+    }, { timeout: 5000 });
+    expect(request).toHaveBeenCalledTimes(2);
+    const bodies = await Promise.all(request.mock.calls.map(async ([target, init]) => {
+      const url = new URL(target instanceof Request ? target.url : String(target));
+      expect(url.origin + url.pathname).toBe(`https://llm.ziy.cc/v1/${messages ? "messages" : "responses"}`);
+      const body = init?.body ? await new Response(init.body).json() : await (target as Request).clone().json();
+      expect(body).toMatchObject({ model: id, stream: true });
+      expect(body).toMatchObject(messages ? { output_config: { effort: level } } : { reasoning: { effort: level } });
+      expect(body.tools.map((tool: { name: string }) => tool.name)).toEqual(expect.arrayContaining(["read_workflow_guide", "blender_status", "tool_search"]));
+      return body;
+    }));
+    const [first, next] = bodies;
+    if (messages) {
+      expect(first.messages).toContainEqual(expect.objectContaining({ role: "user", content: expect.arrayContaining([
+        expect.objectContaining({ type: "image", source: { type: "base64", media_type: image.mediaType, data: image.data } }),
+      ]) }));
+      const result = next.messages.flatMap((message: { content: unknown[] }) => message.content)
+        .find((part: { type?: string; tool_use_id?: string }) => part.type === "tool_result" && part.tool_use_id === "call_guide");
+      expect(JSON.stringify(result?.content)).toContain("# Blender Assets");
+    } else {
+      expect(first.input).toContainEqual(expect.objectContaining({ role: "user", content: expect.arrayContaining([
+        expect.objectContaining({ type: "input_image", image_url: `data:${image.mediaType};base64,${image.data}` }),
+      ]) }));
+      expect(next.input).toContainEqual(expect.objectContaining({ type: "function_call_output", call_id: "call_guide", output: expect.stringContaining("# Blender Assets") }));
+    }
+    const imageId = /Session image: ([\w-]+:\d+)/.exec(JSON.stringify(first.messages ?? first.input))?.[1];
+    expect(imageId).toBeTruthy();
+    request.mockClear()
+      .mockResolvedValueOnce(kunpoAgentReply(id, { name: "recall_image", arguments: { imageId }, id: "call_recall" }))
+      .mockResolvedValueOnce(kunpoAgentReply(id, "Original recalled"));
+    const followUp = await inject("POST", `${base}/turns`, { prompt: "Check the previous reference again." });
+    expect(followUp.statusCode, followUp.body).toBe(202);
+    await vi.waitFor(async () => expect((await inject("GET", base)).json<ConversationDetail>().turns.at(-1)?.items)
+      .toContainEqual(expect.objectContaining({ type: "agentMessage", text: "Original recalled" })), { timeout: 5000 });
+    expect(request).toHaveBeenCalledTimes(2);
+    const [beforeRecall, afterRecall] = await Promise.all(request.mock.calls.map(async ([target, init]) =>
+      init?.body ? new Response(init.body).json() : (target as Request).clone().json()));
+    const history = JSON.stringify(beforeRecall.messages ?? beforeRecall.input);
+    expect(history).toContain(imageId);
+    expect(history).not.toContain(image.data);
+    expect(JSON.stringify(afterRecall.messages ?? afterRecall.input).split(image.data)).toHaveLength(2);
+  });
+
+  it.each(["gpt-6.2-astra", "claude-fable-5-2"])("answers a follow-up without replaying a large script and can recall its exact text with %s", async id => {
+    const { inject, connect, request } = await fixture(); await connect();
+    const project = (await inject("POST", "/projects", { type: "asset-canvas", name: "Script history" })).json();
+    const conversation = (await inject("POST", `/projects/${project.id}/conversations`, { model: { provider: "kunpo", id } })).json();
+    const chat = `/projects/${project.id}/conversations/${conversation.id}`;
+    const script = "# Part of the archived Blender script.\n".repeat(600) + "# private middle marker\n" + "# End of the archived script.\n".repeat(600);
+    const send = async (prompt: string, answer: string) => {
+      const started = await inject("POST", `${chat}/turns`, { prompt });
+      expect(started.statusCode).toBe(202);
+      await vi.waitFor(async () => {
+        const detail = (await inject("GET", chat)).json<ConversationDetail>();
+        expect(detail.agent.status, JSON.stringify(detail.agent)).toBe("idle");
+        expect(detail.turns.at(-1)?.items).toContainEqual(expect.objectContaining({ type: "agentMessage", text: answer }));
+      }, { timeout: 5000 });
+    };
+    const wireHistory = async () => {
+      const [input, init] = request.mock.calls.at(-1)!;
+      const body = await (init?.body ? new Response(init.body) : (input as Request).clone()).json();
+      return JSON.stringify(body.messages ?? body.input);
+    };
+    request.mockClear()
+      .mockResolvedValueOnce(kunpoAgentReply(id, { name: "write", arguments: { path: "model.py", content: script }, id: "save_script" }))
+      .mockResolvedValueOnce(kunpoAgentReply(id, { name: "read", arguments: { path: "model.py" }, id: "inspect_script" }))
+      .mockResolvedValueOnce(kunpoAgentReply(id, "Saved and inspected model.py"));
+    await send("Save this Blender script and inspect it.", "Saved and inspected model.py");
+    expect(await wireHistory()).toContain("private middle marker");
+    request.mockClear().mockResolvedValueOnce(kunpoAgentReply(id, "Texture answer"));
+    await send("How much memory does a 4K texture use?", "Texture answer");
+    expect(request).toHaveBeenCalledOnce();
+    const followup = await wireHistory();
+    expect(followup).not.toContain("private middle marker");
+    expect(followup).toContain("Saved and inspected model.py");
+    const refs = [...followup.matchAll(/recall_tool_text ref=([\w-]+:\d+(?::\w+)?)/g)].map(match => match[1]);
+    expect(refs).toHaveLength(2);
+    request.mockClear()
+      .mockResolvedValueOnce(kunpoAgentReply(id, { name: "recall_tool_text", arguments: { ref: refs[0], offset: 22000 }, id: "recall_script" }))
+      .mockResolvedValueOnce(kunpoAgentReply(id, "Recovered original text"));
+    await send("Look up the middle of that saved script.", "Recovered original text");
+    expect(await wireHistory()).toContain("private middle marker");
+    expect(await readFile(path.join(project.workspacePath, "model.py"), "utf8")).toBe(script);
+  });
+
+  it("returns the selected Canvas JPEG to Astra after a read with text line arguments", async () => {
+    const id = "gpt-6.2-astra";
+    const { inject, connect, request } = await fixture(); await connect();
+    const project = (await inject("POST", "/projects", { type: "asset-canvas", name: "Canvas reference" })).json();
+    const base = `/projects/${project.id}`;
+    const jpeg = await sharp(referencePng()).jpeg().toBuffer();
+    const upload = await inject("POST", "/library/assets", { name: "reference.jpg", image: { mediaType: "image/jpeg", data: jpeg.toString("base64") } });
+    expect(upload.statusCode, upload.body).toBe(201);
+    const boardId = (await inject("GET", `${base}/canvas/workspace`)).json().boards[0].id;
+    const boardPath = `${base}/canvas/boards/${boardId}`;
+    const detail = (await inject("GET", boardPath)).json();
+    const node = { id: "reference", type: "asset", position: { x: 0, y: 0 }, data: { assetId: upload.json().id, mediaType: "image" } };
+    detail.board.nodes = [node]; detail.board.editorLayout.nodes = { [node.id]: node.position };
+    const saved = await inject("PUT", boardPath, detail);
+    expect(saved.statusCode, saved.body).toBe(200);
+    const manifest = JSON.parse(await readFile(path.join(project.workspacePath, "canvas/assets.json"), "utf8"));
+    const args = { path: manifest.assets[node.data.assetId].path, offset: 1, limit: 1 };
+    const conversation = (await inject("POST", `${base}/conversations`, { model: { provider: "kunpo", id } })).json();
+    const chat = `${base}/conversations/${conversation.id}`;
+    request.mockClear()
+      .mockResolvedValueOnce(kunpoAgentReply(id, { name: "read", arguments: args }))
+      .mockResolvedValueOnce(kunpoAgentReply(id, "Image received"));
+    const started = await inject("POST", `${chat}/turns`, { prompt: "Use @Blender to inspect the selected reference.",
+      mentions: [{ name: "blender", displayName: "Blender", marketplaceId: "ohmygame" }],
+      contexts: [{ kind: "canvas-board", label: "Canvas", text: `Current canvas board: canvas/boards/${boardId}.json\nSelected nodes: ${node.id}\nAsset paths and descriptions: canvas/assets.json` }] });
+    expect(started.statusCode, started.body).toBe(202);
+    await vi.waitFor(async () => {
+      const history = (await inject("GET", chat)).json<ConversationDetail>();
+      expect(history.turns.flatMap(turn => turn.items)).toContainEqual(expect.objectContaining({ type: "agentMessage", text: "Image received" }));
+    }, { timeout: 5000 });
+    expect(request).toHaveBeenCalledTimes(2);
+    const [first, next] = await Promise.all(request.mock.calls.map(async ([target, init]) =>
+      init?.body ? new Response(init.body).json() : (target as Request).clone().json()));
+    for (const [name, required] of [["read", ["path"]], ["read_workflow_guide", ["guide"]]] as const) {
+      expect(first.tools.find((tool: { name: string }) => tool.name === name))
+        .toMatchObject({ strict: false, parameters: { required } });
+    }
+    expect(JSON.stringify(first.input)).not.toContain("input_image");
+    expect(next.input).toContainEqual(expect.objectContaining({ type: "function_call_output", call_id: "call_guide",
+      output: expect.arrayContaining([expect.objectContaining({ type: "input_image", image_url: `data:image/jpeg;base64,${jpeg.toString("base64")}` })]) }));
+  });
+
+  it("keeps small visual revisions at their originating tools, then hands off the completed design on the Astra wire", async () => {
+    const { inject, connect, request } = await fixture(); await connect();
+    const model = "gpt-6.2-astra";
+    const project = (await inject("POST", "/projects", { type: "asset-canvas", name: "Design review" })).json();
+    const base = `/projects/${project.id}/conversations`;
+    const chat = (await inject("POST", base, { model: { provider: "kunpo", id: model } })).json();
+    const notes = "assets/canvas/notes.md", originalPath = "assets/canvas/concept.png";
+    const initial = "Match the original costume silhouette.\n".repeat(25);
+    const imagePaths = ["front", "left", "back"].map(view => `assets/canvas/${view}.png`);
+    const paths = [originalPath, ...imagePaths];
+    const pictures = paths.map((_, i) => referencePng({ width: 32 + i, height: 32, color: 2 }));
+    await mkdir(path.join(project.workspacePath, "assets/canvas"), { recursive: true });
+    await Promise.all(paths.map((file, i) => writeFile(path.join(project.workspacePath, file), pictures[i]!)));
+    await writeFile(path.join(project.workspacePath, notes), initial);
+
+    const call = (name: string, id: string, args: object) =>
+      request.mockResolvedValueOnce(kunpoAgentReply(model, { name, id, arguments: args }));
+    const turn = async (prompt: string, answer: string) => {
+      request.mockResolvedValueOnce(kunpoAgentReply(model, answer));
+      const started = await inject("POST", `${base}/${chat.id}/turns`, { prompt });
+      expect(started.statusCode, started.body).toBe(202);
+      await vi.waitFor(async () => {
+        const detail = (await inject("GET", `${base}/${chat.id}`)).json<ConversationDetail>();
+        expect(detail.turns.at(-1)?.items, JSON.stringify(detail.agent)).toContainEqual(expect.objectContaining({ type: "agentMessage", text: answer }));
+      }, { timeout: 5_000 });
+      return Promise.all(request.mock.calls.map(async ([target, init]) => {
+        const wire = await (init?.body ? new Response(init.body) : (target as Request).clone()).json();
+        return wire.input as Array<{ type?: string; call_id?: string; output?: string | Array<{ type: string; image_url?: string }> }>;
+      }));
+    };
+    request.mockClear();
+    call("read", "notes", { path: notes });
+    imagePaths.forEach((file, i) => call("read", `view_${i}`, { path: file }));
+    call("inspect_3d_views", "inspect", { originalPath, imagePaths });
+    call("recall_image", "release", { releaseReviewedImages: true });
+    const history = await turn("Check the design notes and three views before delivery.", "The design is ready for review.");
+    expect(history).toHaveLength(7);
+    const allImages = (input: typeof history[number]) => input.flatMap(item => Array.isArray(item.output)
+      ? item.output.filter(block => block.type === "input_image").map(block => [item.call_id, block.image_url]) : []);
+    const url = (i: number) => "data:image/png;base64," + pictures[i]!.toString("base64");
+    expect(allImages(history[4]!)).toEqual(imagePaths.map((_, i) => [`view_${i}`, url(i + 1)]));
+    expect(allImages(history[5]!)).toEqual(paths.map((_, i) => ["inspect", url(i)]));
+    expect(allImages(history[6]!)).toEqual([]);
+    expect(history[6]!.find(item => item.call_id === "notes" && item.type === "function_call_output")?.output).toContain(initial.trim());
+
+    const revised = "Match the revised collar.";
+    await writeFile(path.join(project.workspacePath, notes), revised);
+    request.mockClear();
+    call("read", "updated_notes", { path: notes });
+    const followUp = await turn("Please revise the collar using the latest notes.", "I have the revised notes.");
+    expect(followUp).toHaveLength(2);
+    const earlierNotes = followUp[0]!.find(item => item.call_id === "notes" && item.type === "function_call_output");
+    expect(earlierNotes?.output).toEqual(expect.any(String));
+    expect(earlierNotes!.output).not.toContain("Match the original costume silhouette.");
+    expect(allImages(followUp[0]!)).toEqual([]);
+    expect(followUp[1]!.find(item => item.call_id === "updated_notes" && item.type === "function_call_output")?.output).toContain(revised);
+    const ref = /recall_tool_text ref=([\w-]+:\d+)/.exec(String(earlierNotes!.output))?.[1];
+    expect(ref).toBeTruthy();
+    request.mockClear();
+    call("recall_tool_text", "original_notes", { ref });
+    const recalled = await turn("Check the original notes from delivery.", "I have both versions.");
+    expect(recalled[1]!.find(item => item.call_id === "original_notes" && item.type === "function_call_output")?.output).toContain(initial.trim());
+  });
+
+  it.each([false, true])("reviews the views before Tripo and the saved initial model before continuing (request changes first: %s)", async rejectInitial => {
+    const { inject, connect, request } = await fixture(); await connect();
+    const model = "claude-fable-5-2";
+    const project = (await inject("POST", "/projects", { type: "web-game", name: "Character turnaround" })).json();
+    const base = `/projects/${project.id}`;
+    const conversation = (await inject("POST", `${base}/conversations`, { model: { provider: "kunpo", id: model } })).json();
+    const chat = `${base}/conversations/${conversation.id}`, jobs = `${base}/canvas/jobs`;
+    const originalPath = "assets/canvas/design.png", original = referencePng({ width: 28, height: 32, color: 2 });
+    const angles = ["front", "left", "back"];
+    const imagePaths = angles.map(angle => `assets/canvas/${angle}.png`);
+    const images = angles.map((_, index) => referencePng({ width: 32 + index, height: 32, color: 2 }));
+    await mkdir(path.join(project.workspacePath, "assets/canvas"), { recursive: true });
+    await writeFile(path.join(project.workspacePath, originalPath), original);
+    await Promise.all(imagePaths.map((file, index) => writeFile(path.join(project.workspacePath, file), images[index]!)));
+    const fallback = request.getMockImplementation()!;
+    const replies: Response[] = [], mediaPaths: string[] = [], approvedUploads: Buffer[] = [];
+    request.mockClear().mockImplementation(async (target, init) => {
+      const url = new URL(target instanceof Request ? target.url : String(target));
+      if (url.pathname === "/v1/messages") {
+        const reply = replies.shift();
+        if (!reply) throw new Error("Unexpected model continuation");
+        return reply;
+      }
+      mediaPaths.push(url.pathname);
+      if (url.pathname === "/tripo/v3/files") {
+        const form = init?.body instanceof FormData ? init.body : await new Response(init?.body, { headers: init?.headers }).formData();
+        approvedUploads.push(Buffer.from(await (form.get("file") as Blob).arrayBuffer()));
+      }
+      if (url.pathname === "/tripo/v3/generation/multiview-to-model")
+        return Response.json({ code: 0, data: { task_id: "task_app_model" } });
+      return fallback(target, init);
+    });
+    const toolReply = (name: string, id: string, textBeforeCall?: string) => kunpoAgentReply(model, { name, id, arguments: name === "inspect_3d_views" ? { imagePaths, originalPath } : { imagePaths }, textBeforeCall });
+    const reviewedReplies = (id: string) => [
+      toolReply("inspect_3d_views", `inspect_${id}`),
+      toolReply("generate_3d_from_views", `generate_${id}`, "The front and back silhouettes align. The side view shows the revised character proportions."),
+    ];
+    const start = async (prompt: string) => {
+      const result = await inject("POST", `${chat}/turns`, { prompt: `@Blender ${prompt}`, mentions: [{ name: "blender", displayName: "Blender", marketplaceId: "ohmygame" }] });
+      expect(result.statusCode, result.body).toBe(202);
+    };
+    const detail = async () => (await inject("GET", chat)).json<ConversationDetail>();
+    const waitForReview = () => vi.waitFor(async () => {
+      const items = (await detail()).turns.flatMap(turn => turn.items);
+      const item = items.find(item => item.type === "approvalRequest" && item.status === "inProgress");
+      if (item?.type !== "approvalRequest" || !item.request.turnaroundReview) {
+        const failed = items.filter(item => item.type === "dynamicToolCall" && item.status === "failed");
+        throw new Error("Waiting for turnaround review. " + JSON.stringify(failed));
+      }
+      expect(item.request).toMatchObject({ kind: "turnaroundReview", canAllowSession: false });
+      const review = item.request.turnaroundReview;
+      expect(item.requestId).toBe(review.reviewId);
+      expect(review.original?.path).toBe(originalPath);
+      expect((await inject("GET", review.original!.url)).rawPayload).toEqual(original);
+      expect(review.views.map(view => [view.angle, view.path])).toEqual(angles.map((angle, index) => [angle, imagePaths[index]]));
+      for (const [index, view] of review.views.entries()) {
+        const snapshot = await inject("GET", view.url);
+        expect(snapshot.statusCode).toBe(200);
+        expect(snapshot.rawPayload).toEqual(images[index]);
+      }
+      const [target, init] = request.mock.calls.at(-1)!;
+      const wire = init?.body ? await new Response(init.body).json() : await (target as Request).clone().json();
+      const returned = wire.messages.at(-1).content.find((part: { type: string }) => part.type === "tool_result");
+      const visible = returned.content.filter((part: { type: string }) => part.type === "image")
+        .map((part: { source: { data: string } }) => Buffer.from(part.source.data, "base64"));
+      expect(visible).toEqual([original, ...images]);
+      return { id: item.requestId, review };
+    }, { timeout: 5000 });
+    const decide = (id: string, decision: string) => inject("POST", `${chat}/approvals/${encodeURIComponent(id)}`, { decision });
+    const noSubmission = async () => {
+      expect(mediaPaths).toEqual([]);
+      expect((await inject("GET", jobs)).json()).toEqual([]);
+    };
+
+    replies.push(toolReply("generate_3d_from_views", "skip_inspection"), kunpoAgentReply(model, "I need to inspect the three images."));
+    await start("Use Blender to make the character from these views.");
+    await vi.waitFor(async () => expect((await detail()).turns.flatMap(turn => turn.items)).toContainEqual(
+      expect.objectContaining({ type: "agentMessage", text: "I need to inspect the three images." })), { timeout: 5000 });
+    expect((await detail()).turns.flatMap(turn => turn.items).some(item => item.type === "approvalRequest")).toBe(false);
+    await noSubmission();
+
+    replies.push(...reviewedReplies("first"));
+    await start("Inspect the turnaround and present it for review.");
+    const first = await waitForReview(); await noSubmission();
+    expect((await decide(first.id, "allow-session")).statusCode).toBe(409);
+    expect((await decide(first.id, "deny")).statusCode).toBe(204);
+    await vi.waitFor(async () => expect((await detail()).turns.at(-1)?.status).toBe("cancelled"), { timeout: 5000 });
+    await noSubmission();
+
+    images[1] = referencePng({ width: 36, height: 32, color: 2 });
+    await writeFile(path.join(project.workspacePath, imagePaths[1]!), images[1]);
+    replies.push(...reviewedReplies("revised"));
+    await start("I revised the side view. Review these three again.");
+    const revised = await waitForReview();
+    expect(revised.review.reviewId).not.toBe(first.review.reviewId);
+    expect(revised.review.views[1]!.url).not.toBe(first.review.views[1]!.url);
+    expect((await decide(first.id, "allow")).statusCode).toBe(409);
+    await noSubmission();
+    const boardId = (await inject("GET", `${base}/canvas/workspace`)).json().boards[0].id;
+    const boardPath = `${base}/canvas/boards/${boardId}`;
+    const board = (await inject("GET", boardPath)).json();
+    board.board.editorLayout.viewport.x -= 400;
+    const savedLayout = await inject("PUT", boardPath, board);
+    expect(savedLayout.statusCode, savedLayout.body).toBe(200);
+    expect(savedLayout.json().revision).not.toBe(board.revision);
+    expect((await decide(revised.id, "allow")).statusCode).toBe(204);
+    const waitForInitialModel = () => vi.waitFor(async () => {
+      const item = (await detail()).turns.at(-1)?.items.find(item => item.type === "approvalRequest" && item.status === "inProgress");
+      if (item?.type !== "approvalRequest" || !item.request.tripoModelReview) throw new Error("Waiting for initial model review");
+      expect(item.request).toMatchObject({ kind: "tripoModelReview", canAllowSession: false });
+      expect(item.requestId).toBe(item.request.tripoModelReview.reviewId);
+      return item.request.tripoModelReview;
+    }, { timeout: 5000 });
+    const initial = await waitForInitialModel();
+    expect((await inject("GET", jobs)).json()).toEqual([expect.objectContaining({ status: "succeeded", run: expect.objectContaining({ files: [expect.objectContaining({ assetId: initial.assetId })] }) })]);
+    expect((await detail()).turns.at(-1)?.items).not.toContainEqual(expect.objectContaining({ type: "agentMessage", text: "The reviewed model is ready." }));
+    const preview = await inject("GET", `/library/assets/${initial.assetId}/content?preview=${initial.fbx}&sha256=${initial.previewSha256}`);
+    expect(preview.statusCode, preview.body).toBe(200);
+    expect(preview.rawPayload.subarray(0, 4).toString()).toBe("glTF");
+    expect((await decide(initial.reviewId, "allow-session")).statusCode).toBe(409);
+    let accepted = initial;
+    if (rejectInitial) {
+      expect((await decide(initial.reviewId, "deny")).statusCode).toBe(204);
+      await vi.waitFor(async () => expect((await detail()).turns.at(-1)?.status).toBe("cancelled"), { timeout: 5000 });
+      expect((await inject("GET", jobs)).json()).toEqual([expect.objectContaining({ status: "succeeded" })]);
+      replies.push(kunpoAgentReply(model, { name: "review_tripo_model", id: "review_initial_again", arguments: { sourceAssetId: initial.assetId } }));
+      await start("Show the same saved model again so I can check the details before deciding.");
+      accepted = await waitForInitialModel();
+      expect(accepted).toMatchObject({ assetId: initial.assetId, previewSha256: initial.previewSha256 });
+      expect(accepted.reviewId).not.toBe(initial.reviewId);
+      expect((await decide(initial.reviewId, "allow")).statusCode).toBe(409);
+    }
+    replies.push(kunpoAgentReply(model, "The reviewed model is ready."));
+    expect((await decide(accepted.reviewId, "allow")).statusCode).toBe(204);
+    await vi.waitFor(async () => {
+      const finished = await detail();
+      expect(finished.agent.status).toBe("idle");
+      expect(finished.turns.at(-1)?.items).toContainEqual(expect.objectContaining({ type: "agentMessage", text: "The reviewed model is ready." }));
+      expect((await inject("GET", jobs)).json()).toEqual([expect.objectContaining({ status: "succeeded" })]);
+    }, { timeout: 5000 });
+    const [target, init] = request.mock.calls.at(-1)!;
+    const wire = init?.body ? await new Response(init.body).json() : await (target as Request).clone().json();
+    const delivered = wire.messages.at(-1).content.find((part: { tool_use_id?: string }) => part.tool_use_id === (rejectInitial ? "review_initial_again" : "generate_revised"));
+    if (!rejectInitial) expect(JSON.stringify(delivered?.content)).toContain("The user approved these reference views on the review card");
+    expect(JSON.stringify(delivered?.content)).toContain("The user accepted this exact Tripo original");
+    expect(approvedUploads).toEqual(images);
+    expect(mediaPaths.filter(p => p.includes("/generation/"))).toEqual(["/tripo/v3/generation/multiview-to-model"]);
+  });
+
   it("rejects incompatible resolved 3D options before app effects and retains one corrected text generation", async () => {
     const { inject, connect, request, directory } = await fixture(); await connect();
     const project = (await inject("POST", "/projects", { type: "web-game" })).json();
@@ -232,6 +843,18 @@ describe("Kunpo app integration", () => {
     request.mockClear();
     const capabilities = await catalog.execute("3d-catalog", {}, undefined, undefined, {} as never);
     expect(capabilities.content[0]).toMatchObject({ type: "text", text: expect.stringContaining('"optionFieldsByOperation"') });
+    const all = JSON.parse((capabilities.content[0] as { text: string }).text);
+    for (const capability of Object.keys(all)) {
+      const scoped = await catalog.execute("scoped-catalog", { capability }, undefined, undefined, {} as never);
+      expect(scoped.content).toEqual([{ type: "text", text: JSON.stringify({ [capability]: all[capability] }) }]);
+      expect(scoped.details).toEqual({ mediaCapabilities: { [capability]: all[capability] } });
+    }
+    const video = vi.spyOn(ProviderVideos.prototype, "catalog").mockRejectedValue(new Error("Unrelated catalog offline"));
+    await expect(catalog.execute("image-catalog", { capability: "image" }, undefined, undefined, {} as never)).resolves.toMatchObject({
+      details: { mediaCapabilities: { image: all.image } },
+    });
+    expect(video).not.toHaveBeenCalled();
+    video.mockRestore();
     const canvasPath = `/projects/${project.id}/canvas`, before = (await inject("GET", `${canvasPath}/workspace`)).json();
     const input = { operation: "text", prompt: "A hero in a neutral T-pose", targetPolycount: 30000, texture: true, pbr: false,
       options: { geometryQuality: "detailed", textureQuality: "detailed", pose: "t-pose" } };
@@ -244,7 +867,8 @@ describe("Kunpo app integration", () => {
     const fallback = request.getMockImplementation()!;
     request.mockImplementation(async (url, init) => new URL(String(url)).pathname === "/tripo/v3/generation/text-to-model"
       ? Response.json({ code: 0, data: { task_id: "task_app_model" } }) : fallback(url, init));
-    await tool.execute("corrected-text-pose", { ...input, options: { geometryQuality: "detailed", textureQuality: "detailed" } }, undefined, undefined, {} as never);
+    const generated = await tool.execute("corrected-text-pose", { ...input, options: { geometryQuality: "detailed", textureQuality: "detailed" } }, undefined, undefined, {} as never);
+    expect(JSON.stringify(generated.content)).not.toContain("approved these reference views");
     await expect(guard.prepare(new AbortController().signal)).resolves.toBeUndefined();
     const submissions = request.mock.calls.filter(([url, init]) => init?.method === "POST" && String(url).includes("/generation/"));
     expect(submissions).toHaveLength(1);
@@ -344,21 +968,24 @@ describe("Kunpo app integration", () => {
     expect(await readFile(path.join(directory, "library/files", `${uploaded.json().id}.jpg`))).toEqual(bytes);
   });
 
-  it.each(["gpt-5.6-sol", "claude-opus-5-5", "claude-fable-5-2"])("continues guarded HTTP 500 for %s through the app and does not replay it after reopening", async id => {
+  it.each([
+    ["gpt-5.6-sol", "HTTP 500"], ["claude-opus-5-5", "HTTP 500"], ["claude-fable-5-2", "HTTP 500"],
+    ["gpt-6.2-astra", "HTTP 500"], ["gpt-6.2-astra", "ECONNRESET"],
+  ] as const)("continues %s after a guarded %s through the app and does not replay it after reopening", async (id, failure) => {
     const { inject, connect, request, directory, app } = await fixture(); await connect();
     vi.spyOn(continuation, "waitForContinuation").mockResolvedValue(true);
     const project = (await inject("POST", "/projects", { name: "Offline continuation" })).json();
     const conversation = (await inject("POST", `/projects/${project.id}/conversations`, { model: { provider: "kunpo", id } })).json();
     const base = `/projects/${project.id}/conversations/${conversation.id}`;
-    const event = (value: object) => `data: ${JSON.stringify(value)}\n\n`;
-    const wire = id === "gpt-5.6-sol" ? event({ id: "fixture", choices: [{ index: 0, delta: { content: "Done" }, finish_reason: "stop" }] }) + "data: [DONE]\n\n"
-      : [
-        { type: "message_start", message: { id: "fixture", type: "message", role: "assistant", model: id, content: [], usage: { input_tokens: 1, output_tokens: 0 } } },
-        { type: "content_block_start", index: 0, content_block: { type: "text", text: "Done" } }, { type: "content_block_stop", index: 0 },
-        { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } }, { type: "message_stop" },
-      ].map(value => `event: ${value.type}\n${event(value)}`).join("");
-    request.mockClear().mockResolvedValueOnce(Response.json({ error: { type: "api_error", message: "PRIVATE_ERROR_BODY" } }, { status: 500, headers: { "x-request-id": "req_auto_500" } }))
-      .mockImplementation(async () => new Response(wire, { headers: { "content-type": "text/event-stream" } }));
+    const chatWire = 'data: {"id":"fixture","choices":[{"index":0,"delta":{"content":"Done"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n';
+    request.mockClear();
+    if (failure === "ECONNRESET") {
+      request.mockRejectedValueOnce(new TypeError("fetch failed", { cause: Object.assign(new Error("PRIVATE_ERROR_BODY"), { code: failure }) }));
+    } else {
+      request.mockResolvedValueOnce(Response.json({ error: { type: "api_error", message: "PRIVATE_ERROR_BODY" } }, { status: 500, headers: { "x-request-id": "req_auto_500" } }));
+    }
+    request.mockImplementation(async () => id === "gpt-5.6-sol"
+        ? new Response(chatWire, { headers: { "content-type": "text/event-stream" } }) : kunpoAgentReply(id, "Done"));
     const started = await inject("POST", `${base}/turns`, { prompt: "AUTO_CONTINUE_CANARY_TASK" }); expect(started.statusCode).toBe(202);
     await vi.waitFor(async () => {
       const response = await inject("GET", base), detail = response.json<ConversationDetail>();
@@ -374,7 +1001,7 @@ describe("Kunpo app integration", () => {
       if (id === "claude-fable-5-2") {
         expect(new URL(target instanceof Request ? target.url : String(target)).pathname).toBe("/v1/messages");
         expect(JSON.parse(body)).toMatchObject({ model: id, stream: true });
-        expect(JSON.parse(body)).not.toHaveProperty("tools");
+        expect(JSON.parse(body).tools).toEqual(expect.arrayContaining([expect.objectContaining({ name: "read_workflow_guide" })]));
       }
       expect(body.match(/AUTO_CONTINUE_CANARY_TASK/g)).toHaveLength(1);
     }
@@ -455,7 +1082,7 @@ describe("Kunpo app integration", () => {
     expect(wait).toHaveBeenCalledTimes(recoverable ? 1 : 0);
   });
 
-  it.each(["gpt-5.6-sol", "claude-opus-5-5"])("preserves explicit image origin through the actual %s Agent HTTP entry and subsequent history", async id => {
+  it.each(["gpt-5.6-sol", "claude-opus-5-5", "claude-fable-5-2", "gpt-6.2-astra"])("sends current generated and uploaded references through %s and keeps recall IDs on the next turn", async id => {
     const requestLog = vi.spyOn(console, "info").mockImplementation(() => {});
     const directory = await temporary(); await new LocalApiKeyStore(path.join(directory, "local-api-keys.json")).modify("kunpo", async () => ({ type: "api_key", key: KEY }));
     const bytes = referencePng({ width: 128, height: 128, color: 2 });
@@ -468,14 +1095,7 @@ describe("Kunpo app integration", () => {
         'data: {"id":"fixture","choices":[{"index":0,"delta":{"content":"Ready"},"finish_reason":null}]}',
         'data: {"id":"fixture","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}', "data: [DONE]", "",
       ].join("\n\n"), { headers: { "content-type": "text/event-stream" } });
-      if (url.pathname === "/v1/messages") return new Response([
-        'event: message_start\ndata: {"type":"message_start","message":{"id":"fixture","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}',
-        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
-        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Ready"}}',
-        'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}',
-        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}',
-        'event: message_stop\ndata: {"type":"message_stop"}', "",
-      ].join("\n\n"), { headers: { "content-type": "text/event-stream" } });
+      if (url.pathname === "/v1/messages" || url.pathname === "/v1/responses") return kunpoAgentReply(id, "Ready");
       throw Error(`Unexpected synthetic test route: ${url.pathname}`);
     });
     vi.stubGlobal("fetch", request);
@@ -502,13 +1122,28 @@ describe("Kunpo app integration", () => {
     expect(observed.every(entry => entry.projectId === project.id && entry.conversationId === conversation.id && entry.outcome === "completed")).toBe(true);
     expect(new Set(observed.map(entry => entry.localRequestId)).size).toBe(2);
     expect(JSON.stringify(observed)).not.toMatch(/Inspect|Continue from|Ready|fake-http-origin|sk-kunpo|data:image/);
-    for (const [target, init] of request.mock.calls) {
-      expect(new URL(target instanceof Request ? target.url : String(target)).pathname).toBe(id === "gpt-5.6-sol" ? "/v1/chat/completions" : "/v1/messages");
-      expect(init?.body).toBeDefined();
-      const body = await new Response(init!.body).json();
-      const parts = body.messages.flatMap((message: any) => Array.isArray(message.content) ? message.content.filter((part: any) => part.type === (id === "gpt-5.6-sol" ? "image_url" : "image")) : []);
-      expect(parts, JSON.stringify(body.messages.map((message: any) => ({ role: message.role, content: Array.isArray(message.content) ? message.content.map((part: any) => part.type) : typeof message.content })))).toHaveLength(2);
-      expect(parts.map((part: any) => id === "gpt-5.6-sol" ? part.image_url.url : part.source.type === "url" ? part.source.url : `data:${part.source.media_type};base64,${part.source.data}`)).toEqual([sourceUrl, `data:image/png;base64,${bytes.toString("base64")}`]);
+    const astra = id === "gpt-6.2-astra", sol = id === "gpt-5.6-sol";
+    const inline = `data:image/png;base64,${bytes.toString("base64")}`;
+    for (const [index, [target, init]] of request.mock.calls.entries()) {
+      const url = new URL(target instanceof Request ? target.url : String(target));
+      expect(url.pathname).toBe(astra ? "/v1/responses" : sol ? "/v1/chat/completions" : "/v1/messages");
+      const body = init?.body ? await new Response(init.body).json() : await (target as Request).clone().json();
+      const imageType = astra ? "input_image" : sol ? "image_url" : "image";
+      const parts = (body.input ?? body.messages).flatMap((message: any) => Array.isArray(message.content) ? message.content.filter((part: any) => part.type === imageType) : []);
+      const sources = parts.map((part: any) => {
+        if (astra) return part.image_url;
+        if (sol) return part.image_url.url;
+        return part.source.type === "url" ? part.source.url : `data:${part.source.media_type};base64,${part.source.data}`;
+      });
+      if (index === 0) {
+        expect(sources).toEqual([sol || id === "claude-opus-5-5" ? sourceUrl : inline, inline]);
+      } else {
+        expect(sources).toEqual([]);
+        const history = JSON.stringify(body.input ?? body.messages);
+        expect(new Set(history.match(/Session image: [\w-]+:\d+/g)).size).toBe(2);
+        expect(history).not.toContain(sourceUrl);
+        expect(history).not.toContain(bytes.toString("base64"));
+      }
       expect(JSON.stringify(body)).not.toContain("libraryAssetId");
     }
   });
@@ -1377,12 +2012,12 @@ describe("Kunpo app integration", () => {
     expect((await reopened.inject("GET", `/projects/${project.id}`)).json().modelSelections).toEqual({ ...DEFAULTS, image: alternate });
   });
 
-  it("offers exactly the three current Kunpo Agents and rejects new selections of retired IDs", async () => {
+  it("offers the four current Kunpo Agents and rejects new selections of retired IDs", async () => {
     const { inject, request, connect } = await fixture(); await connect();
     const project = (await inject("POST", "/projects", {})).json();
     const catalog = (await inject("GET", "/models")).json();
     expect(catalog.models.filter((model: { provider: string }) => model.provider === "kunpo").map((model: { id: string }) => model.id).sort())
-      .toEqual(["claude-fable-5-2", "claude-opus-5-5", "gpt-5.6-sol"]);
+      .toEqual(["claude-fable-5-2", "claude-opus-5-5", "gpt-5.6-sol", "gpt-6.2-astra"]);
     request.mockClear();
     for (const id of ["gpt-6.1-sol", "gemini-3.8-flash", "claude-sonnet-5-5", "kimi-k3.1-pro"]) {
       const model = { provider: "kunpo", id };

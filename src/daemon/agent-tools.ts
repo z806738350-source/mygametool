@@ -11,7 +11,7 @@ import { agentCanvasBoard, resolveAgentAnimation, saveAgentCanvasMedia } from ".
 import { mediaGenerationNeedsConfirmation, DEFAULT_CHARACTER_HEIGHT_METERS, MAX_ANIMATION_ACTIONS } from "../shared/generation-config.js";
 import { supportsWebPreview } from "../shared/project-runtime.js";
 import type { ProjectManager } from "./projects.js";
-import { toolPreflightError } from "./agent-tool-errors.js";
+import { getToolPreflightFailure, toolPreflightError } from "./agent-tool-errors.js";
 import { assertSafeGenerationInput, type ToolRunner } from "./tools.js";
 import { getWorkspaceMedia } from "./workspace.js";
 import { readWebpModelReference } from "./image-working-assets.js";
@@ -30,6 +30,7 @@ import type { AuthorizeAgentAttachment } from "./agent-attachments.js";
 import { projectAnimationSelection } from "./project-media-capabilities.js";
 import { imageModelCapabilities } from "./image-models.js";
 import { inspectModel3D } from "./model3d-inspect.js";
+import type { TripoModelReviewStatus } from "./tripo-model-review.js";
 
 const PI_TOOL_NAMES: Record<ToolId, string> = {
   "generate-image": "generate_image",
@@ -56,7 +57,7 @@ const CANVAS_MEDIA_TOOLS: Partial<Record<import("../shared/contracts.js").AssetC
 };
 
 export function activePiToolNames(enabledTools: readonly ToolId[], registeredToolNames: readonly string[] = []): string[] {
-  const extensionTools = registeredToolNames.filter((name) => ["read_workflow_guide", "blender_status", "run_blender", "recover_blender_run", "list_media_capabilities", "list_animation_actions", "optimize_image_asset", "get_model_asset", "use_canvas_asset", "prepare_three_runtime", "isolated_shell", "recover_isolated_changes", "read_project_file", "build_game", "canvas_check", "canvas_initialize", "playable_add_node", "playable_check", "game_use", "read_attachment", "recall_image"].includes(name));
+  const extensionTools = registeredToolNames.filter((name) => ["tool_search", "read_workflow_guide", "inspect_3d_views", "blender_status", "run_blender", "recover_blender_run", "review_tripo_model", "list_media_capabilities", "list_animation_actions", "optimize_image_asset", "get_model_asset", "use_canvas_asset", "prepare_three_runtime", "isolated_shell", "recover_isolated_changes", "read_project_file", "build_game", "canvas_check", "canvas_initialize", "playable_add_node", "playable_check", "game_use", "read_attachment", "recall_image", "recall_tool_text"].includes(name));
   const mediaTools = registeredToolNames.filter(name => ["recover_media", "recover_canvas_media"].includes(name)
     || (enabledTools.length > 0 && ["generate_canvas_media", "replace_canvas_media"].includes(name)));
   const aliases = mediaToolAliases.filter(([name, id]) => enabledTools.includes(id) && registeredToolNames.includes(name)).map(([name]) => name);
@@ -73,7 +74,7 @@ export function projectPiToolNames(
   registeredToolNames: readonly string[] = [],
 ): string[] {
   return mode === "planning"
-    ? [...planningPiToolNames(), ...["canvas_check", "read_project_file", "read_attachment", "recall_image", "list_media_capabilities", "list_animation_actions", "read_workflow_guide", "blender_status"].filter(name => registeredToolNames.includes(name))]
+    ? [...planningPiToolNames(), ...["canvas_check", "read_project_file", "read_attachment", "recall_image", "recall_tool_text", "list_media_capabilities", "list_animation_actions", "read_workflow_guide", "blender_status"].filter(name => registeredToolNames.includes(name))]
     : activePiToolNames(enabledTools, registeredToolNames);
 }
 
@@ -366,7 +367,42 @@ export function createAgentTools(
   generationScope?: string,
   enabledMediaTools?: () => readonly ToolId[],
   authorizeAttachment?: AuthorizeAgentAttachment,
+  reviewTurnaround?: (toolCallId: string, images: readonly PromptImage[], paths: readonly string[], signal?: AbortSignal, branch?: readonly SessionEntry[]) => Promise<void>,
+  reviewTripoModel?: (assetId: string, signal?: AbortSignal) => Promise<TripoModelReviewStatus | undefined>,
 ): PiToolDefinition[] {
+  function tripoReviewMessage(status: TripoModelReviewStatus, assetId: string) {
+    if (status === "approved") return "The user accepted this exact Tripo original. Use its sourceAssetId for Blender when the task calls for processing.";
+    if (status === "changes-requested") return "The Tripo result is saved, and the user requested changes. Wait for their feedback before any Blender work or further generation.";
+    return `The Tripo result is saved, but initial-model review is pending. Use get_model_asset with assetId "${assetId}" and rebuildPreview if needed, then review_tripo_model. Do not replace the original to fix a local preview.`;
+  }
+  async function withTripoReview(result: Awaited<ReturnType<PiToolDefinition["execute"]>>, signal?: AbortSignal) {
+    const details = result.details as { sourceAssetId?: string; canvasGeneration?: import("../shared/contracts.js").ToolJob } | undefined;
+    const assetId = details?.sourceAssetId;
+    if (!reviewTripoModel || !assetId || (details?.canvasGeneration && details.canvasGeneration.run?.toolId !== "image-to-3d")) return result;
+    const status = await reviewTripoModel(assetId, signal).catch(() => {
+      signal?.throwIfAborted();
+      return "preview-unavailable" as const;
+    });
+    return status ? { ...result, content: [...result.content, { type: "text" as const, text: tripoReviewMessage(status, assetId) }], details: { ...result.details as object, tripoModelReview: status } } : result;
+  }
+  const requireViewReview = async (callId: string, images: readonly PromptImage[], paths: readonly string[], signal?: AbortSignal, branch?: readonly SessionEntry[]) => {
+    signal?.throwIfAborted();
+    if (!reviewTurnaround) throw toolPreflightError("User review of the reference views is required. Open this workflow in an OhMyGame conversation. No generation was submitted.", "approval_required");
+    try {
+      await reviewTurnaround(callId, images, paths, signal, branch);
+      for (const [index, file] of paths.entries()) {
+        const current = await readProjectImage(project.workspacePath, file, "model", signal);
+        if (current.mediaType !== images[index]?.mediaType || current.data !== images[index]?.data)
+          throw new Error("A reference image changed during review. Present the revised views for user review. No generation was submitted.");
+      }
+      signal?.throwIfAborted();
+      return "The user approved these reference views on the review card before they were submitted for 3D generation.";
+    } catch (cause) {
+      signal?.throwIfAborted();
+      if (getToolPreflightFailure(cause)) throw cause;
+      throw toolPreflightError(cause instanceof Error ? cause.message : "The reference views could not be approved. No generation was submitted.", "approval_required");
+    }
+  };
   const attachmentRead = createAgentAttachmentReadTool(project.workspacePath, true, authorizeAttachment);
   const readImageReference = async (file: string, request: Pick<RunImageToolRequest, "prompt" | "imageModel">, signal?: AbortSignal): Promise<PromptImage> => {
     let image: PromptImage;
@@ -596,30 +632,42 @@ export function createAgentTools(
     nodeId: Type.String({ minLength: 1, maxLength: 120 }),
   };
   const canvasJobId = Type.String({ minLength: 1, maxLength: 120, description: "Use the existing job ID from this node's history." });
+  function registeredOutput(assets: Awaited<ReturnType<typeof readCanvasAssets>>["assets"], id?: string) {
+    if (!id) return;
+    return assets[id] ? [id, assets[id]] as const : Object.entries(assets).find(([, asset]) => asset.libraryAssetId === id);
+  }
   async function directCanvasResult(result: Awaited<ReturnType<PiToolDefinition["execute"]>>) {
     const details = result.details && typeof result.details === "object" ? result.details as Record<string, unknown> : {};
     const job = details.canvasGeneration as import("../shared/contracts.js").ToolJob | undefined;
     const file = job?.run?.files[0];
-    const asset = file?.assetId ? (await readCanvasAssets(project.workspacePath)).assets[file.assetId] : undefined;
+    const asset = file?.assetId ? registeredOutput((await readCanvasAssets(project.workspacePath)).assets, file.assetId)?.[1] : undefined;
     if (!file || !asset) return result;
     const type = file.mediaType.startsWith("image/") ? "image" : file.mediaType.startsWith("video/") ? "video" : file.mediaType.startsWith("audio/") ? "audio" : "model";
     const fbx = file.mediaType === "application/vnd.autodesk.fbx";
     if (fbx && !asset.modelPreviewPath) return result;
     return { ...result, details: { ...details, artifact: { type, path: fbx ? asset.modelPreviewPath : asset.path, mediaType: fbx ? "model/gltf-binary" : file.mediaType } } };
   }
-  async function canvasGenerationResult(nodeId: string, current: import("../shared/contracts.js").ToolJob, recovering: boolean) {
-    const manifest = await readCanvasAssets(project.workspacePath);
-    const assets = current.run?.files?.flatMap(file => file.assetId && manifest.assets[file.assetId] ? [manifest.assets[file.assetId]!] : []) ?? [];
-    const paths = assets.flatMap(asset => [asset.path, asset.modelRuntimePath ?? asset.modelPreviewPath].filter(Boolean));
+  async function canvasGenerationResult(nodeId: string, current: import("../shared/contracts.js").ToolJob, recovering: boolean, approvalReceipt?: string) {
+    const { assets } = await readCanvasAssets(project.workspacePath);
+    const registered = (current.run?.files ?? []).flatMap(file => {
+      const entry = registeredOutput(assets, file.assetId);
+      return entry ? [{ file, canvasId: entry[0], asset: entry[1] }] : [];
+    });
+    const paths = registered.flatMap(({ asset }) => [asset.path, asset.modelRuntimePath ?? asset.modelPreviewPath].filter(Boolean));
     if (recovering) {
-      if (!assets.length || assets.length !== current.run?.files.length) throw new Error("The job completed but its local output is unavailable in this project. Check the original project or Library. No new generation was sent.");
-      for (const asset of assets) await getWorkspaceMedia(project.workspacePath, asset.path);
+      if (!registered.length || registered.length !== current.run?.files.length) throw new Error("The job completed but its local output is unavailable in this project. Check the original project or Library. No new generation was sent.");
+      for (const { asset } of registered) await getWorkspaceMedia(project.workspacePath, asset.path);
     }
-    const canvasAssets = current.run?.files?.flatMap(file => file.assetId && manifest.assets[file.assetId]
-      ? [{ assetId: file.assetId, path: manifest.assets[file.assetId]!.path, registered: true, canvasOnly: manifest.assets[file.assetId]!.canvasOnly === true }] : []) ?? [];
+    const canvasAssets = registered.map(({ file, canvasId, asset }) => ({
+      assetId: canvasId, path: asset.path, registered: true, canvasOnly: asset.canvasOnly === true,
+      ...(["model/gltf-binary", "application/vnd.autodesk.fbx"].includes(file.mediaType) ? { sourceAssetId: asset.libraryAssetId ?? canvasId } : {}),
+    }));
+    const modelIds = canvasAssets.flatMap(asset => asset.sourceAssetId ? [asset.sourceAssetId] : []);
+    const handoff = modelIds.length ? ` For Blender, use sourceAssetId with the original project model: ${modelIds.join(", ")}.` : "";
     const candidates = canvasAssets.filter(asset => asset.canvasOnly).map(asset => asset.assetId);
     const usage = candidates.length ? ` Canvas candidates stay editor-only and are not in isolated_shell. Call use_canvas_asset with the selected assetId (${candidates.join(", ")}) and a public/ or src/ destination, then inspect its returned runtime path.` : "";
-    return { content: [{ type: "text" as const, text: `Generated media for node ${nodeId}. Saved and registered in canvas/assets.json: ${paths.join(", ")}. Inspect or play the relevant output to evaluate the actual result.${usage}` }], details: { canvasGeneration: current, canvasAssets } };
+    return { content: [{ type: "text" as const, text: `${approvalReceipt ? approvalReceipt + " " : ""}Generated media for node ${nodeId}. Saved and registered in canvas/assets.json: ${paths.join(", ")}. Inspect or play the relevant output to evaluate the actual result.${handoff}${usage}` }],
+      details: { canvasGeneration: current, canvasAssets, ...(modelIds.length === 1 ? { sourceAssetId: modelIds[0] } : {}) } };
   }
   const generate3DAsset = defineTool({
     name: PI_TOOL_NAMES["image-to-3d"],
@@ -632,20 +680,23 @@ export function createAgentTools(
       if (input.imagePath && input.imagePaths) throw new Error(conflicting3DImagePaths);
       const imagePaths = input.imagePaths ?? (input.imagePath ? [input.imagePath] : []);
       const callId = input.recoverCallId ?? toolCallId;
+      let approvalReceipt: string | undefined;
+      const reviewViews = !input.recoverCallId && (input.operation ?? "image") === "image" && imagePaths.length >= 3;
       const prepareInput = async (): Promise<RunToolRequest> => {
-        if (!input.recoverCallId) await tools.assertMediaInputOptions("image-to-3d", await tools.prepare("image-to-3d", input as RunToolRequest, project.id));
+        const options = !input.recoverCallId && (input.operation ?? "image") === "image"
+          ? { referenceMode: "turnaround" as const, ...input.options } : input.options;
+        if (!input.recoverCallId) await tools.assertMediaInputOptions("image-to-3d", await tools.prepare("image-to-3d", { ...input, options } as RunToolRequest, project.id, ctx?.model?.input?.includes("image")));
         const images: PromptImage[] = [];
         for (const file of imagePaths) images.push(await readProjectImage(project.workspacePath, file, "model", signal));
         signal?.throwIfAborted();
-        const options = !input.recoverCallId && (input.operation ?? "image") === "image"
-          ? { referenceMode: "turnaround" as const, ...input.options } : input.options;
+        if (reviewViews) approvalReceipt = await requireViewReview(callId, images, imagePaths, signal, ctx?.sessionManager?.getBranch?.());
         return {
           model: input.model, operation: input.operation, prompt: input.prompt,
           sourceAssetId: input.sourcePath ? await projects.ensureLibraryAsset(project.id, input.sourcePath) : undefined,
           targetPolycount: input.targetPolycount, texture: input.texture, pbr: input.pbr, options, images,
         };
       };
-      const run = await tools.run("image-to-3d", input.recoverCallId ? prepareInput : await prepareInput(), signal, project.id, { ...recoveryOptions("image-to-3d", callId, signal), agentCanInspectImages: ctx?.model?.input?.includes("image"), ...(input.recoverCallId ? { model3DRecoveryOnly: true } : {}) });
+      const run = await tools.run("image-to-3d", input.recoverCallId || reviewViews ? prepareInput : await prepareInput(), signal, project.id, { ...recoveryOptions("image-to-3d", callId, signal), agentCanInspectImages: ctx?.model?.input?.includes("image"), ...(input.recoverCallId ? { model3DRecoveryOnly: true } : {}) });
       return deliverMedia(run.id, callId, async () => {
         const output = run.files[0];
         if (!output) throw new Error("3D generator returned no output");
@@ -666,14 +717,26 @@ export function createAgentTools(
           } : {}),
         });
         const previewPath = retained?.modelRuntimePath ?? retained?.modelPreviewPath;
+        const handoff = output.assetId ? ` For Blender, use sourceAssetId "${output.assetId}" to open this project's original model.` : "";
         return {
-          content: [{ type: "text" as const, text: !fbx && !retained ? `Generated 3D model saved to ${relativePath}` : `${fbx ? "FBX original" : "Generated 3D model"} saved to ${relativePath}. ${retained?.modelRuntimePath ? `Game-ready model saved to ${retained.modelRuntimePath}; keep all returned resources together in the build. Use get_model_asset for validated runtime resources.` : fbx ? previewPath ? `Triangulated GLB preview saved to ${previewPath}; quad topology remains only in the FBX original.` : "The original is retained; a local preview is unavailable. Do not regenerate to repair a preview." : ""}`.trim() }],
-          details: { modelResources: retained, ...(retained?.modelRuntimePath || fbx && !previewPath ? {} : { artifact: { type: "model", path: previewPath ?? relativePath, mediaType: "model/gltf-binary" } }) },
+          content: [{ type: "text" as const, text: (approvalReceipt ? approvalReceipt + " " : "") + (!fbx && !retained ? `Generated 3D model saved to ${relativePath}` : `${fbx ? "FBX original" : "Generated 3D model"} saved to ${relativePath}. ${retained?.modelRuntimePath ? `Game-ready model saved to ${retained.modelRuntimePath}; keep all returned resources together in the build. Use get_model_asset for validated runtime resources.` : fbx ? previewPath ? `Triangulated GLB preview saved to ${previewPath}; quad topology remains only in the FBX original.` : "The original is retained; a local preview is unavailable. Do not regenerate to repair a preview." : ""}`.trim()) + handoff }],
+          details: { ...(output.assetId ? { sourceAssetId: output.assetId } : {}), modelResources: retained, ...(retained?.modelRuntimePath || fbx && !previewPath ? {} : { artifact: { type: "model", path: previewPath ?? relativePath, mediaType: "model/gltf-binary" } }) },
         };
       });
     },
   });
-  const registeredTools: PiToolDefinition[] = [...(project.type === "web-game" ? [defineTool({
+  const registeredTools: PiToolDefinition[] = [...(reviewTripoModel ? [defineTool({
+    name: "review_tripo_model",
+    label: "Review the initial Tripo model",
+    description: "Present a retained Tripo original for human approval before its first Blender stage. Use its exact sourceAssetId. Loads the local result without generating or replacing it.",
+    executionMode: "sequential",
+    parameters: Type.Object({ sourceAssetId: Type.String({ format: "uuid" }) }, { additionalProperties: false }),
+    execute: async (_id, { sourceAssetId }, signal) => {
+      const status = await reviewTripoModel(sourceAssetId, signal);
+      if (!status) throw toolPreflightError("Choose the project-bound Tripo original. Use get_model_asset to find its sourceAssetId.", "invalid_model_reference");
+      return { content: [{ type: "text", text: tripoReviewMessage(status, sourceAssetId) }], details: { sourceAssetId, tripoModelReview: status } };
+    },
+  })] : []), ...(project.type === "web-game" ? [defineTool({
     name: "prepare_three_runtime",
     label: "Prepare Three.js",
     executionMode: "sequential",
@@ -774,7 +837,7 @@ export function createAgentTools(
   }), generate3DAsset, defineTool({
     name: TURNAROUND_3D_TOOL,
     label: "Generate 3D From Views",
-    description: "Build a production model from inspected orthographic front, left and back images of one subject; add the right view if available. Supply imagePaths in that order, plus any supported geometry and texture settings. The project-selected 3D model is used unless explicitly overridden. For an existing paid result call recover_media with the original tool name and call ID.",
+    description: "Inspect the final ordered front, left, back and optional right views with inspect_3d_views first. Then call this tool with the same imagePaths and supported geometry and texture settings to show the user the actual views for review. Modeling starts only after the user approves this set. No provider upload or paid model request is sent while waiting. The project-selected 3D model is used unless explicitly overridden. For an existing paid result call recover_media with the original tool name and call ID.",
     parameters: turnaround3DParameters,
     execute: (id, input, signal, update, ctx) => generate3DAsset.execute(id, {
       ...input, operation: "image", options: { ...input.options, referenceMode: "turnaround" },
@@ -1096,10 +1159,20 @@ export function createAgentTools(
       const previousCall = previous && await tools.agentMedia.canvasCall(currentCall.agentCall.scope, previous.id);
       const options = recover && previousCall ? recoveryOptions(toolId, previousCall, signal) : currentCall;
       const confirmation = replacement ? confirmedAudioJobId : undefined;
+      const canInspect = ctx?.model?.input?.includes("image");
+      let approvalReceipt: string | undefined;
+      let submitNew = () => canvasStore.generateNode(project.id, input.boardId, input.nodeId, confirmation, "turnaround", canInspect, toolId);
+      const prepareModel = toolId === "image-to-3d" && !recover ? async () => {
+        submitNew = await canvasStore.prepareNode(project.id, input.boardId, input.nodeId, confirmation, "turnaround", canInspect,
+          async (images, paths) => {
+            approvalReceipt = await requireViewReview(toolCallId, images, paths, signal, ctx?.sessionManager?.getBranch?.());
+          }, toolId);
+        signal?.throwIfAborted();
+      } : undefined;
       let safeFailure = false;
       return tools.agentMedia.use(options.agentCall, options.recoveryId, Boolean(recover), options.confirmNew, async (_receipt, save) => {
         const observed = recover && (previous?.status === "running" || previous?.status === "succeeded") ? previous : undefined;
-        const job = observed ?? await (recover ? canvasStore.retry(project.id, recover, true) : canvasStore.generateNode(project.id, input.boardId, input.nodeId, confirmation, "turnaround", ctx?.model?.input?.includes("image")))
+        const job = observed ?? await (recover ? canvasStore.retry(project.id, recover, true) : submitNew())
           .catch((cause) => { safeFailure = true; throw cause; });
         await save({ canvasJobId: job.id });
         // A recovery observer owns its wait, not the job started from the Canvas or another turn.
@@ -1120,9 +1193,9 @@ export function createAgentTools(
             safeFailure = !current.run && !mediaGenerationNeedsConfirmation(current);
             throw new Error(current.error || "Generation failed");
           }
-          return await canvasGenerationResult(input.nodeId, current, Boolean(recover));
+          return await canvasGenerationResult(input.nodeId, current, Boolean(recover), approvalReceipt);
         } finally { signal?.removeEventListener("abort", cancel); }
-      }, () => safeFailure, confirmation ? previousCall ?? confirmation : undefined);
+      }, () => safeFailure, confirmation ? previousCall ?? confirmation : undefined, prepareModel);
     },
   }))] : []), ...(playtest?.driver.available && playtest.driver.capabilities.projectTypes.includes(project.type) && (project.type !== "general" || supportsWebPreview(project))
     ? [createGameUseTool(playtest.driver, playtest.resolveOpenTarget, { bridge: project.type === "interactive-story" ? "reset" : "full" })]
@@ -1194,11 +1267,11 @@ export function createAgentTools(
             return saved?.status === "succeeded" ? canvasGenerationResult(input.nodeId, saved, true) : undefined;
           };
           const result = await completed();
-          if (result) return result;
+          if (result) return withTripoReview(result, args[2]);
           const recover = registeredTools.find(tool => tool.name === "recover_canvas_media")!;
-          try { return await recover.execute(args[0], { ...input, recoverJobId: jobId }, args[2], args[3], args[4]); }
+          try { return await withTripoReview(await recover.execute(args[0], { ...input, recoverJobId: jobId }, args[2], args[3], args[4]), args[2]); }
           catch (cause) {
-            if (cause instanceof MediaAlreadyDelivered) { const result = await completed(); if (result) return result; }
+            if (cause instanceof MediaAlreadyDelivered) { const result = await completed(); if (result) return withTripoReview(result, args[2]); }
             if (cause instanceof Error) cause.message += ` Original Canvas job ${jobId}, board ${input.boardId}, node ${input.nodeId}. Recovery did not authorize a replacement request.`;
             throw cause;
           }
@@ -1227,13 +1300,18 @@ export function createAgentTools(
               : await saveAgentCanvasMedia(project.id, canvasStore, projects, tools, toolId, input, `agent-${recoveryId}`, agentCanvasBoard(args[4]?.sessionManager?.getBranch?.() ?? []), (file, signal) => readImageReference(file, input as Pick<RunImageToolRequest, "prompt" | "imageModel">, signal), args[2]);
             args[2]?.throwIfAborted();
             const generate = registeredTools.find(tool => tool.name === "generate_canvas_media")!;
-            try { return await directCanvasResult(await generate.execute(args[0], target, args[2], args[3], args[4])); }
+            let result;
+            try { result = await directCanvasResult(await generate.execute(args[0], target, args[2], args[3], args[4])); }
             catch (cause) {
-              if (!(cause instanceof MediaAlreadyDelivered)) await canvasStore.recordAgentMediaFailure(project.id, target.boardId, target.nodeId, toolId, cause instanceof Error ? cause.message : String(cause)).catch(() => {});
+              const reason = getToolPreflightFailure(cause)?.reason;
+              const stoppedForReview = toolId === "image-to-3d" && (reason === "approval_required" || reason === "authorization_denied" || reason === "invalid_model_reference" || args[2]?.aborted);
+              if (!(cause instanceof MediaAlreadyDelivered) && !stoppedForReview) await canvasStore.recordAgentMediaFailure(project.id, target.boardId, target.nodeId, toolId, cause instanceof Error ? cause.message : String(cause)).catch(() => {});
               throw cause;
             }
+            return toolId === "image-to-3d" ? withTripoReview(result, args[2]) : result;
           }
-          return await tool.execute(...args);
+          const result = await tool.execute(...args);
+          return toolId === "image-to-3d" || !toolId ? withTripoReview(result, args[2]) : result;
         }
         catch (cause) {
           if (!(cause instanceof MediaAlreadyDelivered)) throw cause;

@@ -45,6 +45,23 @@ const PLUGIN_CATEGORIES = [
 ] as const;
 const PLUGIN_ORDER: readonly string[] = PLUGIN_CATEGORIES.flatMap(category => [...category.plugins]);
 
+function isBundledBlender(plugin: PluginSummary): boolean {
+  return plugin.source.type === "builtIn" && plugin.id === "ohmygame:blender";
+}
+
+function pluginDescription(plugin: PluginSummary): string {
+  return isBundledBlender(plugin) ? t("plugins.blender.description") : plugin.description;
+}
+
+function exampleLabel(plugin: PluginSummary, prompt: string): string {
+  if (isBundledBlender(plugin)) {
+    for (const key of ["fromReference", "fromModel", "procedural"] as const) {
+      if (prompt === t(`plugins.blender.${key}`, { lng: "en" })) return t(`plugins.blender.${key}`);
+    }
+  }
+  return prompt;
+}
+
 function pluginCategory(plugin: PluginSummary) {
   return PLUGIN_CATEGORIES.find(category => category.plugins.some(id => id === plugin.id))?.id ?? "other";
 }
@@ -406,7 +423,7 @@ function PluginCard({ plugin, disabled, onToggle, onOpen }: { plugin: PluginSumm
       <PluginIcon plugin={plugin} />
       <span className="plugin-card-copy">
         <span className="plugin-card-title"><strong>{plugin.displayName}</strong>{plugin.beta ? <small className="plugin-beta">{t("plugins.beta")}</small> : null}{plugin.configurationStatus === "needs-configuration" ? <small className="plugin-status">{t("plugins.needsConfiguration")}</small> : null}{plugin.installed && !plugin.enabled ? <small className="plugin-status">{t("common.disabled")}</small> : null}</span>
-        <span className="plugin-card-description">{plugin.description}</span>
+        <span className="plugin-card-description">{pluginDescription(plugin)}</span>
       </span>
     </button>
     <PluginEnabledSwitch plugin={plugin} disabled={disabled} onToggle={onToggle} />
@@ -522,7 +539,7 @@ function PluginDetailView({ phase, plugin, updating, error, onRetry, onTogglePlu
             {plugin.beta ? <small className="plugin-detail-badge plugin-beta">{t("plugins.beta")}</small> : null}
             {plugin.preinstalled ? <small className="plugin-detail-badge">{t("plugins.included")}</small> : null}
           </div>
-          <p>{plugin.description}</p>
+          <p>{pluginDescription(plugin)}</p>
           <div className="plugin-detail-hero-actions" ref={tryMenu}>
             {plugin.installed && plugin.enabled && firstPrompt ? <button className="plugin-detail-primary" type="button" aria-haspopup="dialog" aria-expanded={Boolean(tryPrompt)} onClick={() => choosePrompt(firstPrompt)}><Play size={13} />{t("plugins.tryNow")}</button> : null}
             {tryPrompt ? <div className="plugin-try-popover project-switcher-popover" role="dialog" aria-label={t("plugins.tryName", { name: plugin.displayName })}>
@@ -553,19 +570,21 @@ function PluginDetailView({ phase, plugin, updating, error, onRetry, onTogglePlu
         <button className="plugin-detail-secondary" type="button" disabled={updating} onClick={() => void openPluginBuilder(plugin.id, "edit").catch(cause => setProjectError(errorMessage(cause)))}><WandSparkles size={13} />{t("plugins.editWithAi")}</button>
         {projectError ? <p role="alert">{projectError}</p> : null}
       </div> : null}
-      {plugin.longDescription ? <section className="plugin-about"><h2>{t("plugins.about")}</h2><p>{plugin.longDescription}</p></section> : null}
+      {plugin.longDescription ? <section className="plugin-about"><h2>{t("plugins.about")}</h2><p>{isBundledBlender(plugin) ? t("plugins.blender.about") : plugin.longDescription}</p></section> : null}
       {prompts.length ? <section className="plugin-prompts">
         <h2>{t("plugins.tryIt")}</h2>
         <div>{prompts.map((prompt) => <button type="button" key={prompt} onClick={() => choosePrompt(prompt)}>
           <span className="plugin-prompt-copy">
             <span className="plugin-prompt-reference"><PluginGlyph plugin={plugin} size={14} />{plugin.displayName}</span>
-            <span className="plugin-prompt-text">{prompt}</span>
+            <span className="plugin-prompt-text">{exampleLabel(plugin, prompt)}</span>
           </span>
           <ChevronRight size={14} />
         </button>)}</div>
         {tryNotice ? <p role="status">{tryNotice}</p> : null}
       </section> : null}
-      <SkillSection pluginId={plugin.id} items={plugin.skills} installed={plugin.installed} disabled={updating || !plugin.enabled} onBrowse={onBrowseSkill} onToggle={onToggleComponent} />
+      <SkillSection pluginId={plugin.id} items={plugin.skills.map(item => isBundledBlender(plugin) && item.id === "skills/blender-assets/SKILL.md"
+        ? { ...item, name: t("plugins.blender.skill"), description: t("plugins.blender.skillDescription") } : item)}
+        installed={plugin.installed} disabled={updating || !plugin.enabled} onBrowse={onBrowseSkill} onToggle={onToggleComponent} />
       <PluginConfigurationPanel plugin={plugin} onChanged={onCapabilitiesChanged} />
       {plugin.enabled && plugin.integration ? <PluginIntegrationPanel key={plugin.id} pluginId={plugin.id} /> : null}
       <PluginDependencyPanel plugin={plugin} />
@@ -663,7 +682,7 @@ function pluginSummary(plugin: PluginDetail): PluginSummary {
 }
 
 function pluginSearchText(plugin: PluginSummary): string {
-  return `${plugin.name} ${plugin.displayName} ${plugin.description} ${plugin.marketplace.displayName}`.toLowerCase();
+  return `${plugin.name} ${plugin.displayName} ${plugin.description} ${pluginDescription(plugin)} ${plugin.marketplace.displayName}`.toLowerCase();
 }
 
 function PluginManagement({ plugin, updating, onBrowse, onRemove, onToggle }: {

@@ -1,6 +1,8 @@
 // @vitest-environment happy-dom
 import { act } from "react";
 import { createRoot } from "react-dom/client";
+import { readFile } from "node:fs/promises";
+import i18next from "i18next";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PluginsSettings } from "../src/renderer/plugins.js";
 import { PluginBuilderSessions } from "../src/renderer/plugin-builder.js";
@@ -89,6 +91,7 @@ beforeEach(() => {
 });
 afterEach(async () => {
   await act(async () => root.unmount());
+  await i18next.changeLanguage("en");
   container.remove();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -100,6 +103,50 @@ async function selectCollection(name: string) {
 }
 
 describe("Plugin library", () => {
+  it.each(["zh-CN", "en"])("shows the bundled Blender workflows in %s and opens the matching English draft", async locale => {
+    await i18next.changeLanguage(locale);
+    const manifest = JSON.parse(await readFile("plugins/blender/.ohmygame-plugin/plugin.json", "utf8")).interface;
+    expect(manifest.shortDescription).toBe(i18next.t("plugins.blender.description", { lng: "en" }));
+    expect(manifest.longDescription).toBe(i18next.t("plugins.blender.about", { lng: "en" }));
+    const blender: PluginDetail = {
+      ...official, id: "ohmygame:blender", name: "blender", displayName: "Blender",
+      description: manifest.shortDescription, longDescription: manifest.longDescription, defaultPrompts: manifest.defaultPrompt,
+      skills: [{ id: "skills/blender-assets/SKILL.md", name: "Blender Assets", enabled: true }],
+    };
+    const personal: PluginDetail = { ...blender, id: "personal:blender", source: { type: "directory" },
+      marketplace: imported.marketplace, description: "A separate plugin", longDescription: "A different workflow" };
+    plugins = [blender, personal];
+    const original = fetch;
+    vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+      const route = decodeURIComponent(new URL(url, "http://localhost").pathname).replace(/^\/api/, "");
+      const plugin = plugins.find(p => route === `/plugins/${p.id}`);
+      if (plugin) return Response.json(plugin);
+      if (route === "/projects") return Response.json([]);
+      return original(url, init);
+    });
+    const onTry = vi.fn(async () => {});
+    const show = async (id?: string) => act(async () => root.render(
+      <PluginsSettings pluginId={id} onPluginChange={() => {}} onTryPlugin={onTry} />,
+    ));
+    await show();
+    expect(container.querySelector(".plugin-card-description")?.textContent).toBe(i18next.t("plugins.blender.description"));
+    await show(blender.id);
+    expect(container.querySelector(".plugin-about p")?.textContent).toBe(i18next.t("plugins.blender.about"));
+    expect(container.querySelector(".plugin-skills")?.textContent).toContain(i18next.t("plugins.blender.skillDescription"));
+    const examples = [...container.querySelectorAll<HTMLButtonElement>(".plugin-prompts button")];
+    const keys = ["fromReference", "fromModel", "procedural"] as const;
+    expect(examples.map(button => button.querySelector(".plugin-prompt-text")?.textContent)).toEqual(keys.map(key => i18next.t(`plugins.blender.${key}`)));
+    for (const [index, button] of examples.entries()) {
+      await act(async () => button.click());
+      await act(async () => container.querySelector<HTMLButtonElement>(".project-switcher-footer button")!.click());
+      expect(onTry).toHaveBeenLastCalledWith(blender, manifest.defaultPrompt[index], undefined);
+      expect(manifest.defaultPrompt[index]).toBe(i18next.t(`plugins.blender.${keys[index]!}`, { lng: "en" }));
+    }
+    await show(personal.id);
+    expect(container.querySelector(".plugin-about p")?.textContent).toBe(personal.longDescription);
+    expect(container.querySelector(".plugin-prompt-text")?.textContent).toBe(manifest.defaultPrompt[0]);
+  });
+
   it("shows beta metadata on the matching card without marking other plugins", async () => {
     plugins[0]!.beta = true;
     await act(async () => root.render(<PluginsSettings onPluginChange={() => {}} onTryPlugin={async () => {}} />));

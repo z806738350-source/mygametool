@@ -51,6 +51,7 @@ export interface DriverContext {
   resume?: string;
   /** The pooled Codex app server this conversation shares with others of the same configuration. */
   codexServer?: { key: string; directory: string };
+  verifyCodexInstallation?: () => Promise<void>;
 }
 
 export interface HttpBridgeHandlers {

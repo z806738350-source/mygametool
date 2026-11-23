@@ -17,6 +17,12 @@ durable host journal records both stages. Uncertain replies preserve the host
 project and keep admission closed. Explicit retries inspect actual state;
 unknown metadata is never treated as an absent volume or successful cleanup.
 
+The managed local desktop launcher compacts Chromium's local storage after
+the window exits when a project was deleted. It copies the live entries into
+a replacement database, excluding only the deleted project's editor keys and
+preserving settings and other origins. An interrupted cleanup is retried before
+the next launch. This step runs after Chromium has closed the profile.
+
 An explicit confirmed deletion may start the existing local VM through the same
 owned lifecycle used by execution. It never creates a replacement VM or allocates
 a project volume or identity merely to delete. A running VM is borrowed; one

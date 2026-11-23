@@ -1,5 +1,5 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   access,
   lstat,
@@ -18,11 +18,6 @@ import {
   registerProjectProcess,
   terminateProjectProcess,
 } from "./process-lifecycle.js";
-import {
-  startBlenderLiveView,
-  type BlenderLiveView,
-  type BlenderLiveViewResult,
-} from "./blender-live-view.js";
 
 const EXECUTABLE = "/Applications/Blender.app/Contents/MacOS/Blender";
 const SANDBOX = "/usr/bin/sandbox-exec";
@@ -57,11 +52,16 @@ export interface BlenderRunInput {
   scriptPath?: string;
   /** Only the application loads these bundled sources; never an Agent-supplied absolute path. */
   bundledScripts?: { entry: string; files: Record<string, string> };
+  /** Only the host's bundled export runs its GLB verification in a fresh worker. */
+  bundledExport?: true;
   inputs: string[];
+  /** Digest of a host-retained parent scene; verify the bytes actually passed to Blender. */
+  expectedInputSha256?: Record<string, string>;
+  /** Host-checked bytes of the original model bound to this project. */
+  boundSource?: { path: string; bytes: Buffer; sha256: string };
+  sourceOriginal?: { assetId: string; sha256: string; format: "fbx" | "glb" };
   args?: string[];
   timeoutMs?: number;
-  /** Host-owned desktop display; never changes the worker's execution policy. */
-  liveView?: boolean;
   /** Effective workflow and review mode, including runs without a chat session. */
   workflowRequest?: object;
   /** Host-owned call identity, retained before execution for recovery without replay. */
@@ -73,7 +73,6 @@ export interface BlenderRunResult {
   outputDirectory: string;
   files: Array<{ path: string; size: number }>;
   log: string;
-  liveView?: BlenderLiveViewResult;
 }
 
 export class BlenderRunError extends Error {
@@ -133,23 +132,38 @@ function sandboxProfile(directory: string): string {
 `;
 }
 
-const BOOTSTRAP = `import json, os, resource, runpy, sys
+const BOOTSTRAP = `import json, math, os, resource, runpy, sys
 from pathlib import Path
 root = Path(__file__).parent
 config = json.loads((root / "launch.json").read_text())
 resource.setrlimit(resource.RLIMIT_FSIZE, (${FILE_LIMIT}, ${FILE_LIMIT}))
 resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
-resource.setrlimit(resource.RLIMIT_CPU, (config["cpu"], config["cpu"]))
+phase = os.environ.get("OHMYGAME_BLENDER_EXPORT_PHASE")
+cpu = config["cpu"]
+charge_file = root / "tmp" / "prepare-cpu.json"
+if phase == "verify":
+    charged = json.loads(charge_file.read_text())
+    if type(charged) != int or not 0 < charged < cpu:
+        raise RuntimeError("Blender export exhausted its shared CPU budget before verification")
+    cpu -= charged
+resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
 os.chdir(root / "inputs")
 sys.path.insert(0, str(root / "scripts"))
-if config.get("liveView"):
-    os.environ["OHMYGAME_BLENDER_LIVE_DIR"] = str(root / "tmp" / "live")
 entry = str(root / "scripts" / config["entry"])
 sys.argv = [entry, "--", *config["args"], "--input-dir", str(root / "inputs"), "--output-dir", str(root / "output")]
+if phase:
+    sys.argv += ["--export-phase", phase, "--export-state", str(root / "tmp" / "export-state.json")]
 runpy.run_path(entry, run_name="__main__")
+if phase == "prepare":
+    # Charge CPU already used plus one second for shutdown. Cap this worker at its
+    # charge so both sequential process limits add up to the original job budget.
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    charged = min(cpu, math.ceil(usage.ru_utime + usage.ru_stime) + 1)
+    resource.setrlimit(resource.RLIMIT_CPU, (charged, charged))
+    charge_file.write_text(json.dumps(charged))
 `;
 
-async function checkMemory(child: ChildProcess): Promise<void> {
+async function checkMemory(child: ChildProcess, stage: string): Promise<void> {
   if (!child.pid || child.exitCode !== null || child.signalCode !== null)
     return;
   const output = await new Promise<string>((resolve, reject) => {
@@ -177,7 +191,7 @@ async function checkMemory(child: ChildProcess): Promise<void> {
   // A sampled watchdog, not a hard RAM quota: a rapid native allocation can exceed it between samples.
   if (Number(rss) > 2 * 1024 * 1024)
     throw new Error(
-      "Blender exceeded the 2 GiB resident-memory watchdog; previous assets are unchanged",
+      `Blender exceeded the 2 GiB resident-memory watchdog during ${stage} (sampled RSS ${rss} KiB, limit 2097152 KiB); previous assets are unchanged`,
     );
 }
 
@@ -290,6 +304,7 @@ export class BlenderRunner {
     id: string;
     status: "completed" | "failed" | "interrupted";
     message?: string;
+    stageError?: string;
     log: string;
   }> {
     if (
@@ -331,7 +346,13 @@ export class BlenderRunner {
       const receipt = JSON.parse(failed.toString("utf8"));
       if (receipt.id !== id || typeof receipt.message !== "string")
         throw new BlenderRunError("Blender failure record is invalid", id);
-      return { id, status: "failed", message: redact(receipt.message), log };
+      // A bundled stage writes its diagnosis even on failure. Partial model files stay private.
+      const stageError = await optional("output/report.json", 1024 * 1024).then(bytes => {
+        if (!bytes) return;
+        const report = JSON.parse(bytes.toString("utf8"));
+        if (typeof report?.error === "string") return redact(report.error, { maxLength: 2000 });
+      }).catch(() => undefined);
+      return { id, status: "failed", message: redact(receipt.message), ...(stageError ? { stageError } : {}), log };
     }
     return {
       id,
@@ -355,13 +376,14 @@ export class BlenderRunner {
     let id: string | undefined,
       directory: string | undefined,
       log = "";
-    let liveView: BlenderLiveView | undefined;
-    let liveResult: BlenderLiveViewResult | undefined;
     try {
       const status = await this.status();
       if (!status.available) throw new Error(status.reason);
       if (!!input.scriptPath === !!input.bundledScripts)
         throw new Error("Choose a project script or bundled Blender workflow");
+      if (input.bundledExport && (input.bundledScripts?.entry !== "pipeline.py" ||
+          input.args?.[0] !== "--stage" || input.args[1] !== "export"))
+        throw new Error("Only the bundled Blender export can start a verification worker");
       const timeout = input.timeoutMs ?? 120_000;
       if (!Number.isInteger(timeout) || timeout < 1000 || timeout > 300_000)
         throw new Error("Blender timeout must be between 1 and 300 seconds");
@@ -413,16 +435,33 @@ export class BlenderRunner {
         throw new Error("Invalid bundled Blender scripts");
       const snapshots: Array<{ path: string; bytes: Buffer }> = [];
       let total = 0;
+      if (input.boundSource) {
+        const source = input.boundSource;
+        relativeFile(source.path);
+        if (!/^source-[a-f0-9-]{36}\.(glb|fbx)$/.test(source.path) || input.inputs.includes(source.path) || input.inputs.length >= 32
+          || !source.bytes.length || source.bytes.length > FILE_LIMIT || createHash("sha256").update(source.bytes).digest("hex") !== source.sha256)
+          throw new Error("The bound Blender source failed its snapshot or size check");
+        total = source.bytes.length;
+        snapshots.push({ path: source.path, bytes: source.bytes });
+      }
       for (const name of input.inputs) {
         signal?.throwIfAborted();
         relativeFile(name);
-        if (!INPUT_EXTENSIONS.has(path.extname(name).toLowerCase()))
-          throw new Error("Unsupported Blender input format");
+        const extension = path.extname(name).toLowerCase();
+        if (extension === ".py")
+          throw new Error(`The Blender inputs parameter accepts data files only. Remove ${JSON.stringify(name)} from inputs and put its required code in the single custom script supplied as scriptPath.`);
+        if (!INPUT_EXTENSIONS.has(extension))
+          throw new Error(`Unsupported Blender input format for ${JSON.stringify(name)}. Supported data files: ${[...INPUT_EXTENSIONS].join(", ")}.`);
         const bytes = await readSafeProjectFile(
           workspace,
           path.join(workspace, name),
           FILE_LIMIT,
         );
+        const expected = input.expectedInputSha256?.[name];
+        if (expected && createHash("sha256").update(bytes).digest("hex") !== expected)
+          throw new Error(extension === ".json"
+            ? "The saved Blender configuration changed before execution. Read the current configuration before retrying."
+            : "The previous Blender scene was edited. Preserve the edit as a separate existing source or continue from the unchanged retained scene.");
         total += bytes.length;
         if (total > INPUT_LIMIT)
           throw new Error("Blender inputs exceed 128 MiB");
@@ -469,10 +508,11 @@ export class BlenderRunner {
           entry: scripts.entry,
           args,
           cpu: Math.ceil(timeout / 1000),
-          liveView: input.liveView === true,
         }),
         { flag: "wx", mode: 0o400 },
       );
+      if (input.sourceOriginal)
+        await writeFile(path.join(directory, "source-original.json"), JSON.stringify(input.sourceOriginal), { flag: "wx", mode: 0o400 });
       if (input.workflowRequest)
         await writeFile(path.join(directory, "workflow.json"), JSON.stringify(input.workflowRequest), { flag: "wx", mode: 0o400 });
       if (input.invocation)
@@ -484,123 +524,127 @@ export class BlenderRunner {
             mode: 0o400,
           },
         );
-      signal?.throwIfAborted();
-      if (input.liveView)
-        liveView = await startBlenderLiveView(
-          directory,
-          async (viewer, viewerDirectory) => {
-            await checkMemory(viewer);
-            await inventory(viewerDirectory, 192 * MiB, false);
-          },
-          signal,
-        );
-      signal?.throwIfAborted();
-      const child = spawn(
-        SANDBOX,
-        [
-          "-p",
-          sandboxProfile(directory),
-          EXECUTABLE,
-          "--background",
-          "--factory-startup",
-          "--disable-autoexec",
-          "--threads",
-          "2",
-          "--python-exit-code",
-          "1",
-          "--python",
-          path.join(directory, "bootstrap.py"),
-        ],
-        {
-          cwd: path.join(directory, "inputs"),
-          detached: true,
-          stdio: ["ignore", "pipe", "pipe"],
-          env: {
-            HOME: path.join(directory, "home"),
-            TMPDIR: path.join(directory, "tmp"),
-            PATH: "/usr/bin:/bin",
-            LANG: "en_US.UTF-8",
-            PYTHONNOUSERSITE: "1",
-            OMP_NUM_THREADS: "2",
-            BLENDER_USER_CONFIG: path.join(directory, "home"),
-            BLENDER_USER_SCRIPTS: path.join(directory, "home"),
-          },
-        },
-      );
-      registerProjectProcess(child);
-      let failure: string | undefined, stopping: Promise<void> | undefined;
-      const stop = (reason: string) => {
-        failure ??= reason;
-        stopping ??= terminateProjectProcess(child);
-      };
-      const abort = () =>
-        stop("Blender job cancelled; previous project assets are unchanged");
-      signal?.addEventListener("abort", abort, { once: true });
-      if (signal?.aborted) abort();
-      const timer = setTimeout(
-        () =>
-          stop("Blender job timed out; previous project assets are unchanged"),
-        timeout,
-      );
-      let scanning: Promise<void> | undefined,
-        memoryCheckedAt = 0;
-      const monitor = setInterval(() => {
-        if (scanning || failure) return;
-        scanning = (async () => {
-          await inventory(directory!, INPUT_LIMIT + 256 * MiB, false).catch(
-            () => {
-              throw new Error("Blender temporary output exceeded its limits");
+      const deadline = performance.now() + timeout;
+      const phases = input.bundledExport ? ["prepare", "verify"] : [undefined];
+      const singleStage = scripts.entry === "pipeline.py" && args[0] === "--stage"
+        ? args[1] ?? "bundled workflow"
+        : "custom script";
+      for (const phase of phases) {
+        signal?.throwIfAborted();
+        const timeLeft = deadline - performance.now();
+        if (timeLeft <= 0)
+          throw new Error("Blender job timed out; previous project assets are unchanged");
+        const stage = phase ? `export ${phase}` : singleStage;
+        const child = spawn(
+          SANDBOX,
+          [
+            "-p",
+            sandboxProfile(directory),
+            EXECUTABLE,
+            "--background",
+            "--quiet",
+            "--factory-startup",
+            "--disable-autoexec",
+            "--threads",
+            "2",
+            "--python-exit-code",
+            "1",
+            "--python",
+            path.join(directory, "bootstrap.py"),
+          ],
+          {
+            cwd: path.join(directory, "inputs"),
+            detached: true,
+            stdio: ["ignore", "pipe", "pipe"],
+            env: {
+              ...(phase ? { OHMYGAME_BLENDER_EXPORT_PHASE: phase } : {}),
+              HOME: path.join(directory, "home"),
+              TMPDIR: path.join(directory, "tmp"),
+              PATH: "/usr/bin:/bin",
+              LANG: "en_US.UTF-8",
+              PYTHONNOUSERSITE: "1",
+              OMP_NUM_THREADS: "2",
+              BLENDER_USER_CONFIG: path.join(directory, "home"),
+              BLENDER_USER_SCRIPTS: path.join(directory, "home"),
             },
-          );
-          if (Date.now() - memoryCheckedAt >= 1000) {
-            memoryCheckedAt = Date.now();
-            await checkMemory(child);
+          },
+        );
+        registerProjectProcess(child);
+        let failure: string | undefined, stopping: Promise<void> | undefined;
+        const stop = (reason: string) => {
+          failure ??= reason;
+          stopping ??= terminateProjectProcess(child);
+        };
+        const abort = () =>
+          stop("Blender job cancelled; previous project assets are unchanged");
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) abort();
+        const timer = setTimeout(
+          () =>
+            stop("Blender job timed out; previous project assets are unchanged"),
+          timeLeft,
+        );
+        let scanning: Promise<void> | undefined,
+          memoryCheckedAt = 0;
+        const monitor = setInterval(() => {
+          if (scanning || failure) return;
+          scanning = (async () => {
+            await inventory(directory!, INPUT_LIMIT + 256 * MiB, false).catch(
+              () => {
+                throw new Error("Blender temporary output exceeded its limits");
+              },
+            );
+            if (Date.now() - memoryCheckedAt >= 1000) {
+              memoryCheckedAt = Date.now();
+              await checkMemory(child, stage);
+            }
+          })()
+            .catch((error) =>
+              stop(
+                error instanceof Error
+                  ? error.message
+                  : "Blender resource monitoring failed",
+              ),
+            )
+            .finally(() => {
+              scanning = undefined;
+            });
+        }, 250);
+        const capture = (bytes: Buffer) => {
+          if (Buffer.byteLength(log) + bytes.length > LOG_LIMIT) {
+            stop("Blender log exceeded its 48 KiB limit");
+            return;
           }
-        })()
-          .catch((error) =>
-            stop(
-              error instanceof Error
-                ? error.message
-                : "Blender resource monitoring failed",
-            ),
-          )
-          .finally(() => {
-            scanning = undefined;
+          log += bytes.toString("utf8");
+        };
+        child.stdout.on("data", capture);
+        child.stderr.on("data", capture);
+        let code: number | null;
+        try {
+          code = await new Promise<number | null>((resolve, reject) => {
+            child.once("error", reject);
+            child.once("close", resolve);
           });
-      }, 250);
-      const capture = (bytes: Buffer) => {
-        if (Buffer.byteLength(log) + bytes.length > LOG_LIMIT) {
-          stop("Blender log exceeded its 48 KiB limit");
-          return;
+        } finally {
+          clearTimeout(timer);
+          clearInterval(monitor);
+          signal?.removeEventListener("abort", abort);
+          await scanning;
+          await (stopping ?? terminateProjectProcess(child));
         }
-        log += bytes.toString("utf8");
-      };
-      child.stdout.on("data", capture);
-      child.stderr.on("data", capture);
-      let code: number | null;
-      try {
-        code = await new Promise<number | null>((resolve, reject) => {
-          child.once("error", reject);
-          child.once("close", resolve);
-        });
-      } finally {
-        clearTimeout(timer);
-        clearInterval(monitor);
-        signal?.removeEventListener("abort", abort);
-        await scanning;
-        await (stopping ?? terminateProjectProcess(child));
-        liveResult = await liveView?.finish();
+        if (failure || code !== 0)
+          throw new Error(
+            failure ??
+              `Blender exited with ${child.signalCode ?? `code ${code ?? "unknown"}`} during ${stage}; inspect the retained job log`,
+          );
+        if (phase === "prepare")
+          await inventory(directory, INPUT_LIMIT + 256 * MiB, false);
       }
       log = redact(log, { maxLength: LOG_LIMIT });
       await writeFile(path.join(directory, "run.log"), log, {
         flag: "wx",
         mode: 0o600,
       });
-      if (failure || code !== 0)
-        throw new Error(
-          failure ??
-            `Blender exited with ${child.signalCode ?? `code ${code ?? "unknown"}`}; inspect the retained job log`,
-        );
       signal?.throwIfAborted();
       const outputDirectory = path.join(directory, "output");
       const files = await inventory(outputDirectory, OUTPUT_LIMIT, true);
@@ -617,7 +661,6 @@ export class BlenderRunner {
         outputDirectory,
         files,
         log,
-        ...(liveResult ? { liveView: liveResult } : {}),
       };
     } catch (error) {
       const message = redact(
@@ -637,7 +680,6 @@ export class BlenderRunner {
       }
       throw new BlenderRunError(message, id, log);
     } finally {
-      await liveView?.finish();
       busy = false;
     }
   }

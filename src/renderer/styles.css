@@ -7458,6 +7458,11 @@ button.home-nav-item-active:hover {
   transition: transform 120ms ease;
 }
 
+.plugin-skill-open .plugin-row-copy > span {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .plugin-skill-open[aria-expanded="true"] > svg {
   transform: rotate(90deg);
 }

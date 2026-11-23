@@ -1,150 +1,44 @@
 ---
 name: blender-assets
-description: Create game models, rigs and animation in local Blender. The Agent checks and repairs each stage, then presents the finished model and motion for final user review.
+description: Use Blender in background mode to build, refine and optimize game props, environments, vehicles, characters and creatures from references or existing models. Check appearance and requested motion at gameplay scale before final user review.
 ---
 
 # Blender Assets
 
-By default the main Agent reviews intermediate stages and continues when the evidence
-meets the user's brief. The user reviews the final candidate. If the user asks to
-see progress, show it and keep working. If they ask to approve a stage, wait there
-for their decision. Ask earlier when a decision only the user can make blocks work.
-Blender performs geometry, rigging, animation and export. Tripo can supply the initial organic mesh.
+Run every Blender stage headlessly with `run_blender`, including custom scripts, GLB verification and rendering. The main Agent reviews intermediate stages against the brief using the run report, saved model and rendered images. Continue from the completed tool result without waiting for a Blender window.
 
-Read [the pipeline reference](references/pipeline.md) before writing configuration.
-Use `blender_status` to check the actual local capability. If it is unavailable, report
-the reason; do not enable shell, MCP or a paid rigging service as a substitute.
+When a stage needs a new or revised script or configuration, include `save.content` or `save.edits` in that `run_blender` call. Wait for the result before starting the next Blender stage.
 
-## Choose the route
+**Before a new Tripo submission from turnaround views**, show the inspected set and wait for the user's approval on the review card. Changed views need a fresh inspection and approval.
 
-- **Props, buildings and vehicles:** describe dimensions, locations, material colors
-  and connections in `parts.json`. Compare those numbers with the requested proportions
-  and available orthographic views, then use the `parts` stage or a custom Blender script. A fully
-  specified primitive prop does not need Tripo or generated reference images.
-- **Characters and creatures:** inspect consistent front, left and back reference
-  images (optional right). For humanoids prefer an A-pose with arms clear of the body
-  and legs apart, or preserve the requested T-pose. Keep hands empty; create weapons
-  separately. Use `list_media_capabilities`, the project-selected Tripo generation
-  model and `generate_3d_from_views`. Keep its original GLB and task receipt. Existing
-  suitable models skip generation. Check the initial shape against the references from
-  multiple angles, including the back, before proceeding to cleanup or rigging.
+**After Tripo returns the initial model**, wait for the user's approval of that model before starting Blender work on it. Follow the [initial model review](references/pipeline.md#review-the-initial-tripo-model) when recovering a result or handling revision feedback.
 
-Use existing media recovery tools for a submitted Tripo job. Local processing never
-requires a new paid generation, and provider rigging is not a fallback for this route.
+**At final delivery**, present the checked export on the Canvas and wait for the user to accept that version before replacing approved game art. The user can also open the saved `scene.blend` manually. Pause at any additional checkpoint the user requests.
 
-## Run a stage
+When technical details are missing, use what is known about the asset, camera, target device and expected on-screen count to choose reversible starting settings. State assumptions that affect the result and proceed. If a firm requirement conflicts with the requested look or use, explain what the player would notice and recommend a feasible option. Ask when proceeding requires a decision from the user. At turnaround and final review, explain what you checked in plain language and ask the user to judge the design or in-game feel. Include technical details when they inform the decision or the user requests them.
 
-Write the configuration or custom Python as ordinary project files. Call `run_blender`
-with a stable `workflow` name, `stage`, `configPath`, and the prior `sourcePath` when
-needed. List additional project-relative inputs explicitly in `inputs`; files not
-listed are unavailable to the process. The stages are `parts`, `clean`, `joints`,
-`rig`, `animate`, `export`, and `custom` (requires `scriptPath`). Consult the tool's
-actual schema and the reference for exact settings.
+## Choose the next step
 
-Each run returns a new `runId` and independent output paths. Preserve the original
-and previous runs. Use the returned `scene.blend` for the next stage. Keep configuration,
-script and result paths in the project's asset production document. If delivery is
-interrupted, call `recover_blender_run` with that runId; it recovers saved work and
-never starts Blender or submits a provider request.
+Check `blender_status` for local availability and reuse a current result from this turn. Refresh after a configuration change or unexpected failure. If Blender is unavailable, report the reason and retain the source. With `read_workflow_guide`, select `blender-assets` and pass the linked filename alone as `reference`. For a revision, start from the retained brief and report. Open only the stage references needed for the current edit that are missing from context.
 
-Authoring runs under `assets/blender/<workflow>/runs/<runId>/` stay on the host;
-the isolated Linux command copy excludes that entire directory, including JSON
-and Python files. Use the registered project file reader (`read` or
-`read_project_file`) to inspect `report.json`, `rig.json`, recipes and, when
-the selected model supports images, the actual renders. For computed checks, use a diagnostic `run_blender` custom script
-with those files explicitly declared in `inputs`. A missing path in
-`isolated_shell` does not mean the original was lost. Do not regenerate it or
-copy the whole authoring run into the game; use `get_model_asset` and its returned
-`runtimePath` for game integration.
+| Starting point | First action | Stage guide |
+| --- | --- | --- |
+| Concept art, new Tripo model | **Before generating the first view**, inspect the original and map identifying features to the front, subject's left and back. Follow the inspection and approval steps before submitting. For local 2D design or weapon corrections, use [design proofs](references/design-proofs.md). Open the 3D pipeline when modeling begins. | [Turnaround and Tripo](references/turnaround.md) |
+| Existing model, including a retained Tripo result | Preserve the selected original and inspect a working copy. Compare its silhouette, materials, UVs, pivots, rig and clips with the requested edit. Keep the parts that already work. | [Source inspection and cleanup](references/pipeline.md) |
+| Dimensioned prop, vehicle or modular environment | Start with measured parts. Check silhouette and assembly against the dimensions. For a kit, test adjoining pieces on their grid. For moving hardware, test the pivot and clearance. A fully specified static prop can go straight from modeling checks to export. | [Measured parts and export](references/pipeline.md) |
 
-Check `blender_status.liveWorkWindow` before promising a live window. When available
-on desktop, each task automatically opens a movable, resizable Blender observer
-and closes it when work finishes or is cancelled. It shows copies of the worker's
-actual intermediate scenes at checkpoints; the Agent is not performing each
-operation through the GUI. Long native operations may hold the previous scene
-until the next checkpoint. Report any observation warning separately from the
-production result. Keep saved work; do not rerun a completed task or use paid
-generation to repair a missing window.
+For a rig, deformation or requested clips, open [rigging and animation](references/rig-animation.md) before placing joints or adapting a skeleton. Bundled `animate` drives one pair of legs on an upright biped. For legless or multi-legged locomotion, reuse a suitable clip or use `custom` to author one. For a custom modeling, animation or diagnostic script, open [Blender Python](references/custom-python.md) before writing it.
 
-Keep the default `reviewPresentation: "internal"` on `run_blender`. Inspect the
-files at their returned paths and leave the main board free of process nodes.
-Bundled modeling stages produce `review.glb` and export produces `model.glb`.
-Custom modeling scripts should export a `review.glb` from their saved scene;
-diagnostic scripts can return just the evidence they measured. To show progress on
-request or evidence for a decision the user needs to make, call
-`recover_blender_run` with the original `runId`,
-`reviewPresentation: "checkpoint"` and the current `boardId` when known.
-Reuse its returned Canvas nodes.
+## Work from the retained source
 
-Custom scripts run inside Blender's bundled Python, in a private directory without
-network or access to other host files. Parse `--input-dir` and `--output-dir` after
-`--` in `sys.argv`; read only declared inputs and save results under output-dir.
-Use `import pipeline` or `import export_glb` to reuse the bundled helpers. The
-executed script and helpers are preserved together in the result's `recipe/`.
-For live observation, use `from live_preview import checkpoint` and call
-`checkpoint("Describe the completed operation")` after meaningful scene changes.
-Use `force=True` for the loaded source and final scene. Updates are otherwise
-limited to once per second; do not add sleeps or launch a GUI yourself. When
-live observation is not enabled, the helper does nothing. The user can watch progress
-in the live window and review the finished asset on the Canvas.
-Do not install packages, launch helpers, or depend on user Blender preferences.
-Save the editable `.blend` explicitly with `bpy.ops.wm.save_as_mainfile(..., compress=False)`; pack textures. Name datablocks explicitly and
-select shader nodes by type rather than translated labels. Bake procedural materials
-that glTF cannot represent. Never load an untrusted `.blend` with auto-execution enabled.
+For a game asset, use the [optimization guide](references/optimization.md) when planning the game copy. Apply improvements suited to the camera, device and instance count. Before delivery, compare the measured savings and appearance against the retained source.
 
-## Review and iterate
+On the first production `run_blender` call, record the goal, route, observable visual criteria and requested deliverables in the brief. Preserve the project asset ID or source path. Keep the same workflow and continue from the previous run's unchanged `scene.blend`. For an interrupted Blender run, use `recover_blender_run` with the original `runId`. For an already submitted Tripo task, recover the original task before considering another paid request.
 
-1. **Clean:** normalize scale, orientation and floor; preserve UVs and materials.
-   Inspect topology and the project's triangle budget. Preserve the original when reducing geometry.
-   Holes, disconnected regions and fused clothes need specific repairs, not blind
-   remeshing. Do not claim cleanup solved topology that its report only counted.
-2. **Joints and regions:** write explicit joint positions in `joints.json`; inspect
-   front/side overlays and region colors. Coordinate values refer to the normalized
-   Blender source. Verify the joint markers and garment boundaries before rigging. Color and position are
-   candidate labels, never proof of body/clothing separation.
-3. **Rig:** use the checked skeleton and rest pose. Correct weights with explicit
-   per-object or vertex-region rules; add garment bones when the asset needs them.
-   Keep weights from crossing unrelated sleeves, torso, belt and hem. Read the weight
-   report and inspect stress poses (arms up/forward, step, head turn) from both sides of a suspect joint.
-4. **Animate:** keep the same skeleton and rest pose. Review key poses before filling
-   a new action. Use foot IK/contact intervals for walking. Inspect foot sliding,
-   floor penetration, loop closure and deformation during playback. The bundled humanoid idle/walk is an editable starting
-   point, not a universal animal or clothing solution.
-5. **Export:** deliver editable `.blend`, GLB, reports and review images. The exporter
-   reuses the bundled `export_glb.py` and verifies a clean reimport. Compare actual
-   bones and animation clips, not just file existence. FBX is an additional exchange
-   format only when the destination needs it; current local FBX previews cannot
-   validate skeletal animation.
+After reducing a Tripo model, run the [static comparison](references/pipeline.md#static-comparison-for-tripo-assets). Repair visible regressions and compare again even if the triangle count meets the target. Adjust estimated targets when the views justify it, honor explicit maximums, and explain any triangle increase at delivery. Use the exact repaired export for final review.
 
-Read the stage report and inspect the corresponding renders with an image-capable
-model. Record the run, evidence, observed defects and next action in the asset document.
-Correct visible or measured defects locally and recheck that stage. After three
-repair attempts, retain the best candidate and identify the remaining problem.
-If essential evidence cannot be inspected, report what is unverified.
-
-Ask for an early decision when the brief leaves a consequential design choice open,
-the fix would visibly depart from the user's reference, the next step needs
-additional spending the user has not authorized, or a persistent defect leaves
-a choice between keeping the candidate and changing its design. Show the relevant
-evidence and explain what each option would look like or cost. Ask one concrete
-question in everyday language. Wait for the user's answer before taking the
-dependent step. Continue work that does not depend on that answer.
+Check the stage report and actual renders at the intended game-camera distance. Record the run, observed defect and correction in the asset document. Recheck the same view, pose or measurement after the edit. Keep unavailable visual evidence marked unverified. If the user asks to see progress, present the completed run on the Canvas with `recover_blender_run` and `reviewPresentation: "checkpoint"`. If a correction would change a defining feature or require additional spending, show the trade-off and wait for the user's decision.
 
 ## Deliver to the game
 
-Check the exported GLB by reimporting it. Present one final candidate on the Canvas
-by calling `recover_blender_run` with the inspected `runId`,
-`reviewPresentation: "final"` and the current `boardId`
-when known. For game delivery, use `get_model_asset` with the returned asset ID to
-resolve its runtime path. Load that candidate in the target engine and verify scale,
-pivot, orientation, materials and every requested clip. Use `game_use` when available.
-Repair any playback failure before inviting the user to review. For an asset-only
-project, verify the GLB and clips and identify which engine checks still need a game scene.
-
-Once the candidate passes the applicable checks, point the user to its model node
-and give a short invitation in their language, such as “Turn the character around
-and play Walk. Does it look and move the way you want? You can accept it or tell me
-what looks wrong.” Wait for that response before recording user acceptance or
-replacing an approved game asset. If the user requests changes, revise the relevant
-stage, repeat the affected checks and present the revised candidate. Keep the
-Agent's observations and the user's decision separate in the asset document.
+Run the bundled `export` stage on the final editable scene. Inspect its reimported GLB, rendered evidence and requested clips, then present that exact run with `recover_blender_run`. Use [the export and Canvas settings](references/pipeline.md) for the final call. For a game, resolve the model with `get_model_asset` and check scale, pivot, materials and playback in the target engine. For an asset-only brief, identify any checks that still require a game scene. Invite the user to rotate the candidate, play the relevant clips and say what they accept or want changed.

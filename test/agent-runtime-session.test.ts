@@ -226,13 +226,22 @@ it("authorizes attachment receipts only through host prompt details on the curre
   expect(authorizeConversationAttachment(manager, reference)).toBe(false);
 });
 
-it.each(["codex-cli", "qoder-cli"] as const)("keeps image recall references across a %s context rebuild without replaying old pixels", async runtime => {
+it.each(["codex-cli", "qoder-cli"] as const)("sends new image IDs to a running %s context and restores references after compaction or expiry", async runtime => {
   const manager = SessionManager.inMemory("/tmp/native-image-handoff");
   const image = { type: "image" as const, mimeType: "image/png", data: "iVBORw0KGgo=" };
-  manager.appendMessage({ role: "user", content: [{ type: "text", text: "Use this visual reference" }, image], timestamp: 1 });
+  manager.appendMessage({ role: "user", content: [{ type: "text", text: "Use these visual references" }, ...Array.from({ length: 64 }, () => image)], timestamp: 1 });
   const originalId = manager.getLeafId()!;
-  const driver = new ScriptedDriver([], undefined);
-  const session = new NativeCodingSession({ runtime, model: "vision-fixture", supportsImages: true, sessionManager: manager, toolNames: ["recall_image", "read_attachment"], createDriver: () => driver, requestApproval: async () => "deny" });
+  const ready: Script = async (_input, sink) => { sink.nativeSession("fixture-thread"); return { status: "completed" }; };
+  const { session, drivers } = fixture([ready, ready, async (_input, sink) => {
+    sink.compaction("start"); sink.compaction("end", {});
+    return { status: "completed" };
+  }, async (_input, sink) => {
+    sink.toolCall("preview", "read", { path: "preview.png" });
+    sink.toolResult("preview", { content: [image] }, false);
+    return { status: "completed" };
+  }, ready, async () => { throw new NativeSessionExpiredError(); }, ready], manager,
+  { runtime, model: "vision-fixture", supportsImages: true, toolNames: ["recall_image", "read_attachment"] });
+  const driver = drivers[0]!;
   try {
     await session.prompt("Continue the existing work");
     expect(driver.inputs).toHaveLength(1);
@@ -241,7 +250,79 @@ it.each(["codex-cli", "qoder-cli"] as const)("keeps image recall references acro
     expect(driver.inputs[0]!.text).toContain("recall_image");
     expect(driver.inputs[0]!.text).toContain("<conversation-handoff>");
     expect(driver.inputs[0]!.text).not.toContain(image.data);
-    expect(manager.getEntry(originalId)).toMatchObject({ type: "message", message: { content: [{ type: "text", text: "Use this visual reference" }, image] } });
+    expect(manager.getEntry(originalId)).toMatchObject({ type: "message", message: { content: expect.arrayContaining([image, { type: "text", text: "Use these visual references" }]) } });
+    await session.prompt("How much memory does a 4K texture use?");
+    expect(driver.inputs[1]).toMatchObject({ text: "How much memory does a 4K texture use?", images: [], requiresImageInput: true });
+    await session.prompt("Use the new reference", { images: [image] });
+    const lastUser = manager.getBranch().findLast(entry => entry.type === "message" && entry.message.role === "user")!;
+    expect(driver.inputs[2]!.text).toContain(`${lastUser.id}:0`);
+    expect(driver.inputs[2]!.text).not.toContain(originalId);
+    await session.prompt("Read a new preview");
+    expect(driver.inputs[3]!.text).toContain(`${originalId}:63`);
+    expect(driver.inputs[3]!.text).toContain(`${lastUser.id}:0`);
+    const preview = manager.getBranch().findLast(entry => entry.type === "message" && entry.message.role === "toolResult")!;
+    await session.prompt("Compare the preview");
+    expect(driver.inputs[4]!.text).toContain(`${preview.id}:0`);
+    expect(driver.inputs[4]!.text).not.toContain(lastUser.id);
+    await session.prompt("Resume after expiry");
+    expect(driver.inputs[5]!.text).toBe("Resume after expiry");
+    expect(drivers[1]!.inputs[0]!.text).toContain(`${preview.id}:0`);
+    expect(drivers[1]!.inputs[0]!.text).toContain(`${originalId}:63`);
+    expect(drivers[1]!.inputs[0]!.text).toContain("<conversation-handoff>");
+    expect(drivers[1]!.inputs[0]!.images).toEqual([]);
+  } finally { await session.dispose(); }
+});
+
+it("bounds a single long handoff turn while keeping its request, latest answer, file paths and tool recovery records", async () => {
+  const manager = SessionManager.inMemory("/tmp/bounded-handoff");
+  const { session } = fixture([async (_input, sink) => {
+    for (let index = 0; index < 64; index++) {
+      sink.textDone(`part-${index}`, `Progress ${index} ${"x".repeat(1500)}`);
+      sink.toolCall(`file-${index}`, "read", { path: `${"y".repeat(200)}-${index}.png` });
+      sink.toolResult(`file-${index}`, { content: [{ type: "text", text: "Read" }] }, false);
+    }
+    sink.toolCall("large-path", "read", { path: "z".repeat(10_000) });
+    sink.toolResult("large-path", { content: [{ type: "text", text: "Invalid path" }] }, true);
+    sink.textDone("final", "The latest modeling result");
+    return { status: "completed" };
+  }], manager);
+  try {
+    await session.prompt("Inspect the character");
+    manager.appendCustomEntry("ohmygame-plan", { note: "Plan start " + "P".repeat(60_000) });
+    const summary = handoffSummary(manager.getBranch())!;
+    const conversation = summary.slice(summary.indexOf("User:"), summary.indexOf("\n\nCurrent structured plan state:"));
+    expect(conversation.length).toBeLessThanOrEqual(12_000);
+    expect(conversation).toContain("User: Inspect the character");
+    expect(conversation).toContain("[Intermediate progress omitted.]");
+    expect(conversation).toContain("The latest modeling result");
+    const plan = summary.split("Current structured plan state:\n")[1]!.split("\n\n")[0]!;
+    expect(plan).toContain("Plan start");
+    expect(plan.length).toBeLessThanOrEqual(1_501);
+    const files = summary.split("Files the earlier agent worked on: ")[1]!.split("\n\n")[0]!;
+    expect(files.length).toBeLessThanOrEqual(2_000);
+    expect(files).toContain("-63.png");
+    expect(summary).toContain('"originalCallId":"large-path"');
+    expect(summary).toContain("recover/review the original call");
+  } finally { await session.dispose(); }
+});
+
+it("reoffers retained image IDs when a turn fails before dispatch and after an unaccepted native turn", async () => {
+  const ready: Script = async (_input, sink) => { sink.nativeSession("image-thread"); return { status: "completed" }; };
+  const manager = SessionManager.inMemory("/tmp/native-unaccepted-image");
+  const { session, drivers } = fixture([ready, async () => ({ status: "aborted" }), ready], manager,
+    { runtime: "codex-cli", supportsImages: true, toolNames: ["recall_image"] });
+  try {
+    await session.prompt("Open a conversation");
+    const failed = vi.spyOn(manager, "appendCustomEntry").mockImplementationOnce(() => { throw new Error("write failed before dispatch"); });
+    try {
+      await expect(session.prompt("Keep this picture", { images: [{ type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" }] })).rejects.toThrow("before dispatch");
+    } finally { failed.mockRestore(); }
+    expect(drivers[0]!.inputs).toHaveLength(1);
+    const failedUser = manager.getBranch().findLast(entry => entry.type === "message" && entry.message.role === "user")!;
+    await session.prompt("First follow-up");
+    expect(drivers[0]!.inputs[1]!.text).toContain(`${failedUser.id}:0`);
+    await session.prompt("Second follow-up");
+    expect(drivers[1]!.inputs[0]!.text).toContain(`${failedUser.id}:0`);
   } finally { await session.dispose(); }
 });
 

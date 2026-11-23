@@ -672,7 +672,8 @@ export type TurnStatus = Extract<ItemStatus, "inProgress" | "completed" | "cance
 
 export type ThreadItemErrorCode = "model_not_configured" | "authentication_failed" | "access_denied" |
   "quota_exceeded" | "rate_limited" | "invalid_request" | "model_unavailable" | "provider_unavailable" |
-  "dns_error" | "connection_refused" | "connection_reset" | "timeout" | "tls_error" |
+  "dns_error" | "connection_refused" | "connection_reset" | "network_unreachable" | "timeout" | "tls_error" |
+  "provider_request_validation_failed" | "provider_response_validation_failed" |
   "sse_idle_timeout" | "sse_validation_failed" | "sse_connection_interrupted" |
   "stream_error" | "network_error" | "runtime_incompatible" | "runtime_probe_failed" | "repeated_media_arguments" | "tool_outcome_unconfirmed";
 

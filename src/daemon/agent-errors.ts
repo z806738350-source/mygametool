@@ -96,6 +96,8 @@ function classifyAgentError(message: string, diagnostics: AgentErrorDiagnostics)
   if (/^Automatic continuation stopped: the outcome of \S+ \([^)\r\n]+\) is unconfirmed\./.test(message)) return "tool_outcome_unconfirmed";
   if (/AGENT_RUNTIME_INCOMPATIBLE/.test(codes) || /^Local CLI compatibility: /.test(message)) return "runtime_incompatible";
   if (/AGENT_RUNTIME_PROBE_FAILED/.test(codes) || /^Local CLI check failed: /.test(message)) return "runtime_probe_failed";
+  if (/\bPROVIDER_REQUEST_VALIDATION_FAILED\b/.test(codes)) return "provider_request_validation_failed";
+  if (/\bPROVIDER_RESPONSE_VALIDATION_FAILED\b/.test(codes)) return "provider_response_validation_failed";
   if (/^No API key\b/i.test(message) || /select an available model|selected model .* is not available|provider .* is disabled/i.test(message)) return "model_not_configured";
   const quota = /insufficient[_ ](?:quota|balance)|quota[_ ]exceeded|out of budget|billing[_ ](?:hard[_ ]|soft[_ ])?limit|usage limit|subscription_sharing_usage_limit_exceeded|GoUsageLimitError|FreeUsageLimitError/i;
   if (status === 402 || quota.test(diagnostics.errorCode ?? "") || ((!Number.isFinite(status) || status < 400 || status === 429) && quota.test(message))) return "quota_exceeded";
@@ -119,6 +121,7 @@ function classifyAgentError(message: string, diagnostics: AgentErrorDiagnostics)
   if (/CERT|TLS|SSL|UNABLE_TO_VERIFY|SELF_SIGNED|ERR_TLS/.test(codes) || /certificate|TLS handshake/i.test(transportText)) return "tls_error";
   if (/ENOTFOUND|EAI_AGAIN/.test(codes) || /getaddrinfo|ENOTFOUND|EAI_AGAIN/i.test(transportText)) return "dns_error";
   if (/ECONNREFUSED/.test(codes) || /connection refused/i.test(transportText)) return "connection_refused";
+  if (/\b(?:ENETUNREACH|EHOSTUNREACH)\b/.test(codes)) return "network_unreachable";
   if (/TIMEOUT|ETIMEDOUT/.test(codes) || /timed? out|timeout/i.test(transportText)) return "timeout";
   if (/ECONNRESET|EPIPE|UND_ERR_SOCKET/.test(codes) || /socket hang up|other side closed/i.test(transportText)) return "connection_reset";
   if (/WEBSOCKET_CLOSE_/.test(codes) || /stream ended|ended without finish_reason|finish_reason: network_error|response interrupted after streaming began|WebSocket closed before completion/i.test(transportText)) return "stream_error";

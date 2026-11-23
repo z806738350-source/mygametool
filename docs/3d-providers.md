@@ -40,9 +40,11 @@ not the local enabled-service list. Its Meshy column is historical only.
 ## Controlled local Blender workflow
 
 The main Agent can orchestrate local Blender without buying Tripo rigging or
-animation. Tripo supplies an initial mesh when needed. The Agent writes and
-revises Blender scripts, checks the intermediate results, and brings the finished
-candidate to the user for a decision on its appearance and motion.
+animation. After Tripo returns an initial model, the Agent presents a rotating
+preview and waits for the user to accept that source before Blender work begins.
+The Agent checks intermediate results, including the [intended weapon action](../plugins/blender/skills/blender-assets/references/rig-animation.md#weapon-actions)
+when requested, and brings the finished candidate to the user for a decision on
+its appearance and motion.
 
 Enable the bundled **Blender** workflow for the project, then ask the main Agent to
 use the Blender workflow for the desired asset. The Agent reads `blender-assets`
@@ -55,41 +57,57 @@ and the optional controlled coding-agent connections.
 | Tool | Purpose |
 | --- | --- |
 | `blender_status` | Inspect local executable and controlled execution availability; no model submission. |
-| `run_blender` | Run a bundled stage or a project Python script against explicitly listed input snapshots. |
+| `run_blender` | Run a bundled stage or a project Python script against explicitly listed input snapshots. Use `save.content` or `save.edits` in the same call to save its configuration or script before the run. |
 | `recover_blender_run` | Recover a saved local run by `runId`, or present that exact result for review after inspection. |
+| `review_tripo_model` | Present a retained Tripo original for approval before Blender opens it. This local step uses the existing `sourceAssetId`. |
 
-On desktop, `blender_status.liveWorkWindow` reports whether live observation is
-available. A Blender work window opens automatically when a task starts. It can
-be moved and resized, and closes automatically when the task finishes or is
-cancelled. When the work window closes on macOS, the existing OhMyGame project
-window returns to the foreground. The observer displays copies of the worker's
-current scene at script checkpoints while production continues. It does not execute the
-Agent's instructions through the Blender interface. Long native operations may
-leave the last scene visible until the next checkpoint.
-
-Bundled stages publish these updates automatically. Custom scripts import
-`checkpoint` from `live_preview` and call it after meaningful operations, without
-adding sleeps to prolong the display. If the window or scene updates are
-unavailable, the run reports a warning and preserves its production result; do
-not rerun a completed task or submit a paid replacement to repair observation.
-The work window shows progress. Final model and animation acceptance still takes
-place in the interactive Canvas, with images as supporting evidence.
+All Agent Blender stages run in the background, including custom scripts,
+GLB reimport checks and rendering. To inspect progress, ask the Agent to show
+a completed stage on the Canvas. The final candidate can be rotated and its
+clips played there alongside the rendered evidence. To inspect or edit the
+scene in Blender yourself, open the saved `scene.blend` from that run.
 
 Use a stable `workflow` slug and a new run for every revision. The stages are
-`parts`, `clean`, `joints`, `rig`, `animate`, `export`, and `custom`. The bundled
-[Blender guide](../plugins/blender/skills/blender-assets/SKILL.md) and its
-[pipeline reference](../plugins/blender/skills/blender-assets/references/pipeline.md)
-define configuration examples, coordinates, joint/region rules and supported motion.
-The guide is available inside the app through `read_workflow_guide`.
+`inspect`, `parts`, `clean`, `joints`, `rig`, `animate`, `export`, and `custom`.
+The [Blender guide](../plugins/blender/skills/blender-assets/SKILL.md) selects the route
+and identifies when to wait for the user's decision. Inside the app,
+`read_workflow_guide` accepts the reference filename.
 
-- **Hard surfaces:** check the dimensions in `parts.json`, construct individual
-  pieces in Blender, review proportions and assembly, and export. Fully specified
-  procedural objects do not need Tripo or paid multi-view generation.
-- **Organic shapes:** check that the reference views depict a consistent subject, generate or reuse a
-  Tripo GLB, and review its silhouette before cleanup. Prefer a clear A-pose with
-  limbs separated; preserve a requested T-pose. Weapons stay separate from hands.
-  Normalize the source, review explicit joints and region assignments, rig, inspect
-  stress poses, then author and review actions on that same skeleton.
+| When to read | Reference |
+| --- | --- |
+| Before generating the first view for a new Tripo model | [Turnaround, visual inspection and user approval](../plugins/blender/skills/blender-assets/references/turnaround.md) |
+| When inspecting an original, building measured geometry, cleaning a mesh or delivering the export | [Blender stages and delivery](../plugins/blender/skills/blender-assets/references/pipeline.md) |
+| When preparing the game copy and comparing it with the source at gameplay scale | [Geometry, textures, materials, baking and animation optimization](../plugins/blender/skills/blender-assets/references/optimization.md) |
+| When fitting joints, testing deformation or authoring clips | [Rigging and animation](../plugins/blender/skills/blender-assets/references/rig-animation.md) |
+| Before writing a custom Blender script | [Custom Python](../plugins/blender/skills/blender-assets/references/custom-python.md) |
+
+The Agent chooses stages from the asset brief, the selected source and the intended
+game use. An existing asset or retained Tripo result is the starting point for
+refinement. A static deliverable can finish at export. The table gives examples
+of what the Agent and user can check on the same candidate.
+
+| Asset and task | Example acceptance evidence |
+| --- | --- |
+| Static prop from an existing Tripo model | Original mesh identity, matched source and candidate views, distinctive contour, texture detail and scale in the intended camera. |
+| Modular environment | Adjacent kit pieces joined on the intended grid, seam and texel continuity, placement pivots and player clearance. |
+| Vehicle or moving mechanism | Wheel or hinge axes, attachment locations and an open/closed or full-travel test that exposes collisions. |
+| Humanoid, creature or mixed organic asset | Landmarks from multiple directions, deformation on the subject's actual anatomy, accessory separation and playback of individually requested actions. |
+| Material or rig edit to an existing game asset | Reimported textures and shading, with the expected UVs, skin and existing clips retained across the requested change. |
+
+The first production run records a `brief` with the goal, route, observable visual
+criteria and any requested clip names, skin, texture maps, triangle budget or
+watertight topology requirement. Stage configurations can test the same boundary
+policy during revisions.
+The Tripo route starts with the project-bound original asset ID in bundled
+`inspect`, `clean` or `export`. Inspection saves the imported scene, inventory and
+four reference views for later edits. Static cleanup preserves hierarchy, pivots,
+normals and coordinates by default. Normalization, welding and triangle reduction
+are explicit operations. Source and candidate views show their effects. On an existing
+mesh the Agent uses that asset ID or a supported project source file. Procedural
+construction starts with parts or a custom Blender script. Carrying the previous
+run's unchanged `scene.blend` into the next stage of the same workflow retains the
+brief and source history. For project-bound originals, results include the
+original asset ID, format and SHA-256.
 
 Every successful run publishes a new directory under
 `assets/blender/<workflow>/runs/<runId>/`. Keep the `.blend`, configuration/script
@@ -101,8 +119,11 @@ Failures and interrupted delivery keep local
 run evidence; recover by the returned `runId` before deciding whether a corrected
 local run is needed. Unfinished outputs must not be called a finished asset.
 
-The bundled idle/walk implementation is a starting point for a specified humanoid
-skeleton. It cannot reliably infer all garments, separate fused hands or legs,
+The bundled idle/walk stage drives one left and one right leg on an upright biped.
+For legless or multi-legged locomotion, reuse a suitable clip or author one with
+a custom Blender script. Check body or foot contacts through a full cycle on
+the reimported GLB. See the [rigging and animation guide](../plugins/blender/skills/blender-assets/references/rig-animation.md).
+The pipeline cannot reliably infer all garments, separate fused hands or legs,
 automatically retopologize a bad mesh, or choose joints for arbitrary animals.
 The Agent can write a custom Blender script with explicit inputs for these cases;
 show unresolved regions instead of describing a generic automatic-weight pass as
@@ -119,14 +140,43 @@ character's cloak may be shortened to fix clipping, show the relevant evidence
 and ask for that decision before changing the design. Additional paid generation
 outside the request also requires confirmation.
 
-Each bundled modeling stage produces `review.glb`; export produces `model.glb`.
+Bundled modeling stages produce `review.glb`, and export produces `model.glb`.
+The `static-review` stage compares the editable scene directly and produces
+paired images and a report.
+The local runner saves the editable scene and exports the GLB in one Blender
+process, then starts a fresh process to reimport that same GLB, sample its
+animations and render the requested review images. Both processes share one
+job ID, deadline and CPU budget. The runner samples each process's resident memory
+and stops the job if a sample exceeds 2 GiB. The outputs become available as a
+completed run after verification finishes.
 New `run_blender` calls default to `reviewPresentation: "internal"`. Reports,
 renders and models stay available at the returned project paths. After checking
-the result, the Agent calls `recover_blender_run` with its `runId` and
-`reviewPresentation: "final"` to show the same model on the selected `boardId`
+the result, the Agent runs bundled `export` on the reviewed editable scene,
+including for custom-made assets. After inspecting that export, the Agent calls
+`recover_blender_run` with its `runId`,
+`reviewPresentation: "final"` and a `visualReview` listing the viewed files and
+observations against the brief. Final presentation checks for the editable scene,
+a passing technical report, one inspectable GLB and the outputs requested in the
+brief. It shows that model on the selected `boardId`
 (or the first board). For a requested intermediate view or a necessary decision it uses
 `reviewPresentation: "checkpoint"`. Presenting a retained run does not start
 Blender or generate another model.
+
+For Tripo-derived assets, the Agent uses `static-review` after reduction to
+compare the editable character against the retained Tripo original. Export
+repeats the comparison with the reimported GLB. Both models use the same pose,
+camera and lighting. The Agent reads the paired images and checks silhouette,
+normals, sharp edges and textures before final presentation. Visual regressions
+stay in internal review for repair even when the triangle count meets the target.
+The Agent can restore local mesh density within a stated maximum and explains
+any measured increase at delivery. Estimated optimization targets can be
+adjusted based on the visible result and the intended game view.
+
+For an animated asset, the exporter samples every delivered clip for movement.
+An optional export setting, `motionReviewClips`, produces three poses from each
+of up to four named clips after the GLB is reimported. The Agent can inspect
+rigid mechanism travel, creature poses or character deformations with the same
+tool, then play the clips in the target game to check their timing and fit.
 
 Final presentation shows the interactive model and up to three supporting views.
 When a run contains a large set of pose tests, only clearly identified standard
@@ -141,7 +191,8 @@ sides. Off-screen and hidden-page rotation and playback pause; returning to a
 released Canvas model restores its selected clip
 and playback position, including a manual pause. Joint/region overlays
 and stress-pose images remain supporting evidence; static images do not validate
-motion. Custom modeling scripts must also export a review GLB. Diagnostic-only
+motion. Custom modeling scripts save an editable scene for bundled export and
+can also provide an intermediate review GLB. Diagnostic-only
 scripts need no model. Recovery reuses the same nodes and preserves user edits.
 
 Local script failures with a confirmed stopped job remain failures, but no longer
@@ -227,11 +278,43 @@ generate a missing view directly, the Agent uses `generate_reference_image`
 with the original artwork in `imagePaths`. A localized edit uses
 `generate_image` with a real PNG mask. Interrupted calls use `recover_media`
 with the original tool name and call ID. The
-main Agent checks the actual angles and pose visually. If the selected main
-Agent only accepts text, switch to a vision-capable model and inspect the
-views before submitting. Before a new formal submission, OhMyGame checks
-that the chosen 3D model accepts the views and that
-each image decodes and has distinct pixels. Recovery uses the retained job.
+main Agent uses the original design and intended pose to specify landmarks for
+each view and inspect the resulting images. The front is checked against the
+original. A true left profile follows the subject's own left side, including
+asymmetric details such as a strap running from one shoulder to the opposite
+waist, where the body may hide the far attachment. For a humanoid back view,
+the Agent checks the hands, thumbs, heels and toes against the limb pose and
+viewpoint. It revises the affected angle and compares the full set again.
+For a new production model the Agent shows the full set on the Canvas and calls
+the read-only `inspect_3d_views` with the final ordered `imagePaths` and, when
+available, an `originalPath` for the concept art (a project path or authorized
+attachment reference). The Agent compares the returned images and describes a
+specific visual observation for each view in chat. If the selected main Agent
+only accepts text, switch to a vision-capable model for the inspection.
+OhMyGame checks that the chosen 3D model accepts the views and that each image
+decodes and has distinct pixels.
+
+A direct `generate_3d_from_views` call or a saved turnaround node's
+`generate_canvas_media` call opens a review card before submission to Tripo.
+A missing or stale inspection blocks the card. The user can compare the front,
+left, back and optional right views with the supplied original and approve the
+pictured set or ask for changes. The provider receives only the ordered views.
+Panning, zooming, and moving nodes during review do not invalidate the approval.
+Changes to generation settings or reference images require a fresh review.
+If saving the decision fails, the card stays available for a retry. If the
+local app restarts while waiting for a decision, reopen the conversation and
+ask the Agent to inspect the saved Canvas views and show a fresh review card.
+The existing images can be reused, and the new card requires its own decision.
+After a revision the Agent inspects the full set again before requesting a
+new decision. Recovering a previously submitted job uses the existing provider task.
+
+After the Agent saves the successful Tripo result, a separate review card lets
+the user rotate and accept the actual initial model. Their acceptance covers
+that exact project-bound original before the first Blender run. Selecting
+**Request changes** keeps the saved result and returns control to the user for
+revision notes. If the app closes while the card is open, ask the Agent to show
+the retained model again with `review_tripo_model`. A new paid generation
+requires authorization, and the new result gets its own initial-model review.
 
 For a direct production model, call `generate_3d_from_views` with
 `imagePaths` ordered front, left, back and optionally right. Pass the selected

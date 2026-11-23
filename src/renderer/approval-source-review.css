@@ -354,3 +354,89 @@
 .approval-card-migration code {
   overflow-wrap: anywhere;
 }
+
+.turnaround-review {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.turnaround-review > p { margin: 0; }
+.approval-card-turnaround.approval-card > footer {
+  justify-content: flex-end;
+}
+.approval-card-turnaround > footer button {
+  white-space: nowrap;
+}
+.turnaround-review-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(72px, 100%), 1fr));
+  gap: 6px;
+  max-height: 30dvh;
+  overflow-y: auto;
+}
+.turnaround-review-grid button {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: zoom-in;
+}
+.turnaround-review-grid small {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.turnaround-review-grid button:hover { background: var(--surface-hover); }
+.turnaround-review-grid .turnaround-review-original { border-style: dashed; }
+.turnaround-review-grid img {
+  display: block;
+  width: 100%;
+  height: clamp(60px, 10dvh, 104px);
+  object-fit: contain;
+}
+.turnaround-review-error,
+.turnaround-review-dialog > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.turnaround-review-dialog {
+  max-width: 94vw;
+  max-height: 94dvh;
+  margin: auto;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  background: var(--surface);
+  color: var(--text);
+}
+.turnaround-review-dialog::backdrop { background: rgba(0, 0, 0, 0.65); }
+.turnaround-review-comparison {
+  display: grid;
+  grid-auto-columns: minmax(0, 1fr);
+  grid-auto-flow: column;
+  gap: 10px;
+}
+.turnaround-review-comparison figure {
+  min-width: 0;
+  margin: 0;
+  text-align: center;
+}
+.turnaround-review-comparison img {
+  display: block;
+  max-width: 100%;
+  max-height: 72dvh;
+  margin: 4px auto 0;
+  object-fit: contain;
+}
+.turnaround-review-comparison figcaption { margin-top: 4px; }
+.turnaround-review-dialog > p { margin: 4px 0 0; }

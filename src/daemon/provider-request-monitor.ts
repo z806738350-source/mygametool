@@ -117,8 +117,9 @@ export class ProviderRequestTrace {
     // result (or original caller signal) owns classification in that case.
     if (!this.modelOwned) this.finish("cancelled");
   }
-  finish(outcome: ProviderRequestOutcome, category?: "timeout" | "dns" | "connection" | "cancelled" | "local-policy" | "unknown", timeoutKind?: "connect" | "headers" | "body" | "deadline" | "unknown"): void {
+  finish(outcome: ProviderRequestOutcome, category?: "timeout" | "dns" | "connection" | "cancelled" | "local-policy" | "unknown", timeoutKind?: "connect" | "headers" | "body" | "deadline" | "unknown", transportCode?: string): void {
     if (this.#finished) return;
+    this.#errorCode ??= safeId(transportCode);
     this.#finished = true; clearTimeout(this.#timer);
     if (this.#abort) this.#signal?.removeEventListener("abort", this.#abort);
     this.#log("finished", { outcome, ...(category ? { errorCategory: category } : {}), ...(timeoutKind ? { timeoutKind } : {}) });

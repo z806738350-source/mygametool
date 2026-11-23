@@ -3,6 +3,7 @@ import type { CustomProviderDetails, CustomProviderModel, ModelRef } from "./con
 
 export const KUNPO_PROVIDER_ID = "kunpo";
 export const KUNPO_FABLE_MODEL_ID = "claude-fable-5-2";
+export const KUNPO_ASTRA_MODEL_ID = "gpt-6.2-astra";
 export const KUNPO_BASE_URL = "https://llm.ziy.cc/v1";
 export const KUNPO_MODEL_ROLES = ["agent", "image", "video", "sound-effect", "speech", "music", "3d-generation", "3d-remesh", "3d-rig", "3d-texture"] as const;
 export type KunpoModelRole = typeof KUNPO_MODEL_ROLES[number];
@@ -30,7 +31,8 @@ function option(role: KunpoModelRole, provider: string, id: string, protocol: st
 export const KUNPO_MODEL_OPTIONS: readonly KunpoModelOption[] = [
   option("agent", "kunpo", "gpt-5.6-sol", "openai-completions", "text-chat", "Images and tools are listed in the model square; reasoning controls and context limits are not independently documented.", { images: true, tools: true }),
   option("agent", "kunpo", "claude-opus-5-5", "anthropic-messages", "claude-opus-55", "Adaptive thinking is always enabled; tools use auto and preserve signed thinking history.", { images: true, tools: true }),
-  option("agent", "kunpo", KUNPO_FABLE_MODEL_ID, "anthropic-messages", "claude-fable-52", "Text chat and streamed text replies. The Kunpo route currently supports text input and output only.", { images: false, tools: false }),
+  option("agent", "kunpo", KUNPO_FABLE_MODEL_ID, "anthropic-messages", "claude-fable-52", "Accepts text and images and uses local Agent tools through Anthropic Messages.", { images: true, tools: true }),
+  option("agent", "kunpo", KUNPO_ASTRA_MODEL_ID, "openai-responses", "overview", "Accepts text and images and uses local Agent tools through the Responses API.", { images: true, tools: true }),
   option("image", "openai", "gpt-image-2.5-sunburst", "openai-images", "image-generation/models/gpt-image-series", "Synchronous image generation and editing; PNG transparency and edit masks.", { images: true, transparency: true, mask: true, maxReferences: 16 }),
   option("image", "openai", "gpt-image-2.5-flare", "openai-images", "image-generation/models/gpt-image-series", "Synchronous image generation and editing; PNG transparency and edit masks.", { images: true, transparency: true, mask: true, maxReferences: 16 }),
   ...GPT_IMAGE_26_IDS.map(id => option("image", "openai", id, "openai-images", "image-generation/models/gpt-image-series", "Static images and edits, text-to-SVG and animated GIF.", { images: true, transparency: true, mask: true, maxReferences: 16 })),
@@ -88,7 +90,9 @@ export function kunpoProviderDetails(): CustomProviderDetails {
       reasoning: true, thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: null, max: null }, supportsImages: true, usages: { language: true } },
     { id: KUNPO_FABLE_MODEL_ID, name: KUNPO_FABLE_MODEL_ID, api: "anthropic-messages", baseUrl: "https://llm.ziy.cc", contextWindow: 1_000_000, maxTokens: 128_000,
       // High is Kunpo's default; the Messages adapter sends an explicit effort only for Low.
-      reasoning: true, thinkingLevelMap: { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: null }, supportsImages: false, usages: { language: true } },
+      reasoning: true, thinkingLevelMap: { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: null }, supportsImages: true, usages: { language: true } },
+    { id: KUNPO_ASTRA_MODEL_ID, name: KUNPO_ASTRA_MODEL_ID, api: "openai-responses", baseUrl: KUNPO_BASE_URL, contextWindow: 1_050_000, maxTokens: 128_000,
+      reasoning: true, thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" }, supportsImages: true, usages: { language: true } },
   ];
   const video: CustomProviderModel[] = ["tencent-vod-vs-2.5", "minimax-video-h3"].map((id) => ({
     id, name: id, api: "openai-completions", ...budget, reasoning: false, supportsImages: false,

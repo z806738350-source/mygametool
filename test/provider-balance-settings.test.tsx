@@ -40,9 +40,8 @@ const render = (value: ProviderSummary) => act(async () => root.render(<ModelsSe
 it("shows the complete Kunpo role catalog read-only without a custom endpoint or model editor", async () => {
   await render({ ...provider("kunpo", true), name: "KunpoAPI" });
   const agentRows = container.querySelectorAll('[role="list"][aria-label="Agent"] [role="listitem"]');
-  expect(Array.from(agentRows, row => row.querySelector("strong")?.textContent)).toEqual(["gpt-5.6-sol", "claude-opus-5-5", "claude-fable-5-2"]);
-  expect(agentRows[2]?.getAttribute("title")).toBe(t("kunpoModels.textOnlyHelp"));
-  expect(agentRows[2]?.textContent).toContain(t("kunpoModels.textOnlyLabel"));
+  expect(Array.from(agentRows, row => row.querySelector("strong")?.textContent)).toEqual(["gpt-5.6-sol", "claude-opus-5-5", "claude-fable-5-2", "gpt-6.2-astra"]);
+  for (const row of agentRows) expect(row.getAttribute("title")).toBe(t("kunpoModels.agentHelp"));
   expect(container.textContent).toContain("gpt-image-2.5-sunburst");
   expect(container.textContent).toContain("doubao-seedance-2-5-260628");
   expect(container.textContent).toContain("seed-audio-1.0");

@@ -107,6 +107,7 @@ describe("agent error diagnostics", () => {
   it.each<[string, ThreadItemErrorCode]>([
     ["ENOTFOUND", "dns_error"], ["EAI_AGAIN", "dns_error"],
     ["ECONNREFUSED", "connection_refused"], ["ECONNRESET", "connection_reset"],
+    ["EHOSTUNREACH", "network_unreachable"], ["ENETUNREACH", "network_unreachable"],
     ["UND_ERR_CONNECT_TIMEOUT", "timeout"], ["CERT_HAS_EXPIRED", "tls_error"],
     ["DEPTH_ZERO_SELF_SIGNED_CERT", "tls_error"], ["UNABLE_TO_VERIFY_LEAF_SIGNATURE", "tls_error"],
   ])("classifies a nested %s without guessing from the SDK wrapper", (code, expected) => {
@@ -115,6 +116,21 @@ describe("agent error diagnostics", () => {
     const result = thrownAgentError(error);
     expect(result.code).toBe(expected);
     expect(result.diagnostics?.causes).toContainEqual({ name: "Error", message: "transport failure", code });
+    expect(agentErrorDiagnosticText(result)).toContain("Connection details: Connection error.");
+    expect(agentErrorDiagnosticText(result)).not.toContain("Provider response:");
+  });
+
+  it.each([
+    ["PROVIDER_REQUEST_VALIDATION_FAILED", "provider_request_validation_failed", "Request failed a local check"],
+    ["PROVIDER_RESPONSE_VALIDATION_FAILED", "provider_response_validation_failed", "Response failed a local check"],
+  ])("presents a wrapped %s as a local check", (code, expected, title) => {
+    const cause = Object.assign(new Error("Guarded provider check failed"), { code });
+    const diagnostic = createProviderFailureDiagnostic(new Error("Connection error.", { cause }));
+    const result = assistantMessageError({ errorMessage: "Connection error.", diagnostics: [diagnostic] });
+    expect(result.code).toBe(expected);
+    expect(agentErrorPresentation(result).title).toBe(title);
+    expect(agentErrorDiagnosticText(result)).toContain("Local check details:");
+    expect(agentErrorDiagnosticText(result)).not.toContain("Provider response:");
   });
 
   it.each<[number, string, ThreadItemErrorCode]>([

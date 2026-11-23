@@ -519,7 +519,9 @@ export function ProjectShell({
       await answerApproval(project.id, conversation.id, approval.requestId, decision, sourceConfirmation, volumeMigrationConfirmation);
       return true;
     } catch (error) {
-      dispatch({ type: "notice", message: errorMessage(error) });
+      if (approval.request.kind !== "turnaroundReview" && approval.request.kind !== "tripoModelReview") {
+        dispatch({ type: "notice", message: errorMessage(error) });
+      }
       return false;
     }
   }

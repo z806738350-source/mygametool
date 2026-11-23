@@ -92,11 +92,13 @@ describe("reviewed Kunpo selections", () => {
     const provider = kunpoProviderDetails();
     const language = provider.models.filter((entry) => entry.usages?.language);
     expect(language.map((entry) => [entry.id, entry.api])).toEqual([
-      ["gpt-5.6-sol", "openai-completions"], ["claude-opus-5-5", "anthropic-messages"], ["claude-fable-5-2", "anthropic-messages"],
+      ["gpt-5.6-sol", "openai-completions"], ["claude-opus-5-5", "anthropic-messages"], ["claude-fable-5-2", "anthropic-messages"], ["gpt-6.2-astra", "openai-responses"],
     ]);
     expect(language[0]!.reasoning).toBe(false);
-    expect(language[2]!.supportsImages).toBe(false);
-    expect(kunpoModelOption("agent", { provider: "kunpo", id: "claude-fable-5-2" })).toMatchObject({ capabilities: { images: false, tools: false } });
+    for (const model of language) {
+      expect(model.supportsImages).toBe(true);
+      expect(kunpoModelOption("agent", { provider: "kunpo", id: model.id })).toMatchObject({ protocol: model.api, capabilities: { images: true, tools: true } });
+    }
     const choices = language.map((entry) => ({ provider: provider.id, ...entry }));
     expect(recommendedAgentModel(choices, "kunpo")?.id).toBe("gpt-5.6-sol");
     expect(preferredAgentModel(choices, choices[1], KUNPO_DEFAULT_MODEL_REFS.agent)?.id).toBe("claude-opus-5-5");

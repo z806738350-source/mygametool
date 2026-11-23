@@ -12,14 +12,15 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { promptContextLabels, splitPromptContext, withProjectDesignContext } from "./prompt-context.js";
+import { compactHistoricalDesignContext, promptContextLabels, splitPromptContext, withProjectDesignContext } from "./prompt-context.js";
 import { gameDesignMetadata } from "./game-design-context.js";
 import { createHash, randomUUID } from "node:crypto";
 import { withProviderRequestScope } from "./provider-request-monitor.js";
 import { existsSync } from "node:fs";
 import { fileChangeMetadata } from "./file-line-changes.js";
-import { createAgentAttachmentReadTool, createLocalAgentFileTools } from "./agent-local-files.js";
+import { createAgentAttachmentReadTool, createLocalAgentFileTools, localAgentPath } from "./agent-local-files.js";
 import { getAttachmentReferences, type AttachmentReference } from "./agent-attachments.js";
+import { projectToolSearch } from "./pi-tool-search.js";
 import { readWorkspaceNotice } from "./workspace-notice.js";
 import type { AgentContextUsage, AgentMessagePhase, AgentReasoningLevel, AgentStatus, ConversationAgentState, ConversationAttachment, PendingPrompt, PlanMode, PlanSessionState, PlanState, PluginMention, ProjectAgentActivity, ProjectState, PromptImage, PromptReference, QuestionnaireAnswer, QuestionnaireQuestion, QuestionnaireResult, ResponsesTransportMode, ThreadItem, ThreadItemError, ToolArtifact, ToolId, TurnChanges } from "../shared/contracts.js";
 import { hasPluginMentionToken, parsePluginMentions, serializePluginMentions } from "../shared/plugins.js";
@@ -27,16 +28,19 @@ import type { RuntimeEventBus } from "../shared/events.js";
 import type { AgentRuntimeId, ApprovalDecision, ApprovalRequestDetails } from "../shared/agent-runtimes.js";
 import { isVolumeMigrationReview, validVolumeMigrationConfirmation, type VolumeMigrationConfirmation } from "../shared/volume-migration.js";
 import { validSourceConfirmation, type IsolatedSourceConfirmation } from "../shared/execution-storage.js";
-import { hasImageHistory, hasToolHistory, type StoredConversation } from "./conversations.js";
+import { hasImageHistory, hasToolHistory, sessionReasoningLevel, type StoredConversation } from "./conversations.js";
 import { kunpoModelOption } from "../shared/kunpo-models.js";
 import { replayNativeMessages } from "./agent-runtimes/replay.js";
 import { mcpToolInput, parseMcpToolIdentity } from "../shared/mcp.js";
 import type { PluginSkillRegistration } from "./plugin-runtime.js";
 import { appendSystemPromptForProject, type AgentPromptProject } from "./agent-prompts.js";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage, UserMessage } from "@earendil-works/pi-ai";
 import type { PluginMcpHost } from "./plugin-mcp-host.js";
 import { installDeepSeekImageFiles } from "./deepseek-image-files.js";
 import { recordSessionImageOrigins, sessionImageOrigins, SessionImages } from "./session-images.js";
+import { completedToolTextEdits, createToolTextRecall, toolHistoryExtension } from "./session-tool-history.js";
 import { installSessionImageRequests } from "./session-image-requests.js";
 import { AGENT_ERROR_ENTRY, assistantMessageError, normalizeAgentError, RepeatedMediaArgumentsError, thrownAgentError } from "./agent-errors.js";
 import {
@@ -46,8 +50,12 @@ import {
 import { normalizeAssistantMessage, normalizeAssistantText, AssistantTextStreamNormalizer } from "./assistant-thinking.js";
 import { AUTO_CONTINUE_DELAYS, AUTO_CONTINUE_ENTRY, AUTO_CONTINUE_PROMPT, AutoContinueTools, isRecoverableInterruption, waitForContinuation, type AgentInterruption } from "./agent-auto-continue.js";
 import { getToolConfirmedFailure } from "./agent-tool-errors.js";
+import { answerModelTriangleQuestion, type ModelTriangleAnswer } from "./model-report-answer.js";
+import { readCanvasBoard } from "./canvas-workspace.js";
+import { readSafeProjectFile } from "./safe-project-file.js";
 
 const CONTINUATION_SUPERSEDED = Symbol("newer user message");
+export const MAX_APPROVAL_REQUEST_ID_LENGTH = 1_024;
 
 function supportsAgentTools(model?: RuntimeModel): boolean {
   return kunpoModelOption("agent", model)?.capabilities.tools !== false;
@@ -68,6 +76,7 @@ export interface CodingSession {
   readonly emitsInitialUserMessage?: boolean;
   readonly sessionManager?: Pick<SessionManager, "appendCustomEntry" | "getBranch"> & Partial<Pick<SessionManager, "branch">>;
   prompt(prompt: string, options?: { images?: PiPromptImage[] }): Promise<void>;
+  recordLocalModelReport?(prompt: string, answer: string, checkpoint: string | undefined, emit: (event: AgentSessionEvent) => void): void;
   /** Application-owned continuation; never repeats the original prompt or SDK retry loop. */
   readonly interruption?: AgentInterruption;
   prepareContinuation?(signal: AbortSignal): Promise<void>;
@@ -1223,12 +1232,31 @@ export class AgentManager {
         return "cancelled";
       }
 
-      const activeTools = this.options.activeToolNames?.(project, active.mode, managed.session) ?? BASE_TOOL_NAMES;
-      managed.session.setActiveToolsByName?.(managed.session.getAllTools?.().some((tool) => tool.name === "recall_image")
-        ? [...new Set([...activeTools, "recall_image"])] : activeTools);
-      appendPromptDetails(managed.session.sessionManager, active, prompt);
-      await this.#promptWithContinuation(project, active, managed.session, () => images.length
-        ? managed.session.prompt(prompt, { images: images.map(toPiImage) }) : managed.session.prompt(prompt));
+      const { session } = managed;
+      const key = conversationKey(project.id, active.conversationId);
+      const canAnswerLocally = () => !this.#queueMutations.has(key) &&
+        !this.#pendingPrompts.get(key)?.length && !this.#steeringPrompts.get(key)?.length;
+      const report = session.recordLocalModelReport && session.sessionManager && active.mode === "normal" && !active.left &&
+        !images.length && !active.references.length && !active.attachments.length && !active.mentions.length && canAnswerLocally()
+        ? answerModelTriangleQuestion(active.prompt, session.sessionManager.getBranch()) : undefined;
+      const useReport = report && await canUseLocalModelReport(active.attachmentContext, report, project.workspacePath);
+      const checkpoint = useReport && canAnswerLocally() && !isCancelling(active)
+        ? await this.options.checkpoints?.snapshot(project) : undefined;
+      if (isCancelling(active)) {
+        this.#markCancelled(project.id, active);
+        return "cancelled";
+      }
+
+      appendPromptDetails(session.sessionManager, active, prompt);
+      if (useReport && canAnswerLocally()) {
+        session.recordLocalModelReport!(prompt, report.text, checkpoint, (event) => this.#forwardEvent(project.id, active.conversationId, event));
+      } else {
+        const activeTools = this.options.activeToolNames?.(project, active.mode, session) ?? BASE_TOOL_NAMES;
+        session.setActiveToolsByName?.(session.getAllTools?.().some((tool) => tool.name === "recall_image")
+          ? [...new Set([...activeTools, "recall_image"])] : activeTools);
+        await this.#promptWithContinuation(project, active, session, () => images.length
+          ? session.prompt(prompt, { images: images.map(toPiImage) }) : session.prompt(prompt));
+      }
       if (isCancelling(active)) {
         this.#markCancelled(project.id, active);
         return "cancelled";
@@ -1602,7 +1630,8 @@ export class AgentManager {
     if (!active || active.status !== "running" || active.ended) return Promise.resolve("deny");
     const pendingForConversation = this.#approvals.get(key) ?? new Map<string, PendingApproval>();
     this.#approvals.set(key, pendingForConversation);
-    const id = pendingForConversation.has(requestId) ? `${requestId}:${randomUUID()}` : requestId;
+    const id = !requestId || requestId.length > MAX_APPROVAL_REQUEST_ID_LENGTH || pendingForConversation.has(requestId)
+      ? randomUUID() : requestId;
     const item: Extract<ThreadItem, { type: "approvalRequest" }> = {
       id: `${active.turnId}:approval:${id}`,
       turnId: active.turnId,
@@ -1632,7 +1661,7 @@ export class AgentManager {
     });
   }
 
-  answerApproval(projectId: string, conversationId: string, requestId: string, decision: ApprovalDecision, sourceConfirmation?: IsolatedSourceConfirmation, volumeMigrationConfirmation?: VolumeMigrationConfirmation): void {
+  answerApproval(projectId: string, conversationId: string, requestId: string, decision: ApprovalDecision, sourceConfirmation?: IsolatedSourceConfirmation, volumeMigrationConfirmation?: VolumeMigrationConfirmation): void | Promise<void> {
     const key = conversationKey(projectId, conversationId);
     const pending = this.#approvals.get(key)?.get(requestId);
     if (!pending) throw new Error("Approval request is no longer active");
@@ -1648,6 +1677,9 @@ export class AgentManager {
     const active = this.#activeTurns.get(key);
     if (active) this.#completeItem(projectId, active, { ...pending.item, status: "completed", decision });
     pending.resolve(decision);
+    // Return control to the artist. A model must not re-prompt or start a different generation in this turn.
+    if (decision === "deny" && (pending.item.request.kind === "turnaroundReview" || pending.item.request.kind === "tripoModelReview") && active)
+      return this.cancel(projectId, conversationId, active.turnId);
   }
 
   #denyApprovals(projectId: string, active: ActiveTurn): void {
@@ -2717,6 +2749,48 @@ function storedPromptBefore(entries: readonly SessionEntry[], userIndex: number,
   return undefined;
 }
 
+type UserPromptMessage = Extract<AgentMessage, { role: "user" }>;
+
+function projectStoredDesignPrompt(message: UserPromptMessage, entries: readonly SessionEntry[], index: number): UserPromptMessage {
+  const content = message.content;
+  const lastText = typeof content === "string" ? -1 : content.findLastIndex(block => block.type === "text");
+  const block = typeof content === "string" ? undefined : content[lastText];
+  const text = typeof content === "string" ? content : block?.type === "text" ? block.text : undefined;
+  if (!text?.includes("Canvas workspace: canvas/AGENTS.md")) return message;
+  const original = storedPromptBefore(entries, index, textContent(content))?.attachmentContext;
+  if (!original || !text.endsWith(original)) return message;
+  const compact = compactHistoricalDesignContext(original);
+  if (compact === original) return message;
+  const replacement = text.slice(0, -original.length) + compact;
+  return { ...message, content: typeof content === "string" ? replacement : content.map((item, i) => i === lastText ? { ...item, text: replacement } : item) };
+}
+
+/** Read only authenticated host-added metadata from completed turns. Keep user text and images intact. */
+export function projectPastDesignContexts(messages: AgentMessage[], entries: readonly SessionEntry[], cache: WeakMap<UserPromptMessage, UserPromptMessage>): AgentMessage[] {
+  const latest = messages.findLastIndex(message => message.role === "user");
+  const stop = messages.findLastIndex((message, i) => i < latest && message.role === "assistant" && message.stopReason === "stop");
+  if (stop < 1) return messages;
+  // Restored SDK messages may be copies. A duplicate timestamp is ambiguous even if one prompt has a receipt.
+  const sources = new Map<number, { message: UserPromptMessage; index: number } | null>();
+  entries.forEach((entry, index) => {
+    if (entry.type !== "message" || entry.message.role !== "user") return;
+    const time = entry.message.timestamp;
+    sources.set(time, sources.has(time) ? null : { message: entry.message, index });
+  });
+  return messages.map((message, i) => {
+    if (i >= stop || message.role !== "user") return message;
+    const source = sources.get(message.timestamp);
+    if (!source) return message;
+    let projected = cache.get(source.message);
+    if (!projected) {
+      projected = projectStoredDesignPrompt(source.message, entries, source.index);
+      cache.set(source.message, projected);
+    }
+    if (projected === source.message || !isDeepStrictEqual(source.message.content, message.content)) return message;
+    return { ...message, content: projected.content };
+  });
+}
+
 /** Receipts are granted by host-written prompt details bound to an actual user message, never by user-authored markup. */
 export function authorizeConversationAttachment(manager: Pick<SessionManager, "getBranch">, reference: AttachmentReference): boolean {
   const entries = manager.getBranch();
@@ -3157,9 +3231,9 @@ function appendPlanState(sessionManager: CodingSession["sessionManager"], state:
   sessionManager.appendCustomEntry("ohmygame-plan", state);
 }
 
-const BASE_TOOL_NAMES = ["read", "write", "edit", "ls", "find", "grep", "read_attachment", "recall_image"];
+const BASE_TOOL_NAMES = ["read", "write", "edit", "ls", "find", "grep", "read_attachment", "recall_image", "recall_tool_text"];
 const LOCAL_AGENT_TOOL_NAMES = new Set([
-  ...BASE_TOOL_NAMES, "read_workflow_guide", "blender_status", "run_blender", "recover_blender_run", "questionnaire", "update_plan", "canvas_check", "canvas_initialize", "prepare_three_runtime", "list_media_capabilities",
+  ...BASE_TOOL_NAMES, "read_workflow_guide", "inspect_3d_views", "blender_status", "run_blender", "recover_blender_run", "review_tripo_model", "questionnaire", "update_plan", "canvas_check", "canvas_initialize", "prepare_three_runtime", "list_media_capabilities",
   "isolated_shell", "recover_isolated_changes", "build_game", "playable_add_node", "playable_check", "game_use", "generate_canvas_media", "get_model_asset", "optimize_image_asset", "use_canvas_asset",
   "generate_image", "generate_reference_image", "generate_video", "generate_3d_asset", "generate_3d_from_views", "animate_3d_asset",
   "generate_speech", "generate_sound_effect", "generate_music", "recover_media", "recover_canvas_media", "replace_canvas_media",
@@ -3245,25 +3319,31 @@ export async function createPiSession(
   const images = new SessionImages(sessionManager, path.join(project.storagePath ?? path.dirname(project.workspacePath), "request-image-previews"));
   const authorizeAttachment = (reference: AttachmentReference) => authorizeConversationAttachment(sessionManager, reference);
   const localTools = !toolsAvailable ? [] : [...createLocalAgentFileTools(project.workspacePath, mutateWorkspace, model?.input.includes("image") === true, authorizeAttachment),
-    createAgentAttachmentReadTool(project.workspacePath, model?.input.includes("image") === true, authorizeAttachment), ...(textOnly ? [] : [images.recallTool as ToolDefinition]),
+    createAgentAttachmentReadTool(project.workspacePath, model?.input.includes("image") === true, authorizeAttachment), createToolTextRecall(sessionManager) as ToolDefinition, ...(textOnly ? [] : [images.recallTool as ToolDefinition]),
     ...customTools.filter((tool) => LOCAL_AGENT_TOOL_NAMES.has(tool.name) && !BASE_TOOL_NAMES.includes(tool.name) && (!textOnly || tool.name !== "game_use"))];
   const continuationTools = new AutoContinueTools(localTools, { sessionManager, assertCurrent: assertCheckpoint });
+  // Apply the same Pi projection to completed work in conversations saved by older versions.
+  if (toolsAvailable) for (const edit of completedToolTextEdits(sessionManager.buildSessionProjection().entries)) {
+    sessionManager.appendContextEdit(edit.targetId, edit.replacement);
+  }
   const { session } = await createAgentSession({
     cwd: project.workspacePath,
     agentDir,
     noTools: "builtin",
     // The SDK can retain inactive builtins and restored tool loadouts. Keep unsafe tools out of its registry as well.
-    tools: localTools.map((tool) => tool.name),
+    tools: [...localTools.map((tool) => tool.name), ...(toolsAvailable ? ["tool_search"] : [])],
     excludeTools: toolsAvailable ? ["bash", "powershell", "mcp", "mcp__*"] : ["*"],
     customTools: continuationTools.wrap(),
     model: model ? compatibleRuntimeModel(model) : undefined,
+    // Pi restores this setting automatically only once a conversation contains messages.
+    thinkingLevel: sessionReasoningLevel(sessionManager),
     modelRuntime,
     resourceLoader,
     sessionManager,
     settingsManager: sessionSettings,
   });
   stopForCheckpointFailure = () => { void session.abort().catch(() => {}); };
-  const mediaTools = new Set(localTools.filter(tool => tool.prepareArguments).map(tool => tool.name));
+  const mediaTools = new Set(localTools.filter(tool => !BASE_TOOL_NAMES.includes(tool.name) && tool.prepareArguments).map(tool => tool.name));
   const finishTurn = session.agent.finishTurn;
   let repeatedTool: string | undefined;
   session.agent.finishTurn = async (turn, signal) => {
@@ -3280,9 +3360,12 @@ export async function createPiSession(
     return streamFunction(...args);
   };
   const convertToLlm = session.agent.convertToLlm;
+  const pastDesignContexts = new WeakMap<UserPromptMessage, UserPromptMessage>();
   session.agent.convertToLlm = async (messages) => {
     // Turns a coding agent ran reach Pi's model as text, not as calls of tools Pi does not have or calls differently.
-    const converted = await convertToLlm(replayNativeMessages(messages));
+    const entries = sessionManager.getBranch();
+    const previous = projectPastDesignContexts(messages, entries, pastDesignContexts);
+    const converted = await convertToLlm(replayNativeMessages(previous));
     return converted.map((message) => message.role === "assistant" ? normalizeAssistantMessage(message) : message);
   };
   installDeepSeekImageFiles(session, agentDir);
@@ -3314,6 +3397,18 @@ export async function createPiSession(
     ? { kind: "runtime_interrupted", source: "pi", code: "isolated_effects_retained", phase: "tools", repairOnly: true } : undefined });
   return Object.assign(session, {
     emitsInitialUserMessage: true,
+    recordLocalModelReport: (text: string, answer: string, checkpoint: string | undefined, emit: (event: AgentSessionEvent) => void) => {
+      const user: UserMessage = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
+      const message = modelReportMessage(answer, user.timestamp);
+      emit({ type: "message_start", message: user });
+      if (checkpoint) sessionManager.appendCustomEntry(CHECKPOINT_ENTRY, { version: 1, commit: checkpoint });
+      emit({ type: "message_end", message: user });
+      sessionManager.appendMessage(user);
+      sessionManager.appendMessage(message);
+      session.refreshContext();
+      emit({ type: "message_update", message, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: answer, partial: message } });
+      emit({ type: "message_end", message });
+    },
     prepareContinuation,
     resumeAfterInterruption,
     prepareHttp500Continuation: prepareContinuation,
@@ -3329,6 +3424,60 @@ export async function createPiSession(
     },
     getSkills: () => [],
   });
+}
+
+export function modelReportMessage(text: string, timestamp: number): AssistantMessage {
+  return {
+    role: "assistant",
+    api: "ohmygame-local",
+    provider: "ohmygame-local",
+    model: "verified-model-report",
+    content: [{ type: "text", text }],
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "stop",
+    timestamp,
+  };
+}
+
+export async function canUseLocalModelReport(context: string, answer: ModelTriangleAnswer, workspacePath: string): Promise<boolean> {
+  try {
+    const reportFile = await localAgentPath(workspacePath, answer.reportPath);
+    const report = JSON.parse((await readSafeProjectFile(workspacePath, reportFile, 1024 * 1024)).toString("utf8"));
+    const source = answer.target === "source";
+    const roundtrip = source ? report.checks?.previewRoundtrip : report.checks?.roundtrip;
+    if (report.stage !== (source ? "inspect" : "export") || report.geometry?.triangles !== answer.triangles ||
+      roundtrip?.passed !== true || roundtrip.trianglesAfter !== answer.triangles ||
+      (!source && report.technicalChecksPassed !== true)) return false;
+    return await modelReportContextMatches(context, answer, workspacePath);
+  } catch {
+    return false;
+  }
+}
+
+async function modelReportContextMatches(context: string, answer: ModelTriangleAnswer, workspacePath: string): Promise<boolean> {
+  const { block } = splitPromptContext(context);
+  if (!block) return !context.includes("<editor-context>");
+  try {
+    const items: unknown = JSON.parse(block.slice("\n\n<editor-context>\n".length, -"\n</editor-context>".length)).items;
+    if (!Array.isArray(items)) return false;
+    if (items.length === 0) return true;
+    if (items.length !== 1 || items[0]?.kind !== "canvas-board" || typeof items[0].text !== "string") return false;
+    const match = /^Current canvas board: canvas\/boards\/([a-zA-Z0-9_-]{1,100})\.json\nSelected nodes: (.+)$/.exec(items[0].text);
+    const boardId = answer.target === "source" ? answer.sourceCanvas?.boardId ?? answer.boardId : answer.boardId;
+    if (!match || match[1] !== boardId) return false;
+    if (match[2] === "none") return true;
+    const selection = JSON.parse(match[2]!);
+    const id = selection.nodes?.[0]?.id;
+    if (selection.total !== 1 || selection.nodes?.length !== 1 || typeof id !== "string") return false;
+    const board = await readCanvasBoard(workspacePath, boardId);
+    const node = board?.board.nodes.find(node => node.id === id);
+    if (answer.target === "source") return id === answer.sourceCanvas?.nodeId && node?.type === "model-3d" &&
+      node.data.model?.provider === "tripo" && node.data.assetId === answer.sourceAssetId;
+    return answer.canvasNodeIds.includes(id) && node?.type === "asset" && node.data.assetId === answer.deliveryAssetId;
+  } catch {
+    return false;
+  }
 }
 
 /** Ambient Pi skills are disabled; bundled text workflows are served by read_workflow_guide. */
@@ -3368,11 +3517,13 @@ async function createPiResourceLoader(
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
-    extensionFactories: [{ name: "assistant-thinking-sanitizer", factory: assistantThinkingSanitizerExtension, hidden: true },
+    extensionFactories: [...(options.toolsAvailable ? [{ name: "tool-text-history", factory: toolHistoryExtension, hidden: true }] : []),
+      ...(options.toolsAvailable ? [{ name: "project-tool-search", factory: projectToolSearch, hidden: true }] : []),
+      { name: "assistant-thinking-sanitizer", factory: assistantThinkingSanitizerExtension, hidden: true },
       ...(options.checkpointFactory ? [{ name: "checkpoints", factory: options.checkpointFactory, hidden: true }] : [])],
     appendSystemPrompt: options.toolsAvailable ? [
       ...(options.appendSystemPrompt ?? []),
-      "Current local secure edition execution contract (overrides generic workflow guidance above): Host Shell, native CLI, MCP/plugin execution, custom host commands and Cloud/Community publication remain unavailable. When isolated_shell is explicitly registered, it runs only in a bounded Linux VM copy with no host HOME, credentials or external network; source additions/edits require an unchanged host baseline and acknowledged return. Deletions, private files, links, oversized returns and conflicts are refused. Cancellation or failure retains unreturned changes for explicit recovery and blocks replacement; report retained changes rather than claiming they were saved. Dependency preparation, builds and dynamic Web previews use the registered VM backend; public npm requires exact v3 locks and excludes Git/URL dependencies, private credentials and install lifecycle scripts. game_use may prepare a dynamic preview through that backend; inspect returned status and report unsupported cases rather than claiming success. Do not use an absent tool or assume a host shell. File tools support relative non-private UTF-8 files. With an image-capable model, read can also open project PNG/JPEG/WebP images for visual inspection. Hidden files, links and parent paths are unavailable. Preserve the project's stack. Without a VM backend, prefer self-contained static files for a new browser game.",
+      "Current local secure edition execution contract (overrides generic workflow guidance above): Use the project's registered tools for requested work. OhMyGame dispatches each tool call and returns its result. Use that result to decide the next step or report completion. Bundled workflows such as Blender use their registered project tools. Arbitrary host commands, external MCP servers and Cloud/Community publication remain unavailable. When isolated_shell is explicitly registered, it runs only in a bounded Linux VM copy with no host HOME, credentials or external network; source additions/edits require an unchanged host baseline and acknowledged return. Deletions, private files, links, oversized returns and conflicts are refused. Cancellation or failure retains unreturned changes for explicit recovery and blocks replacement; report retained changes rather than claiming they were saved. Dependency preparation, builds and dynamic Web previews use the registered VM backend; public npm requires exact v3 locks and excludes Git/URL dependencies, private credentials and install lifecycle scripts. game_use may prepare a dynamic preview through that backend; inspect returned status and report unsupported cases rather than claiming success. Do not use an absent tool or assume a host shell. File tools support relative non-private UTF-8 files. With an image-capable model, read can also open project PNG/JPEG/WebP images for visual inspection. Hidden files, links and parent paths are unavailable. Preserve the project's stack. Without a VM backend, prefer self-contained static files for a new browser game.",
     ] : ["Answer in text. This connection has no tools or image input."],
     agentsFilesOverride: ({ agentsFiles }) => ({ agentsFiles: projectContextFiles(agentsFiles, workspacePath, agentDir) }),
   });
@@ -3413,7 +3564,8 @@ function recoverableSessionInterruption(session: CodingSession, failure: ThreadI
     return source && interruption?.source === source && isRecoverableInterruption(interruption) ? interruption : undefined;
   }
   if (failure.code && ["authentication_failed", "access_denied", "quota_exceeded", "invalid_request", "model_unavailable",
-    "sse_validation_failed", "runtime_incompatible", "runtime_probe_failed", "tool_outcome_unconfirmed"].includes(failure.code)) return;
+    "provider_request_validation_failed", "provider_response_validation_failed", "sse_validation_failed",
+    "runtime_incompatible", "runtime_probe_failed", "tool_outcome_unconfirmed"].includes(failure.code)) return;
   const diagnostics = failure.diagnostics;
   if (/auth|credential|permission|policy|quota|credit|billing|payment|budget/i.test(diagnostics?.errorCode ?? "")) return;
   const repair = session.interruption;
@@ -3422,7 +3574,8 @@ function recoverableSessionInterruption(session: CodingSession, failure: ThreadI
   if (status !== undefined && [408, 429, 500, 502, 503, 504].includes(status))
     return { kind: "transient", source: "pi", code: `http_${status}`, phase: "stream" };
   const codes = [diagnostics?.errorCode, ...(diagnostics?.causes?.map(cause => cause.code) ?? [])];
-  const transient = new Set(["SSE_IDLE_TIMEOUT", "SSE_CONNECTION_INTERRUPTED", "ECONNRESET", "EPIPE", "UND_ERR_SOCKET", "ETIMEDOUT", "EAI_AGAIN"]);
+  const transient = new Set(["SSE_IDLE_TIMEOUT", "SSE_CONNECTION_INTERRUPTED", "ECONNRESET", "EPIPE", "UND_ERR_SOCKET",
+    "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "EAI_AGAIN"]);
   const code = codes.find((code): code is string => typeof code === "string" && transient.has(code));
   if (code) return { kind: "transient", source: "pi", code, phase: "stream" };
   if ((diagnostics?.transport === "sse" || diagnostics?.transport === "websocket") &&

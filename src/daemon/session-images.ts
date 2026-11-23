@@ -1,13 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { ImageContent, Model, Api, TranscriptContext, Message } from "@earendil-works/pi-ai";
+import { isDeepStrictEqual } from "node:util";
+import type { ImageContent, TextContent, Model, Api, TranscriptContext, Message, ToolCall } from "@earendil-works/pi-ai";
+import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { defineTool, type SessionManager, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { isDeepSeekFileModel } from "./deepseek-image-files.js";
 import { PNG_SIGNATURE } from "./image-format.js";
 import type { PromptImage } from "../shared/contracts.js";
 import { containsKnownSensitiveValue } from "../shared/sensitive-values.js";
+import { KUNPO_ASTRA_MODEL_ID, KUNPO_BASE_URL, KUNPO_PROVIDER_ID } from "../shared/kunpo-models.js";
 export { prepareSessionImageDisplay } from "./retained-image-display.js";
 
 export const IMAGE_OFFLOAD_ENTRY = "ohmygame-image-offload-v1";
@@ -17,6 +20,14 @@ export const INLINE_IMAGE_LOW_BYTES = 10 * 1024 * 1024;
 export const INLINE_IMAGE_HIGH_COUNT = 64;
 export const INLINE_IMAGE_LOW_COUNT = 32;
 export const MODEL_REQUEST_HIGH_BYTES = 32 * 1024 * 1024;
+const ASTRA_INLINE_SCOPE = "inline:kunpo-astra-responses";
+// Local watermarks for long visual workflows. Current references can exceed them, up to the shared hard budget.
+const astraHistory = { highCount: 32, lowCount: 16, highBytes: 8 * 1024 * 1024, lowBytes: 4 * 1024 * 1024, retainedBytes: 12 * 1024 * 1024 };
+const inlineHistory = { highCount: INLINE_IMAGE_HIGH_COUNT, lowCount: INLINE_IMAGE_LOW_COUNT, highBytes: INLINE_IMAGE_HIGH_BYTES, lowBytes: INLINE_IMAGE_LOW_BYTES };
+export function inlineImageScope(model: Pick<Model<Api>, "provider" | "id" | "api" | "baseUrl">): string {
+  return model.provider === KUNPO_PROVIDER_ID && model.id === KUNPO_ASTRA_MODEL_ID && model.api === "openai-responses"
+    && model.baseUrl.replace(/\/+$/, "") === KUNPO_BASE_URL ? ASTRA_INLINE_SCOPE : "inline";
+}
 // Allow room for the original images before the smaller outbound model budget is applied.
 export const MAX_ORIGINAL_TURN_BYTES = 4 * MODEL_REQUEST_HIGH_BYTES;
 export type Json = Record<string, unknown>;
@@ -24,10 +35,13 @@ export const object = (value: unknown): value is Json => !!value && typeof value
 
 interface ImageOccurrence {
   image: ImageContent;
+  toolCallId?: string;
   game: boolean;
   protected: boolean;
+  previousObservation?: boolean;
 }
 interface OffloadData { scope: string; images: string[] }
+interface SentToolPictures { output: Json[]; omittedText: string; ids: string[]; bytes: number }
 interface ImageOrigins { version: 1; messageHash: string; assetIds: Array<string | null> }
 const originId = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value) && !containsKnownSensitiveValue(value);
 
@@ -198,6 +212,35 @@ export function wireImages(payload: unknown): WireImage[] {
 
 const imageText = (id: string) => `Session image: ${id}. Use recall_image with this imageId to inspect the original again.`;
 const omittedText = (id?: string) => id ? `[Image omitted from model context. ${imageText(id)}]` : "[Image omitted from model context.]";
+
+/** Match Pi's one merged text block and its ordered pictures to genuine source occurrences. */
+function sentToolPictures(callId: string, output: unknown, observed: Map<string, ImageOccurrence>): SentToolPictures | undefined {
+  if (!Array.isArray(output)) return;
+  const [label, ...pictures] = output;
+  if (label?.type !== "input_text" || typeof label.text !== "string" || !pictures.length) return;
+  const ids = markerIds(label.text);
+  if (ids.length !== pictures.length) return;
+  let bytes = 0;
+  for (const [i, picture] of pictures.entries()) {
+    const source = observed.get(ids[i]!);
+    if (!source || source.toolCallId !== callId || picture?.type !== "input_image" ||
+        picture.image_url !== `data:${source.image.mimeType};base64,${source.image.data}`) return;
+    bytes += source.image.data.length;
+  }
+  const markers = new Map(ids.map(id => [imageText(id), omittedText(id)]));
+  return { ids, bytes, output, omittedText: label.text.split("\n").map((line: string) => markers.get(line) ?? line).join("\n") };
+}
+
+/** A retained output must differ from the current one only by images that aged out of the working set. */
+function onlyRetiredPictures(previous: SentToolPictures, output: unknown, retired: ReadonlySet<string>) {
+  const [label, ...pictures] = previous.output;
+  const remaining = pictures.filter((_, index) => !retired.has(previous.ids[index]!));
+  if (remaining.length === pictures.length) return false;
+  if (!remaining.length) return previous.omittedText === output;
+  const markers = new Map([...retired].map(id => [imageText(id), omittedText(id)]));
+  const text = (label!.text as string).split("\n").map(line => markers.get(line) ?? line).join("\n");
+  return isDeepStrictEqual(output, [{ ...label, text }, ...remaining]);
+}
 const imageBlocks = (content: unknown): ImageContent[] => Array.isArray(content)
   ? content.filter((block): block is ImageContent => object(block) && block.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string") : [];
 const entryImages = (entry: SessionEntry | undefined): ImageContent[] => imageBlocks(
@@ -210,23 +253,105 @@ export function sessionImageReferences(entries: readonly SessionEntry[]): Array<
   return entries.flatMap(entry => entryImages(entry).map((image, index) => ({ imageId: `${entry.id}:${index}`, mimeType: image.mimeType })));
 }
 
-export function sessionImageReferenceContext(entries: readonly SessionEntry[]): string | undefined {
+export function hasSessionImages(entries: readonly SessionEntry[]): boolean {
+  return entries.some(entry => entryImages(entry).length > 0);
+}
+
+export function sessionImageReferenceContext(entries: readonly SessionEntry[], offset = 0): string | undefined {
   const references = sessionImageReferences(entries);
-  if (!references.length) return undefined;
-  const latest = references.slice(-64), omitted = references.length - latest.length;
+  const end = references.length - offset;
+  if (end <= 0) return undefined;
+  const omitted = Math.max(0, end - 64);
   return [
     "Retained image references on the current conversation branch:",
-    ...latest.map(reference => JSON.stringify(reference)),
-    ...(omitted ? [`${omitted} older image references are omitted from this list.`] : []),
+    ...references.slice(omitted, end).map(reference => JSON.stringify(reference)),
+    ...(omitted ? [`${omitted} older image references are omitted from this list. Call recall_image with offset ${offset + 64} to list the previous page.`] : []),
     "This list contains no image pixels. This applies only to the reference list, not to the separate image content blocks returned by recall_image. Use recall_image with the exact imageId to read the original before making visual claims. Text descriptions are not visual evidence.",
   ].join("\n");
 }
 const messageKey = (message: { role: string; timestamp: number; toolCallId?: string }) =>
   JSON.stringify([message.role === "custom" ? "user" : message.role, message.timestamp, message.toolCallId]);
 
+function releasesReviewedImages(call: ToolCall) {
+  return call.arguments.releaseReviewedImages === true && (["edit", "write", "recall_image"].includes(call.name)
+    || call.name === "run_blender" && Object.hasOwn(call.arguments, "save"));
+}
+
+/** Pi serializes summaries and automatic continuations as user messages. They do not start a new visual task. */
+export function visualWorkingSet(messages: readonly Message[], entries: readonly SessionEntry[], stableFeedback: boolean) {
+  const synthetic = new Set<number>();
+  const users = new Map<number, Array<Extract<Message, { role: "user" }>["content"]>>();
+  for (const entry of entries) {
+    if (entry.type === "message" && entry.message.role === "user") {
+      const sameTime = users.get(entry.message.timestamp);
+      if (sameTime) sameTime.push(entry.message.content);
+      else users.set(entry.message.timestamp, [entry.message.content]);
+    }
+    if (entry.type === "custom_message" || entry.type === "branch_summary" || entry.type === "compaction")
+      synthetic.add(Date.parse(entry.timestamp));
+    if (entry.type === "message" && entry.message.role === "bashExecution") synthetic.add(entry.message.timestamp);
+  }
+  const currentUser = messages.findLastIndex(message => message.role === "user" && (!synthetic.has(message.timestamp)
+    || users.get(message.timestamp)?.some(content => content === message.content || isDeepStrictEqual(content, message.content))));
+  const batches = new Map<number, number[]>();
+  const canRecall = getCurrentTools(messages).some(tool => tool.name === "recall_image");
+  let caller: number | undefined;
+  let handoff: Map<string, string> | undefined;
+  let reviewing = true;
+  let released = false;
+  let feedbackAt: number | undefined;
+  for (let i = currentUser + 1; i < messages.length; i++) {
+    const message = messages[i]!;
+    if (message.role === "assistant") {
+      caller = i;
+      const calls = message.content.filter(block => block.type === "toolCall");
+      handoff = canRecall && message.stopReason === "toolUse" && calls.some(releasesReviewedImages)
+        ? new Map(calls.map(call => [call.id, call.name])) : undefined;
+      continue;
+    }
+    if (message.role !== "toolResult" && message.role !== "user") continue;
+    const hasImages = imageBlocks(message.content).length > 0;
+    if (handoff) {
+      const details = message.role === "toolResult" && message.toolName === "run_blender" && object(message.details) ? message.details : undefined;
+      const status = object(details?.blender) ? details.blender.status : undefined;
+      // Saving a Blender recipe can succeed even if the subsequent run fails.
+      const version = details?.projectFileVersion;
+      const saved = object(version) && typeof version.path === "string" && typeof version.sha256 === "string" && /^[a-f0-9]{64}$/.test(version.sha256);
+      if (message.role !== "toolResult" || hasImages || handoff.get(message.toolCallId) !== message.toolName ||
+          (!saved && (message.isError || status === "saved-not-run" || status === "failed"))) handoff = undefined;
+      else {
+        handoff.delete(message.toolCallId);
+        if (!handoff.size) {
+          batches.clear(); reviewing = false; handoff = undefined;
+          released = true; feedbackAt = undefined;
+        }
+      }
+    }
+    if (!hasImages) continue;
+    reviewing = true;
+    if (stableFeedback && released && message.role === "toolResult") feedbackAt ??= i;
+    const batch = message.role === "toolResult" ? caller ?? i : i;
+    const siblings = batches.get(batch);
+    if (siblings) siblings.push(i);
+    else batches.set(batch, [i]);
+  }
+  const groups = new Map<number, number>();
+  const required = new Set<number>();
+  if (currentUser >= 0 && reviewing && !(stableFeedback && released)) { groups.set(currentUser, currentUser); required.add(currentUser); }
+  const observations = [...batches].slice(-2);
+  for (const [batch, indices] of observations) for (const index of indices) {
+    groups.set(index, batch);
+    if (batch === observations.at(-1)?.[0]) required.add(index);
+  }
+  return { groups, required, currentUser, feedbackAt };
+}
+
 /** Session originals and branch-local decisions are authoritative; the preview cache is disposable. */
 export class SessionImages {
   private occurrences = new Map<string, ImageOccurrence>();
+  private workingSetOmissions = new Set<string>();
+  private previousPictures?: { leaf: string; boundary: string; tools: Map<string, SentToolPictures> };
+  private lastResizeSetting?: boolean;
   constructor(private readonly manager: SessionManager, private readonly cacheDir: string) {}
 
   private originRecords(): Map<string, Array<string | null>> {
@@ -235,9 +360,20 @@ export class SessionImages {
 
   readonly recallTool = defineTool({
     name: "recall_image", label: "Recall Image",
-    description: "Read an original image retained in this conversation, including screenshots omitted from model context. Use the imageId shown in its placeholder.",
-    parameters: Type.Object({ imageId: Type.String({ pattern: "^[a-zA-Z0-9_-]+:[0-9]+$" }) }),
-    execute: async (_callId, { imageId }) => {
+    promptGuidelines: [
+      "Inspect required images together and record visual findings first. When moving to nonvisual work, mark the next edit or write with releaseReviewedImages=true; recall originals for further comparison or revised views.",
+    ],
+    description: "Read a retained original by imageId, or list image IDs with optional paging offset. After inspecting all needed images, set releaseReviewedImages alone to keep only recallable references during nonvisual work.",
+    parameters: Type.Object({ imageId: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9_-]+:[0-9]+$" })), offset: Type.Optional(Type.Integer({ minimum: 0 })), releaseReviewedImages: Type.Optional(Type.Boolean()) }),
+    execute: async (_callId, { imageId, offset, releaseReviewedImages }) => {
+      if (releaseReviewedImages) {
+        if (imageId !== undefined || offset !== undefined) throw new Error("Release reviewed images separately from listing or recalling them.");
+        return { content: [{ type: "text" as const, text: "Visual review complete. The original images remain available by imageId." }], details: undefined };
+      }
+      if (imageId === undefined) {
+        const text = sessionImageReferenceContext(this.manager.getBranch(), offset) ?? "No retained image references on this page.";
+        return { content: [{ type: "text" as const, text }], details: undefined };
+      }
       const [entryId, index] = imageId.split(":");
       const entry = this.manager.getBranch().find((item) => item.id === entryId);
       const image = entryImages(entry)[Number(index)];
@@ -248,7 +384,15 @@ export class SessionImages {
   });
 
   async prepare(context: TranscriptContext, model: Model<Api>, resizeReadImages = true): Promise<TranscriptContext> {
+    const astra = inlineImageScope(model) === ASTRA_INLINE_SCOPE;
+    if (!astra || this.lastResizeSetting !== resizeReadImages) this.previousPictures = undefined;
+    this.lastResizeSetting = resizeReadImages;
     if (isDeepSeekFileModel(model)) return context;
+    return this.annotate(context, resizeReadImages, visualWorkingSet(context.messages, this.manager.getBranch(), astra));
+  }
+
+  /** Match SDK blocks to canonical occurrences before applying wire-format budgets. */
+  async annotate(context: TranscriptContext, resizeReadImages = true, working?: ReturnType<typeof visualWorkingSet>): Promise<TranscriptContext> {
     const sources = new Map<string, Array<{ id: string; images: ImageContent[] }>>();
     for (const entry of this.manager.getBranch()) {
       const message = entry.type === "message" && "content" in entry.message ? entry.message
@@ -264,9 +408,12 @@ export class SessionImages {
     const origins = this.originRecords();
     const messages: Message[] = [];
     const occurrences = new Map<string, ImageOccurrence>();
+    const workingSetOmissions = new Set<string>();
+    const feedback: Array<{ id: string; image: ImageContent }> = [];
     const lastUser = context.messages.findLastIndex((message) => message.role === "user");
     const recentImages = context.messages.map((message, index) => message.role === "toolResult" && imageBlocks(message.content).length ? index : -1)
       .filter((index) => index >= 0).slice(-2);
+    const projected: Array<{ content: Array<TextContent | ImageContent>; index: number; id: string; group: number; image: ImageContent }> = [];
     for (let messageIndex = 0; messageIndex < context.messages.length; messageIndex++) {
       const message = context.messages[messageIndex];
       if (message.role === "system" || message.role === "assistant" || !Array.isArray(message.content)) { messages.push(message); continue; }
@@ -278,28 +425,125 @@ export class SessionImages {
       if (source) used.add(source.id);
       let index = 0;
       let convertedRead = false;
-      const content = [];
+      const content: Array<TextContent | ImageContent> = [];
       for (const block of message.content) {
         if (block.type !== "image") { content.push(block); continue; }
         const id = source ? `${source.id}:${index}` : undefined;
         const assetId = source ? origins.get(source.id)?.[index] : undefined;
         index++;
+        if (working && id && !working.groups.has(messageIndex)) {
+          if (message.role === "toolResult") workingSetOmissions.add(id);
+          if (messageIndex === working.currentUser && working.feedbackAt !== undefined)
+            feedback.push({ id, image: block });
+          content.push({ type: "text", text: omittedText(id) });
+          continue;
+        }
         const game = message.role === "toolResult" && message.toolName === "game_use";
         const read = message.role === "toolResult" && message.toolName === "read" && resizeReadImages;
         const preview = game || read ? await this.preview(block, game) : block;
         const image = assetId && preview.data === block.data && preview.mimeType === block.mimeType ? { ...preview, libraryAssetId: assetId } : preview;
         if (read && image.mimeType !== block.mimeType) convertedRead = true;
         if (id) {
-          occurrences.set(id, { image, game, protected: messageIndex === lastUser || recentImages.includes(messageIndex) });
+          occurrences.set(id, { image, game, toolCallId: message.role === "toolResult" ? message.toolCallId.split("|")[0] : undefined,
+            protected: working ? working.required.has(messageIndex) : messageIndex === lastUser || recentImages.includes(messageIndex),
+            previousObservation: working !== undefined && !working.required.has(messageIndex) });
           content.push({ type: "text" as const, text: imageText(id) });
+          if (working) projected.push({ content, index: content.length, id, group: working.groups.get(messageIndex)!, image });
         }
         content.push(image);
       }
-      messages.push({ ...message, content: convertedRead ? content.map((block) => block.type === "text"
-        ? { ...block, text: block.text.replace("Read image file [image/png]", "Read image file [image/jpeg]") } : block) : content } as Message);
+      if (messageIndex === working?.feedbackAt && message.role === "toolResult") {
+        // Reopen the comparison at the new evidence instead of rewriting the user message.
+        for (const { id, image } of feedback) {
+          if (imageBlocks(content).some(block => block.mimeType === image.mimeType && block.data === image.data)) continue;
+          occurrences.set(id, { image, game: false, protected: true, toolCallId: message.toolCallId.split("|")[0] });
+          content.push({ type: "text", text: `Earlier user reference for this comparison.\n${imageText(id)}` }, image);
+        }
+      }
+      if (convertedRead) for (const [index, block] of content.entries()) {
+        if (block.type === "text") content[index] = { ...block, text: block.text.replace("Read image file [image/png]", "Read image file [image/jpeg]") };
+      }
+      messages.push({ ...message, content } as Message);
+    }
+    // A later observation already supplies these same bytes. Keep the ordering and all views inside a comparison batch.
+    const latest = new Map<string, { id: string; group: number; mime: string }>();
+    for (const slot of projected.reverse()) {
+      const duplicate = latest.get(slot.image.data);
+      if (duplicate && duplicate.group !== slot.group && duplicate.mime === slot.image.mimeType) {
+        slot.content[slot.index] = { type: "text", text: `${omittedText(slot.id)} Identical pixels are included under session image ${duplicate.id} in this request.` };
+        if (occurrences.get(slot.id)?.protected) occurrences.get(duplicate.id)!.protected = true;
+      } else latest.set(slot.image.data, { id: slot.id, group: slot.group, mime: slot.image.mimeType });
     }
     this.occurrences = occurrences;
+    this.workingSetOmissions = workingSetOmissions;
     return { ...context, messages };
+  }
+
+  /** Keep previously accepted comparison pictures in their original tool results while they fit. */
+  withPreviousToolImages<T>(base: T, scope: string, preserveRetiringRenders = true) {
+    const unchanged = { payload: base, commit() {}, discard() {} };
+    if (scope !== ASTRA_INLINE_SCOPE || !object(base) || !Array.isArray(base.input)) return unchanged;
+    const branch = this.manager.getBranch();
+    const leaf = branch.findLast(entry => entry.id)?.id;
+    const boundary = branch.findLast(entry => entry.type === "compaction" || entry.type === "branch_summary" ||
+      entry.type === "message" && (entry.message.role === "user" ||
+        entry.message.role === "toolResult" && entry.message.toolName === "inspect_3d_views" ||
+        entry.message.role === "assistant" && entry.message.content.some(block => block.type === "toolCall" && releasesReviewedImages(block))))?.id;
+    const current = wireImages(base);
+    let bytes = current.reduce((n, image) => n + image.data.length, 0), count = current.length;
+    const maxBytes = preserveRetiringRenders ? astraHistory.retainedBytes : astraHistory.lowBytes;
+    const maxCount = astraHistory.highCount;
+    if (!leaf || !boundary || !count || bytes > maxBytes || count > maxCount) {
+      this.previousPictures = undefined;
+      return unchanged;
+    }
+    const previous = this.previousPictures;
+    const prior = previous?.boundary === boundary && branch.some(entry => entry.id === previous.leaf) ? previous.tools : undefined;
+    const omitted = this.omitted(scope, branch);
+    const observed = this.occurrences;
+    const freshTools = new Map<string, SentToolPictures>();
+    const restored = new Map<string, SentToolPictures>();
+    const calls = new Set<string>(), results = new Set<string>(), ambiguous = new Set<string>();
+    for (const item of base.input) {
+      if (!object(item) || typeof item.call_id !== "string") continue;
+      const seen = item.type === "function_call" ? calls : item.type === "function_call_output" ? results : undefined;
+      if (seen?.has(item.call_id)) ambiguous.add(item.call_id);
+      seen?.add(item.call_id);
+    }
+    const input = base.input.map(item => {
+      if (!object(item) || item.type !== "function_call_output" || typeof item.call_id !== "string" ||
+          !calls.has(item.call_id) || ambiguous.has(item.call_id)) return item;
+      const old = prior?.get(item.call_id);
+      const sent = sentToolPictures(item.call_id, item.output, observed);
+      if (old && !old.ids.some(id => omitted.has(id))) {
+        const retired = new Set(old.ids.filter(id => this.workingSetOmissions.has(id)));
+        const extraBytes = old.bytes - (sent?.bytes ?? 0);
+        const matches = preserveRetiringRenders
+          ? (typeof item.output === "string" || !!sent) && onlyRetiredPictures(old, item.output, retired)
+          : retired.size === old.ids.length && old.omittedText === item.output;
+        if (matches && (!preserveRetiringRenders || (bytes + extraBytes <= maxBytes && count + retired.size <= maxCount))) {
+          restored.set(item.call_id, old);
+          bytes += extraBytes;
+          count += retired.size;
+          return { ...item, output: old.output };
+        }
+      }
+      if (sent) freshTools.set(item.call_id, sent);
+      return item;
+    });
+    let payload = base;
+    if (restored.size && bytes <= maxBytes && count <= maxCount) {
+      const expanded = { ...base, input };
+      if (Buffer.byteLength(JSON.stringify(expanded)) <= MODEL_REQUEST_HIGH_BYTES) {
+        payload = expanded;
+        for (const [id, old] of restored) freshTools.set(id, old);
+      }
+    }
+    return { payload, commit: () => {
+      if (observed === this.occurrences) this.previousPictures = { leaf, boundary, tools:freshTools };
+    }, discard: () => {
+      if (observed === this.occurrences) this.previousPictures = undefined;
+    } };
   }
 
   applyOmissions(payload: unknown, scope: string): WireImage[] {
@@ -313,21 +557,24 @@ export class SessionImages {
   /** The caller has already applied Files conversion or extracted the actual WS delta. */
   budget(payload: unknown, scope: string, force = false): boolean {
     const images = this.applyOmissions(payload, scope);
+    const target = scope === ASTRA_INLINE_SCOPE ? astraHistory : inlineHistory;
     // SDKs such as Bedrock serialize binary blobs as Base64, not numeric object keys.
     const requestBytes = () => Buffer.byteLength(JSON.stringify(payload,
       (_key, value) => value instanceof Uint8Array ? Buffer.from(value).toString("base64") : value));
     let bytes = images.reduce((total, image) => total + Buffer.byteLength(image.data), 0);
     let count = images.length;
-    if (!force && bytes <= INLINE_IMAGE_HIGH_BYTES && count <= INLINE_IMAGE_HIGH_COUNT
+    if (!force && bytes <= target.highBytes && count <= target.highCount
       && requestBytes() <= MODEL_REQUEST_HIGH_BYTES) return false;
+    // Keep both sides of an active comparison at the soft watermarks; a real size failure can still shrink the older side.
+    const keepComparison = !force && bytes <= INLINE_IMAGE_HIGH_BYTES && count <= INLINE_IMAGE_HIGH_COUNT && requestBytes() <= MODEL_REQUEST_HIGH_BYTES;
     const selected: string[] = [];
     const candidates = images.flatMap((image) => {
       const occurrence = image.id ? this.occurrences.get(image.id) : undefined;
-      return occurrence && occurrence.image.data === image.data && occurrence.image.mimeType === image.mime && !occurrence.protected
+      return occurrence && occurrence.image.data === image.data && occurrence.image.mimeType === image.mime && !occurrence.protected && !(keepComparison && occurrence.previousObservation)
         ? [{ image, game: occurrence.game }] : [];
     }).sort((a, b) => Number(!a.game) - Number(!b.game));
     for (const { image } of candidates) {
-      if ((!force || selected.length > 0) && bytes <= INLINE_IMAGE_LOW_BYTES && count <= INLINE_IMAGE_LOW_COUNT
+      if ((!force || selected.length > 0) && bytes <= target.lowBytes && count <= target.lowCount
         && requestBytes() <= MODEL_REQUEST_HIGH_BYTES) break;
       image.omit(); selected.push(image.id!); bytes -= Buffer.byteLength(image.data); count--;
     }
@@ -337,9 +584,10 @@ export class SessionImages {
     return selected.length > 0;
   }
 
-  private omitted(scope: string): Set<string> {
-    return new Set(this.manager.getBranch().flatMap((entry) => {
-      if (entry.type !== "custom" || entry.customType !== IMAGE_OFFLOAD_ENTRY || !object(entry.data) || entry.data.scope !== scope || !Array.isArray(entry.data.images)) return [];
+  private omitted(scope: string, branch = this.manager.getBranch()): Set<string> {
+    return new Set(branch.flatMap((entry) => {
+      if (entry.type !== "custom" || entry.customType !== IMAGE_OFFLOAD_ENTRY || !object(entry.data) || !Array.isArray(entry.data.images)) return [];
+      if (entry.data.scope !== scope && !(scope === ASTRA_INLINE_SCOPE && entry.data.scope === "inline")) return [];
       return entry.data.images.filter((id): id is string => typeof id === "string");
     }));
   }

@@ -109,7 +109,9 @@ describe("Tripo V3 generation", () => {
     });
     const runner = new ToolRunner(directory, { generate: vi.fn() }, new TripoProvider(() => "fixture-key", request, 0));
     await runner.load();
-    const tools = createAgentTools(project, runner, projects);
+    let approve!: () => void;
+    const review = vi.fn(() => new Promise<void>(resolve => { approve = resolve; }));
+    const tools = createAgentTools(project, runner, projects, undefined, undefined, undefined, undefined, undefined, undefined, review);
     async function call(name: string, id: string, args: AgentToolCall["arguments"]) {
       const tool = tools.find(entry => entry.name === name)!;
       return runToolCall({ type: "toolCall", name, id, arguments: args }, {
@@ -131,7 +133,14 @@ describe("Tripo V3 generation", () => {
     const { referenceMode: _mode, ...expectedOptions } = options;
     expect(corrected).toEqual({ imagePaths, model: args.model, targetPolycount: 12000, texture: true, pbr: false, options: expectedOptions });
     const creation = generate === "generate_3d_from_views" ? corrected : { ...args, options: { ...options, smartUv: false } };
-    const first = await call(generate, "image-only", creation);
+    const pending = call(generate, "image-only", creation);
+    await vi.waitFor(() => expect(review).toHaveBeenCalledOnce());
+    expect(request).not.toHaveBeenCalled();
+    const reopened = new ToolRunner(directory, { generate: vi.fn() });
+    const [ownership] = await reopened.agentMedia.projectRecords(project.id);
+    expect(await reopened.agentMedia.scopeRecords(ownership!.scopes[0]!)).toEqual([]);
+    approve();
+    const first = await pending;
     expect(first.isError).toBe(true);
     const uploads = request.mock.calls.filter(([url]) => String(url).endsWith("/files"));
     expect(uploads).toHaveLength(3);
@@ -151,6 +160,8 @@ describe("Tripo V3 generation", () => {
     request.mockClear();
     const recovered = await call("recover_media", "download-again", { tool: generate, recoverCallId: "image-only", originalArguments: creation });
     expect(recovered.isError, JSON.stringify(recovered.result.content)).toBe(false);
+    expect(JSON.stringify(recovered.result.content)).not.toContain("approved these reference views");
+    expect(review).toHaveBeenCalledOnce();
     const details = recovered.result.details as { artifact: { path: string } };
     expect(await readFile(path.join(project.workspacePath, details.artifact.path))).toEqual(TEST_GLB);
     expect(request.mock.calls.length).toBeGreaterThan(0);

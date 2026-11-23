@@ -1,4 +1,6 @@
 import { existsSync } from "node:fs";
+import type { SpawnOptions } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import {
   link,
   mkdir,
@@ -18,6 +20,10 @@ import {
 } from "../src/daemon/blender-runner.js";
 
 const monitor = vi.hoisted(() => ({ rss: undefined as string | undefined, transientStats: 0, transientDirectories: 0, missingCompletedOutput: false }));
+const bootstrapTest = vi.hoisted(() => ({
+  phases: undefined as string[] | undefined,
+  onStart: undefined as ((phase: string) => void) | undefined,
+}));
 vi.mock("node:fs/promises", async (original) => {
   const actual = await original<typeof import("node:fs/promises")>();
   const missing = () => Object.assign(new Error("ENOENT: snapshot was atomically replaced"), { code: "ENOENT" });
@@ -44,6 +50,18 @@ vi.mock("node:child_process", async (original) => {
   const actual = await original<typeof import("node:child_process")>();
   return {
     ...actual,
+    spawn: (file: string, args: string[], options: SpawnOptions) => {
+      if (file === "/usr/bin/sandbox-exec") expect(args).toContain("--background");
+      if (file === "/usr/bin/sandbox-exec" && bootstrapTest.phases) {
+        const phase = options.env?.OHMYGAME_BLENDER_EXPORT_PHASE ?? "single";
+        bootstrapTest.phases.push(phase);
+        bootstrapTest.onStart?.(phase);
+        const bootstrap = args[args.indexOf("--python") + 1]!;
+        // Exercise the actual staged bootstrap with tiny stand-in Python, without starting Blender.
+        return actual.spawn("/usr/bin/python3", [bootstrap], options);
+      }
+      return actual.spawn(file, args, options);
+    },
     execFile: (...args: unknown[]) => {
       if (args[0] === "/bin/ps" && monitor.rss !== undefined) {
         (args[3] as (error: Error | null, stdout: string) => void)(
@@ -61,7 +79,18 @@ const supported =
   process.platform === "darwin" &&
   existsSync("/Applications/Blender.app/Contents/MacOS/Blender");
 let directory: string, workspace: string, runner: BlenderRunner;
+it("recovers the bundled stage diagnosis when the log has no traceback", async () => {
+  const id = randomUUID();
+  const job = path.join(directory, "jobs", id);
+  await mkdir(path.join(job, "output"), { recursive: true });
+  await writeFile(path.join(job, "failed.json"), JSON.stringify({ id, message: "Blender exited with code 1" }));
+  await writeFile(path.join(job, "output", "report.json"), JSON.stringify({ error: "Input contains no meshes" }));
+  expect(await runner.inspectJob(id)).toMatchObject({ status: "failed", stageError: "Input contains no meshes" });
+  await expect(runner.readJob(id)).rejects.toThrow("Blender exited");
+});
 beforeEach(async () => {
+  bootstrapTest.phases = undefined;
+  bootstrapTest.onStart = undefined;
   monitor.rss = undefined;
   monitor.transientStats = 0;
   monitor.transientDirectories = 0;
@@ -77,6 +106,97 @@ afterEach(async () => {
   await rm(directory, { recursive: true, force: true });
 });
 
+it.each([
+  ["scene.blend", /previous Blender scene was edited/],
+  ["parts.json", /saved Blender configuration changed/],
+] as const)("rejects a same-length edit to %s before launching Blender", async (file, message) => {
+  vi.spyOn(runner, "status").mockResolvedValue({ available: true, executable: "unused" });
+  await writeFile(path.join(workspace, "export.py"), "# unused");
+  await writeFile(path.join(workspace, file), "edited-input");
+  const originalDigest = createHash("sha256").update("parent-input").digest("hex");
+  await expect(runner.run({
+    workspace, scriptPath: "export.py", inputs: [file], expectedInputSha256: { [file]: originalDigest },
+  })).rejects.toThrow(message);
+  expect(await readFile(path.join(workspace, file), "utf8")).toBe("edited-input");
+  expect(existsSync(path.join(directory, "jobs"))).toBe(false);
+});
+
+describe.skipIf(!existsSync("/usr/bin/python3"))("bundled Blender export workers", () => {
+  it.each(["prepare", "verify", "none"])("retains one job with a %s failure point", async (failAt) => {
+    vi.spyOn(runner, "status").mockResolvedValue({ available: true, executable: "unused" });
+    bootstrapTest.phases = [];
+    const entry = `import json, os, resource, sys
+from pathlib import Path
+def arg(flag):
+    return sys.argv[sys.argv.index(flag) + 1]
+phase = arg("--export-phase")
+state = Path(arg("--export-state"))
+output = Path(arg("--output-dir"))
+assert state == output.parent / "tmp" / "export-state.json"
+cpu = resource.getrlimit(resource.RLIMIT_CPU)[1]
+if phase == "prepare":
+    state.write_text(json.dumps([os.getpid(), cpu]))
+    (output / "asset.glb").write_bytes(b"prepared")
+else:
+    pid, first_cpu = json.loads(state.read_text())
+    assert pid != os.getpid() and 0 < cpu < first_cpu
+    assert (output / "asset.glb").read_bytes() == b"prepared"
+print("worker-" + phase, flush=True)
+if phase == ${JSON.stringify(failAt)}:
+    raise RuntimeError("planned failure")
+`;
+    const job = runner.run({
+      workspace, inputs: [], bundledExport: true, args: ["--stage", "export"],
+      bundledScripts: { entry: "pipeline.py", files: { "pipeline.py": entry } },
+    });
+    if (failAt === "none") {
+      const result = await job;
+      expect(result.files.map(file => file.path)).toEqual(["asset.glb"]);
+      expect(result.log).toMatch(/worker-prepare[\s\S]*worker-verify/);
+      expect((await runner.inspectJob(result.id)).status).toBe("completed");
+    } else {
+      const failure = await job.catch(error => error) as BlenderRunError;
+      expect(failure).toBeInstanceOf(BlenderRunError);
+      expect(failure.message).toContain(`during export ${failAt}`);
+      expect((await runner.inspectJob(failure.jobId!)).status).toBe("failed");
+      await expect(runner.readJob(failure.jobId!)).rejects.toThrow();
+    }
+    expect(bootstrapTest.phases).toEqual(failAt === "prepare" ? ["prepare"] : ["prepare", "verify"]);
+  });
+
+  it.each(["deadline", "memory"] as const)("stops verification at its job %s limit", async reason => {
+    vi.spyOn(runner, "status").mockResolvedValue({ available: true, executable: "unused" });
+    bootstrapTest.phases = [];
+    monitor.rss = "1024\n";
+    const clock = performance.now.bind(performance);
+    let elapsed = 0;
+    const now = vi.spyOn(performance, "now").mockImplementation(() => clock() + elapsed);
+    bootstrapTest.onStart = phase => {
+      if (phase === "prepare" && reason === "deadline") elapsed = 28_500;
+      if (phase === "verify" && reason === "memory") monitor.rss = "2097153\n";
+    };
+    try {
+      const entry = `import sys, time
+from pathlib import Path
+if sys.argv[sys.argv.index("--export-phase") + 1] == "verify":
+    time.sleep(3)
+(Path(sys.argv[sys.argv.index("--output-dir") + 1]) / "asset.glb").write_bytes(b"asset")
+`;
+      const job = runner.run({
+        workspace, inputs: [], bundledExport: true, args: ["--stage", "export"], timeoutMs: 30_000,
+        bundledScripts: { entry: "pipeline.py", files: { "pipeline.py": entry } },
+      });
+      const failure = await job.catch(error => error) as BlenderRunError;
+      expect(failure).toBeInstanceOf(BlenderRunError);
+      expect(failure.message).toMatch(reason === "deadline" ? /timed out/ : /export verify \(sampled RSS 2097153 KiB, limit 2097152 KiB\)/);
+      expect(bootstrapTest.phases).toEqual(["prepare", "verify"]);
+      expect((await runner.inspectJob(failure.jobId!)).status).toBe("failed");
+    } finally {
+      now.mockRestore();
+    }
+  });
+});
+
 describe.skipIf(!supported)("controlled local Blender", () => {
   it("tolerates disappearing temporary snapshot entries but keeps completed-output inspection strict", async () => {
     await writeFile(path.join(workspace, "model.py"), `import sys, time
@@ -90,12 +210,12 @@ output = Path(sys.argv[sys.argv.index("--output-dir") + 1])
 `);
     monitor.transientStats = 1;
     monitor.transientDirectories = 1;
-    const result = await runner.run({ workspace, scriptPath: "model.py", inputs: [], liveView: false, timeoutMs: 30_000 });
+    const result = await runner.run({ workspace, scriptPath: "model.py", inputs: [], timeoutMs: 30_000 });
     expect(monitor.transientStats).toBe(0);
     expect(monitor.transientDirectories).toBe(0);
     expect(result.files).toEqual([{ path: "report.json", size: 2 }]);
     monitor.missingCompletedOutput = true;
-    await expect(runner.run({ workspace, scriptPath: "model.py", inputs: [], liveView: false, timeoutMs: 30_000 })).rejects.toThrow("ENOENT");
+    await expect(runner.run({ workspace, scriptPath: "model.py", inputs: [], timeoutMs: 30_000 })).rejects.toThrow("ENOENT");
   }, 40_000);
 
   it("rejects traversal, credentials, links and invalid limits before starting a job", async () => {
@@ -119,6 +239,8 @@ output = Path(sys.argv[sys.argv.index("--output-dir") + 1])
     await expect(run(["linked.json"])).rejects.toThrow("non-linked");
     await expect(run(["symbolic.json"])).rejects.toThrow("Linked");
     await expect(run(["a.json", "a.json"])).rejects.toThrow("distinct");
+    await expect(run(["common.py"])).rejects.toThrow(/data files only.*common\.py.*single custom script.*scriptPath/);
+    await expect(run(["mesh.obj"])).rejects.toThrow(/mesh\.obj.*Supported data files/);
     await expect(
       runner.run({
         workspace,
@@ -143,7 +265,7 @@ p = argparse.ArgumentParser()
 p.add_argument("--input-dir"); p.add_argument("--output-dir")
 a = p.parse_args(sys.argv[sys.argv.index("--") + 1:])
 output = Path(a.output_dir)
-checks = {}
+checks = {"headless": bpy.app.background}
 def denied(name, operation):
     try:
         operation()
@@ -205,6 +327,7 @@ bpy.ops.render.render(write_still=True)
         ),
       ),
     ).toEqual({
+      headless: true,
       outside_read: true,
       outside_write: true,
       input_write: true,
@@ -351,6 +474,6 @@ os.symlink(${JSON.stringify(workspace)}, output)
         inputs: [],
         timeoutMs: 60_000,
       }),
-    ).rejects.toThrow("2 GiB resident-memory watchdog");
+    ).rejects.toThrow(/2 GiB resident-memory watchdog during custom script \(sampled RSS 2097153 KiB, limit 2097152 KiB\)/);
   }, 20_000);
 });

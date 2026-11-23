@@ -2,6 +2,20 @@
 
 Design and Asset Canvas share a project directory the agent edits with its ordinary file tools.
 The canvas renders those files and autosaves user edits into the same sources.
+
+For a set of related board changes, the Pi Agent can send one `edit` with
+multiple `edits` entries for the same file. Each replacement must match one
+distinct part of the original. The host checks the combined board before
+saving. Independent calls for different files can share a model request.
+Reads, generation, inspection and user approval still precede changes that
+depend on their results.
+Within one user turn, the agent can reuse exact text visible in its successful
+file reads and edits. It can request adjacent schema sections in one ranged
+read. A project text read or save records the file version in the active Pi
+branch. If the file changes elsewhere, the next edit asks the agent to read
+the current source again. The agent also reads again when its evidence is
+missing, excerpted, or out of date. Image review uses the actual images from
+the current run.
 The agent can initialize a canvas when design or asset work needs it, without
 requiring the user to open Design first.
 The agent shows final media deliverables on the relevant board, reusing existing
@@ -175,7 +189,11 @@ to 200 UTF-8 bytes. Renaming a node does not rename the workspace file or shared
 Library asset; adding the asset to another project still uses its asset name.
 
 The editor supplies the current board path and selected node IDs as a
-removable chat context. The agent reads current files before making changes.
+removable chat context. Ordinary questions carry a short workspace index pointer
+and, for games with a main design, its current title and source. The host reads
+the index for this pointer. Selecting a document explicitly attaches its saved
+Markdown snapshot and revision. Selecting nodes keeps their IDs and references.
+The agent bases each change on the current source.
 Concurrent edits to different fields merge; competing edits require the user
 to choose a version. A node type change is adopted as a whole when the other
 version of that node is unchanged; competing edits during a type change require

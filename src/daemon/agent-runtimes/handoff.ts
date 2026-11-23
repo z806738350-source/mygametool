@@ -6,6 +6,7 @@ import { getIsolatedOperationReceipts, retainedIsolatedOperationEvidence, retain
 const MAX_SUMMARY = 12_000;
 const MAX_MESSAGE = 1_500;
 const MAX_TURNS = 12;
+const MAX_FILE_LIST = 2_000;
 const MAX_EFFECTS = 24;
 const MAX_EFFECT_TEXT = 500;
 const MAX_EFFECT_SUMMARY = 6_000;
@@ -105,11 +106,18 @@ export function handoffSummary(
   const kept: string[] = [];
   let length = 0;
   for (const turn of turns.slice(-MAX_TURNS).reverse()) {
-    const text = turn.join("\n");
-    if (length + text.length > MAX_SUMMARY && kept.length) break;
+    let text = turn.join("\n");
+    if (length + text.length > MAX_SUMMARY) {
+      if (kept.length) break;
+      const opening = `${turn[0]}\n[Intermediate progress omitted.]\n`;
+      const tail = text.slice(-(MAX_SUMMARY - opening.length));
+      text = opening + tail.slice(tail.indexOf("\n") + 1);
+    }
     kept.unshift(text);
-    length += text.length;
+    length += text.length + 2;
   }
+  const recentFiles = [...files].filter(file => file.length <= MAX_FILE_LIST).slice(-40);
+  while (recentFiles.join(", ").length > MAX_FILE_LIST) recentFiles.shift();
   const omitted = turns.length - kept.length;
   const plan = entries.findLast(
     (entry) => entry.type === "custom" && entry.customType === "ohmygame-plan",
@@ -135,9 +143,9 @@ export function handoffSummary(
           "The workspace has been restored or a turn was undone. Inspect the current files before continuing; earlier descriptions may no longer match them.",
         ]
       : []),
-    ...(files.size
+    ...(recentFiles.length
       ? [
-          `Files the earlier agent worked on: ${[...files].slice(-40).join(", ")}`,
+          `Files the earlier agent worked on: ${recentFiles.join(", ")}`,
         ]
       : []),
     ...(effects.size ? [effectSummary(effects)] : []),

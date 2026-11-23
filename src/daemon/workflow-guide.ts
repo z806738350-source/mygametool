@@ -1,7 +1,7 @@
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import path from "node:path";
-import type { ProjectType } from "../shared/contracts.js";
+import { readProjectWorkflow, type AgentPromptProject } from "./agent-prompts.js";
 import type { BundledPluginStore } from "./bundled-plugins.js";
 import type { PluginSettingsStore } from "./plugin-settings.js";
 import { readSafeProjectFile } from "./safe-project-file.js";
@@ -9,11 +9,11 @@ import { readSafeProjectFile } from "./safe-project-file.js";
 const studioWorkflows = new Set(["web-game-studio", "game-studio", "threejs-world", "blender"]);
 
 /** Packaged production notes, independently of executable plugins or ambient Pi skills. */
-export function workflowGuideTools(type: ProjectType, store: BundledPluginStore, settings: PluginSettingsStore) {
+export function workflowGuideTools(project: AgentPromptProject, store: BundledPluginStore, settings: PluginSettingsStore) {
   const guides = new Map<string, { root: string; pluginId: string; skillId: string }>();
   for (const bundled of store.list()) {
     const plugin = settings.decorate(bundled);
-    if (!studioWorkflows.has(plugin.name) || !plugin.enabled || !plugin.projectTypes?.includes(type)) continue;
+    if (!studioWorkflows.has(plugin.name) || !plugin.enabled || !plugin.projectTypes?.includes(project.type)) continue;
     const root = store.installedPath(plugin.id);
     if (!root) continue;
     for (const skill of plugin.skills) {
@@ -22,16 +22,17 @@ export function workflowGuideTools(type: ProjectType, store: BundledPluginStore,
       }
     }
   }
-  if (!guides.size) return [];
   return [defineTool({
     name: "read_workflow_guide", label: "Read studio workflow",
-    description: "Read an enabled bundled studio guide or a text reference named by that guide. This only returns writing. It cannot start Blender, plugin programs, or MCP servers.",
+    description: "Read an OhMyGame operating reference or an enabled studio guide. Returns text only.",
     parameters: Type.Object({
-      guide: Type.Union([...guides.keys()].map(name => Type.Literal(name))),
+      guide: Type.Union(["ohmygame", ...guides.keys()].map(name => Type.Literal(name))),
       reference: Type.Optional(Type.String({ maxLength: 120, pattern: "^[a-zA-Z0-9_-]+\\.(md|txt)$", description: "For a guide's references/ link, the filename only." })),
     }, { additionalProperties: false }),
     execute: async (_id, { guide, reference }, signal) => {
       signal?.throwIfAborted();
+      if (guide === "ohmygame")
+        return { content: [{ type: "text", text: readProjectWorkflow(project, reference) }], details: { guide, source: reference ?? "index" } };
       const entry = guides.get(guide);
       const plugin = entry && store.read(entry.pluginId);
       const current = plugin && settings.decorate(plugin);

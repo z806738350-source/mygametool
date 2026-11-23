@@ -5,9 +5,13 @@ import { isVolumeMigrationReview, validVolumeMigrationReview, validVolumeMigrati
 import type {
   ApprovalDecision,
   ApprovalRequestDetails,
+  TripoModelReview,
 } from "../shared/agent-runtimes.js";
-import { ChevronRight, FileText, InfoCircle, Terminal } from "./icons.js";
+import { ChevronRight, FileText, Image, InfoCircle, Terminal } from "./icons.js";
 import { formatBytes } from "./format-bytes.js";
+import { TurnaroundReviewViews } from "./turnaround-review-views.js";
+import { ModelPreview } from "./model-preview.js";
+import { getLibraryAsset } from "./api.js";
 import { t } from "./i18n.js";
 import "./approval-source-review.css";
 
@@ -31,6 +35,7 @@ export function ApprovalCard({
   const [filesReviewed, setFilesReviewed] = useState(false);
   const [codeReviewed, setCodeReviewed] = useState(false);
   const [decisionFailed, setDecisionFailed] = useState(false);
+  const [readyReviewId, setReadyReviewId] = useState<string>();
   const [migrationConsent, setMigrationConsent] = useState({ key: "", capacityReviewed: false, oldVolumeRetained: false });
   // A second click can arrive before the disabled buttons render; one answer is sent per request.
   const answering = useRef(false);
@@ -41,8 +46,14 @@ export function ApprovalCard({
     setCodeReviewed(false);
     setDecisionFailed(false);
     setMigrationConsent({ key: "", capacityReviewed: false, oldVolumeRetained: false });
-  }, [request.requestId, request.turnId, request.request.isolatedSourceReview?.reviewId, request.request.volumeMigration?.planId]);
+  }, [request.requestId, request.turnId, request.request.isolatedSourceReview?.reviewId, request.request.volumeMigration?.planId, request.request.turnaroundReview?.reviewId, request.request.tripoModelReview?.reviewId]);
   const details = request.request;
+  const turnaround = details.kind === "turnaroundReview";
+  const views = details.turnaroundReview;
+  const tripo = details.kind === "tripoModelReview";
+  const model = details.tripoModelReview;
+  const visualReview = turnaround || tripo;
+  const visualReviewId = (turnaround ? views : model)?.reviewId;
   const migrationRequested = details.kind === "volumeMigration" || details.volumeMigration !== undefined;
   const migration = migrationRequested && isVolumeMigrationReview(details.volumeMigration) ? details.volumeMigration : undefined;
   const creatingVolume = migration?.source.profileId === "unallocated";
@@ -52,11 +63,12 @@ export function ApprovalCard({
     oldVolumeRetained: migrationConsent.key === migrationKey && migrationConsent.oldVolumeRetained } : undefined;
   const source = migrationRequested ? undefined : details.isolatedSourceReview;
   const confirmation = source ? { reviewId: source.reviewId, filesReviewed, codeReviewed } : undefined;
-  const canApprove = migrationRequested ? details.kind === "volumeMigration" && !details.canAllowSession && !details.isolatedSourceReview && validVolumeMigrationConfirmation(migration, migrationConfirmation)
+  const canApprove = visualReview ? Boolean(visualReviewId && visualReviewId === readyReviewId && !details.canAllowSession)
+    : migrationRequested ? details.kind === "volumeMigration" && !details.canAllowSession && !details.isolatedSourceReview && validVolumeMigrationConfirmation(migration, migrationConfirmation)
     : !source || validSourceConfirmation(source, confirmation);
   const agent = agentName ?? t("approval.theAgent");
   const title =
-    migrationRequested ? t(creatingVolume ? "approval.migrationCreateTitle" : "approval.migrationTitle") : source ? t("approval.sourceReviewScope", { generation: source.generation, count: source.files.length }) : details.kind === "command"
+    turnaround ? t("approval.turnaroundTitle") : tripo ? t("approval.tripoModelTitle") : migrationRequested ? t(creatingVolume ? "approval.migrationCreateTitle" : "approval.migrationTitle") : source ? t("approval.sourceReviewScope", { generation: source.generation, count: source.files.length }) : details.kind === "command"
       ? t("approval.commandTitle", { agent })
       : details.kind === "file"
         ? t("approval.fileTitle", { agent })
@@ -78,7 +90,7 @@ export function ApprovalCard({
       answered = migrationRequested && decision === "allow" ? await onDecide(decision, undefined, migrationConfirmation)
         : source && decision === "allow" ? await onDecide(decision, confirmation) : await onDecide(decision);
     } catch {
-      /* The parent displays the request error. */
+      /* A failed decision leaves this request open for another attempt. */
     }
     if (!answered) {
       answering.current = false;
@@ -88,17 +100,19 @@ export function ApprovalCard({
   }
   return (
     <section
-      className={`questionnaire-card approval-card${source || migrationRequested ? " approval-card-source" : ""}${migrationRequested ? " approval-card-migration" : ""}`}
+      className={`questionnaire-card approval-card${source || migrationRequested ? " approval-card-source" : ""}${migrationRequested ? " approval-card-migration" : ""}${visualReview ? " approval-card-turnaround" : ""}`}
       aria-label={t("approval.label")}
       aria-busy={submitting}
     >
       <header>
-        {source || migrationRequested ? <FileText size={15} aria-hidden="true" /> : <Terminal size={14} aria-hidden="true" />}
+        {visualReview ? <Image size={15} aria-hidden="true" /> : source || migrationRequested ? <FileText size={15} aria-hidden="true" /> : <Terminal size={14} aria-hidden="true" />}
         <strong>{title}</strong>
         {waiting > 0 ? (
           <small>{t("approval.waiting", { count: waiting })}</small>
         ) : null}
       </header>
+      {turnaround && views ? <TurnaroundReviewViews key={views.reviewId} review={views} onReady={setReadyReviewId} /> : null}
+      {tripo && model ? <TripoModelReviewPreview key={model.reviewId} review={model} onReady={setReadyReviewId} /> : null}
       {details.command !== undefined ? (
         <pre className="approval-card-detail">
           <code>{details.command}</code>
@@ -210,6 +224,7 @@ export function ApprovalCard({
         </ul>
       ) : null}
       {details.network ? <p>{t("approval.networkAccess")}</p> : null}
+      {visualReview && decisionFailed ? <p className="approval-source-status approval-source-error" role="alert">{t("approval.sourceDecisionFailed")}</p> : null}
       <footer>
         {migrationRequested ? <p className={`approval-source-status${decisionFailed ? " approval-source-error" : ""}`} role={decisionFailed ? "alert" : "status"}>
           {t(decisionFailed ? "approval.sourceDecisionFailed" : submitting ? "approval.sourceSubmitting" : !validVolumeMigrationReview(migration) ? "approval.migrationBlocked" : canApprove ? "approval.sourceReady" : "approval.migrationNeedsConfirmation")}
@@ -223,9 +238,9 @@ export function ApprovalCard({
           disabled={submitting}
           onClick={() => void decide("deny")}
         >
-          {t("approval.deny")}
+          {t(visualReview ? "approval.turnaroundRevise" : "approval.deny")}
         </button>
-        {details.canAllowSession && !source && !migrationRequested ? (
+        {details.canAllowSession && !source && !migrationRequested && !visualReview ? (
           <button
             type="button"
             className="settings-secondary-button"
@@ -242,11 +257,42 @@ export function ApprovalCard({
           disabled={submitting || !canApprove}
           onClick={() => void decide("allow")}
         >
-          {t(migrationRequested ? creatingVolume ? "approval.migrationCreateApprove" : "approval.migrationApprove" : "approval.allow")}
+          {t(turnaround ? "approval.turnaroundApprove" : tripo ? "approval.tripoModelApprove" : migrationRequested ? creatingVolume ? "approval.migrationCreateApprove" : "approval.migrationApprove" : "approval.allow")}
         </button>
       </footer>
     </section>
   );
+}
+
+function TripoModelReviewPreview({ review, onReady }: { review: TripoModelReview; onReady(id: string | undefined): void }) {
+  const [url, setUrl] = useState<string>();
+  const [failed, setFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  useEffect(() => {
+    const controller = new AbortController();
+    let objectUrl: string | undefined;
+    setUrl(undefined);
+    setFailed(false);
+    onReady(undefined);
+    void getLibraryAsset(review.assetId, review.fbx, controller.signal, review.previewSha256).then(blob => {
+      if (controller.signal.aborted) return;
+      objectUrl = URL.createObjectURL(blob);
+      setUrl(objectUrl);
+    }).catch(() => { if (!controller.signal.aborted) setFailed(true); });
+    return () => {
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [review, attempt, onReady]);
+  return <div className="turnaround-review">
+    <p>{t("approval.tripoModelSummary")}</p>
+    {failed ? <div className="turnaround-review-error">
+      <span role="alert">{t("approval.tripoModelLoadFailed")}</span>
+      <button type="button" className="settings-secondary-button" onClick={() => setAttempt(value => value + 1)}>{t("common.retry")}</button>
+    </div> : url ? <ModelPreview source={url} label={review.name} minHeight={240} animate={false} clipPicker={false}
+      onLoad={() => onReady(review.reviewId)} onError={() => { onReady(undefined); setFailed(true); }} />
+      : <span role="status">{t("common.loading")}</span>}
+  </div>;
 }
 
 function VolumeMigrationDetails({ review }: { review: VolumeMigrationReview }) {
@@ -288,6 +334,14 @@ function VolumeMigrationDetails({ review }: { review: VolumeMigrationReview }) {
 export function approvalOutcomeLabel(
   item: Extract<ThreadItem, { type: "approvalRequest" }>,
 ): string {
+  if (item.request.kind === "turnaroundReview") {
+    if (item.status !== "completed") return t("approval.turnaroundUnanswered");
+    return t(item.decision === "allow" ? "approval.turnaroundApproved" : "approval.turnaroundChangesRequested");
+  }
+  if (item.request.kind === "tripoModelReview") {
+    if (item.status !== "completed") return t("approval.tripoModelUnanswered");
+    return t(item.decision === "allow" ? "approval.tripoModelApproved" : "approval.tripoModelChangesRequested");
+  }
   const subject =
     (item.request.kind === "volumeMigration" ? t(item.request.volumeMigration?.source?.profileId === "unallocated" ? "approval.migrationCreateTitle" : "approval.migrationTitle") : undefined) ??
     item.request.command ??

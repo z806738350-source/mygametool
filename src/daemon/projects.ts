@@ -9,6 +9,7 @@ import type { LibraryAssetProject, MediaModelDefaults, PreviewViewport, ProjectC
 import { defaultProjectName } from "../shared/project-names.js";
 import { isProjectType, isWebRuntimeProjectType, supportsWebPreview } from "../shared/project-runtime.js";
 import { deleteAssetMetadata, readAssetMetadata, renameAssetMetadata, writeAssetMetadata } from "./asset-metadata.js";
+import { FBX_MEDIA_TYPE, isFbxArtifact } from "./fbx-preview.js";
 import { getWorkspaceMedia, resolveWorkspaceDirectory, resolveWorkspaceEntry, WorkspaceError } from "./workspace.js";
 import type { AssetLibrary } from "./asset-library.js";
 import { isProjectPackageManager } from "./package-manager.js";
@@ -32,7 +33,7 @@ import { runtimeMediaFileLimit } from "../shared/execution-capacity-profiles.js"
 import { knownSensitiveValueRevision } from "../shared/sensitive-values.js";
 import { inheritToolPreflightFailure, toolPreflightError } from "./agent-tool-errors.js";
 import { prepareThreeRuntime } from "./three-runtime.js";
-import { readModelResources, storeModelResources } from "./model-resources.js";
+import { modelOriginalPath, readModelResources, storeModelResources } from "./model-resources.js";
 import { inspectModel3D } from "./model3d-inspect.js";
 
 const PROJECT_LOAD_CONCURRENCY = 8;
@@ -676,6 +677,62 @@ export class ProjectManager {
     return (await readAssetMetadata(project.workspacePath)).prompts[assetPath];
   }
 
+  /** Use only a model already bound to this project; never grant read access by a global ID alone. */
+  async blenderModelSource(id: string, assetId: string, signal?: AbortSignal) {
+    const project = this.#projects.get(id), library = this.assetLibrary;
+    if (!project || !library) throw new ProjectAssetError("The project or model library is unavailable", 404);
+    const { bindings } = await this.#modelBindings(project.workspacePath);
+    const original = library.get(assetId);
+    const extension = original?.contentType === "model/gltf-binary" ? "glb" : original?.contentType === FBX_MEDIA_TYPE ? "fbx" : undefined;
+    const binding = [...bindings].find(([file, linked]) => linked === assetId && path.extname(file).toLowerCase() === `.${extension}`);
+    if (!original || !extension || !binding) throw new ProjectAssetError("Choose an original GLB or FBX assetId bound to this project. Use get_model_asset to list its models.", 403);
+    const opened = await library.openSnapshot(assetId, 64 * 1024 * 1024, false, signal);
+    try {
+      const sha256 = opened.snapshot.sha256;
+      const privateOriginal = modelOriginalPath(sha256, original.contentType);
+      const filename = binding[0] === privateOriginal ? path.join(project.workspacePath, privateOriginal)
+        : await localAgentPath(project.workspacePath, binding[0]);
+      const bytes = await readSafeProjectFile(project.workspacePath, filename);
+      signal?.throwIfAborted();
+      if (createHash("sha256").update(bytes).digest("hex") !== sha256)
+        throw new ProjectAssetError("The project model differs from its bound original. Select an unchanged original or explicitly import the edit as an existing asset.", 409);
+      const validFormat = extension === "fbx" ? isFbxArtifact(bytes)
+        : bytes.length >= 20 && bytes.toString("ascii", 0, 4) === "glTF" && bytes.readUInt32LE(4) === 2 && bytes.readUInt32LE(8) === bytes.length;
+      if (!validFormat) throw new ProjectAssetError("The original model bytes do not match their GLB or FBX format.", 400);
+      const protocol = original.generation?.protocol;
+      return { assetId, extension, sha256, bytes, tripo: original.origin === "generated" && protocol === "tripo-v3" };
+    } finally {
+      await opened.snapshot.release();
+    }
+  }
+
+  async #modelBindings(workspace: string) {
+    const metadata = await readAssetMetadata(workspace), canvas = await readCanvasAssets(workspace);
+    const bindings = new Map(Object.entries(metadata.libraryAssets));
+    for (const [key, value] of Object.entries(canvas.assets)) bindings.set(value.path, value.libraryAssetId ?? key);
+    return { bindings, canvas, metadata };
+  }
+
+  async boundTripoModelIds(id: string, paths: readonly string[]) {
+    const project = this.#projects.get(id), library = this.assetLibrary;
+    const modelPaths = paths.filter(file => /\.(?:fbx|glb)$/i.test(file)).map(file => path.posix.normalize(file.replaceAll("\\", "/")).toLowerCase());
+    if (!project || !library || !modelPaths.length) return [];
+    const { bindings, canvas, metadata } = await this.#modelBindings(project.workspacePath);
+    for (const [file, preview] of Object.entries(metadata.previews)) {
+      const original = bindings.get(file);
+      if (original && !bindings.has(preview)) bindings.set(preview, original);
+    }
+    for (const [key, asset] of Object.entries(canvas.assets)) {
+      for (const file of [asset.modelPreviewPath, asset.modelRuntimePath])
+        if (file && !bindings.has(file)) bindings.set(file, asset.libraryAssetId ?? key);
+    }
+    return [...new Set([...bindings].flatMap(([file, assetId]) => {
+      if (!modelPaths.includes(file.toLowerCase())) return [];
+      const asset = library.get(assetId);
+      return asset?.origin === "generated" && asset.generation?.protocol === "tripo-v3" ? [assetId] : [];
+    }))];
+  }
+
   async modelAssetResources(id: string, reference?: { assetId?: string; path?: string; rebuildPreview?: boolean }, signal?: AbortSignal) {
     signal?.throwIfAborted();
     if (reference?.assetId && reference.path) {
@@ -684,9 +741,7 @@ export class ProjectManager {
     }
     const project = this.#projects.get(id);
     if (!project || !this.assetLibrary) throw new ProjectAssetError("The project or Library is unavailable", 404);
-    const metadata = await readAssetMetadata(project.workspacePath), canvas = await readCanvasAssets(project.workspacePath);
-    const bindings = new Map(Object.entries(metadata.libraryAssets));
-    for (const [key, value] of Object.entries(canvas.assets)) bindings.set(value.path, value.libraryAssetId ?? key);
+    const { bindings, canvas } = await this.#modelBindings(project.workspacePath);
     if (!reference?.assetId && !reference?.path) return [...bindings].filter(([file]) => [".fbx", ".glb"].includes(path.extname(file).toLowerCase())).map(([file, assetId]) => ({ assetId, originalPath: file }));
     const binding = [...bindings].find(([file, assetId]) => reference.path ? file === reference.path : assetId === reference.assetId || canvas.assets[reference.assetId!]?.path === file);
     if (!binding) {

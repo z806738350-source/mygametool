@@ -22,8 +22,8 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-describe("composer text-only model", () => {
-  const model = { provider: "kunpo", id: "claude-fable-5-2" };
+describe("composer model capabilities", () => {
+  const model = { provider: "independent", id: "text-model", name: "Text model", providerName: "Independent", reasoningLevels: [], supportsImages: false };
 
   it.each(["image/png", ""])("retains an image draft and refuses button and form submission (%s)", async (type) => {
     vi.stubGlobal("URL", class extends URL { static createObjectURL() { return "blob:mock"; } static revokeObjectURL() {} });
@@ -31,7 +31,7 @@ describe("composer text-only model", () => {
     const file = new File(["image"], "screenshot.png", { type });
     const session = composerDrafts.get({ projectId: "publish-test", conversationId: "chat" });
     session.update({ prompt: "Inspect this screenshot", attachments: [{ id: "shot", file, relativePath: file.name }] });
-    const props = await render({ model });
+    const props = await render({ model, models: [model] });
     expect(container.querySelector<HTMLButtonElement>(".send-button")!.disabled).toBe(true);
     expect(container.querySelector('[role="alert"]')?.textContent).toContain("Image input is not enabled");
     await act(async () => container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
@@ -41,7 +41,7 @@ describe("composer text-only model", () => {
   });
 
   it("keeps captured playable context until a vision model is selected", async () => {
-    const props = await render({ model, initialDraft: { prompt: "Inspect this element", mentions: [] }, contexts: [{ key: "pick", kind: "playable-element", label: "Button" }] });
+    const props = await render({ model, models: [model], initialDraft: { prompt: "Inspect this element", mentions: [] }, contexts: [{ key: "pick", kind: "playable-element", label: "Button" }] });
     expect(container.querySelector<HTMLButtonElement>(".send-button")!.disabled).toBe(true);
     await act(async () => container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
     expect(props.onSubmit).not.toHaveBeenCalled();
@@ -49,6 +49,18 @@ describe("composer text-only model", () => {
     await render({ ...props, model: { provider: "kunpo", id: "gpt-5.6-sol" } });
     expect(container.querySelector<HTMLButtonElement>(".send-button")!.disabled).toBe(false);
     expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it.each(["claude-fable-5-2", "gpt-6.2-astra"])("sends a reference image with %s", async (id) => {
+    vi.stubGlobal("URL", class extends URL { static createObjectURL() { return "blob:mock"; } static revokeObjectURL() {} });
+    const file = new File(["image"], "reference.png", { type: "image/png" });
+    const attachment = { id: "ref", batchId: "batch", name: file.name, relativePath: file.name, size: file.size, kind: "image" as const, mediaType: file.type };
+    vi.spyOn(api, "uploadProjectAttachment").mockResolvedValue(attachment);
+    composerDrafts.get({ projectId: "publish-test", conversationId: "chat" }).update({ prompt: "Inspect this reference", attachments: [{ id: "ref", file, relativePath: file.name }] });
+    const props = await render({ model: { provider: "kunpo", id } });
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    await act(async () => container.querySelector<HTMLButtonElement>(".send-button")!.click());
+    expect(props.onSubmit).toHaveBeenCalledWith("Inspect this reference", [], [], "normal", [attachment], [], []);
   });
 
   it("retains the draft until the user replaces a retired Kunpo Agent", async () => {
@@ -66,7 +78,7 @@ describe("composer text-only model", () => {
     const attachment = { id: "notes", batchId: "batch", name: file.name, relativePath: file.name, size: file.size, kind: "text" as const, mediaType: file.type };
     vi.spyOn(api, "uploadProjectAttachment").mockResolvedValue(attachment);
     composerDrafts.get({ projectId: "publish-test", conversationId: "chat" }).update({ prompt: "Read these notes", attachments: [{ id: "notes", file, relativePath: file.name }] });
-    const props = await render({ model, contexts: [{ key: "node", kind: "playable-node", label: "Game" }] });
+    const props = await render({ model, models: [model], contexts: [{ key: "node", kind: "playable-node", label: "Game" }] });
     expect(container.querySelector<HTMLButtonElement>(".send-button")!.disabled).toBe(false);
     await act(async () => container.querySelector<HTMLButtonElement>(".send-button")!.click());
     expect(props.onSubmit).toHaveBeenCalledWith("Read these notes", [], [], "normal", [attachment], [], []);

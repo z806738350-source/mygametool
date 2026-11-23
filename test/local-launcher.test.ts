@@ -1,11 +1,15 @@
 import { execFile } from "node:child_process";
-import { chmod, link, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ClassicLevel } from "classic-level";
+import { ProjectLifecycle } from "../src/daemon/project-lifecycle.js";
+import { compactProjectBrowserStorage } from "../src/desktop/project-browser-storage.js";
+import { PROJECT_BROWSER_CLEANUP_DIRECTORY } from "../src/shared/project-browser-storage.js";
 // @ts-ignore The import-safe MJS launcher intentionally has no declaration file.
-import { launchEnvironment, launchPaths, protectEnvMetadata } from "../scripts/local-launch.mjs";
+import { assertBrowserStorageRestored, launchEnvironment, launchPaths, protectEnvMetadata } from "../scripts/local-launch.mjs";
 
 const directories: string[] = [];
 const script = new URL("../scripts/local-launch.mjs", import.meta.url);
@@ -18,6 +22,50 @@ async function temporary() {
   directories.push(directory);
   return directory;
 }
+
+it("rewrites retired browser keys after the app closes and preserves binary data for live projects and other origins", async () => {
+  const root = await temporary();
+  const deleted = "11111111-1111-4111-8111-111111111111";
+  const retained = "22222222-2222-4222-8222-222222222222";
+  const projects = path.join(root, "projects");
+  const queue = path.join(root, PROJECT_BROWSER_CLEANUP_DIRECTORY);
+  const live = path.join(root, "desktop", "browser", "Local Storage", "leveldb");
+  await mkdir(path.join(projects, retained), { recursive: true });
+  await mkdir(path.dirname(live), { recursive: true });
+  const openDatabase = () => new ClassicLevel<Buffer, Buffer>(live, { keyEncoding: "buffer", valueEncoding: "buffer" });
+  const key = (value: string) => Buffer.from(`_file://\0\x01${value}`);
+  const old = key(`canvas-active:${deleted}`);
+  const late = Buffer.concat([Buffer.from("_file://\0\x00"), Buffer.from(`canvas-board:${deleted}:草稿`, "utf16le")]);
+  const keep = [key("ohmygame:appearance"), key(`canvas-active:${retained}`), Buffer.from(`_https://example.invalid\0\x01canvas-active:${deleted}`)];
+  const opaqueValue = Buffer.from([0, 165, 255]);
+  const database = openDatabase();
+  try {
+    await database.put(old, Buffer.from("old local board"));
+    await database.del(old);
+    await database.put(late, Buffer.from("draft from an interrupted delete"));
+    for (const k of keep) await database.put(k, opaqueValue);
+  } finally { await database.close(); }
+  const allBytes = async () => Buffer.concat(await Promise.all((await readdir(live)).map((name) => readFile(path.join(live, name)))));
+  expect((await allBytes()).includes(old)).toBe(true);
+  const lifecycle = new ProjectLifecycle(root);
+  await lifecycle.scheduleBrowserCleanup(deleted);
+  await lifecycle.scheduleBrowserCleanup(retained);
+  // Recover a quit interrupted between the two renames, then finish the pending rewrite.
+  await rename(live, live + ".project-cleanup-previous");
+  const paths = { profile: path.join(root, "desktop") };
+  await expect(assertBrowserStorageRestored(paths)).rejects.toThrow("浏览器设置库还未恢复");
+  await compactProjectBrowserStorage(root);
+  await expect(assertBrowserStorageRestored(paths)).resolves.toBeUndefined();
+  const rewritten = await allBytes();
+  expect(rewritten.includes(old)).toBe(false);
+  expect(rewritten.includes(late)).toBe(false);
+  expect(await readdir(queue)).toEqual([retained]);
+  const reopened = openDatabase();
+  try {
+    for (const k of keep) expect(await reopened.get(k)).toEqual(opaqueValue);
+    expect(await reopened.get(late)).toBeUndefined();
+  } finally { await reopened.close(); }
+});
 
 describe("local source launcher boundaries", () => {
   it("keeps paths with spaces inside the dedicated project runtime", () => {

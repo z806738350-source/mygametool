@@ -414,9 +414,10 @@ export class ToolRunner {
       return await this.#withGenerationLog(toolId, () => prepared, signal, projectId, async () => {
         const recoveryId = options.recoveryId ?? randomUUID();
         let executing = false;
+        let reviewedRequest: RunToolRequest | undefined;
         const execute = async () => {
           // A saved run can be delivered even if its original references or model disappeared.
-          const request = typeof input === "function" ? await input() : input;
+          const request = reviewedRequest ?? (typeof input === "function" ? await input() : input);
           if (typeof input === "function") assertSafeGenerationInput(request);
           prepared = await this.#prepare(toolId, request, projectId, options.model3DRecoveryOnly ? undefined : options.agentCanInspectImages);
           if (options.imageRecoveryOnly && !await this.hasSavedImageResult(recoveryId)) throw new ToolRunError("No saved image result is available for this call. Recovery never submits a new generation.", 409);
@@ -428,6 +429,8 @@ export class ToolRunner {
         };
         if (!options.agentCall) return execute();
         const recovering = Boolean(options.imageRecoveryOnly || options.videoRecoveryOnly || options.model3DRecoveryOnly || options.audioRecoveryOnly);
+        const reviewModel = !recovering && toolId === "image-to-3d" && typeof input === "function"
+          ? async () => { reviewedRequest = await input(); signal?.throwIfAborted(); } : undefined;
         return this.agentMedia.use({ ...options.agentCall, ...(projectId ? { projectId } : {}) }, recoveryId, recovering, confirmNew, async (receipt, save) => {
           if (receipt.runId) {
             const stored = await this.#readRun(receipt.runId);
@@ -438,7 +441,7 @@ export class ToolRunner {
           await save({ runId: run.id });
           return run;
         }, async (cause) => !executing || (cause instanceof ToolRunError && !cause.submissionOutcome
-          && !await this.mediaWasAttempted(toolId, recoveryId) && (cause.notSubmitted || [400, 401, 403, 404, 429].includes(cause.statusCode))));
+          && !await this.mediaWasAttempted(toolId, recoveryId) && (cause.notSubmitted || [400, 401, 403, 404, 429].includes(cause.statusCode))), undefined, reviewModel);
       });
     } finally {
       if (projectId) {

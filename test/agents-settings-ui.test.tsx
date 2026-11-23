@@ -516,6 +516,21 @@ it("explains a Windows sandbox incompatibility instead of reporting an empty mod
   expect(host.textContent).not.toContain("Codex did not list its models");
 });
 
+it.each([
+  ["controlled Codex executable", "OhMyGame has not verified this Codex executable"],
+  ["controlled Codex Code Mode runner", "OhMyGame could not verify this installation’s Codex tool runner"],
+])("explains the %s audit failure in Codex settings", async (capability, notice) => {
+  api.listAgentRuntimes.mockResolvedValueOnce([{
+    ...agent("codex-cli", "Codex", true),
+    version: undefined,
+    auth: { status: "unknown", billing: "unknown" },
+    diagnostics: [{ code: "runtime-incompatible", capability, message: "Backend audit detail" }],
+  }]);
+  await act(async () => root.render(<AgentsSettings view={{ page: "agent", id: "codex-cli" }} onViewChange={vi.fn()} onOpenProviders={vi.fn()} />));
+  expect(host.querySelector('[role="alert"]')?.textContent).toContain(notice);
+  expect(host.textContent).not.toContain("Update it and check again");
+});
+
 
 async function loginDetail() {
   api.listAgentRuntimes.mockResolvedValueOnce([{ ...agent("codex-cli", "Codex", false), auth: { status: "signed-out", billing: "unknown" } }]);

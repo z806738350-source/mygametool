@@ -118,6 +118,11 @@ export async function splitModelResources(
   );
 }
 
+export function modelOriginalPath(sha256: string, contentType: string): string {
+  const name = contentType === FBX_MEDIA_TYPE ? "original.fbx" : `${sha256}.glb`;
+  return `.data/model-assets/${sha256}/${name}`;
+}
+
 /** Retain originals; use split resources or the existing verified runtime-media channel. */
 export async function storeModelResources(
   workspace: string,
@@ -133,7 +138,7 @@ export async function storeModelResources(
     throw new Error("A linked project root is unavailable");
   workspace = await realpath(workspace);
   const sha = digest(original),
-    originalPath = `.data/model-assets/${sha}/${asset.contentType === FBX_MEDIA_TYPE ? "original.fbx" : `${sha}.glb`}`;
+    originalPath = modelOriginalPath(sha, asset.contentType);
   const retained = `.data/model-assets/${sha}/runtime-retained`;
   await immutable(workspace, originalPath, original, false, undefined, signal);
   const result: ModelResources = {

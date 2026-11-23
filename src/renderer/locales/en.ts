@@ -1,10 +1,7 @@
 // English is the source language. Add every UI string here first.
-import { blenderLiveViewLabels } from "../../shared/blender-live-view-labels.js";
-
 import { GPT_IMAGE_26_PROBLEMS } from "../../shared/gpt-image-26.js";
 
 const en = {
-  blenderLiveView: blenderLiveViewLabels.en,
   localEdition: {
     title: "Local edition",
     cloudUnavailable: "This local edition does not provide accounts, Community, cloud publishing, or hosted model quotas. Local projects work without signing in.",
@@ -17,8 +14,7 @@ const en = {
     status: { unverified: "Not live-tested", pending: "Not integrated" },
     pendingHelp: "This candidate can be saved, but generation remains disabled until its integration is ready.",
     unverifiedHelp: "The adapter is available. Real-account access and model quality have not been verified.",
-    textOnlyHelp: "This KunpoAPI model supports text chat only. Choose another model to inspect images or run project tools.",
-    textOnlyLabel: "Text chat only",
+    agentHelp: "Accepts text and images. OhMyGame runs the project tools enabled for this chat.",
     removedAgent: "This model has been removed from this app’s KunpoAPI list. Select another model to continue this chat.",
     textOnlyDraft: "Image input is not enabled for this connection. Remove the image context or choose an image-enabled connection.",
     speechHelp: "Voice-generation candidate. Exact script reading is unverified; subtitles and timing alignment are not provided.",
@@ -1562,6 +1558,8 @@ const en = {
     diagnostic: {
       checkRequired: "Sign-in status has not been checked during this app session. Check again.",
       qoderProbeFailed: "Qoder’s sign-in status could not be confirmed. Check again.",
+      codexExecutableUnaudited: "OhMyGame has not verified this Codex executable for controlled use. Select the verified native CLI from the ChatGPT app.",
+      codexRunnerUnaudited: "OhMyGame could not verify this installation’s Codex tool runner. Restore the verified ChatGPT CLI installation and check again.",
       codexWindowsSandbox: "Codex’s unelevated Windows sandbox cannot enforce OhMyGame’s file access restrictions. Set up the elevated sandbox in Codex, or use MXC with a supported device and CLI, then check again.",
       notInstalled: "OhMyGame could not find the {{name}} CLI. If it is installed, specify its executable path or check again.",
       invalidExecutable: "The selected executable is missing or cannot be executed. Correct the path, or clear it and save to restore automatic detection.",
@@ -1574,6 +1572,24 @@ const en = {
     },
   },
   approval: {
+    turnaroundTitle: "Review the 3D reference views",
+    turnaroundSummary: "Open each view to check the design. Approve to start 3D generation, or request changes and describe them in chat.",
+    turnaroundAngles: { original: "Original concept", front: "Front", left: "Left side", back: "Back", right: "Right side", additional: "View {{number}}" },
+    turnaroundCheck: { original: "For visual comparison only.", front: "Compare silhouette and proportions with the original.", left: "Check asymmetric details on the subject’s own left.", back: "For characters, check how hands and feet face from behind.", right: "Check asymmetric details on the subject’s own right." },
+    turnaroundInspect: "Enlarge {{angle}}",
+    turnaroundLoadFailed: "The reference images could not be displayed.",
+    turnaroundRevise: "Request changes",
+    turnaroundApprove: "Approve and generate",
+    turnaroundApproved: "Reference views approved for 3D generation",
+    turnaroundChangesRequested: "Changes requested to the reference views",
+    turnaroundUnanswered: "Reference view review closed without approval",
+    tripoModelTitle: "Review the initial Tripo model",
+    tripoModelSummary: "Rotate the model to check its shape and details before Blender processing. To request changes, describe them in chat.",
+    tripoModelLoadFailed: "The 3D preview could not be displayed.",
+    tripoModelApprove: "Approve model",
+    tripoModelApproved: "Initial Tripo model approved",
+    tripoModelChangesRequested: "Changes requested to the initial Tripo model",
+    tripoModelUnanswered: "Initial Tripo model review closed without approval",
     migrationTitle: "Approve execution storage migration",
     migrationCreateTitle: "Create execution storage",
     migrationSummary: "Move this project's verified execution workspace to the selected larger volume. This approval applies only to the exact plan below; it does not approve source changes or another project.",
@@ -1765,6 +1781,18 @@ const en = {
       message:
         "The connection closed unexpectedly. Check your network or proxy, then try again.",
     },
+    network_unreachable: {
+      title: "Network destination unreachable",
+      message: "The network reported that it could not reach the destination. Check the connection and the route to the endpoint or proxy.",
+    },
+    provider_request_validation_failed: {
+      title: "Request failed a local check",
+      message: "OhMyGame stopped this model request during its local checks before sending it.",
+    },
+    provider_response_validation_failed: {
+      title: "Response failed a local check",
+      message: "OhMyGame received response headers and withheld the response during local checks. Check the provider’s usage before submitting again.",
+    },
     timeout: {
       title: "Model request timed out",
       message:
@@ -1806,6 +1834,8 @@ const en = {
       error: "Error",
       notConfigured: "The selected model isn't configured.",
       providerResponse: "Provider response",
+      connectionDetails: "Connection details",
+      localValidation: "Local check details",
       streamDetails: "Stream details",
       localCli: "Local CLI details",
       localTool: "Local operation details",
@@ -1989,11 +2019,13 @@ const en = {
     preparedThree: "Prepared local Three.js",
     checkingBlender: "Checking local Blender",
     checkedBlender: "Checked local Blender",
-    runningBlender: "Processing the 3D asset in Blender",
-    ranBlender: "Processed the 3D asset in Blender",
+    runningBlender: "Running a Blender task",
+    ranBlender: "Ran a Blender task",
     recoveringBlender: "Recovering saved Blender results",
     recoveredBlender: "Recovered saved Blender results",
     checkingMediaModels: "Checking project media models",
+    readingTurnaround: "Reading turnaround views",
+    readTurnaround: "Read turnaround views",
     checkedMediaModels: "Checked project media models",
     checkingAnimationActions: "Checking animation actions",
     checkedAnimationActions: "Checked animation actions",
@@ -2250,6 +2282,15 @@ const en = {
     },
   },
   plugins: {
+    blender: {
+      description: "Build game models in the background with Blender and review them on the Canvas.",
+      about: "The Agent runs local Blender headlessly to refine a model or build a prop to size. For a new character, Tripo can generate the starting mesh after you approve the turnaround views. The Agent saves an editable .blend file and checks the exported GLB. On the Canvas, rotate the model, play any animations and approve it or request changes.",
+      skill: "Blender Assets",
+      skillDescription: "Build game assets in the background from references or existing models. Optimize geometry and textures for the game camera, then check appearance and requested animations before Canvas review.",
+      fromReference: "Build a character from the selected references. If Tripo is available, show me the turnaround views for approval before generating the mesh. Refine it in Blender and show me the verified GLB on the Canvas.",
+      fromModel: "Refine the selected 3D model in Blender. Preserve its source, inspect its geometry and materials, and verify the exported GLB.",
+      procedural: "Create a static game prop from my dimensions using procedural geometry in Blender. Check its scale and silhouette, then export a GLB.",
+    },
     beta: "Beta",
     public: "Public",
     personal: "Personal",

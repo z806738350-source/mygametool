@@ -1,7 +1,12 @@
 import type { ThreadItemError, ThreadItemErrorCode } from "../shared/contracts.js";
 import { t } from "./i18n.js";
 
-const KNOWN_CODES = new Set<ThreadItemErrorCode>(["model_not_configured", "authentication_failed", "access_denied", "quota_exceeded", "rate_limited", "invalid_request", "model_unavailable", "provider_unavailable", "dns_error", "connection_refused", "connection_reset", "timeout", "tls_error", "sse_idle_timeout", "sse_validation_failed", "sse_connection_interrupted", "stream_error", "network_error", "runtime_incompatible", "runtime_probe_failed", "repeated_media_arguments", "tool_outcome_unconfirmed"]);
+const CONNECTION_ERRORS = new Set<ThreadItemErrorCode>(["dns_error", "connection_refused", "connection_reset", "network_unreachable", "timeout", "tls_error", "network_error"]);
+const KNOWN_CODES = new Set<ThreadItemErrorCode>([...CONNECTION_ERRORS, "model_not_configured", "authentication_failed", "access_denied", "quota_exceeded", "rate_limited", "invalid_request", "model_unavailable", "provider_unavailable", "provider_request_validation_failed", "provider_response_validation_failed", "sse_idle_timeout", "sse_validation_failed", "sse_connection_interrupted", "stream_error", "runtime_incompatible", "runtime_probe_failed", "repeated_media_arguments", "tool_outcome_unconfirmed"]);
+
+export function isConnectionError(code: ThreadItemErrorCode | undefined): boolean {
+  return code !== undefined && CONNECTION_ERRORS.has(code);
+}
 
 export function agentErrorPresentation(error: ThreadItemError): { title: string; message: string } {
   const code = error.code && KNOWN_CODES.has(error.code) ? error.code : "unknown";
@@ -15,9 +20,14 @@ export function agentErrorDiagnosticRows(error: ThreadItemError): Array<[string,
   const details = error.diagnostics;
   const localCli = error.code === "runtime_incompatible" || error.code === "runtime_probe_failed";
   const streamFailure = error.code?.startsWith("sse_") || error.code === "stream_error";
-  const rows: Array<[string, string]> = error.code === "model_not_configured"
-    ? [[t("agentError.row.error"), t("agentError.row.notConfigured")]]
-    : [[t(localCli ? "agentError.row.localCli" : streamFailure ? "agentError.row.streamDetails" : "agentError.row.providerResponse"), error.message]];
+  const localValidation = error.code === "provider_request_validation_failed" || error.code === "provider_response_validation_failed";
+  const rows: Array<[string, string]> = [];
+  if (error.code === "model_not_configured") rows.push([t("agentError.row.error"), t("agentError.row.notConfigured")]);
+  else if (localCli) rows.push([t("agentError.row.localCli"), error.message]);
+  else if (localValidation) rows.push([t("agentError.row.localValidation"), error.message]);
+  else if (streamFailure) rows.push([t("agentError.row.streamDetails"), error.message]);
+  else if (isConnectionError(error.code)) rows.push([t("agentError.row.connectionDetails"), error.message]);
+  else rows.push([t("agentError.row.providerResponse"), error.message]);
   if (!details) return rows;
   if (details.provider) rows.push([t("agentError.row.provider"), details.provider]);
   if (details.model) rows.push([t("agentError.row.model"), details.model]);

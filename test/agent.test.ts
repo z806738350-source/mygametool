@@ -7,6 +7,7 @@ import path from "node:path";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { AgentManager, compatibleRuntimeModel, conversationItems, lastAssistantError, loadPiSkillCatalog, type CodingSession, type RuntimeModel } from "../src/daemon/agent.js";
 import * as gameDesignContext from "../src/daemon/game-design-context.js";
+import * as kunpoModels from "../src/shared/kunpo-models.js";
 import { promptContextBlock } from "../src/daemon/prompt-context.js";
 import type { StoredConversation } from "../src/daemon/conversations.js";
 import type { AgentReasoningLevel, ProjectState } from "../src/shared/contracts.js";
@@ -957,7 +958,33 @@ describe("bounded automatic continuation", () => {
     await vi.advanceTimersByTimeAsync(AUTO_CONTINUE_DELAYS[0]); await expect(turn.result).resolves.toBe("completed");
     expect(resume).toHaveBeenCalledOnce(); expect(session.prompt).toHaveBeenCalledOnce();
   });
-  it.each([[429, "insufficient_quota"], [200, "SSE_VALIDATION_FAILED"]] as const)("does not reinterpret HTTP %s %s as a transient model interruption", async (status, code) => {
+  it.each(["ECONNRESET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"])("resumes after a nested %s without requiring an HTTP response", async code => {
+    const { manager, session, project, conversation, events, prepare, resume } = setup();
+    const cause = Object.assign(new Error("Could not reach the configured provider"), { code });
+    const sdkFailure = new Error("Connection error.", { cause });
+    session.prompt.mockImplementation(async () => {
+      session.messages.push({ ...failure(), errorMessage: sdkFailure.message, diagnostics: [createProviderFailureDiagnostic(sdkFailure)] });
+    });
+    const turn = manager.prompt(project, conversation, "Build once");
+    await scheduled(events, project);
+    await vi.advanceTimersByTimeAsync(AUTO_CONTINUE_DELAYS[0]);
+    await expect(turn.result).resolves.toBe("completed");
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(resume).toHaveBeenCalledOnce();
+    expect(session.prompt).toHaveBeenCalledExactlyOnceWith("Build once");
+  });
+  it("keeps an unclassified connection failure terminal", async () => {
+    const { manager, session, project, conversation, prepare, resume } = setup();
+    const sdkFailure = new Error("Connection error.", { cause: new Error("Could not reach the configured provider") });
+    session.prompt.mockImplementation(async () => {
+      session.messages.push({ ...failure(), errorMessage: sdkFailure.message, diagnostics: [createProviderFailureDiagnostic(sdkFailure)] });
+    });
+    await expect(manager.prompt(project, conversation, "Build").result).rejects.toThrow("Connection error.");
+    expect(prepare).not.toHaveBeenCalled();
+    expect(resume).not.toHaveBeenCalled();
+  });
+  it.each([[429, "insufficient_quota"], [200, "SSE_VALIDATION_FAILED"], [503, "PROVIDER_REQUEST_VALIDATION_FAILED"],
+    [503, "PROVIDER_RESPONSE_VALIDATION_FAILED"]] as const)("does not reinterpret HTTP %s %s as a transient model interruption", async (status, code) => {
     const { manager, session, project, conversation, prepare, resume } = setup();
     session.prompt.mockImplementation(async () => { session.messages.push({ ...failure(status), diagnostics: [{ type: "provider_failure", details: { status, errorCode: code, transport: "sse" } }] }); });
     await expect(manager.prompt(project, conversation, "Build").result).rejects.toThrow();
@@ -3041,12 +3068,15 @@ describe("AgentManager", () => {
   it.each([
     ["image input enabled", "image input disabled"],
     ["image input disabled", "image input enabled"],
-    ["Kunpo Fable", "another provider's Fable"],
-    ["another provider's Fable", "Kunpo Fable"],
+    ["tools enabled", "tools disabled"],
+    ["tools disabled", "tools enabled"],
   ])("recreates the session when switching from %s to %s", async (from, to) => {
+    const capabilities = vi.spyOn(kunpoModels, "kunpoModelOption").mockImplementation((_role, ref) =>
+      ref?.id === "tools disabled" ? { ...kunpoModels.KUNPO_MODEL_OPTIONS[0]!, id: ref.id, capabilities: { tools: false } } : undefined);
+    onTestFinished(() => capabilities.mockRestore());
     const model = (name: string) => ({
-      provider: name === "Kunpo Fable" ? "kunpo" : "custom-provider",
-      id: name.includes("Fable") ? "claude-fable-5-2" : name,
+      provider: "custom-provider",
+      id: name,
       input: name === "image input enabled" ? ["text", "image"] : ["text"],
     }) as RuntimeModel;
     const previous = model(from), next = model(to);

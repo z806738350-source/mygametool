@@ -15,6 +15,15 @@ The local server streams file uploads to disk separately from the conversation.
 One chat request can carry up to 128 MiB of original encoded images before the
 outbound model budget is applied. If the combined images exceed that limit,
 send fewer per message. Already uploaded originals can be reused.
+Local project responses are served with `Cache-Control: no-store`. Conversation
+previews are kept in the project-scoped daemon cache and removed with the project.
+
+The built-in agent can answer a standalone triangle-count question about the
+original Tripo model or the delivered GLB from an unambiguous verified Blender
+report in the current conversation. It checks the retained report and any
+selected Canvas model and records the answer in the conversation without a
+provider request. Questions with attachments, ambiguous targets or unverified
+changes use the regular agent path, as do repair and visual review requests.
 
 Text attachments up to 1 MiB provide a read-only `attachment:<batch>/<id>`
 reference for the agent's `read` tool. Other file types and larger text
@@ -36,7 +45,9 @@ unchanged, and GPT-6.1's unverified visual input remains unavailable.
 In the local secure edition, `read` accepts PNG, JPEG and WebP project paths
 only for image-capable models. It returns the original image bytes, not a UTF-8
 interpretation, after the bounded 64 MiB secure file snapshot has checked paths,
-links, concurrent changes and registered credential values. Text reads retain
+links, concurrent changes and registered credential values. The optional `offset`
+and `limit` arguments paginate text only. When a model includes them on a project
+or attachment image read, the tool returns the whole image. Text reads retain
 their 1 MiB limit. The existing request-image preview and transmission budgets
 below still apply; reading an image does not rewrite its workspace original.
 
@@ -77,15 +88,56 @@ See [Responses transport](responses-transport.md) for settings and recovery poli
 
 ## Inline budgets and recovery
 
+For managed visual Agent requests in the local edition, the current user’s
+attachments and the latest two batches of visual tool results from that turn
+form the working set. Parallel reads of a set of views count as one batch.
+Text-only tool results normally keep the same working set. After comparing the
+required images, the Agent can mark a successful `edit` or `write` with
+`releaseReviewedImages: true` when moving on to nonvisual work. A combined
+Blender save and run or a standalone `recall_image` also accepts this flag.
+The next request carries recallable IDs. A failed or incomplete tool batch, or one that returns fresh
+images, keeps the visual comparison available. For a combined Blender call,
+the release depends on a verified save, even if the run then fails.
+A new user message starts a
+fresh one. Older pictures stay in the conversation as recallable IDs on the
+model side. When the user refers back to a picture, the Agent can call
+`recall_image` to bring that original into the current comparison.
+
 These are application defaults, not advertised provider limits:
 
 - Trigger image omission above 20 MiB of Base64 or 64 inline images.
 - Remove a batch toward 10 MiB and 32 images, prioritizing old `game_use` images.
 - The lower limits are cleanup targets. Protected images may keep a reduced request
   above them, as long as the 20 MiB / 64-image hard limits still hold.
-- Protect images in the latest user message and the two most recent image-bearing
-  observations. If protected images alone cannot fit, fail locally.
+- If the protected images alone exceed a hard limit, fail locally.
 - Limit the complete serialized request to 32 MiB, including text and JSON.
+
+Kunpo’s `gpt-6.2-astra` Responses route starts omitting older images when
+their combined inline count exceeds 32 or their Base64 exceeds 8 MiB. It aims
+for 16 images and 4 MiB while keeping the latest parallel tool results
+together, so a batch of animation keyframes can still be compared. Protected
+images can exceed these cleanup targets within the shared hard limits above.
+The original images remain available through `recall_image`. This route uses
+its own omission records. A generic HTTP 400 does not trigger a retry.
+
+During an active visual turn, the same Astra route may also keep pictures from
+the last accepted request in their original tool results. Their source, tool
+call ID, other pictures and accompanying text must still match on the current
+Pi branch. Astra can keep a retiring render in a tool result that still
+contains the user's feedback image. The combined visual input must fit within
+12 MiB of Base64, 32 pictures and the complete request budget. This can
+preserve a reusable prefix when new Blender evidence arrives. Fresh renders
+remain available for inspection and revision. A complete `inspect_3d_views`
+comparison starts with its original working set. A new user turn, explicit
+visual release or compaction clears
+this optional history. A 413 on an expanded request gets one retry with the
+original visual working set.
+
+When a released visual review resumes in the same Astra turn, the original
+user attachment is included with the new comparison evidence and its earlier
+message retains the recall placeholder. This preserves that earlier part of
+the request and still lets the model compare the original pixels with the new
+renders.
 
 For OpenAI, the image budget is evaluated after Files conversion or WebSocket
 delta extraction. Historical file references do not consume the inline budget.
@@ -180,3 +232,34 @@ Official contracts:
 - [ChatGPT plan usage limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)
 - [Responses WebSocket mode](https://developers.openai.com/api/docs/guides/websocket-mode)
 - [Images and vision](https://developers.openai.com/api/docs/guides/images-vision)
+
+### Offline long-repair regression
+
+Run the recorded Kunpo/Blender session from the repository root. Use the local
+Pi session JSONL, the daemon log and the matching usage CSV. Keep the session
+with its retained project files and Blender job receipts so the replay can check
+the approved snapshots and the exact versions of the scripts or configurations.
+
+```sh
+node --import tsx scripts/replay-long-repair.mjs \
+  --session "$session_file" --requests "$daemon_log" --billing "$usage_csv" \
+  --direct-model-report --output "$new_report"
+```
+
+The regression reconstructs the wire input, checks each newly observed image byte
+and order against the prior projection, and validates both complete approval
+sets. It checks that a later review leaves the original feedback message alone,
+that retiring renders preserve the previous request prefix in the recorded cases,
+the delivery handoff retains the inspected source triangle count, and folded
+Blender calls use the same recipes. A stub replaces the Blender worker. The
+replay does not contact Kunpo or Tripo.
+
+The report separates actual CSV charges from estimates for both application
+versions. The direct report scenario checks the retained Blender measurement
+and the selected Canvas asset and replaces the two recorded face-count requests
+with the same local answer the application records. Estimates keep recorded
+output tokens for requests that still go to the provider and compare recorded
+cache reuse with the case where Kunpo reuses a newly matching complete request prefix. It also reports
+chronological calibration errors and the largest remaining write estimates.
+The CSV covers the billed comparison interval. Earlier requests in the same
+session still take part in the image regression and prefix comparison.

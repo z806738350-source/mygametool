@@ -7,8 +7,10 @@ import {
   approvalOutcomeLabel,
 } from "../src/renderer/approval-card.js";
 import { projectTurnDisplay } from "../src/renderer/turn-display.js";
+import * as api from "../src/renderer/api.js";
 import i18next from "i18next";
 import type { ThreadItem } from "../src/shared/contracts.js";
+import type { ApprovalDecision } from "../src/shared/agent-runtimes.js";
 import { validSourceConfirmation, type IsolatedSourceReview } from "../src/shared/execution-storage.js";
 import { isVolumeMigrationReview, validVolumeMigrationConfirmation, validVolumeMigrationReview, type VolumeMigrationReview } from "../src/shared/volume-migration.js";
 import { volumeMigrationReview, volumeMigrationConfirmation } from "./volume-migration-fixture.js";
@@ -24,6 +26,7 @@ afterEach(async () => {
   await act(async () => root.unmount());
   container.remove();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 const request: Extract<ThreadItem, { type: "approvalRequest" }> = {
@@ -40,6 +43,101 @@ const request: Extract<ThreadItem, { type: "approvalRequest" }> = {
   },
   status: "inProgress",
 };
+
+function viewReview(reviewId: string): typeof request {
+  const angles = ["front", "left", "back"] as const;
+  return { ...request, request: { kind: "turnaroundReview", tool: "generate_3d_from_views", canAllowSession: false,
+    turnaroundReview: { reviewId, views: angles.map(angle => ({ angle, path: angle + ".png", url: reviewId + "/" + angle })) } } };
+}
+
+it("displays each review image, enlarges it and only approves the loaded set once", async () => {
+  const first = viewReview("first"), revised = viewReview("revised"), decide = vi.fn(async () => true);
+  const fetch = vi.spyOn(api, "getConversationImage").mockResolvedValue(new Blob(["image"]));
+  vi.spyOn(URL, "createObjectURL").mockImplementation(() => "blob:review-" + crypto.randomUUID());
+  const revoke = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+  const render = (item: typeof request) => act(async () => root.render(<ApprovalCard request={item} onDecide={decide} waiting={0} />));
+  const approve = () => [...container.querySelectorAll("button")].find(item => item.textContent === "Approve and generate")!;
+  const images = () => [...container.querySelectorAll<HTMLImageElement>(".turnaround-review-grid img")];
+  await render(first);
+  expect(approve().disabled).toBe(true);
+  expect(images().map(image => image.alt)).toEqual(["Front", "Left side", "Back"]);
+  expect(fetch.mock.calls.map(call => call[0])).toEqual(["first/front", "first/left", "first/back"]);
+  await act(async () => images().slice(0, 2).forEach(image => image.dispatchEvent(new Event("load"))));
+  expect(approve().disabled).toBe(true);
+  await act(async () => images()[2].dispatchEvent(new Event("load")));
+  expect(approve().disabled).toBe(false);
+  await act(async () => images()[1].closest("button")!.click());
+  expect(container.querySelector("dialog img")?.getAttribute("src")).toBe(images()[1].src);
+  await render(revised);
+  expect(revoke).toHaveBeenCalledTimes(3);
+  expect(container.querySelector("dialog")).toBeNull();
+  expect(approve().disabled).toBe(true);
+  await act(async () => images().forEach(image => image.dispatchEvent(new Event("load"))));
+  await act(async () => { approve().click(); approve().click(); });
+  expect(decide).toHaveBeenCalledExactlyOnceWith("allow");
+});
+
+it("keeps a failed view review closed to generation and lets the user request changes", async () => {
+  const pending = viewReview("failed"), decide = vi.fn(async () => true);
+  vi.spyOn(api, "getConversationImage").mockRejectedValue(new Error("unavailable"));
+  await act(async () => root.render(<ApprovalCard request={pending} waiting={0} onDecide={decide} />));
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain("could not be displayed");
+  expect([...container.querySelectorAll("button")].find(item => item.textContent === "Approve and generate")?.disabled).toBe(true);
+  await act(async () => [...container.querySelectorAll("button")].find(item => item.textContent === "Request changes")!.click());
+  expect(decide).toHaveBeenCalledExactlyOnceWith("deny");
+  expect(approvalOutcomeLabel({ ...pending, status: "completed", decision: "deny" })).toBe("Changes requested to the reference views");
+});
+
+it("enables initial model approval after its pinned rotatable preview loads", async () => {
+  if (!customElements.get("model-viewer")) customElements.define("model-viewer", class extends HTMLElement {});
+  const decide = vi.fn(async (_decision: ApprovalDecision) => true);
+  const fetchModel = vi.spyOn(api, "getLibraryAsset").mockResolvedValue(new Blob(["preview"]));
+  vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:tripo-model");
+  const revoke = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+  const model = { reviewId: "initial", assetId: "asset", name: "character.fbx", fbx: true, previewSha256: "a".repeat(64) };
+  const pending = { ...request, request: { kind: "tripoModelReview" as const, tool: "review_tripo_model", canAllowSession: false, tripoModelReview: model } };
+  const render = (item: typeof request) => act(async () => root.render(<ApprovalCard request={item} onDecide={decide} waiting={0} />));
+  const button = (label: string) => [...container.querySelectorAll("button")].find(item => item.textContent === label)!;
+  await render(pending);
+  expect(fetchModel).toHaveBeenCalledWith(model.assetId, true, expect.any(AbortSignal), model.previewSha256);
+  expect(button("Approve model").disabled).toBe(true);
+  const viewer = container.querySelector("model-viewer")!;
+  expect(viewer.hasAttribute("camera-controls")).toBe(true);
+  await act(async () => viewer.dispatchEvent(new Event("load")));
+  expect(button("Approve model").disabled).toBe(false);
+  await act(async () => { button("Approve model").click(); button("Approve model").click(); });
+  expect(decide).toHaveBeenCalledExactlyOnceWith("allow");
+
+  const revised = { ...pending, requestId: "revised", request: { ...pending.request, tripoModelReview: { ...model, reviewId: "revised" } } };
+  fetchModel.mockRejectedValueOnce(new Error("missing preview"));
+  await render(revised);
+  expect(revoke).toHaveBeenCalledWith("blob:tripo-model");
+  expect(button("Approve model").disabled).toBe(true);
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain("could not be displayed");
+  await act(async () => button("Request changes").click());
+  expect(decide.mock.calls.map(call => call[0])).toEqual(["allow", "deny"]);
+  expect(approvalOutcomeLabel({ ...revised, status: "completed", decision: "deny" })).toBe("Changes requested to the initial Tripo model");
+});
+
+it("compares a view with the source concept and waits for both to display", async () => {
+  const pending = viewReview("compared");
+  pending.request.turnaroundReview!.original = { path: "concept.png", url: "original" };
+  vi.spyOn(api, "getConversationImage").mockResolvedValue(new Blob(["image"]));
+  vi.spyOn(URL, "createObjectURL").mockImplementation(() => "blob:review-" + crypto.randomUUID());
+  vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+  await act(async () => root.render(<ApprovalCard request={pending} waiting={0} onDecide={vi.fn()} />));
+  const images = [...container.querySelectorAll<HTMLImageElement>(".turnaround-review-grid img")];
+  const approve = [...container.querySelectorAll("button")].find(button => button.textContent === "Approve and generate")!;
+  expect(images.map(image => image.alt)).toEqual(["Original concept", "Front", "Left side", "Back"]);
+  expect(container.textContent).toContain("For visual comparison only.");
+  await act(async () => images.slice(1).forEach(image => image.dispatchEvent(new Event("load"))));
+  expect(approve.disabled).toBe(true);
+  await act(async () => images[0].dispatchEvent(new Event("load")));
+  expect(approve.disabled).toBe(false);
+  await act(async () => images[2].closest("button")!.click());
+  expect([...container.querySelectorAll<HTMLImageElement>("dialog img")].map(image => image.src))
+    .toEqual([images[0].src, images[2].src]);
+});
 
 it.each([false, true])("volume migration requires exact one-time native confirmation; creates first volume=%s", async create => {
   const review = volumeMigrationReview("project-1", create), decide = vi.fn(async () => true);

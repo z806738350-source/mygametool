@@ -14,15 +14,18 @@ conversations, rewrite project defaults, change Kunpo credentials or media
 selections, or reroute Asset Canvas text generation. Project-level Agent defaults
 still use their existing contract; this stage does not add Qoder to that field.
 
-This source connection accepts only the statically reviewed macOS arm64
-artifacts: **Qoder Agent SDK 1.0.59** and its paired native **CLI 1.1.83**. The
-isolated installations are under `.runtime/qoder-sdk/1.0.59/` and
-`.runtime/qoder-cli/1.1.83/`; the repository's root dependencies are unchanged.
-The executable and SDK entry are checked before startup. Detection does not run
-candidate executables or login shells. Another version, platform or artifact
-needs a new compatibility review; a matching version string is insufficient.
-The SDK's default installer, shared-daemon selection and automatic runtime
-downloads are not used by this connection.
+The connection uses the reviewed **Qoder Agent SDK 1.0.59** from
+`.runtime/qoder-sdk/1.0.59/` on macOS arm64. **CLI 1.1.83** is the reference
+installation. OhMyGame checks the selected native executable or the newest
+eligible version at `.runtime/qoder-cli/<version>/qoder`. Automatic selection
+can use an older installation if a newer one's signature or version check fails.
+For an updated CLI,
+it verifies the official Qoder Developer ID signature first, then checks the
+reported version with a fresh configuration and network access disabled. It
+checks the SDK handshake and controlled tool inventory before releasing a user
+prompt. Replacing the executable triggers its signature and version checks
+again. The SDK package remains fixed, and the SDK installer, shared-daemon
+selection and automatic runtime downloads remain off.
 
 An owned helper process loads the SDK with a minimal environment and starts an
 explicit private process daemon. Separate `HOME` and `QODER_CONFIG_DIR`
@@ -193,9 +196,12 @@ compliance.
 
 `recall_image` reads an original image block retained on the current branch,
 including older screenshots and images whose large request copies were
-explicitly omitted. Native continuation and context rebuilding receive a bounded
-list of branch-local image IDs, with an explicit omitted count; the list contains
-no pixels. Agents must call `recall_image` before relying on earlier visual
+explicitly omitted. When a native context starts, reopens, rebuilds or reports
+compaction, the next message carries up to 64 recent branch-local image IDs.
+Later turns carry newly retained IDs. The reference list contains no pixels.
+Even after an unreported compaction, `recall_image` without an ID lists retained
+references, with an offset for earlier pages. Agents must recall an original by
+ID before relying on earlier visual
 details. Old image attachments without canonical file receipts can still use
 their retained session image IDs. Restoring or switching an agent does not
 automatically resubmit image generation or resend all historical images.
@@ -211,8 +217,8 @@ prove that a remote provider understood the pixels. See
 [retained image inspection before adoption](isolated-storage-lifecycle.md#controlled-review-and-adoption-of-a-legacy-batch)
 for the size, queue, cancellation and saved-artifact boundaries.
 
-The controlled tool registries use `controlled-codex-v14` and
-`controlled-qoder-v13`. Older native contexts rebuild from shared history only
+The controlled tool registries use `controlled-codex-v16` and
+`controlled-qoder-v15`. Older native contexts rebuild from shared history only
 on the next user turn. Updating the application does not start another model
 request, replay a prior turn or tool call, or upgrade old receipts, approvals
 and generation contracts.
@@ -312,25 +318,22 @@ can be used. These messages report link preparation, not successful login. Closi
 OhMyGame stops its owned CLI processes. Recheck after completing the browser flow;
 no automated login or paid model request is needed to inspect this page.
 
-This initial connection is pinned to the audited macOS native executable
-`0.167.0-alpha.4.1`, SHA-256
-`7cb8700a47be3c81bb3c5efbf2d2adc716ce3db4806e9dc992f2925f78b2b194`, bundled
-inside the installed ChatGPT app. Discovery never executes a login shell. An
-unrecognized binary is rejected before version or authentication probes run.
-An app update or a different CLI build needs another isolation check before
-changing this pin; it is not automatically accepted. Do not select `bin/codex`,
-which is a shell launcher; use `CodexCLI.app/Contents/MacOS/codex`.
+The controlled macOS connection checks new installations automatically.
+Select `CodexCLI.app/Contents/MacOS/codex` within the ChatGPT or Codex app. The
+application verifies the OpenAI Developer ID signatures of both the CLI and
+the separate Code Mode runner before launching either. It then checks the
+supported isolation protocol, the effective settings and the named
+filesystem profile in a temporary configuration. Discovery never launches a
+login shell. Shell launchers such as `bin/codex` cannot pass the signature check.
 
-This CLI uses Code Mode's separate V8 runner to dispatch project tools through
-`functions.exec`. The controlled connection enables that runner with in-process
-fallback disabled and verifies its SHA-256
-`1cf6ad4fa020d5d7165a62d18b0e1673204a5985b693f22c2b890ac02a6822ba`.
-The November 12 compatibility check used the real CLI with a local mock model
-and an OS network restriction to one loopback proxy port. API and ChatGPT routing,
-controlled tools, planning restrictions and cancellation passed; native project,
-private-directory and protected-path writes were denied, as was native shell
-execution. The fixture's exact eight-tool inventory and the V8 runtime's lack of Node and
-network access were rechecked. No real credentials or inference were used.
+Each new installation must also pass a local model fixture on loopback without
+account credentials. The fixture checks the actual native tool declarations,
+observes a controlled callback from the separate V8 runner and rejects
+native filesystem writes if a patch tool is offered. Results are reused for
+the same installation during the daemon session. A change to the CLI or its
+runner repeats the check before the separate account can be used. An
+incompatible update displays the failing check. The tested version shown in
+Settings is a reference, while eligibility comes from these checks.
 Only the `ohmygame` namespace is registered for project tools; native `functions`,
 `collaboration`, `web` and `clock` namespaces are excluded from nested dispatch.
 This JavaScript runtime has no Node, filesystem, subprocess or network APIs.
@@ -340,8 +343,8 @@ patching, external MCP, plugins and the global execution switch remain disabled
 or denied by the existing permission profile. Native tool notifications do not
 duplicate the host's structured tool result or replace its artifact metadata.
 Older tool registries are rebuilt from shared conversation history on the next
-turn. This protocol is experimental and remains pinned to the audited CLI and
-runner; a successful local mock does not establish real-provider media success.
+turn. The protocol remains experimental. A successful local check does not
+establish real-provider media success.
 
 Codex's project tools use the existing stdio dynamic-tool bridge, now including
 OhMyGame's guarded file tools. No arbitrary HTTP tool endpoint is opened.
@@ -655,7 +658,8 @@ plan mode, cancellation, errors and events are the same code.
   protocol after original tool outcomes and task ownership are verified. Failed
   contexts rebuild; continuation does not resend the user message or checkpoint.
 - **Handoff.** When an agent joins a conversation it has not seen, its first
-  message carries a summary built from the stored record: recent turns and the
+  message carries a summary built from the stored record: up to 12,000 characters
+  of recent turns (keeping the request and latest progress from a long turn) and the
   files the earlier agent worked on, bounded tool results with original call/job
   IDs and unresolved-outcome warnings, the structured plan, and restore notices.
   It asks no model, and private context such

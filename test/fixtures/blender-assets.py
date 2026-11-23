@@ -65,6 +65,16 @@ hidden = bpy.context.object
 hidden.name = "HiddenProp"
 move_to(hidden, static)
 hidden.hide_render = True
+# Render-disabled nested backup, still visible in the viewport. A naive export
+# would include its three open edges or count them against a watertight brief.
+backups = bpy.data.collections.new("Backups")
+geometry.children.link(backups)
+backups.hide_render = True
+backup_mesh = bpy.data.meshes.new("BackupTriangle")
+backup_mesh.from_pydata([(40, 0, 0), (41, 0, 0), (40, 1, 0)], [], [(0, 1, 2)])
+backups.objects.link(bpy.data.objects.new("HiddenCollectionHelper", backup_mesh))
+# The same object remains eligible through its visible Geometry collection.
+backups.objects.link(prop)
 static.objects.link(bpy.data.objects.new(
     "PresentationCamera", bpy.data.cameras.new("PresentationCamera")
 ))
@@ -112,7 +122,27 @@ for frame, amount in [(1, 0), (12, 1), (24, 0)]:
     stretch.keyframe_insert(data_path="value", frame=frame)
 rig.animation_data.action.name = "Sway"
 skinned.data.shape_keys.animation_data.action.name = "Stretch"
+mechanical = collection("Mechanism")
+hinge = bpy.data.objects.new("Hinge", None)
+mechanical.objects.link(hinge)
+# Clear the other props in the three-quarter camera so the silhouette exposes playback.
+hinge.location = (9, 0, 4)
+bpy.ops.mesh.primitive_cube_add(size=0.5, location=(1.5, 0, 0))
+lever = bpy.context.object
+lever.name = "Lever"
+move_to(lever, mechanical)
+lever.parent = hinge
+# A short excursion between regular QA samples. Only the non-mesh parent is keyed.
+for frame, angle in [(1, 0), (2, 0), (3, .7), (4, 0), (81, 0)]:
+    hinge.rotation_euler.y = -angle
+    hinge.keyframe_insert(data_path="rotation_euler", frame=frame)
+hinge.animation_data.action.name = "Trigger"
 bpy.context.scene.frame_end = 24
 bpy.context.scene.render.fps = 24
 bpy.context.scene.frame_set(1)
 bpy.ops.wm.save_as_mainfile(filepath=str(source))
+if "--stalled" in sys.argv:
+    for frame in (1, 10, 24):
+        lever.keyframe_insert(data_path="location", frame=frame)
+    lever.animation_data.action.name = "Jammed"
+    bpy.ops.wm.save_as_mainfile(filepath=str(source.with_name("stalled.blend")))

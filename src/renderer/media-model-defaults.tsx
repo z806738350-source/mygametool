@@ -173,7 +173,7 @@ function ProjectModelSelectionField({ role, selected, project, disabled, menuCon
       options={[
         { value: "", label: fallback },
         ...(selected && !current ? [{ value: modelKey(selected), label: t("mediaDefaults.modelUnavailable", { id: selected.id }), disabled: true }] : []),
-        ...options.map((option) => ({ value: modelKey(option), label: `${option.name} · ${t(`kunpoModels.status.${option.status}`)}`, shortLabel: option.name,
+        ...options.map((option) => ({ value: modelKey(option), label: role === "agent" && option.status !== "pending" ? option.name : `${option.name} · ${t(`kunpoModels.status.${option.status}`)}`, shortLabel: option.name,
           disabled: option.status === "pending", title: kunpoModelHelp(option) })),
       ]} onChange={(key) => onChange(options.find((option) => modelKey(option) === key))} />
   </div>;
@@ -183,7 +183,7 @@ export function kunpoModelHelp(model: KunpoModelOption | undefined, role = model
   if (model?.status === "pending") return t("kunpoModels.pendingHelp");
   if (role === "speech") return t("kunpoModels.speechHelp");
   if (role === "music") return t("kunpoModels.musicHelp");
-  if (model?.role === "agent" && model.capabilities.tools === false) return t("kunpoModels.textOnlyHelp");
+  if (model?.role === "agent" && model.capabilities.images && model.capabilities.tools) return t("kunpoModels.agentHelp");
   return t("kunpoModels.unverifiedHelp");
 }
 

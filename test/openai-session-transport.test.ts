@@ -128,7 +128,8 @@ describe("OpenAI session transport", () => {
     const messages = Array.from({ length: 5 }, (_, index) => ({ role: "toolResult" as const, toolCallId: `call-${index}`, toolName: "game_use", timestamp: index + 1, isError: false,
       content: [{ type: "image" as const, mimeType: "image/jpeg", data: "YQ==" }] }));
     messages.forEach((message) => manager.appendMessage(message));
-    const prepared = await images.prepare(normalizeContext({ messages }), model);
+    // Feed all five canonical images to the transport to exercise its own 1009 retry budget.
+    const prepared = await images.annotate(normalizeContext({ messages }));
     const request = body(convertResponsesMessages(model, prepared, new Set(["openai"])));
     const delegate = vi.fn<typeof fetch>(() => { throw new Error("unexpected HTTP"); });
     await (await send(transport.wrapFetch(delegate), request)).text();
@@ -157,7 +158,8 @@ describe("OpenAI session transport", () => {
     for (let index = 1; index <= 5; index++) {
       const message = { role: "user" as const, timestamp: index, content: [{ type: "image" as const, mimeType: "image/jpeg", data: "a".repeat(6 * 1024 * 1024) }] };
       manager.appendMessage(message); messages.push(message);
-      const prepared = await images.prepare(normalizeContext({ messages }), model);
+      // A stable full prefix isolates socket delta budgeting from per-turn visual projection.
+      const prepared = await images.annotate(normalizeContext({ messages }));
       const request = body(convertResponsesMessages(model, prepared, new Set(["openai"])));
       if (index === 5) sockets[0].close();
       await (await send(fetch, request)).text(); transport.complete(`resp-${index === 5 ? 1 : index}`, []);

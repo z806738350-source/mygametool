@@ -18,7 +18,7 @@ import type { CodingQueuedPrompt, CodingSession, SkillCatalogItem } from "../age
 import { handoffSummary } from "./handoff.js";
 import { NATIVE_API } from "./replay.js";
 import { inside } from "./policy.js";
-import { sessionImageReferenceContext, sessionImageReferences } from "../session-images.js";
+import { hasSessionImages, sessionImageReferenceContext } from "../session-images.js";
 import { isRecoverableInterruption, type AgentInterruption, type AutoContinueTools } from "../agent-auto-continue.js";
 import { getToolConfirmedFailure, getToolPreflightFailure } from "../agent-tool-errors.js";
 import { getIsolatedOperationReceipts, getIsolatedRepairResolutions, getIsolatedRepairPending } from "../isolated-tool-receipts.js";
@@ -219,6 +219,7 @@ export class NativeCodingSession implements CodingSession {
   #readOnly = false;
   #handoff: boolean;
   #nativeSessionId?: string;
+  #imageReferencesThrough?: string;
   #usage?: AgentContextUsage;
   #allowed = new Set<string>();
   #readFolders: string[] = [];
@@ -379,7 +380,7 @@ export class NativeCodingSession implements CodingSession {
   async #sendSteering(entry: NativeQueuedPrompt): Promise<void> {
     // Other native adapters retain next-turn delivery until they expose a safe boundary.
     if (!this.#running || !this.#driver.steer || entry.submitted) return;
-    const requiresImageInput = entry.images.length > 0 || sessionImageReferences(this.sessionManager.getBranch()).length > 0;
+    const requiresImageInput = entry.images.length > 0 || hasSessionImages(this.sessionManager.getBranch());
     if (requiresImageInput && this.options.supportsImages === false)
       throw new Error("This conversation contains images, but the selected connection does not have image input enabled; the instruction was not submitted.");
     const sending = this.#driver.steer(entry.id, { text: entry.text, images: entry.images, readOnly: this.#readOnly,
@@ -637,6 +638,7 @@ export class NativeCodingSession implements CodingSession {
 
   recordNativeSession(sessionId: string): void {
     if (sessionId === this.#nativeSessionId) return;
+    if (this.#nativeSessionId) this.#imageReferencesThrough = undefined;
     this.#nativeSessionId = sessionId;
     this.sessionManager.appendCustomEntry(NATIVE_SESSION_ENTRY, {
       version: 2,
@@ -690,6 +692,7 @@ export class NativeCodingSession implements CodingSession {
   }
 
   emit(event: AgentSessionEvent): void {
+    if (event.type === "compaction_end") this.#imageReferencesThrough = undefined;
     this.#emit(event);
   }
 
@@ -722,21 +725,26 @@ export class NativeCodingSession implements CodingSession {
     }
     if (signal.aborted) return true;
     const branch = this.sessionManager.getBranch();
-    const requiresImageInput = images.length > 0 || sessionImageReferences(branch).length > 0;
-    const imageContext = this.options.toolNames.includes("recall_image") ? sessionImageReferenceContext(branch) : undefined;
+    const requiresImageInput = images.length > 0 || hasSessionImages(branch);
     const notice = await this.options.turnNotice?.().catch(() => undefined);
-    let wire = notice
+    const currentPrompt = notice
       ? `${text}\n\nWorkspace restore notice (inspect current files before continuing):\n${notice}`
       : text;
-    const currentPrompt = wire;
-    if (this.#handoff) {
-      const summary = handoffSummary(history);
-      if (summary) wire = `${summary}\n\n${wire}`;
-      this.#handoff = false;
-    }
-    if (imageContext) wire = `${imageContext}\n\n${wire}`;
-    if (continuation && this.options.continuationTools?.recoverySummary)
-      wire = `${this.options.continuationTools.recoverySummary}\n\n${wire}`;
+    let listedThrough: string | undefined;
+    let listedSession: string | undefined;
+    const wirePrompt = (handoff: boolean) => {
+      let references: string | undefined;
+      if (requiresImageInput && this.options.toolNames.includes("recall_image")) {
+        listedSession = this.#nativeSessionId;
+        const previous = listedSession && this.#imageReferencesThrough;
+        const start = previous ? branch.findLastIndex(entry => entry.id === previous) + 1 : 0;
+        references = sessionImageReferenceContext(start ? branch.slice(start) : branch);
+        listedThrough = branch.at(-1)?.id;
+      }
+      return [continuation && this.options.continuationTools?.recoverySummary, references, handoff && handoffSummary(history), currentPrompt]
+        .filter(Boolean).join("\n\n");
+    };
+    const wire = wirePrompt(this.#handoff);
     // A crash or interrupted write must never leave an earlier ready marker
     // claiming that this native context still matches the branch.
     this.#storeNativeState("active");
@@ -744,6 +752,11 @@ export class NativeCodingSession implements CodingSession {
     const sink = turn.sink();
     const bindRecorder = () => {
       Object.assign(sink, turn.sink());
+      const recordCompaction = sink.compaction;
+      sink.compaction = (phase, result) => {
+        if (phase === "end") listedThrough = undefined;
+        recordCompaction(phase, result);
+      };
       const recordToolResult = sink.toolResult;
       sink.toolResult = (...result) => {
         // Persist the actual rejection/effect receipt before interrupting the adapter.
@@ -798,16 +811,14 @@ export class NativeCodingSession implements CodingSession {
         if (!(cause instanceof NativeSessionExpiredError) || signal.aborted)
           throw cause;
         await this.#resetContext();
-        const summary = handoffSummary(history);
         outcome = await runNative(
           {
-            text: `${imageContext ? `${imageContext}\n\n` : ""}${summary ? `${summary}\n\n${currentPrompt}` : currentPrompt}`,
+            text: wirePrompt(true),
             images,
             readOnly: this.#readOnly,
             ...(requiresImageInput ? { requiresImageInput: true } : {}),
           },
         );
-        this.#handoff = false;
       }
     } catch (cause) {
       outcome = signal.aborted
@@ -841,8 +852,11 @@ export class NativeCodingSession implements CodingSession {
       ...(signal.aborted ? { cancelOrigin: this.#cancelOrigin ?? "host" } : {}),
     });
     turn.finish(outcome);
-    if (outcome.status === "completed") this.#storeNativeState("ready");
-    else await this.#resetContext();
+    if (outcome.status === "completed") {
+      this.#storeNativeState("ready");
+      this.#handoff = false;
+      if (!listedSession || listedSession === this.#nativeSessionId) this.#imageReferencesThrough = listedThrough;
+    } else await this.#resetContext();
     return outcome.status !== "completed";
   }
 
@@ -895,6 +909,7 @@ export class NativeCodingSession implements CodingSession {
   async #resetContext(): Promise<void> {
     this.#storeNativeState("invalid");
     this.#nativeSessionId = undefined;
+    this.#imageReferencesThrough = undefined;
     await this.#driver.dispose();
     this.#driver = this.options.createDriver(undefined, {
       model: this.options.model,

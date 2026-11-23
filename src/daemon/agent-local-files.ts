@@ -1,8 +1,11 @@
 import { constants } from "node:fs";
+import { createHash } from "node:crypto";
 import { lstat, mkdir, open, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import {
+  createEditToolDefinition,
   defineTool,
+  type SessionManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -29,10 +32,38 @@ const MAX_OUTPUT = 64 * 1024;
 const MAX_ENTRIES = 2000;
 const RASTER_IMAGE = /\.(?:png|jpe?g|webp)$/i;
 const OTHER_BINARY_FILES = /\.(?:bmp|ico|tiff?|zip|pdf|woff2?|ttf)$/i;
-const text = (value: string, details?: { diff: string }) => ({
+const releaseReviewedImages = Type.Optional(Type.Boolean({
+  description: "Set true after inspecting all required images, when the next steps need only the review conclusions. Originals remain available via recall_image.",
+}));
+export interface ProjectFileVersion { path: string; sha256: string }
+type FileResultDetails = { diff?: string; projectFileVersion?: ProjectFileVersion };
+const text = (value: string, details?: FileResultDetails) => ({
   content: [{ type: "text" as const, text: value }],
   details,
 });
+
+/** The caller has already checked this relative path with localAgentPath. */
+export function projectFileVersionPath(relative: string): string {
+  return relative.split(/[\\/]/).filter(part => part && part !== ".").join("/");
+}
+
+function projectFileVersion(relative: string, bytes: Buffer): ProjectFileVersion {
+  return { path: projectFileVersionPath(relative), sha256: createHash("sha256").update(bytes).digest("hex") };
+}
+
+function observedFileVersion(manager: Pick<SessionManager, "getLeafEntry" | "getEntry"> | undefined, file: string): ProjectFileVersion | undefined {
+  if (!manager?.getLeafEntry) return;
+  for (let entry = manager.getLeafEntry(); entry; entry = entry.parentId ? manager.getEntry(entry.parentId) : undefined) {
+    if (entry.type === "compaction" || entry.type === "branch_summary") return;
+    if (entry.type !== "message") continue;
+    const message = entry.message;
+    if (message.role === "user" || message.role === "assistant" && message.stopReason === "stop") return;
+    if (message.role !== "toolResult" ||
+      !(message.toolName === "run_blender" || !message.isError && ["read", "write", "edit"].includes(message.toolName))) continue;
+    const version = (message.details as FileResultDetails | undefined)?.projectFileVersion;
+    if (version?.path === file && typeof version.sha256 === "string") return version;
+  }
+}
 
 class FilePolicyError extends Error {
   constructor(
@@ -149,25 +180,32 @@ export async function localAgentPath(
   return current;
 }
 
-async function readText(file: string): Promise<string> {
+async function readTextSnapshot(file: string): Promise<{ source: string; bytes: Buffer }> {
   const handle = await open(
     file,
     constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW ?? 0),
   );
   try {
-    const entry = await handle.stat();
+    const entry = await handle.stat({ bigint: true });
     if (!entry.isFile() || entry.size > MAX_FILE_BYTES)
       throw new Error("Read supports ordinary UTF-8 project files up to 1 MiB");
-    if (entry.nlink !== 1)
+    if (entry.nlink !== 1n)
       throw new FilePolicyError(
         "Hard-linked files are unavailable to the agent",
         "unsafe_path",
       );
-    const bytes = Buffer.alloc(MAX_FILE_BYTES + 1);
-    const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
-    if (bytesRead > MAX_FILE_BYTES)
-      throw new Error("Binary or oversized files cannot be read as text");
-    return decodeFileText(bytes.subarray(0, bytesRead));
+    const bytes = Buffer.alloc(Number(entry.size));
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+      if (!bytesRead) break;
+      offset += bytesRead;
+    }
+    const current = await lstat(file, { bigint: true });
+    if (offset !== bytes.length || current.dev !== entry.dev || current.ino !== entry.ino ||
+        current.ctimeNs !== entry.ctimeNs || current.size !== entry.size)
+      throw new Error("Project file changed during the read; read it again");
+    return { source: decodeFileText(bytes), bytes };
   } finally {
     await handle.close();
   }
@@ -190,7 +228,8 @@ async function writeText(
   relative: string,
   content: string,
   signal?: AbortSignal,
-): Promise<{ diff: string } | undefined> {
+  expectedSource?: Buffer,
+): Promise<FileResultDetails> {
   const media = mediaFileInfo(relative);
   if (
     (media && media.contentType !== "image/svg+xml") ||
@@ -244,13 +283,13 @@ async function writeText(
   }
   // From mkdir onward an exception may follow a real filesystem change. Never
   // infer "no effect" from a later failure, even before content is truncated.
-  await mkdir(path.dirname(file), { recursive: true });
+  if (expectedSource === undefined) await mkdir(path.dirname(file), { recursive: true });
   await localAgentPath(workspace, relative, true);
   // Do not truncate until the opened inode has also passed the private-file boundary.
   const handle = await open(
     file,
     constants.O_RDWR |
-      constants.O_CREAT |
+      (expectedSource === undefined ? constants.O_CREAT : 0) |
       constants.O_NONBLOCK |
       (constants.O_NOFOLLOW ?? 0),
     0o600,
@@ -284,6 +323,8 @@ async function writeText(
     } catch {
       throw new Error("Write cannot replace a binary file");
     }
+    if (expectedSource !== undefined && !original.equals(expectedSource))
+      throw toolPreflightError("The file has changed. Read it again before editing.", "edit_text_not_unique");
     const before =
       bytesRead <= MAX_CHANGE_BYTES ? changeText(original) : undefined;
     signal?.throwIfAborted();
@@ -303,9 +344,13 @@ async function writeText(
       throw new Error(
         "Project file changed during inspection; retry without replacing the original",
       );
+    const keepBom = expectedSource !== undefined && original.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf]));
+    if (keepBom && Buffer.byteLength(content, "utf8") + 3 > MAX_FILE_BYTES)
+      throw toolPreflightError("Write supports project files up to 1 MiB", "text_too_large");
+    const saved = Buffer.from(keepBom ? "\uFEFF" + content : content, "utf8");
     await handle.truncate(0);
-    await handle.writeFile(content, "utf8");
-    return fileDiff(before, content);
+    await handle.writeFile(saved);
+    return { ...fileDiff(before, content), projectFileVersion: projectFileVersion(relative, saved) };
   } finally {
     await handle.close();
   }
@@ -355,17 +400,18 @@ export function createLocalAgentFileTools(
   allowImages = false,
   authorizeAttachment?: AuthorizeAgentAttachment,
 ): ToolDefinition[] {
+  const piEdit = createEditToolDefinition(workspace);
   const tools: ToolDefinition[] = [
     defineTool({
       name: "read",
       label: "Read project file",
       description: allowImages
-        ? "Read a non-private UTF-8 file or PNG/JPEG/WebP image by relative project path. For a chat attachment in the current conversation branch, pass its exact attachment: reference. Images are read whole, without offset or limit. Preserve original images; never replace them with text placeholders."
+        ? "Read a non-private UTF-8 file or PNG/JPEG/WebP image by relative project path. For a chat attachment in the current conversation branch, pass its exact attachment: reference. Images are always read whole. Line offsets and limits apply only to text. Preserve original images and never replace them with text placeholders."
         : "Read a non-private UTF-8 file by relative project path. For a text chat attachment in the current conversation branch, pass its exact attachment: reference. Image input is unavailable for this model. Preserve original media files.",
       parameters: Type.Object({
         path: Type.String(),
-        offset: Type.Optional(Type.Integer({ minimum: 1 })),
-        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
+        offset: Type.Optional(Type.Integer({ minimum: 1, description: "First text line (1-based)." })),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000, description: "Text line count. Read one range covering adjacent sections together." })),
       }),
       execute: async (_id, input, signal) => {
         signal?.throwIfAborted();
@@ -406,10 +452,6 @@ export function createLocalAgentFileTools(
             throw new FilePolicyError(
               "The selected connection does not have image input enabled; choose an image-enabled connection. Preserve the original image.",
               "authorization_denied",
-            );
-          if (input.offset !== undefined || input.limit !== undefined)
-            throw new Error(
-              "Image reads do not support text offset or limit; read the complete image",
             );
           if (attachment && !isReadableAgentImageAttachment(attachment))
             throw new Error(
@@ -454,11 +496,8 @@ export function createLocalAgentFileTools(
             details: undefined,
           };
         }
-        const source = attachment
-          ? decodeFileText(
-              await readSafeProjectFile(workspace, file, MAX_FILE_BYTES),
-            )
-          : await readText(file);
+        const project = attachment ? undefined : await readTextSnapshot(file);
+        const source = project?.source ?? decodeFileText(await readSafeProjectFile(workspace, file, MAX_FILE_BYTES));
         const lines = source
           .split("\n")
           .slice(
@@ -466,7 +505,8 @@ export function createLocalAgentFileTools(
             (input.offset ?? 1) - 1 + (input.limit ?? 200),
           );
         await assertAttachmentAllowed();
-        return text(lines.join("\n").slice(0, MAX_OUTPUT));
+        return text(lines.join("\n").slice(0, MAX_OUTPUT), project
+          ? { projectFileVersion: projectFileVersion(input.path, project.bytes) } : undefined);
       },
     }),
     defineTool({
@@ -475,7 +515,7 @@ export function createLocalAgentFileTools(
       description:
         "Write a UTF-8 text file by relative project path. Never overwrite images or other binary media with placeholders. Private files, parent paths and symlinks are unavailable. Canvas boards must match canvas/schemas/board.schema.json; asset nodes require data.assetId and data.mediaType (image, video, audio or model). Invalid boards are rejected before saving.",
       executionMode: "sequential",
-      parameters: Type.Object({ path: Type.String(), content: Type.String() }),
+      parameters: Type.Object({ path: Type.String(), content: Type.String(), releaseReviewedImages }),
       execute: async (_id, input, signal) => {
         signal?.throwIfAborted();
         return text(
@@ -487,37 +527,59 @@ export function createLocalAgentFileTools(
     defineTool({
       name: "edit",
       label: "Edit project file",
+      promptGuidelines: [
+        "Batch independent changes to one file in edit.edits; group independent tool calls in one turn. Wait for results that affect later choices.",
+      ],
       description:
-        "Replace one exact occurrence of oldText in a non-private UTF-8 project file. Paths must be relative. Canvas board edits are schema-validated before saving; asset nodes require data.assetId and data.mediaType (image, video, audio or model).",
+        "Edit one relative UTF-8 project file. Batch independent replacements in edits[], each matching a unique, disjoint part of the original. Group independent tool calls in one turn. Canvas boards are validated before saving; asset nodes require data.assetId and data.mediaType.",
       executionMode: "sequential",
       parameters: Type.Object({
         path: Type.String(),
-        oldText: Type.String({ minLength: 1 }),
-        newText: Type.String(),
+        edits: Type.Array(piEdit.parameters.properties.edits.items, { minItems: 1 }),
+        releaseReviewedImages,
       }),
-      execute: async (_id, input, signal) => {
+      prepareArguments: piEdit.prepareArguments,
+      execute: async (_id, input, signal, _onUpdate, ctx) => {
         signal?.throwIfAborted();
-        let source: string;
+        let snapshot: Awaited<ReturnType<typeof readTextSnapshot>>;
         try {
-          source = await readText(await localAgentPath(workspace, input.path));
+          snapshot = await readTextSnapshot(await localAgentPath(workspace, input.path));
         } catch (cause) {
           rethrowPreflightPolicyFailure(cause);
         }
-        const index = source.indexOf(input.oldText);
-        if (index < 0 || index !== source.lastIndexOf(input.oldText))
-          throw toolPreflightError(
-            "oldText must match exactly once",
-            "edit_text_not_unique",
-          );
+        const prior = observedFileVersion(ctx?.sessionManager, projectFileVersionPath(input.path));
+        if (prior && prior.sha256 !== projectFileVersion(input.path, snapshot.bytes).sha256)
+          throw toolPreflightError("The project file has changed since your last observation. Read it again before editing.", "edit_text_not_unique");
+        const source = snapshot.source;
+        // Direct host callers can also have saved Pi's legacy single-edit shape.
+        const { edits } = piEdit.prepareArguments!({ ...input });
+        if (!Array.isArray(edits) || !edits.length)
+          throw toolPreflightError("edits must contain at least one replacement", "edit_text_not_unique");
+        const matches = edits.map((edit) => {
+          if (!edit || typeof edit.oldText !== "string" || !edit.oldText || typeof edit.newText !== "string")
+            throw toolPreflightError("Each edit needs nonempty oldText and a string newText", "edit_text_not_unique");
+          const start = source.indexOf(edit.oldText);
+          if (start < 0 || start !== source.lastIndexOf(edit.oldText))
+            throw toolPreflightError("oldText must match exactly once", "edit_text_not_unique");
+          return { start, end: start + edit.oldText.length, replacement: edit.newText };
+        }).sort((a, b) => a.start - b.start);
+        const parts: string[] = [];
+        let cursor = 0;
+        for (const match of matches) {
+          if (match.start < cursor)
+            throw toolPreflightError("Replacements must not overlap in the original file", "edit_text_not_unique");
+          parts.push(source.slice(cursor, match.start), match.replacement);
+          cursor = match.end;
+        }
+        parts.push(source.slice(cursor));
         return text(
           "Project file edited.",
           await writeText(
             workspace,
             input.path,
-            source.slice(0, index) +
-              input.newText +
-              source.slice(index + input.oldText.length),
+            parts.join(""),
             signal,
+            snapshot.bytes,
           ),
         );
       },
@@ -578,7 +640,7 @@ export function createLocalAgentFileTools(
           signal?.throwIfAborted();
           let source: string;
           try {
-            source = await readText(await localAgentPath(workspace, file));
+            source = (await readTextSnapshot(await localAgentPath(workspace, file))).source;
           } catch {
             continue;
           }

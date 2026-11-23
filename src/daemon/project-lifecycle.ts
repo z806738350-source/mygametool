@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
+import { PROJECT_BROWSER_CLEANUP_DIRECTORY } from "../shared/project-browser-storage.js";
 
 const PHASES = ["requested", "retiring-volume", "volume-retired", "deleting-host", "complete"] as const;
 type Phase = typeof PHASES[number] | "aborted" | "unknown";
@@ -19,6 +20,24 @@ export class ProjectLifecycle {
   readonly #records = new Map<string, DeletionRecord>();
   constructor(private readonly dataDirectory: string) {}
 
+  deletingHost(id: string): boolean {
+    return this.#records.get(id)?.phase === "deleting-host";
+  }
+
+  async scheduleBrowserCleanup(id: string): Promise<void> {
+    if (!projectId(id)) throw new ProjectLifecycleError("Invalid project deletion identity.");
+    const directory = await this.#directory(true, PROJECT_BROWSER_CLEANUP_DIRECTORY);
+    const marker = await open(path.join(directory, id), "wx", 0o600).catch((cause: NodeJS.ErrnoException) => {
+      if (cause.code !== "EEXIST") throw cause;
+    });
+    if (!marker) return;
+    try { await marker.sync(); } finally { await marker.close(); }
+    if (process.platform !== "win32") {
+      const folder = await open(directory, constants.O_RDONLY);
+      try { await folder.sync(); } finally { await folder.close(); }
+    }
+  }
+
   pending(id: string): boolean {
     const phase = this.#records.get(id)?.phase;
     return this.#active.has(id) || !!phase && phase !== "complete" && phase !== "aborted";
@@ -28,8 +47,8 @@ export class ProjectLifecycle {
       "Project deletion is pending. Retry deletion or recover the retained execution workspace before continuing.",
     );
   }
-  async #directory(create: boolean): Promise<string> {
-    const directory = path.join(await realpath(this.dataDirectory), "project-lifecycle");
+  async #directory(create: boolean, name = "project-lifecycle"): Promise<string> {
+    const directory = path.join(await realpath(this.dataDirectory), name);
     if (create) await mkdir(directory, { recursive: true, mode: 0o700 });
     const info = await lstat(directory);
     if (!info.isDirectory() || info.isSymbolicLink() || process.platform !== "win32" &&
