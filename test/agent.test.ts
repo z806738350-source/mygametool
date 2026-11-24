@@ -46,6 +46,60 @@ describe("continuation tool safety", () => {
   });
   const isolated = { scope: "project_command" as const, namespace: "test" as const, projectId: "11111111-1111-4111-8111-111111111111", operationId: "a".repeat(32) };
   const report = (phase: IsolatedOperationReceipt["phase"], extra: Partial<IsolatedOperationReceipt> = {}, cause?: unknown) => reportIsolatedOperation({ ...isolated, phase, ...extra }, cause);
+  it.each([false, true])("consumes the exact withdrawal and preserves independent legacy refusals (%s)", async independent => {
+    const journal = SessionManager.inMemory("/tmp/source-withdrawal-log");
+    const user = journal.appendMessage({ role: "user", content: "Old task", timestamp: 1 });
+    const snapshotId = "b".repeat(64), reviewId = "c".repeat(64), withdrawalId = "d".repeat(32);
+    const execute = vi.fn<ToolDefinition["execute"]>().mockImplementation(async () => {
+      for (const phase of ["input_preflight", "prepare_submitting", "prepared", "run_submitting", "running", "captured", "retained", "released"] as const)
+        await report(phase, { mode: "shell", generation: 37, ...(["captured", "retained", "released"].includes(phase) ? { snapshotId } : {}) });
+      throw new Error("Deletion requires review");
+    });
+    const lookup = vi.fn().mockResolvedValue({ reviewId, withdrawalId });
+    const source = Object.assign(tool("isolated_shell", execute), { sourceDeletionDisposition: lookup });
+    const recovery = tool("recover_isolated_changes");
+    const tools = [source, recovery, tool("read_project_file"), tool("write")];
+    const makeGuard = () => { const guard = new AutoContinueTools(tools, { sessionManager: journal }); guard.reset(user); return guard; };
+    const call = (id: string, name: string, input: object) => journal.appendMessage({ role: "assistant", api: "ohmygame-native", content: [{ type: "toolCall", id, name, arguments: input }], timestamp: 2 } as never);
+    const output = (id: string, name: string, isError: boolean, details?: object, receipts?: readonly IsolatedOperationReceipt[], text = "Historical record") => journal.appendMessage({ role: "toolResult", toolCallId: id, toolName: name, content: [{ type: "text", text }], isError, timestamp: 3, details, isolatedOperations: receipts } as never);
+    const original = makeGuard();
+    call("original", "isolated_shell", { command: "delete fixture" });
+    const failure = await run(original.wrap()[0]!, "original", { command: "delete fixture" }).catch(cause => cause);
+    output("original", "isolated_shell", true, undefined, getIsolatedOperationReceipts(failure));
+    call("inspect", recovery.name, { action: "inspect" });
+    output("inspect", recovery.name, false, { projectId: isolated.projectId, generation: "37", dirty: true, recoverable: false });
+    call("review", recovery.name, { action: "review", generation: "37" });
+    output("review", recovery.name, false, { projectId: isolated.projectId, generation: "37", reviewId, rawSnapshotId: snapshotId, blockers: [{ path: "test.js" }] });
+    const refused = (id: string, args: object, error: string) => {
+      call(id, recovery.name, args);
+      journal.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: user, userEntryId: user, tool: recovery.name, callId: id, state: "started" });
+      journal.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: user, userEntryId: user, tool: recovery.name, callId: id, state: "unknown" });
+      output(id, recovery.name, true, undefined, undefined, error);
+    };
+    const blocked = "This review has blocked files; preserve every version and resolve the listed risks before adoption";
+    refused("blocked-adopt", { action: "adopt", reviewId }, blocked);
+    refused("ineligible-recover", { action: "recover", generation: "37" }, "This inspected generation is not eligible for recovery. Keep both versions. Do not repeat inspect/recover or regenerate to clear the blocker. Review the listed blocked paths in Execution storage & recovery.");
+    refused("invalid-file-option", { action: "adopt", reviewId, path: "test.js" }, "path, variant and sha256 are valid only for read_image");
+    if (independent) {
+      refused("unconfirmed-error", { action: "adopt", reviewId }, "Lost response after recovery started");
+      refused("other-review", { action: "adopt", reviewId: "f".repeat(64) }, blocked);
+    }
+    const resumed = makeGuard();
+    const operation = resumed.prepare(new AbortController().signal);
+    if (independent) await expect(operation).rejects.toThrow("unconfirmed-error");
+    else {
+      await operation;
+      const [shell, , read, write] = resumed.wrap();
+      await expect(run(shell!, "original", { command: "delete fixture" })).resolves.toMatchObject({ isError: true, details: { sourceDeletionDisposition: { reviewId, withdrawalId } } });
+      await expect(run(shell!, "replay-different-id", { command: "delete fixture" })).rejects.toThrow("Do not replay");
+      await expect(run(write!, "edit-before-read", { path: "game.mjs" })).rejects.toThrow("Read the current project files");
+      await run(read!, "fresh-read", { path: "game.mjs" });
+      await expect(run(write!, "edit-after-read", { path: "game.mjs" })).resolves.toEqual(result);
+    }
+    expect(lookup).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ callId: "original", generation: 37, rawSnapshotId: snapshotId, operationId: isolated.operationId }));
+    expect(execute).toHaveBeenCalledOnce();
+    expect(journal.getBranch().filter(entry => entry.type === "custom" && entry.customType === "ohmygame-source-recovery-not-started")).toHaveLength(3);
+  });
   it.each(["pi-live", "pi-reloaded", "native-live", "native-reloaded"])("permits a corrected command after a confirmed unchanged failure without replaying its original call (%s)", async scenario => {
     const manager = SessionManager.inMemory("/tmp/confirmed-command-failure"), user = manager.appendMessage({ role: "user", content: "Inspect the existing rig", timestamp: 1 });
     const execute = vi.fn<ToolDefinition["execute"]>().mockImplementationOnce(async () => {
@@ -241,7 +295,7 @@ describe("continuation tool safety", () => {
     old.appendMessage({ role: "toolResult", toolCallId: "source", toolName: "isolated_shell", content: [{ type: "text", text: "Unknown" }], isError: true, timestamp: 3 } as never);
     const restored = new AutoContinueTools([source], { sessionManager: old }); restored.reset(oldUser); expect(restored.repairable).toBe(false); await expect(restored.prepare(new AbortController().signal)).rejects.toThrow();
   });
-  it.each([false, true])("refreshes only local build/open caches after trusted publication and controlled reread (reload=%s)", async reload => {
+  it.each([false, true])("preserves build cache, independent game opens, and paid receipts after publication and reread (reload=%s)", async reload => {
     const manager = SessionManager.inMemory("/tmp/repair-publication-cache"), user = manager.appendMessage({ role: "user", content: "Task", timestamp: 1 });
     const build = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(result), game = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(result), paid = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(result);
     const shell = vi.fn<ToolDefinition["execute"]>(async () => { for (const phase of ["input_preflight", "prepare_submitting", "prepared", "run_submitting", "running", "captured", "retained", "released"] as const)
@@ -265,7 +319,7 @@ describe("continuation tool safety", () => {
     await expect(run(guard.wrap()[0]!, "build-new", {})).rejects.toThrow("Read the current project files");
     await run(guard.wrap()[5]!, "read", { path: "game.txt" });
     for (const [name, id, input] of [["build_game", "build-old", {}], ["game_use", "open-old", { operation: "open" }], ["game_use", "click-old", { operation: "click", x: 1 }], ["generate_image", "paid-old", { prompt: "Original" }], ["build_game", "build-new", {}], ["game_use", "open-new", { operation: "open" }], ["game_use", "click-new", { operation: "click", x: 1 }], ["generate_image", "paid-new", { prompt: "Original" }], ["build_game", "build-again", {}], ["game_use", "open-again", { operation: "open" }]] as const) await invoke(name, id, input);
-    expect(build).toHaveBeenCalledTimes(2); expect(game).toHaveBeenCalledTimes(3); expect(paid).toHaveBeenCalledOnce(); expect(shell).toHaveBeenCalledOnce();
+    expect(build).toHaveBeenCalledTimes(2); expect(game.mock.calls.map(([id]) => id)).toEqual(["open-old", "click-old", "open-new", "open-again"]); expect(paid).toHaveBeenCalledOnce(); expect(shell).toHaveBeenCalledOnce();
     await expect(run(guard.wrap()[3]!, "source-new-id", { command: "original" })).rejects.toThrow("Do not replay");
   });
   it("does not treat a prepublication read finishing after settlement as a fresh project read", async () => {

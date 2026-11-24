@@ -1,5 +1,6 @@
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
+import { toolPreflightError } from "./agent-tool-errors.js";
 import { Type } from "typebox";
 import type { IsolatedProjectExecution } from "./isolated-project-execution.js";
 import type { IsolatedSourceReview } from "../shared/execution-storage.js";
@@ -16,6 +17,7 @@ import {
 import {
   inheritIsolatedRepairProof,
   inheritIsolatedRepairResolutions,
+  type IsolatedRepairTarget,
 } from "./isolated-tool-receipts.js";
 
 export interface RetainedImageReadResult {
@@ -36,8 +38,9 @@ export function createIsolatedShellTool(
     timeout: number,
     signal?: AbortSignal,
   ) => ReturnType<IsolatedProjectExecution["shell"]>,
+  sourceDeletionDisposition?: (target: IsolatedRepairTarget) => Promise<{ reviewId: string; withdrawalId: string } | undefined>,
 ) {
-  return defineTool({
+  const tool = defineTool({
     name: "isolated_shell",
     label: "Run isolated Linux command",
     description:
@@ -65,6 +68,7 @@ export function createIsolatedShellTool(
       };
     },
   });
+  return Object.assign(tool, { sourceDeletionDisposition });
 }
 
 export function createBuildGameTool(
@@ -243,7 +247,7 @@ export function createIsolatedRecoveryTool(
         };
       }
       if (input.path !== undefined || input.variant !== undefined || input.sha256 !== undefined)
-        throw new Error("path, variant and sha256 are valid only for read_image");
+        throw toolPreflightError("path, variant and sha256 are valid only for read_image", "invalid_recovery_input");
       if (input.action === "upgrade_capacity" || input.action === "inspect_capacity_migration") {
         if (Object.keys(input).some(key => key !== "action" && !(input.action === "upgrade_capacity" && key === "targetProfileId")) || (input.targetProfileId !== undefined && !["capacity-128-v2", "capacity-128-media64-v3"].includes(input.targetProfileId))) throw new Error("Native capacity migration accepts only its action and an exact target profile; approval cannot come from model arguments");
         if (input.action === "upgrade_capacity" && (uncertainGeneration || uncertainReview || reviewed && !reviewed.completed)) throw new Error("Resolve the original retained operation before changing capacity");
@@ -424,8 +428,9 @@ export function createIsolatedRecoveryTool(
           );
         if (reviewed.blockers.length)
           throw Object.assign(
-            new Error(
+            toolPreflightError(
               "This review has blocked files; preserve every version and resolve the listed risks before adoption",
+              "source_review_required",
             ),
             { recoveryNotStarted: true },
           );
@@ -522,7 +527,7 @@ export function createIsolatedRecoveryTool(
           "A prior adoption result is uncertain. Inspect its original transaction; do not bypass it with another recovery action",
         );
       if (inspectionRefusal)
-        throw Object.assign(new Error(inspectionRefusal), {
+        throw Object.assign(toolPreflightError(inspectionRefusal, "source_review_required"), {
           code: "ISOLATED_REVIEW_REQUIRED",
           recoveryNotStarted: true,
         });

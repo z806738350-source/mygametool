@@ -3,6 +3,7 @@ import { Check, Errors } from "typebox/value";
 import { inheritToolPreflightFailure } from "../agent-tool-errors.js";
 import { inheritIsolatedOperationReceipts, inheritIsolatedRepairResolutions, inheritIsolatedRepairPending } from "../isolated-tool-receipts.js";
 import type { NativeToolResult } from "./native-session.js";
+import { replayPlaytestReceipt } from "../playtest-tools.js";
 
 /** The MCP server name the agents know OhMyGame's tools under. */
 export const BRIDGE_SERVER_NAME = "ohmygame";
@@ -117,6 +118,20 @@ export class ToolBridge {
         }, output), output), output), output),
         isError: (output as typeof output & { isError?: boolean }).isError === true,
       };
+    } catch (cause) {
+      return failure(cause instanceof Error ? cause.message : String(cause), cause);
+    }
+  }
+
+  /** The native adapter has already matched this original result to the same toolUseID and input. */
+  async replayPlaytest(
+    args: Record<string, unknown>, callId: string, original: { result: NativeToolResult; isError: boolean }, signal: AbortSignal,
+  ): Promise<{ result: NativeToolResult; isError: boolean }> {
+    if (signal.aborted) return failure("The turn was cancelled");
+    const tool = this.#tools.get("game_use");
+    if (!tool || (this.#active && !this.#active.has("game_use"))) return failure("Tool game_use is not available");
+    try {
+      return { ...original, result: await replayPlaytestReceipt(tool, callId, args, original.result, original.isError, signal) };
     } catch (cause) {
       return failure(cause instanceof Error ? cause.message : String(cause), cause);
     }

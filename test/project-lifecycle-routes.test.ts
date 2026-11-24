@@ -351,6 +351,38 @@ it("never offers source recovery for an active dirty guest operation", async () 
   expect(response.json()).toMatchObject({ state: "busy", dirty: true, recoverable: false, generation: "8" });
 });
 
+it("offers and executes only the authenticated reviewed deletion withdrawal for this project", async () => {
+  const { app, execution, project } = await fixture("withdrawal-access");
+  const reviewId = "a".repeat(64), paths = ["src/_t.mjs"];
+  const candidate = { reviewId, generation: "37", paths, status: "available" };
+  let inspected = false;
+  const status = vi.fn(async () => inspected ? { deletionWithdrawal: candidate } : { deletionWithdrawalNeedsReview: true });
+  const openStorage = vi.fn(async () => {});
+  const reviewSource = vi.fn(async (_project: unknown, _generation: string, guard: (op: () => void) => Promise<void>) => guard(() => { inspected = true; }));
+  const withdraw = vi.fn(async () => ({ ...candidate, status: "withdrawn" }));
+  Object.assign(execution, { openRecoveryStorage: openStorage, reviewSource, deletionWithdrawalStatus: status, withdrawSourceDeletion: withdraw });
+  execution.inventoryProject.mockResolvedValue({ projectId: project.id, namespace: "test", generation: 37,
+    state: "recovery-pending", dirty: true, active: false } as never);
+  execution.inspectSource.mockResolvedValue({ namespace: "test", projectId: project.id, generation: 37,
+    complete: true, changes: [{ kind: "deleted", path: paths[0], reason: "Deletion requires review" }], excluded: 0, blockers: 1 } as never);
+  const root = `/projects/${project.id}/execution-storage`, url = `${root}/withdraw-deletion`;
+  const headers = { authorization: "Bearer withdrawal-access" };
+  expect((await app.inject({ method: "GET", url: root, headers })).json()).toMatchObject({ recoverable: false, deletionWithdrawalNeedsReview: true });
+  expect(reviewSource).not.toHaveBeenCalled();
+  const opened = await app.inject({ method: "POST", url: `${root}/open`, headers, payload: {} });
+  expect(opened.statusCode, opened.body).toBe(204);
+  expect(reviewSource).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: project.id }), "37", expect.any(Function));
+  expect((await app.inject({ method: "GET", url: root, headers })).json()).toMatchObject({ recoverable: false, deletionWithdrawal: candidate });
+  const payload = { generation: "37", reviewId };
+  expect((await app.inject({ method: "POST", url, payload })).statusCode).toBe(401);
+  expect((await app.inject({ method: "POST", url, headers, payload: { ...payload, path: paths[0] } })).statusCode).toBe(400);
+  expect(withdraw).not.toHaveBeenCalled();
+  const result = await app.inject({ method: "POST", url, headers, payload });
+  expect(result.statusCode, result.body).toBe(200);
+  expect(withdraw).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: project.id }), "37", reviewId);
+  expect(execution.recoverSource).not.toHaveBeenCalled();
+});
+
 it("does not advertise or start recovery when retained-file inspection is unavailable", async () => {
   const { app, execution, project } = await fixture();
   execution.inventoryProject.mockResolvedValue({ projectId: project.id, namespace: "test", generation: 37,

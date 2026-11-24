@@ -424,6 +424,47 @@ it.each(["codex-cli", "qoder-cli"] as const)("continues %s after correcting an o
   } finally { await session.dispose(); }
 });
 
+it("reopens an identical game target under a new Qoder toolUseID after continuation", async () => {
+  const manager = SessionManager.inMemory("/tmp/native-playtest-reopen");
+  const snapshot = { runtime: "web" as const, capabilities: WEB_GAME_USE_CAPABILITIES, viewport: { width: 800, height: 600 } };
+  let opened = 0;
+  const request = vi.fn<GameRuntimeAdapter["request"]>().mockImplementation(async input => {
+    if (input.operation === "open") return { operation: "open", snapshot: { ...snapshot, sessionId: `session-${++opened}` } };
+    if (input.operation === "close") return { operation: "close" };
+    throw Error("Unexpected fixture operation");
+  });
+  const tool = createGameUseTool({ available: true, capabilities: WEB_GAME_USE_CAPABILITIES, request, close() {} }, async () => ({ runtime: "web", url: "http://127.0.0.1:43123/" }));
+  const guard = new AutoContinueTools([tool], { sessionManager: manager });
+  const bridge = new ToolBridge(guard.wrap(), true);
+  const open = { operation: "open" };
+  const invoke = async (sink: NativeTurnSink, signal: AbortSignal, id: string, args: Record<string, unknown>) => {
+    sink.toolCall(id, "game_use", args);
+    const outcome = await bridge.call("game_use", args, id, signal);
+    sink.toolResult(id, outcome.result, outcome.isError);
+    return outcome;
+  };
+  let reopened: Awaited<ReturnType<typeof invoke>> | undefined;
+  const driver = new ScriptedDriver([async (_input, sink, signal) => {
+    await invoke(sink, signal, "toolu_open_first", open);
+    await invoke(sink, signal, "toolu_close_first", { operation: "close", sessionId: "session-1" });
+    return { status: "failed", error: "Segment limit", interruption: { kind: "turn_limit", source: "qoder", code: "qoder_max_turns" } };
+  }, async (_input, sink, signal) => {
+    reopened = await invoke(sink, signal, "toolu_open_second", open);
+    return { status: "completed" };
+  }], undefined);
+  const session = new NativeCodingSession({ runtime: "qoder-cli", model: "fixture", sessionManager: manager, continuationTools: guard,
+    toolNames: ["game_use"], setActiveTools: names => bridge.setActive(names), createDriver: () => driver, requestApproval: async () => "deny" });
+  try {
+    await session.prompt("Reopen the same game to finish verification");
+    expect(session.interruption?.kind).toBe("turn_limit");
+    await session.prepareContinuation(new AbortController().signal);
+    await session.resumeAfterInterruption();
+    expect(reopened?.isError).toBe(false);
+    expect(reopened?.result.details).toMatchObject({ playtest: { sessionId: "session-2" } });
+    expect(request.mock.calls.map(([input]) => input.operation)).toEqual(["open", "close", "open"]);
+  } finally { await session.dispose(); }
+});
+
 it.each(["codex-cli", "qoder-cli"] as const)("retains %s local audio rejection across continuation without replaying generation", async runtime => {
   const manager = SessionManager.inMemory("/tmp/native-audio-input"), request = vi.fn<typeof fetch>().mockResolvedValue(new Response(Buffer.from("ID3fixture"), { headers: { "content-type": "audio/mpeg" } }));
   const provider = new VolcengineSeedAudioProvider(() => "fixture-key", request);

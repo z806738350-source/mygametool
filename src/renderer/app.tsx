@@ -10,8 +10,8 @@ import { SidebarPageLayout } from "./sidebar-page.js";
 import { WindowDragRegion } from "./window-drag-region.js";
 import type { PluginMention, ProjectState, PromptAttachment, PromptImage, PromptMode } from "../shared/contracts.js";
 import type { PluginDetail } from "../shared/plugins.js";
-import { pluginMentionToken } from "../shared/plugins.js";
-import { createConversation, createProject, getProject, MODELS_CHANGED_EVENT } from "./api.js";
+import { INK_STUDIO_PLUGIN_ID, pluginMentionToken } from "../shared/plugins.js";
+import { createConversation, createProject, getProject, MODELS_CHANGED_EVENT, updateProjectInkStudio } from "./api.js";
 import type { ComposerDraft } from "./composer.js";
 import { runtimeConnection, useReadyRuntimeGeneration } from "./runtime-connection.js";
 import { Onboarding, OnboardingArrival, OnboardingLoading } from "./onboarding.js";
@@ -136,6 +136,7 @@ export function App() {
       if (!ready) return;
       project = ready;
     }
+    if (plugin.id === INK_STUDIO_PLUGIN_ID) project = await updateProjectInkStudio(project.id, true);
     const conversation = await createConversation(project.id);
     const mention: PluginMention = {
       name: plugin.name,

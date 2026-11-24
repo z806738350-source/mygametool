@@ -30,6 +30,7 @@ import {
   inspectRuntimeMedia,
   mediaHeaderMatches,
   runtimeMediaPath,
+  PROJECT_SOURCE_LIMITS,
   inspectProjectSourceBudget,
   transferPath,
   type TransferFile,
@@ -82,6 +83,7 @@ export interface StoredSourceReview {
   retained?: RetainedReviewPlan;
   publicationId?: string;
   recoveryOperationId?: string;
+  deletionWithdrawal?: { id: string; phase: "restoring" | "disposed" | "withdrawn" };
 }
 export interface PreparedRasterFile extends RuntimeMedia {
   artifactKind: "raw" | "working";
@@ -1880,6 +1882,9 @@ export async function readSourceReview(
       !Number.isFinite(Date.parse(value.approvedAt))) ||
     (value.acknowledged !== undefined &&
       typeof value.acknowledged !== "boolean") ||
+    (value.deletionWithdrawal !== undefined &&
+      (!value.deletionWithdrawal || !/^[a-f0-9]{32}$/.test(value.deletionWithdrawal.id) ||
+        !["restoring", "disposed", "withdrawn"].includes(value.deletionWithdrawal.phase))) ||
     (value.superseded !== undefined && typeof value.superseded !== "boolean")
   )
     throw refusal("review receipt is damaged or belongs to different source");
@@ -2117,7 +2122,7 @@ export async function saveSourceReview(
   await syncPublicationDirectory(root);
 }
 
-async function sourceReviews(
+export async function sourceReviews(
   workspace: string,
   projectId: string,
   namespace: "manual" | "test",
@@ -2148,19 +2153,54 @@ async function sourceReviews(
   return records;
 }
 
+/** Derive the missing paths from the reviewed byte identities, never from an error message. */
+export function sourceDeletionReview(record: StoredSourceReview) {
+  const { retained, review } = record;
+  const source = retained?.sourceContract;
+  if (!retained || !source || record.approvedAt || record.acknowledged || record.superseded ||
+    !retained.allOriginalsRetained || retained.retentionError || review.files.length || !review.blockers.length ||
+    reviewSnapshotDigest(record.hostFiles) !== reviewSnapshotDigest(record.guestBaseline)) return undefined;
+  const raw = new Map(retained.rawFiles.map(file => [file.path, file]));
+  const host = new Map(record.hostFiles.map(file => [file.path, file]));
+  const deleted = record.guestBaseline.filter(file => !raw.has(file.path)).map(file => host.get(file.path)!);
+  const unchanged = record.guestBaseline.filter(file => raw.has(file.path));
+  if (!deleted.length || deleted.length !== review.blockers.length ||
+    reviewSnapshotDigest(unchanged) !== retained.rawSnapshotId ||
+    deleted.some(file => !file || !review.blockers.some(b => b.path === file.path) ||
+      !Number.isSafeInteger(file.size) || file.size! < 0 || file.size! > PROJECT_SOURCE_LIMITS.fileBytes ||
+      runtimeMediaPath(file.path) || isStaticRasterPath(file.path)) ||
+    deleted.reduce((bytes, file) => bytes + file.size!, 0) > PROJECT_SOURCE_LIMITS.totalBytes) return undefined;
+  const [original] = retained.originOperations;
+  if (retained.originOperations.length !== 1 || !original || original.mode !== "shell" || original.phase !== "released" || original.acknowledged ||
+    original.snapshotId !== retained.rawSnapshotId || original.sourceManifestVersion !== source.version ||
+    (source.version === 2 && original.sourceProfileId !== source.profileId) ||
+    original.sourceBaseManifestId !== source.baseManifestId || original.sourceResultManifestId !== source.rawManifestId) return undefined;
+  return { deleted, original, source };
+}
+
+function deletionReviewIdentity(record: StoredSourceReview): string | undefined {
+  const selected = sourceDeletionReview(record);
+  return selected && [record.review.generation, selected.original.operationId, selected.original.snapshotId, selected.source.baseManifestId].join(":");
+}
+
 export async function assertNoUnapprovedSourceReview(
   workspace: string,
   projectId: string,
   namespace: "manual" | "test",
 ): Promise<void> {
   const records = await sourceReviews(workspace, projectId, namespace);
+  const withdrawn = new Set(records.flatMap(record => {
+    const identity = record.deletionWithdrawal?.phase === "withdrawn" ? deletionReviewIdentity(record) : undefined;
+    return identity ? [identity] : [];
+  }));
   if (
     records.some(
       (record) =>
         !record.approvedAt &&
         !record.acknowledged &&
         !record.superseded &&
-        (record.review.files.length || record.review.blockers.length),
+        (record.review.files.length || record.review.blockers.length) &&
+        !withdrawn.has(deletionReviewIdentity(record) ?? ""),
     )
   )
     throw refusal(
@@ -2183,6 +2223,7 @@ export async function supersedeUnapprovedSourceReviews(
       record.review.generation === approved.review.generation &&
       !record.approvedAt &&
       !record.acknowledged &&
+      !record.deletionWithdrawal &&
       !record.superseded
     ) {
       record.superseded = true;

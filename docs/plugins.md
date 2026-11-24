@@ -342,6 +342,10 @@ it skips when Blender is not provided. Godot import/runtime and authenticated
 Maker initialization/build/publication still need their respective local/account
 environments.
 
+## Ink Studio
+
+The optional bundled Ink Studio plugin adds a procedural pixel-art workflow for static Web Games. Enable it in Plugins, then use **Try now** or select `@Ink Studio` in a project conversation. See [Ink Studio prototypes](ink-studio.md) for the project setting, runtime and playtest workflow.
+
 ## Additional Beta workflows
 
 Cocos Creator, WeChat Mini Games, Douyin Mini Games, Unity, Unreal Engine,

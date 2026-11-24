@@ -108,6 +108,11 @@ export class PluginSettingsStore {
     });
   }
 
+  /** Publish a prepared plugin effect before or after any competing settings change. */
+  duringSettings<T>(operation: () => Promise<T>): Promise<T> {
+    return this.#enqueueMutation(operation);
+  }
+
   #enqueueMutation<T>(mutation: () => Promise<T>): Promise<T> {
     const result = this.#writes.then(mutation);
     this.#writes = result.then(() => undefined, () => undefined);

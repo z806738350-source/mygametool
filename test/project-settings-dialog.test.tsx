@@ -7,9 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProjectState } from "../src/shared/contracts.js";
 const inspectProjectPreview = vi.fn(async () => ({}));
 const updateProjectRunSettings = vi.fn<() => Promise<ProjectState>>();
+const updateProjectInkStudio = vi.fn<(id: string, enabled: boolean) => Promise<ProjectState>>();
 vi.doMock(path.resolve("src/renderer/api.ts"), () => ({
   inspectProjectPreview,
   updateProjectRunSettings,
+  updateProjectInkStudio,
 }));
 const { ProjectSettingsDialog } =
   await import("../src/renderer/project-settings-dialog.js");
@@ -170,6 +172,21 @@ describe("preview settings drafts", () => {
       ),
     );
   }
+
+  it("saves the Ink Studio switch without submitting preview settings", async () => {
+    const enabled: ProjectState = { ...project, type: "web-game", inkStudioEnabled: true };
+    const disabled: ProjectState = { ...enabled, inkStudioEnabled: undefined };
+    const onSaved = vi.fn();
+    updateProjectInkStudio.mockResolvedValue(disabled);
+    await act(async () => root.render(<ProjectSettingsDialog project={enabled} onClose={() => {}} onSaved={onSaved} />));
+    const ink = container.querySelector<HTMLInputElement>('input[aria-label="Ink Studio"]')!;
+    expect(ink.checked).toBe(true);
+    await act(async () => ink.click());
+    expect(updateProjectInkStudio).toHaveBeenCalledWith(enabled.id, false);
+    expect(onSaved).toHaveBeenCalledWith(disabled);
+    expect(updateProjectRunSettings).not.toHaveBeenCalled();
+    expect(container.querySelector('[role="status"]')?.textContent).toBe("Ink Studio setting saved");
+  });
 
   it.each(["ready", "starting", "waiting", "stopped", "error"] as const)(
     "keeps the unique %s stop action after the browser shortcut and outside the collapsed preview actions",

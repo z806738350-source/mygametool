@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { OwnedPlaytestDriver } from "../src/daemon/owned-playtest.js";
-import { WEB_GAME_USE_CAPABILITIES, type GameRuntimeAdapter, type PlaytestRequest, type PlaytestResult } from "../src/shared/playtest.js";
+import { WEB_GAME_USE_CAPABILITIES, getPlaytestActionFailure, type GameRuntimeAdapter, type PlaytestRequest, type PlaytestResult } from "../src/shared/playtest.js";
 
 function driver() {
   let nextId = 1;
@@ -14,6 +14,25 @@ function driver() {
 const open: PlaytestRequest = { operation: "open", target: { runtime: "web", url: "http://127.0.0.1:1234" }, viewport: { width: 1280, height: 720 } };
 
 describe("agent-owned Playtest", () => {
+  it("queries only owned windows and keeps disconnects distinct from confirmed closure", async () => {
+    const shared = driver();
+    const first = new OwnedPlaytestDriver(shared), second = new OwnedPlaytestDriver(shared);
+    await first.request(open);
+    await second.request(open);
+    await expect(second.sessionStatus("session-1")).resolves.toBe("unknown");
+    expect(shared.request).toHaveBeenCalledTimes(2);
+    shared.request.mockRejectedValueOnce(new Error("Desktop disconnected"));
+    await expect(first.sessionStatus("session-1")).resolves.toBe("unknown");
+    expect(first.ownedSessionIds()).toEqual(["session-1"]);
+    shared.request.mockResolvedValueOnce({ operation: "sessionStatus", sessionId: "session-1", resourceStatus: "closing" });
+    await expect(first.sessionStatus("session-1")).resolves.toBe("closing");
+    shared.request.mockResolvedValueOnce({ operation: "sessionStatus", sessionId: "session-1", resourceStatus: "closed" });
+    await expect(first.sessionStatus("session-1")).resolves.toBe("closed");
+    await expect(first.sessionStatus("session-1")).resolves.toBe("closed");
+    const error = await first.request({ operation: "act", sessionId: "session-1", actions: [{ type: "press", key: "Enter" }] }).catch(cause => cause);
+    expect(getPlaytestActionFailure(error)).toMatchObject({ phase: "session_unavailable", completedActions: 0, inputDispatched: false });
+    expect(shared.request.mock.calls.map(([request]) => request.operation)).toEqual(["open", "open", "sessionStatus", "sessionStatus", "sessionStatus"]);
+  });
   it("cleans only its own sessions and permits reuse in a later run", async () => {
     const shared = driver();
     const first = new OwnedPlaytestDriver(shared);

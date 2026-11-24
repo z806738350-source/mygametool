@@ -438,6 +438,32 @@ class ControlCommands(unittest.TestCase):
                 with self.assertRaises(ValueError): self.call('review-source-media', {**base, **change})
                 lock.assert_not_called(); read.assert_not_called()
 
+    def test_source_deletion_withdrawal_controls_use_exact_requests_and_the_expected_locks(self):
+        binding = {'namespace': 'manual', 'projectId': PROJECT, 'generation': 37, 'originalOperationId': IDENTIFIER,
+                   'withdrawalId': 'b' * 32, 'reviewId': 'c' * 64, 'rawSnapshotId': 'd' * 64,
+                   'rawManifestId': 'e' * 64, 'baseManifestId': 'f' * 64}
+        for operation, request, phase in (
+            ('inspect-source-deletion-withdrawal', binding, 'restoring'),
+            ('restore-source-deletions', {**binding, 'files': [{'path': 'src/source.mjs', 'data': 'a' * 132000}]}, 'restored'),
+            ('confirm-source-deletion-withdrawal', binding, 'confirmed'),
+        ):
+            read_only = operation.startswith('inspect')
+            with self.subTest(operation=operation), \
+                 mock.patch.object(storage, operation.replace('-', '_'), return_value={**binding, 'phase': phase}) as action, \
+                 mock.patch.object(storage, 'review_locked', side_effect=lambda **_kwargs: nullcontext()) as reader, \
+                 mock.patch.object(storage, 'locked', side_effect=nullcontext) as writer, \
+                 mock.patch.object(controller, 'state_ready') as initialize:
+                self.assertEqual(self.call(operation, request), {**binding, 'phase': phase})
+                action.assert_called_once_with(request)
+                if read_only:
+                    reader.assert_called_once_with(initialize=True)
+                    writer.assert_not_called()
+                else:
+                    writer.assert_called_once_with()
+                    reader.assert_not_called()
+                self.assertEqual(initialize.call_count, int(not read_only))
+        self.command.assert_not_called()
+
     def test_retained_capture_and_ack_forward_the_explicit_version_without_authority_payloads(self):
         binding = {**BINDING, 'reviewVersion': 2}
         for operation, request in [('capture', binding), ('acknowledge', {**binding, 'snapshotId': 'c' * 64})]:

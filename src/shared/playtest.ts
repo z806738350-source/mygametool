@@ -144,12 +144,15 @@ export interface PlaytestWatchState {
   activeSessions: number;
 }
 
+export type PlaytestResourceStatus = "live" | "closing" | "closed" | "unknown";
+
 export type PlaytestRequest =
   | { operation: "open"; target: GameUseOpenTarget; viewport: PlaytestViewport }
   | { operation: "inspect"; sessionId: string }
   | { operation: "act"; sessionId: string; actions: PlaytestAction[] }
   | { operation: "capture"; sessionId: string }
   | { operation: "close"; sessionId: string }
+  | { operation: "sessionStatus"; sessionId: string }
   | { operation: "closeAll" };
 
 export type PlaytestResult =
@@ -157,7 +160,9 @@ export type PlaytestResult =
   | { operation: "inspect"; snapshot: GameUseSnapshot }
   | { operation: "act"; snapshot: GameUseSnapshot }
   | { operation: "capture"; capture: PlaytestCapture }
-  | { operation: "close" | "closeAll" };
+  | { operation: "close"; resourceStatus?: PlaytestResourceStatus }
+  | { operation: "sessionStatus"; sessionId: string; resourceStatus: PlaytestResourceStatus }
+  | { operation: "closeAll" };
 
 export interface GameRuntimeAdapter {
   readonly available: boolean;
@@ -165,6 +170,8 @@ export interface GameRuntimeAdapter {
   request(request: PlaytestRequest, signal?: AbortSignal): Promise<PlaytestResult>;
   /** References owned by this adapter; they may have expired. Never lists another conversation's windows. */
   ownedSessionIds?(): readonly string[];
+  /** A fresh observation for an authenticated receipt. Never runs page code. */
+  sessionStatus?(sessionId: string, signal?: AbortSignal): Promise<PlaytestResourceStatus>;
   close(): void;
 }
 
@@ -175,7 +182,7 @@ export interface PlaytestActionFailure {
   completedActions: number;
   failedAction: number;
   actionType: PlaytestAction["type"];
-  phase: "target_lookup" | "action";
+  phase: "target_lookup" | "session_unavailable" | "action";
   inputDispatched: false | "unknown";
 }
 

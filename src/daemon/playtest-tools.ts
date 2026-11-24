@@ -1,7 +1,7 @@
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
 import { getPlaytestActionFailure, getPlaytestOpenFailure } from "../shared/playtest.js";
-import { toolPreflightError } from "./agent-tool-errors.js";
+import { getToolPreflightFailure, inheritToolPreflightFailure, toolPreflightError } from "./agent-tool-errors.js";
 import type {
   GameRuntimeAdapter,
   GameUseInputCapability,
@@ -75,6 +75,39 @@ const parameters = gameUseParameters(actionSchema);
  */
 const resetOnlyParameters = gameUseParameters(Type.Union([...inputActions, resetBridgeAction])) as unknown as typeof parameters;
 
+type GameUseReceiptTool = ToolDefinition & Pick<GameRuntimeAdapter, "sessionStatus">;
+type ToolResult = Awaited<ReturnType<ToolDefinition["execute"]>>;
+
+export async function currentPlaytestStatus(tool: GameUseReceiptTool, sessionId: string | undefined, signal?: AbortSignal) {
+  const status = sessionId && tool.sessionStatus ? await tool.sessionStatus(sessionId, signal).catch(() => "unknown" as const) : "unknown";
+  signal?.throwIfAborted();
+  return status;
+}
+
+/** Decorate a retained result without dispatching the original operation or refreshing window activity. */
+export async function replayPlaytestReceipt<T extends { content: ToolResult["content"]; details?: unknown }>(
+  tool: GameUseReceiptTool, callId: string, input: Record<string, unknown>, result: T, isError: boolean, signal?: AbortSignal,
+): Promise<T> {
+  const details = (result.details ?? {}) as Partial<Record<"playtest" | "playtestAction" | "playtestCapture" | "playtestClose", { sessionId?: string; status?: string }>> & { playtestReplay?: { originalOutcome: string } };
+  const sessionId = details.playtest?.sessionId ?? details.playtestAction?.sessionId ?? details.playtestCapture?.sessionId ?? details.playtestClose?.sessionId ??
+    (typeof input.sessionId === "string" ? input.sessionId : undefined);
+  const resourceStatus = await currentPlaytestStatus(tool, sessionId, signal);
+  const replay = {
+    receiptReplayed: true,
+    originalOutcome: details.playtestReplay?.originalOutcome ?? (isError ? (getToolPreflightFailure(result) ? "not_executed" : "unknown") : (details.playtestAction?.status ?? details.playtestClose?.status ?? "succeeded")),
+    ...(sessionId ? { sessionId } : {}),
+    resourceStatus,
+    actionsReexecuted: false,
+    ...(resourceStatus === "closed" ? { nextAction: "open_new_session" } : {}),
+  };
+  return inheritToolPreflightFailure({
+    ...result,
+    content: [{ type: "text", text: `Historical game_use receipt for ${JSON.stringify(callId)}. This replay opened no window and sent no player input. Use a fresh inspect or capture for current playtest evidence.\n${JSON.stringify(replay)}` },
+      ...(details.playtestReplay ? result.content.slice(1) : result.content)],
+    details: { ...details, playtestReplay: replay },
+  }, result);
+}
+
 function gameUseParameters<Action extends TSchema>(action: Action) {
   return Type.Object({
     operation: Type.Union([
@@ -95,8 +128,8 @@ export function createGameUseTool(
   driver: GameRuntimeAdapter,
   resolveOpenTarget: () => Promise<GameUseOpenTarget>,
   { bridge = "full" }: { bridge?: "full" | "reset" } = {},
-): ToolDefinition<typeof parameters> {
-  return defineTool<typeof parameters, unknown>({
+): ReturnType<typeof defineTool<typeof parameters>> & Pick<GameRuntimeAdapter, "sessionStatus"> {
+  return { ...defineTool<typeof parameters, unknown>({
     name: "game_use",
     label: "Game Use",
     description: "Use the current game runtime as a player: open and control the game, inspect interactive elements and canvas state, capture screenshots, review console and network failures, and call an optional deterministic game bridge. Successful open and act return a fresh state snapshot; stopped batches report progress and require inspect before more input. Reuse the returned sessionId and close the session when finished.",
@@ -160,8 +193,13 @@ export function createGameUseTool(
       }
       if (input.operation === "close") {
         const sessionId = requiredSessionId(input.operation, input.sessionId);
-        await driver.request({ operation: "close", sessionId }, signal);
+        const result = await driver.request({ operation: "close", sessionId }, signal);
+        if (result.operation !== "close") throw new Error("Unexpected game use response");
         inspections(driver).delete(sessionId);
+        if (result.resourceStatus && result.resourceStatus !== "closed") {
+          return { content: [{ type: "text", text: `Game session ${sessionId} closure is ${result.resourceStatus}; this response did not confirm disposal.` }],
+            details: { playtestClose: { sessionId, status: "unconfirmed", resourceStatus: result.resourceStatus } } };
+        }
         return { content: [{ type: "text", text: `Closed game session ${sessionId}` }], details: undefined };
       }
       const sessionId = requiredSessionId(input.operation, input.sessionId);
@@ -175,7 +213,7 @@ export function createGameUseTool(
       inspections(driver).delete(sessionId);
       return snapshotResult(result.snapshot);
     },
-  });
+  }), sessionStatus: driver.sessionStatus?.bind(driver) };
 }
 
 async function act(driver: GameRuntimeAdapter, sessionId: string, actions: PlaytestAction[], signal?: AbortSignal) {
@@ -183,19 +221,23 @@ async function act(driver: GameRuntimeAdapter, sessionId: string, actions: Playt
     signal?.throwIfAborted();
     const result = await driver.request({ operation: "act", sessionId, actions }, signal);
     if (result.operation !== "act") throw new Error("Unexpected game use response");
+    if (result.snapshot.sessionId !== sessionId) throw new Error("The input result did not match the requested game session");
     return snapshotResult(result.snapshot);
   } catch (cause) {
     signal?.throwIfAborted();
-    inspections(driver).add(sessionId);
     const reason = cause instanceof Error ? cause.message : String(cause);
     const receipt = getPlaytestActionFailure(cause);
     const failure = receipt?.sessionId === sessionId && receipt.failedAction === receipt.completedActions + 1
       && receipt.completedActions >= 0 && receipt.completedActions < actions.length && actions[receipt.completedActions]?.type === receipt.actionType ? receipt : undefined;
-    if (failure?.phase === "target_lookup" && failure.inputDispatched === false && failure.actionType === "click") {
+    const unavailable = failure?.phase === "session_unavailable";
+    if (!unavailable) inspections(driver).add(sessionId);
+    if (failure?.inputDispatched === false && (unavailable || failure.phase === "target_lookup" && failure.actionType === "click")) {
       const status = failure.completedActions ? "partially_completed" : "not_executed";
       return {
-        content: [{ type: "text" as const, text: `${reason}. Batch stopped: ${failure.completedActions} earlier action(s) completed; the failed click sent no player input and no later actions ran. Inspect session ${JSON.stringify(sessionId)} before continuing. Do not replay completed actions; choose only the remaining intended actions from fresh state.` }],
-        details: { playtestAction: { status, ...failure, requestedActions: actions.length, requiresInspection: true } },
+        content: [{ type: "text" as const, text: unavailable
+          ? `${reason}. Batch stopped: ${failure.completedActions} earlier action(s) completed; no input was sent for the unavailable action and no later actions ran. Open a new session if needed. Do not replay completed actions.`
+          : `${reason}. Batch stopped: ${failure.completedActions} earlier action(s) completed; the failed click sent no player input and no later actions ran. Inspect session ${JSON.stringify(sessionId)} before continuing. Do not replay completed actions; choose only the remaining intended actions from fresh state.` }],
+        details: { playtestAction: { status, ...failure, requestedActions: actions.length, requiresInspection: !unavailable } },
       };
     }
     const progress = failure ? `${failure.completedActions} earlier action(s) completed; the failed action's input delivery is unknown. ` : "Earlier actions may already have run. ";

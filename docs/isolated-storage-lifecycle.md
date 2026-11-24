@@ -408,6 +408,31 @@ verification-only continuation; old unmapped histories are not reclassified.
 The Agent must then reread current project files before further effects. Startup
 does not resume old tasks, adopt files or process a retained generation.
 
+### Withdraw a rejected source deletion
+
+In **Execution storage and recovery**, choose **Withdraw deletion, keep local
+files** for a supported reviewed batch. This action handles a batch with only
+ordinary source deletions and a verified common baseline from a released
+isolated shell command. The review uses retained review version 2 and the
+generation's existing source manifest contract. The exact reviewed batch can
+be eligible even when ordinary recovery is unavailable.
+If a new deletion is waiting for its first review, use **Open execution
+storage** in the same panel. This prepares the review before the separate
+withdrawal confirmation.
+
+The host checks the saved review and the current files. It records the intent,
+then sends the verified baseline bytes for the missing files to the isolated
+store. The guest restores only those paths and verifies the resulting full
+manifest. The host records the withdrawal before asking the guest to confirm
+it. The host project files remain untouched. Mixed changes, a changed baseline,
+or a conflicting operation remain pending for review.
+
+After an interrupted result, use **Check or finish withdrawal** to inspect or
+finish the same request. The saved result is scoped to the original reviewed
+operation. Other pending changes may still prevent editing. A source change is
+confirmed only after a new controlled edit returns and receives its normal
+source acknowledgement.
+
 ### Versioned host recovery reservations
 
 Legacy-contract source publications use journal version 3. Negotiated manifest-v1

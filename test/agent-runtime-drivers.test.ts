@@ -17,6 +17,8 @@ import * as controlledCodex from "../src/daemon/agent-runtimes/controlled-codex.
 import * as codexIsolation from "../src/daemon/agent-runtimes/codex-isolation-check.js";
 import { CODEX_CONTROLLED_CONFIG, CODEX_TOOL_NAMESPACE, controlledCodexEnvironment } from "../src/daemon/agent-runtimes/controlled-codex.js";
 import { createLocalAgentFileTools } from "../src/daemon/agent-local-files.js";
+import { createGameUseTool } from "../src/daemon/playtest-tools.js";
+import { WEB_GAME_USE_CAPABILITIES, type GameRuntimeAdapter } from "../src/shared/playtest.js";
 import { controlledQoderEnvironment } from "../src/daemon/agent-runtimes/controlled-qoder.js";
 import { createIsolatedRecoveryTool } from "../src/daemon/isolated-shell-tool.js";
 import { CodexDriver } from "../src/daemon/agent-runtimes/codex.js";
@@ -2687,11 +2689,11 @@ describe("controlled Codex adapter", () => {
     let segment = 0;
     const f = await setup(cli => {
       segment++;
-      tool(cli, 990, "edit", { path: "fixture.txt", oldText: "absent", newText: "after" }, "rejected-edit");
+      tool(cli, 990, "edit", { path: "fixture.txt", edits: [{ oldText: "absent", newText: "after" }] }, "rejected-edit");
     }, (message, cli) => {
       if (message.id === 990 && message.result) {
         expect(message.result.success).toBe(false);
-        tool(cli, 991, "edit", { path: "fixture.txt", oldText: "before", newText: "after" }, segment === 1 ? "corrected-edit" : "continuation-edit");
+        tool(cli, 991, "edit", { path: "fixture.txt", edits: [{ oldText: "before", newText: "after" }] }, segment === 1 ? "corrected-edit" : "continuation-edit");
         return true;
       }
       if (message.id === 991 && message.result) {
@@ -4689,12 +4691,13 @@ describe.skipIf(!existsSync(installedQoderSdk) || !!process.versions.bun || proc
     await expect(access(path.join(env.QODER_CONFIG_DIR!, ".auth", "user"))).rejects.toMatchObject({ code: "ENOENT" });
   }, 15000);
 
-  it.each(["safe", "newer-compatible", "unsafe-inventory", "ignored-skills", "ignored-meta-deny", "malformed-control", "changed-snapshot-tools", "changed-snapshot-session", "snapshot-after-hook", "vision-initial", "vision-tool", "vision-resume", "vision-false", "vision-missing", "vision-drift", "vision-tool-false", "vision-resume-missing", "vision-tool-gif", "vision-tool-malformed", "result-turn-limit", "result-turn-limit-recover", "edit-preflight-recover", "steering", "steering-timeout"] as const)("checks actual SDK startup, control frames and tools with %s output", async (scenario) => {
+  it.each(["safe", "newer-compatible", "unsafe-inventory", "ignored-skills", "ignored-meta-deny", "malformed-control", "changed-snapshot-tools", "changed-snapshot-session", "snapshot-after-hook", "vision-initial", "vision-tool", "vision-resume", "vision-false", "vision-missing", "vision-drift", "vision-tool-false", "vision-resume-missing", "vision-tool-gif", "vision-tool-malformed", "result-turn-limit", "result-turn-limit-recover", "edit-preflight-recover", "game-use-recover", "steering", "steering-timeout"] as const)("checks actual SDK startup, control frames and tools with %s output", async (scenario) => {
     const steering = scenario.startsWith("steering");
     const steeringTimeout = scenario === "steering-timeout";
     const preflightRecovery = scenario === "edit-preflight-recover";
-    const recovers = scenario === "result-turn-limit-recover" || preflightRecovery;
-    const toolName = preflightRecovery ? "edit" : "write";
+    const gameUseRecovery = scenario === "game-use-recover";
+    const recovers = scenario === "result-turn-limit-recover" || preflightRecovery || gameUseRecovery;
+    const toolName = gameUseRecovery ? "game_use" : preflightRecovery ? "edit" : "write";
     const invalidToolImage = scenario === "vision-tool-gif" || scenario === "vision-tool-malformed";
     const structuredFailure = scenario === "result-turn-limit";
     const usesSession = scenario === "safe" || scenario === "newer-compatible" || scenario === "snapshot-after-hook" || scenario === "vision-initial" || scenario === "vision-tool" || invalidToolImage || structuredFailure || recovers;
@@ -4792,10 +4795,23 @@ await runQoderSdkHost(process.stdin, process.stdout, async () => {
       await mkdir(workspace, { mode: 0o700 });
       const edit = createLocalAgentFileTools(workspace).find(tool => tool.name === "edit")!;
       if (preflightRecovery) await writeFile(path.join(workspace, "fixture.txt"), "before");
-      const execute = vi.fn(async (...call: unknown[]) => preflightRecovery ? edit.execute(...call as Parameters<typeof edit.execute>) : ({ content: hasToolImage ? [toolImage] : [{ type: "text" as const, text: "Local controlled tool completed" }], details: {} }));
-      const write = preflightRecovery ? { ...edit, execute } : defineTool({ name: "write", label: "Local write fixture", description: "Controlled local fixture", parameters: Type.Object({ path: Type.String(), content: Type.String() }), execute });
+      let opened = 0;
+      let firstClosed = false;
+      const play = vi.fn<GameRuntimeAdapter["request"]>(async input => {
+        if (input.operation === "open") return { operation: "open", snapshot: { sessionId: `fixture-playtest-${++opened}`,
+          runtime: "web", capabilities: WEB_GAME_USE_CAPABILITIES, viewport: input.viewport } };
+        if (input.operation === "close" && input.sessionId === "fixture-playtest-1") {
+          firstClosed = true;
+          return { operation: "close", resourceStatus: "closed" };
+        }
+        throw Error("Unexpected SDK playtest fixture request");
+      });
+      const gameUse = createGameUseTool({ available: true, capabilities: WEB_GAME_USE_CAPABILITIES, request: play, close() {},
+        sessionStatus: async () => firstClosed ? "closed" : "live" }, async () => ({ runtime: "web", url: "http://127.0.0.1:43123/" }));
+      const execute = vi.fn(async (...call: unknown[]) => gameUseRecovery ? gameUse.execute(...call as Parameters<typeof gameUse.execute>) : preflightRecovery ? edit.execute(...call as Parameters<typeof edit.execute>) : ({ content: hasToolImage ? [toolImage] : [{ type: "text" as const, text: "Local controlled tool completed" }], details: {} }));
+      const controlledTool = gameUseRecovery ? { ...gameUse, execute } : preflightRecovery ? { ...edit, execute } : defineTool({ name: "write", label: "Local write fixture", description: "Controlled local fixture", parameters: Type.Object({ path: Type.String(), content: Type.String() }), execute });
       const manager = SessionManager.create(workspace, path.join(root, "persisted-session"));
-      const guard = new AutoContinueTools([write] as never, { sessionManager: manager });
+      const guard = new AutoContinueTools([controlledTool] as never, { sessionManager: manager });
       const bridge = new ToolBridge(guard.wrap(), true, false, { getBranch: () => manager.getBranch() });
       const drivers: QoderDriver[] = [];
       const createDriver = () => {
@@ -4854,9 +4870,10 @@ await runQoderSdkHost(process.stdin, process.stdout, async () => {
         expect(reopened.getBranch().filter(entry => entry.type === "custom" && entry.customType === "ohmygame-native-outcome").at(-1)).toMatchObject({ data: { segment: 1, sdkNumTurns: 64 } });
         expect(await readFile(manager.getSessionFile()!, "utf8")).not.toContain("PRIVATE_TERMINAL_CANARY");
       }
-      expect(execute).toHaveBeenCalledTimes(preflightRecovery ? 2 : 1);
+      expect(execute).toHaveBeenCalledTimes(gameUseRecovery ? 3 : preflightRecovery ? 2 : 1);
       const retainedResults = reopened.getBranch().filter(entry => entry.type === "message" && entry.message.role === "toolResult");
-      expect(retainedResults).toHaveLength(preflightRecovery ? 4 : recovers ? 2 : 1);
+      expect(retainedResults).toHaveLength(gameUseRecovery || preflightRecovery ? 4 : recovers ? 2 : 1);
+      if (gameUseRecovery) expect(play.mock.calls.map(([input]) => input.operation)).toEqual(["open", "close", "open"]);
       if (preflightRecovery) {
         expect(await readFile(path.join(workspace, "fixture.txt"), "utf8")).toBe("after");
         expect(retainedResults.filter(entry => entry.type === "message" && (entry.message as { toolCallId?: string }).toolCallId === "rejected-edit")).toEqual([
@@ -4865,8 +4882,8 @@ await runQoderSdkHost(process.stdin, process.stdout, async () => {
         ]);
         expect(handoffSummary(reopened.getBranch())).toContain('"originalCallId":"corrected-edit","tool":"edit","state":"completed"');
       }
-      expect(events.filter(event => event.type === "tool_execution_start")).toHaveLength(preflightRecovery ? 4 : recovers ? 2 : 1);
-      expect(events.filter(event => event.type === "tool_execution_end")).toHaveLength(preflightRecovery ? 4 : recovers ? 2 : 1);
+      expect(events.filter(event => event.type === "tool_execution_start")).toHaveLength(gameUseRecovery || preflightRecovery ? 4 : recovers ? 2 : 1);
+      expect(events.filter(event => event.type === "tool_execution_end")).toHaveLength(gameUseRecovery || preflightRecovery ? 4 : recovers ? 2 : 1);
     } else {
       started = await request("turn/start", { turnId: "sdk-wire-turn", model: selectedModel, reasoningLevel: "high", contextWindow: 128000, text: "Exercise only the local SDK protocol fixture.", images, ...(scenario.startsWith("vision-resume") ? { resume: "11111111-1111-4111-8111-111111111111", requiresImageInput: true } : {}), instructions: "Use only the provided local fixture tool.",
         tools: [{ name: "write", description: "Controlled local fixture", inputSchema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"], additionalProperties: false } }] });
@@ -4898,8 +4915,8 @@ await runQoderSdkHost(process.stdin, process.stdout, async () => {
     if (completes) {
       expect(started, JSON.stringify(sent)).toMatchObject({ result: { sessionId: "11111111-1111-4111-8111-111111111111" } });
       await vi.waitFor(() => expect(sent.some(message => message.method === "sdk/message" && ((message.params as Frame).message as Frame).type === "result"), JSON.stringify(sent)).toBe(true));
-      expect(toolCalls).toHaveLength(preflightRecovery ? 4 : recovers ? 2 : 1);
-      expect(toolCalls[0]!.params).toMatchObject(preflightRecovery ? { name: "edit", callId: "rejected-edit", arguments: { path: "fixture.txt", oldText: "absent", newText: "after" } } : { name: "write", callId: "runtime-call-1", arguments: { path: "fixture.txt", content: "SDK transport result" } });
+      expect(toolCalls).toHaveLength(gameUseRecovery ? 6 : preflightRecovery ? 4 : recovers ? 2 : 1);
+      expect(toolCalls[0]!.params).toMatchObject(gameUseRecovery ? { name: "game_use", callId: "game-open-first", arguments: { operation: "open" } } : preflightRecovery ? { name: "edit", callId: "rejected-edit", arguments: { path: "fixture.txt", edits: [{ oldText: "absent", newText: "after" }] } } : { name: "write", callId: "runtime-call-1", arguments: { path: "fixture.txt", content: "SDK transport result" } });
       const emitted = sent.filter(message => message.method === "sdk/message").map(message => (message.params as Frame).message as Frame);
       const completedIndex = emitted.findIndex(message => message.type === "assistant");
       expect(emitted[completedIndex]!.message).toMatchObject({ id: "fixture-assistant", content: [{ type: "text", text: "Local SDK protocol completed." }] });
@@ -4984,8 +5001,17 @@ await runQoderSdkHost(process.stdin, process.stdout, async () => {
       expect(queryInitialize).toMatchObject({ sdkMcpServers: ["ohmygame"], skills: [], agents: {}, enableFileCheckpointing: false, promptSuggestions: false, independentPlanModeControls: true, permissionMode: "default" });
       expect(frames.find(frame => frame.modelPolicy)).toMatchObject({ modelPolicy: { model: selectedModel, parameters: { reasoningEffort: "high", contextWindow: 128000 } } });
       expect(frames.find(frame => frame.permission === "native")).toMatchObject({ response: { behavior: "deny" } });
-      expect(frames.find(frame => frame.permission === "controlled")).toMatchObject({ response: { behavior: "allow", toolUseID: preflightRecovery ? "rejected-edit" : "runtime-call-1" } });
-      if (preflightRecovery) {
+      expect(frames.find(frame => frame.permission === "controlled")).toMatchObject({ response: { behavior: "allow", toolUseID: gameUseRecovery ? "game-open-first" : preflightRecovery ? "rejected-edit" : "runtime-call-1" } });
+      if (gameUseRecovery) {
+        const receipts = frames.filter(frame => frame.toolResult).map(frame => JSON.stringify(frame.toolResult));
+        expect(receipts).toHaveLength(6);
+        expect(receipts[0]).toContain("fixture-playtest-1");
+        expect(receipts[1]).toContain('\\"resourceStatus\\":\\"live\\"');
+        expect(receipts[3]).toContain('\\"resourceStatus\\":\\"closed\\"');
+        expect(receipts[4]).toContain('\\"resourceStatus\\":\\"closed\\"');
+        expect(receipts[5]).toContain("fixture-playtest-2");
+        expect(JSON.stringify(frames.find(frame => frame.conflictingToolResult)?.conflictingToolResult)).toContain("CALL_ID_CONFLICT");
+      } else if (preflightRecovery) {
         expect(frames.filter(frame => frame.toolResult && frame.callId === "rejected-edit")).toEqual([
           expect.objectContaining({ toolResult: { mcp_response: { jsonrpc: "2.0", id: expect.any(Number), result: { isError: true, content: [{ type: "text", text: "oldText must match exactly once" }] } } } }),
           expect.objectContaining({ toolResult: { mcp_response: { jsonrpc: "2.0", id: expect.any(Number), result: { isError: true, content: [{ type: "text", text: "oldText must match exactly once" }] } } } }),

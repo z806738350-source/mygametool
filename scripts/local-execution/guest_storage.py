@@ -823,6 +823,47 @@ def _remove_empty(root):
 
 
 class Backend:
+    @staticmethod
+    def assert_deletion_destinations(workspace, paths):
+        for relative in paths:
+            if os.path.lexists(_relative(workspace, relative)):
+                raise lifecycle.LifecycleError('GENERATION_CHANGED', 'A withdrawal destination already exists; its contents were kept')
+
+    @staticmethod
+    def sync_deletion_destinations(workspace, paths):
+        for parent in {_relative(workspace, relative).parent for relative in paths}:
+            volume_write(lifecycle.sync_directory, parent)
+
+    @staticmethod
+    def clean_source_withdrawal_stage(scratch, identity):
+        try:
+            info = scratch.lstat()
+        except FileNotFoundError:
+            return
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink not in (1, 2)
+                or info.st_uid not in (os.getuid(), identity['uid'])):
+            raise lifecycle.LifecycleError('UNSAFE_STORAGE', 'Unknown withdrawal staging file was retained')
+        volume_write(scratch.unlink)
+        volume_write(lifecycle.sync_directory, scratch.parent)
+
+    @staticmethod
+    def restore_deleted_source(workspace, item, identity, scratch):
+        target = _relative(workspace, item['path'])
+        descriptor = volume_write(os.open, scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(descriptor, 'wb') as stream:
+                volume_write(stream.write, base64.b64decode(item['data'], validate=True))
+                volume_write(stream.flush)
+                volume_write(os.chown, scratch, identity['uid'], identity['gid'], follow_symlinks=False)
+                volume_write(os.fchmod, stream.fileno(), 0o755 if item['executable'] else 0o644)
+                volume_write(os.fsync, stream.fileno())
+            try:
+                volume_write(os.link, scratch, target, follow_symlinks=False)
+            except FileExistsError:
+                raise lifecycle.LifecycleError('GENERATION_CHANGED', 'A withdrawal destination already exists; its contents were kept') from None
+        finally:
+            Backend.clean_source_withdrawal_stage(scratch, identity)
+
     def identity_readiness(self):
         file = ROOT.parent / 'identity-range-v2.json'
         if not os.path.lexists(file):
@@ -1665,7 +1706,7 @@ def _store():
 
 
 def health():
-    return {**_store().health(), 'runtimeMediaVersion': 1, 'buildMediaVersion': 1, 'sourceInspectionVersion': 1, 'rasterReturnVersion': 1, 'rasterInspectionVersion': 2, 'captureVersion': 2, 'sourceManifestVersion': 1, 'manifestCaptureVersion': 3, 'legacyReviewVersion': 1, 'retainedReviewVersion': 2, 'capacityProfileVersion': 3, 'profileManifestVersion': 2, 'profileCaptureVersion': 4, 'profileUploadVersion': 1, 'volumeMigrationVersion': 1, 'capacityProfiles': [dict(profile) for profile in RUNTIME_PROFILES.values()]}
+    return {**_store().health(), 'runtimeMediaVersion': 1, 'buildMediaVersion': 1, 'sourceInspectionVersion': 1, 'rasterReturnVersion': 1, 'rasterInspectionVersion': 2, 'captureVersion': 2, 'sourceManifestVersion': 1, 'manifestCaptureVersion': 3, 'legacyReviewVersion': 1, 'retainedReviewVersion': 2, 'sourceDeletionWithdrawalVersion': 1, 'capacityProfileVersion': 3, 'profileManifestVersion': 2, 'profileCaptureVersion': 4, 'profileUploadVersion': 1, 'volumeMigrationVersion': 1, 'capacityProfiles': [dict(profile) for profile in RUNTIME_PROFILES.values()]}
 
 def overview():
     try:
@@ -1753,6 +1794,18 @@ def cancel(spec):
 
 def recover(spec):
     return _store().recover(spec)
+
+
+def restore_source_deletions(spec):
+    return _store().restore_source_deletions(spec)
+
+
+def inspect_source_deletion_withdrawal(spec):
+    return _store().inspect_source_deletion_withdrawal(spec)
+
+
+def confirm_source_deletion_withdrawal(spec):
+    return _store().confirm_source_deletion_withdrawal(spec)
 
 
 def retire(spec):

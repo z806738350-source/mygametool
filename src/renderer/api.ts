@@ -252,6 +252,10 @@ export async function updateProjectRunSettings(projectId: string, input: Project
   });
 }
 
+export function updateProjectInkStudio(projectId: string, enabled: boolean): Promise<ProjectState> {
+  return request(`/projects/${projectId}/settings/ink-studio`, { method: "PUT", body: JSON.stringify({ enabled }) });
+}
+
 export async function duplicateProject(projectId: string): Promise<ProjectState> {
   return request(`/projects/${projectId}/duplicate`, { method: "POST" });
 }
@@ -315,6 +319,9 @@ export interface ProjectExecutionStorage {
   generation?: string;
   reason?: string;
   approvedReviewId?: string;
+  deletionWithdrawal?: import("../shared/execution-storage.js").SourceDeletionWithdrawal;
+  deletionWithdrawalReason?: string;
+  deletionWithdrawalNeedsReview?: boolean;
 }
 
 export async function getProjectExecutionStorage(projectId: string): Promise<ProjectExecutionStorage> {
@@ -329,6 +336,13 @@ export async function recoverProjectExecutionStorage(projectId: string, generati
   assertProjectCanvasDraftsSaved(projectId);
   return request(`/projects/${projectId}/execution-storage/recover`, {
     method: "POST", body: JSON.stringify({ generation }), workspaceVersion: workspaceVersion(projectId),
+  });
+}
+
+export async function withdrawProjectSourceDeletion(projectId: string, generation: string, reviewId: string): Promise<import("../shared/execution-storage.js").SourceDeletionWithdrawal> {
+  assertProjectCanvasDraftsSaved(projectId);
+  return request(`/projects/${projectId}/execution-storage/withdraw-deletion`, {
+    method: "POST", body: JSON.stringify({ generation, reviewId }), workspaceVersion: workspaceVersion(projectId),
   });
 }
 

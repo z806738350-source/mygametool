@@ -18,6 +18,7 @@ interface PendingRequest {
 }
 
 const REQUEST_TIMEOUT_MS = 30_000;
+const STATUS_TIMEOUT_MS = 2_000;
 
 export class ProcessPlaytestDriver implements GameRuntimeAdapter {
   readonly capabilities = WEB_GAME_USE_CAPABILITIES;
@@ -42,11 +43,12 @@ export class ProcessPlaytestDriver implements GameRuntimeAdapter {
     if (!this.available) return Promise.reject(new Error("Game use is not available in this environment"));
     if (signal?.aborted) return Promise.reject(abortError());
     const id = randomUUID();
+    const timeoutMs = request.operation === "sessionStatus" ? Math.min(this.timeoutMs, STATUS_TIMEOUT_MS) : this.timeoutMs;
     return new Promise<PlaytestResult>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        this.#settle(id, new Error(`Game use request timed out after ${this.timeoutMs}ms`));
+        this.#settle(id, new Error(`Game use request timed out after ${timeoutMs}ms`));
         this.#send({ channel: "ohmygame:playtest-cancel", id });
-      }, this.timeoutMs);
+      }, timeoutMs);
       const onAbort = signal ? () => {
         this.#settle(id, abortError());
         this.#send({ channel: "ohmygame:playtest-cancel", id });
@@ -88,7 +90,7 @@ export class ProcessPlaytestDriver implements GameRuntimeAdapter {
       const valid = request?.operation === "act" && failure?.version === 1 && failure.sessionId === request.sessionId
         && Number.isInteger(failure.completedActions) && failure.completedActions >= 0 && failure.completedActions < request.actions.length
         && failure.failedAction === failure.completedActions + 1 && request.actions[failure.completedActions]?.type === failure.actionType
-        && (failure.phase === "target_lookup" && failure.actionType === "click" && failure.inputDispatched === false
+        && ((failure.phase === "session_unavailable" || failure.phase === "target_lookup" && failure.actionType === "click") && failure.inputDispatched === false
           || failure.phase === "action" && failure.inputDispatched === "unknown");
       this.#settle(message.id, valid ? playtestActionError(message.error, failure!) : new Error(message.error));
     }

@@ -181,6 +181,23 @@ describe("playtest DOM target consistency", () => {
       expect(getPlaytestActionFailure(cause)).toMatchObject({ completedActions: 0, phase: "action", inputDispatched: "unknown" });
     } finally { await fixture.close(); }
   });
+  it("reports no input if the owned window closes during target lookup", async () => {
+    const fixture = await domPlaytest('<button>Start</button>');
+    const { driver, window, snapshot: { sessionId } } = fixture;
+    try {
+      await expect(driver.request({ operation: "sessionStatus", sessionId })).resolves.toMatchObject({ resourceStatus: "live" });
+      const evaluate = window.webContents.executeJavaScript.getMockImplementation()!;
+      window.webContents.executeJavaScript.mockImplementationOnce(async script => {
+        const observation = await evaluate(script);
+        await driver.request({ operation: "close", sessionId });
+        return observation;
+      });
+      const error = await driver.request({ operation: "act", sessionId, actions: [{ type: "click", target: { text: "Start" } }] }).catch(cause => cause);
+      expect(getPlaytestActionFailure(error)).toMatchObject({ sessionId, completedActions: 0, phase: "session_unavailable", inputDispatched: false });
+      expect(window.debugger.commands.filter(command => command.method.startsWith("Input."))).toHaveLength(0);
+      await expect(driver.request({ operation: "sessionStatus", sessionId })).resolves.toMatchObject({ resourceStatus: "closed" });
+    } finally { await fixture.close(); }
+  });
   it("refuses ambiguous matches across frames before any mouse input", async () => {
     const fixture = await domPlaytest('<button>Start</button>');
     try {
@@ -314,10 +331,15 @@ describe("electron playtest driver", () => {
       vi.advanceTimersByTime(900);
       expect(window.destroyed).toBe(false);
       expect(driver.watchState().activeSessions).toBe(1);
+      const executed = window.webContents.executeJavaScript.mock.calls.length;
+      await expect(driver.request({ operation: "sessionStatus", sessionId: opened.snapshot.sessionId })).resolves.toMatchObject({ resourceStatus: "live" });
+      expect(window.webContents.executeJavaScript).toHaveBeenCalledTimes(executed);
 
       vi.advanceTimersByTime(100);
       expect(window.destroyed).toBe(true);
       expect(driver.watchState().activeSessions).toBe(0);
+      await expect(driver.request({ operation: "sessionStatus", sessionId: opened.snapshot.sessionId })).resolves.toMatchObject({ resourceStatus: "closed" });
+      await expect(driver.request({ operation: "sessionStatus", sessionId: "unrecognized" })).resolves.toMatchObject({ resourceStatus: "unknown" });
       await expect(driver.request({ operation: "inspect", sessionId: opened.snapshot.sessionId })).rejects.toThrow("Game session not found");
     } finally {
       vi.useRealTimers();
@@ -524,7 +546,7 @@ describe("electron playtest driver", () => {
     window.destroyed = true;
     expect(driver.watchState().activeSessions).toBe(1);
 
-    await expect(driver.request({ operation: "close", sessionId: opened.snapshot.sessionId })).resolves.toEqual({ operation: "close" });
+    await expect(driver.request({ operation: "close", sessionId: opened.snapshot.sessionId })).resolves.toEqual({ operation: "close", resourceStatus: "closed" });
     expect(driver.watchState().activeSessions).toBe(0);
     expect(window.debugger.isAttached).not.toHaveBeenCalled();
     expect(window.debugger.detach).not.toHaveBeenCalled();

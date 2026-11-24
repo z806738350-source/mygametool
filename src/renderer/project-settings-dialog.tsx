@@ -18,7 +18,7 @@ import type {
   ProjectRunSettings,
   ProjectState,
 } from "../shared/contracts.js";
-import { inspectProjectPreview, updateProjectRunSettings } from "./api.js";
+import { inspectProjectPreview, updateProjectInkStudio, updateProjectRunSettings } from "./api.js";
 import { supportsWebPreview } from "../shared/project-runtime.js";
 import { t } from "./i18n.js";
 
@@ -134,6 +134,7 @@ export function ProjectSettingsDialog({
 }) {
   const previewToggle = useRef<HTMLInputElement>(null);
   const automaticToggle = useRef<HTMLInputElement>(null);
+  const [inkStudioSaved, setInkStudioSaved] = useState(false);
   const [webPreviewEnabled, setWebPreviewEnabled] = useState(
     supportsWebPreview(project),
   );
@@ -288,6 +289,20 @@ export function ProjectSettingsDialog({
     }
   }
 
+  async function changeInkStudio(enabled: boolean) {
+    setSaving(true);
+    setError(undefined);
+    setInkStudioSaved(false);
+    try {
+      await onSaved(await updateProjectInkStudio(project.id, enabled));
+      setInkStudioSaved(true);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <ProjectSettingsDialogFrame
       busy={saving}
@@ -304,6 +319,23 @@ export function ProjectSettingsDialog({
           <span>{t("projectSettings.project")}</span>
           <strong title={project.name}>{project.name}</strong>
         </section>
+        {project.type === "web-game" ? (
+          <div className="project-settings-preview-toggle">
+            <strong>{t("projectSettings.inkStudio")}</strong>
+            {inkStudioSaved ? <span role="status">{t("projectSettings.inkStudioSaved")}</span> : null}
+            <label className="settings-toggle">
+              <input
+                type="checkbox"
+                role="switch"
+                aria-label={t("projectSettings.inkStudio")}
+                checked={project.inkStudioEnabled === true}
+                disabled={saving}
+                onChange={(event) => void changeInkStudio(event.target.checked)}
+              />
+              <span aria-hidden="true" />
+            </label>
+          </div>
+        ) : null}
         <section
           className="project-settings-switches"
           aria-label={t("projectSettings.previewAccess")}

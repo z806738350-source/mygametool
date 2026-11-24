@@ -425,6 +425,8 @@ export interface ProjectState extends ProjectPreviewSettings {
   integration?: { pluginId: string; preview?: "external" };
   /** General Game's explicit Web preview opt-in; missing means disabled. */
   webPreviewEnabled?: boolean;
+  /** Local opt-in for the Ink Studio workflow in this Web Game. */
+  inkStudioEnabled?: boolean;
   /** Directory, relative to the workspace root, in which the Web Game preview starts. */
   startupDirectory?: string;
   /** Package script that starts the Web Game preview. Defaults to `dev`. */

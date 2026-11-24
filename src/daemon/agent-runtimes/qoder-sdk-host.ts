@@ -94,7 +94,7 @@ interface HostTurn {
   controller: AbortController;
   tools: HostTool[];
   hookCalls: Map<string, Map<string, number>>;
-  forwardedCalls: Map<string, { input: string; result: Promise<unknown> }>;
+  forwardedCalls: Map<string, { input: string; params: ObjectValue; result: Promise<unknown> }>;
   ready: Promise<void>;
   resolveReady(): void;
   rejectReady(error: Error): void;
@@ -588,22 +588,23 @@ export class QoderSdkHost {
           if (count > 1) calls.set(callId, count - 1);
           else turn.hookCalls.delete(key);
           let cached = turn.forwardedCalls.get(callId);
+          const replay = name === "game_use" && !!cached;
           if (cached && cached.input !== key)
             throw new HostError(
-              "The Qoder tool call ID was reused with different arguments",
+              `${name === "game_use" || cached.params.name === "game_use" ? "CALL_ID_CONFLICT: " : ""}The Qoder tool call ID was reused with different arguments`,
             );
           if (!cached) {
+            const forwarded = { name, arguments: params?.arguments ?? {}, callId };
             cached = {
               input: key,
-              result: this.#requestTool(
-                turn,
-                { name, arguments: params?.arguments ?? {}, callId },
-                extra.signal,
-              ),
+              params: forwarded,
+              result: this.#requestTool(turn, forwarded, extra.signal),
             };
             turn.forwardedCalls.set(callId, cached);
           }
-          const result = await cached.result;
+          const original = await cached.result;
+          this.#assertActive(turn);
+          const result = replay ? await this.#requestTool(turn, { ...cached.params, replay: true }, extra.signal) : original;
           this.#assertActive(turn);
           const content = object(result)?.content;
           const images = Array.isArray(content)

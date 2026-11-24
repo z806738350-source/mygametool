@@ -21,6 +21,7 @@ const specialistTools = new Set([
   "review_tripo_model",
   "game_use",
   "prepare_three_runtime",
+  "ensure_ink_runtime",
   "optimize_image_asset",
   "get_model_asset",
   "isolated_shell",

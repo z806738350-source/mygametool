@@ -210,6 +210,21 @@ def retained_review_request(spec):
     return spec
 
 
+def source_deletion_withdrawal_request(spec, files=False):
+    keys = {'namespace', 'projectId', 'generation', 'originalOperationId', 'withdrawalId',
+            'reviewId', 'rawSnapshotId', 'rawManifestId', 'baseManifestId'}
+    if (not isinstance(spec, dict) or set(spec) != keys | ({'files'} if files else set())
+            or type(spec['generation']) is not int or spec['generation'] < 1
+            or any(not isinstance(spec[name], str) or not re.fullmatch('[a-f0-9]{64}', spec[name])
+                   for name in ('reviewId', 'rawSnapshotId', 'rawManifestId', 'baseManifestId'))
+            or spec['rawManifestId'] == spec['baseManifestId']):
+        fail('INVALID_REQUEST', 'Source deletion withdrawal requires its exact reviewed identity')
+    project_key(spec['namespace'], spec['projectId'])
+    if operation(spec['withdrawalId']) == operation(spec['originalOperationId']):
+        fail('INVALID_REQUEST', 'Use a distinct source deletion withdrawal identity')
+    return {name: spec[name] for name in keys}
+
+
 def media_capture_request(spec):
     if (not isinstance(spec, dict) or set(spec) - {'sourceManifestVersion', 'sourceBaseManifestId', 'sourceProfileId'} != {'namespace', 'projectId', 'operationId', 'generation', 'leaseToken', 'captureVersion'}
             or type(spec['generation']) is not int or spec['generation'] < 1
@@ -407,6 +422,17 @@ class Store:
                             or delta.get('beforeManifestId') != op['sourceBaseManifestId']
                             or delta.get('afterManifestId') != op.get('sourceResultManifestId')):
                         fail('UNSAFE_STORAGE', 'Invalid source manifest operation summary')
+            if 'sourceDeletionWithdrawal' in op:
+                withdrawal = op['sourceDeletionWithdrawal']
+                if (not isinstance(withdrawal, dict) or withdrawal.get('phase') not in ('restoring', 'restored', 'confirmed')
+                        or not self._matches_deletion_origin(op_id, op,
+                            source_deletion_withdrawal_request({name: value for name, value in withdrawal.items() if name != 'phase'}))):
+                    fail('UNSAFE_STORAGE', 'Source deletion withdrawal lost its original operation')
+                record = data['records'][op['key']]
+                if withdrawal['phase'] != 'confirmed' and (record.get('operationId') != op_id
+                        or record['generation'] != op['generation'] or not record['dirty']
+                        or record.get('sourceManifestId') != withdrawal['baseManifestId'] or record.get('syncPending')):
+                    fail('UNSAFE_STORAGE', 'Pending source deletion withdrawal lost its guarded baseline')
         self._known(data)
         return data
 
@@ -1319,6 +1345,8 @@ class Store:
     def acknowledge(self, spec):
         data = self._read()
         key, record, op = self._binding(data, spec, {'finished', 'released'})
+        if op.get('sourceDeletionWithdrawal'):
+            fail('RECOVERY_REQUIRED', 'The original deletion is being withdrawn; normal acknowledgement is unavailable')
         typed = self._manifest_binding(record, op, spec, result=True)
         reviewed = op.get('reviewVersion') == 2
         streamed = op.get('captureVersion') in (2, 3, 4)
@@ -1412,6 +1440,9 @@ class Store:
         record = data['records'].get(key)
         if not record or record['generation'] != spec.get('generation'):
             fail('GENERATION_CHANGED', 'Recovery generation changed')
+        pending = data['operations'].get(record.get('operationId'), {}).get('sourceDeletionWithdrawal')
+        if pending and pending['phase'] != 'confirmed':
+            fail('RECOVERY_REQUIRED', 'The original source deletion withdrawal must be inspected or confirmed')
         typed = self._manifest_binding(record, None, spec, result=review_version == 2)
         if self._busy(data, key) or self._global_operations(data) >= 2:
             fail('ACTIVE_OPERATION', 'An isolated operation is still active')
@@ -1464,6 +1495,120 @@ class Store:
         record['operationId'] = op_id
         self._save(data)
         return self._value(key, record, op_id, op)
+
+    @staticmethod
+    def _matches_deletion_origin(op_id, op, binding):
+        return (op_id == binding['originalOperationId']
+                and op.get('key') == project_key(binding['namespace'], binding['projectId'])
+                and op.get('generation') == binding['generation']
+                and op.get('phase') == 'released' and not op.get('acknowledged')
+                and op.get('mode') in ('shell', 'build', 'install')
+                and (op.get('sourceManifestVersion'), op.get('captureVersion')) in ((1, 3), (2, 4))
+                and op.get('snapshotId') == binding['rawSnapshotId']
+                and op.get('sourceBaseManifestId') == binding['baseManifestId']
+                and op.get('sourceResultManifestId') == binding['rawManifestId'])
+
+    def _deletion_origin(self, binding):
+        data = self._read()
+        op_id = binding['originalOperationId']
+        op = data['operations'].get(op_id, {})
+        if not self._matches_deletion_origin(op_id, op, binding):
+            fail('INVALID_BINDING', 'Source deletion withdrawal requires the original released, unacknowledged capture')
+        withdrawal = op.get('sourceDeletionWithdrawal')
+        if withdrawal and withdrawal != {**binding, 'phase': withdrawal['phase']}:
+            fail('INVALID_BINDING', 'Another decision already owns this source deletion withdrawal')
+        return data, op, data['records'][op['key']], withdrawal
+
+    def inspect_source_deletion_withdrawal(self, spec):
+        binding = source_deletion_withdrawal_request(spec)
+        _, _, _, withdrawal = self._deletion_origin(binding)
+        return withdrawal if withdrawal else {**binding, 'phase': 'absent'}
+
+    def _deletion_workspace(self, data, op, record, binding):
+        key = op['key']
+        if (record.get('operationId') != binding['originalOperationId'] or record['generation'] != binding['generation']
+                or record.get('sourceManifestId') != binding['baseManifestId'] or not record['dirty']
+                or record.get('syncPending') or record.get('transition')):
+            fail('GENERATION_CHANGED', 'The original source deletion no longer owns the dirty generation')
+        if self._busy(data, key):
+            fail('ACTIVE_OPERATION', 'An isolated operation is still active')
+        self._idle(key, record)
+        return self._activate(data, key, record) / 'workspace'
+
+    def restore_source_deletions(self, spec):
+        binding = source_deletion_withdrawal_request(spec, files=True)
+        items = spec['files']
+        if (not isinstance(items, list) or not items or any(not isinstance(item, dict)
+                or set(item) != {'path', 'sha256', 'data', 'executable'} for item in items)):
+            fail('INVALID_REQUEST', 'Source deletion withdrawal accepts ordinary source files only')
+        items = self.backend.validate_files(items)
+        for item in items:
+            try:
+                content = base64.b64decode(item['data'], validate=True).decode('utf-8')
+            except UnicodeError:
+                fail('INVALID_REQUEST', 'Source deletion withdrawal requires UTF-8 source text')
+            if '\x00' in content:
+                fail('INVALID_REQUEST', 'Source deletion withdrawal requires UTF-8 source text')
+        data, op, record, withdrawal = self._deletion_origin(binding)
+        if record['generation'] != binding['generation']:
+            fail('GENERATION_CHANGED', 'This source generation changed; inspect the original withdrawal receipt')
+        baseline = record_source_manifest(record)
+        original = {item['path']: item for item in baseline['files']}
+        requested = {item['path']: item for item in snapshot_source_manifest(items)['files']}
+        raw = [item for path, item in original.items() if path not in requested]
+        if (len(requested) != len(items) or any(item['kind'] != 'source' or item != original.get(path)
+                for path, item in requested.items())
+                or source_manifest(raw, op.get('sourceProfileId'))['manifestId'] != binding['rawManifestId']
+                or source_digest(raw) != binding['rawSnapshotId']):
+            fail('RECOVERY_REQUIRED', 'The reviewed changes are not exactly the listed source deletions; every version is retained')
+        if withdrawal and withdrawal['phase'] == 'confirmed':
+            return withdrawal
+        workspace = self._deletion_workspace(data, op, record, binding)
+        scratch = workspace.parent / ('source-withdraw-' + binding['withdrawalId'])
+        if withdrawal and withdrawal['phase'] == 'restoring':
+            self.backend.clean_source_withdrawal_stage(scratch, record['identity'])
+        snapshot = self._retained_snapshot(data, op['key'], record, workspace)
+        current = {item['path']: item for item in snapshot['sourceManifest']['files']}
+        missing = set(original) - set(current)
+        if (any(item != original.get(path) for path, item in current.items()) or missing - set(requested)
+                or (not withdrawal and (missing != set(requested) or snapshot['snapshotId'] != binding['rawSnapshotId']))):
+            fail('GENERATION_CHANGED', 'Guest source changed before withdrawal; every version is retained')
+        if withdrawal and withdrawal['phase'] == 'restored':
+            if missing:
+                fail('GENERATION_CHANGED', 'Restored guest source no longer matches its original baseline')
+            return withdrawal
+        self.backend.assert_deletion_destinations(workspace, sorted(missing))
+        if not withdrawal:
+            withdrawal = {**binding, 'phase': 'restoring'}
+            op['sourceDeletionWithdrawal'] = withdrawal
+            self._save(data)
+        for item in items:
+            if item['path'] in missing:
+                self.backend.restore_deleted_source(workspace, item, record['identity'], scratch)
+        current = self._retained_snapshot(data, op['key'], record, workspace)
+        if current['sourceResultManifestId'] != binding['baseManifestId']:
+            fail('RECOVERY_REQUIRED', 'Restored guest source does not match the full original baseline')
+        self.backend.sync_deletion_destinations(workspace, requested)
+        withdrawal['phase'] = 'restored'
+        self._save(data)
+        return withdrawal
+
+    def confirm_source_deletion_withdrawal(self, spec):
+        binding = source_deletion_withdrawal_request(spec)
+        data, op, record, withdrawal = self._deletion_origin(binding)
+        if not withdrawal or withdrawal['phase'] == 'restoring':
+            fail('RECOVERY_REQUIRED', 'The original source deletion restoration is not complete')
+        if withdrawal['phase'] == 'confirmed':
+            return withdrawal
+        workspace = self._deletion_workspace(data, op, record, binding)
+        snapshot = self._retained_snapshot(data, op['key'], record, workspace)
+        if snapshot['sourceResultManifestId'] != binding['baseManifestId']:
+            fail('GENERATION_CHANGED', 'Guest source changed before withdrawal confirmation')
+        record.update(sourceDigest=snapshot['snapshotId'], dirty=False)
+        record.pop('recoveryReason', None)
+        withdrawal['phase'] = 'confirmed'
+        self._save(data)
+        return withdrawal
 
     def retire(self, spec):
         key = project_key(spec.get('namespace'), spec.get('projectId'))

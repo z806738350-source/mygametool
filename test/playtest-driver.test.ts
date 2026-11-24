@@ -27,16 +27,16 @@ describe("process playtest driver", () => {
     else expect(getPlaytestOpenFailure(cause)).toBeUndefined();
     driver.close();
   });
-  it.each(["valid", "uncertain", "session", "count", "action", "phase", "request", "message-only"])("binds action progress to its exact pending request (%s)", async variant => {
+  it.each(["valid", "unavailable", "uncertain", "session", "count", "action", "phase", "request", "message-only"])("binds action progress to its exact pending request (%s)", async variant => {
     const ipc = new FakeIpc(), driver = new ProcessPlaytestDriver(ipc);
     const result = driver.request(variant === "request" ? { operation: "inspect", sessionId: "session-1" }
       : { operation: "act", sessionId: "session-1", actions: [{ type: "click", target: { text: "Start" } }] });
     const sent = ipc.sent[0]!;
     const failure = { version: 1, sessionId: variant === "session" ? "session-2" : "session-1", completedActions: variant === "count" ? 1 : 0,
-      failedAction: 1, actionType: variant === "action" ? "press" : "click", phase: variant === "phase" ? "invented" : variant === "uncertain" ? "action" : "target_lookup", inputDispatched: variant === "uncertain" ? "unknown" : false };
+      failedAction: 1, actionType: variant === "action" ? "press" : "click", phase: variant === "phase" ? "invented" : variant === "uncertain" ? "action" : variant === "unavailable" ? "session_unavailable" : "target_lookup", inputDispatched: variant === "uncertain" ? "unknown" : false };
     ipc.emit("message", { channel: "ohmygame:playtest-response", id: sent.id, error: "Target lookup failed", ...(variant === "message-only" ? {} : { actionFailure: failure }) });
     const cause = await result.catch(error => error);
-    if (["valid", "uncertain"].includes(variant)) expect(getPlaytestActionFailure(cause)).toEqual(failure);
+    if (["valid", "unavailable", "uncertain"].includes(variant)) expect(getPlaytestActionFailure(cause)).toEqual(failure);
     else expect(getPlaytestActionFailure(cause)).toBeUndefined();
     driver.close();
   });

@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tide Circuit</title>
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./game.mjs"></script>
+</head>
+<body>
+  <main>
+    <h1>Tide Circuit</h1>
+    <p id="instructions">Move with WASD or the arrow keys. Step away from the amber rings and survive for 30 seconds.</p>
+    <div class="hud"><output id="time" aria-label="Seconds remaining">30.0</output><button id="start" type="button" data-testid="start" disabled>Start</button></div>
+    <canvas id="arena" width="320" height="200" tabindex="0" aria-label="Tidal platform game arena" aria-describedby="instructions status"></canvas>
+    <p id="status" role="status">Loading game…</p>
+  </main>
+</body>
+</html>

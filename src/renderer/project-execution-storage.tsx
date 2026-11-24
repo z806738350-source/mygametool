@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { ProjectState } from "../shared/contracts.js";
+import type { SourceDeletionWithdrawal } from "../shared/execution-storage.js";
 import {
   getProjectExecutionStorage,
   openProjectExecutionStorage,
   recoverProjectExecutionStorage,
+  withdrawProjectSourceDeletion,
   ApiError,
   type ProjectExecutionStorage,
 } from "./api.js";
@@ -22,6 +24,12 @@ const states = new Set([
   "unavailable",
 ]);
 
+function validWithdrawal(value: SourceDeletionWithdrawal) {
+  return !!value && /^[a-f0-9]{64}$/.test(value.reviewId) && /^[0-9]{1,32}$/.test(value.generation) &&
+    ["available", "pending", "withdrawn"].includes(value.status) && Array.isArray(value.paths) &&
+    value.paths.length > 0 && value.paths.length <= 2000 && value.paths.every(path => typeof path === "string" && path.length > 0);
+}
+
 function checkedState(
   value: ProjectExecutionStorage,
   projectId: string,
@@ -38,6 +46,9 @@ function checkedState(
         !/^[0-9]{1,32}$/.test(value.generation))) ||
     (value.reason !== undefined && typeof value.reason !== "string")
     || (value.approvedReviewId !== undefined && !/^[a-f0-9]{64}$/.test(value.approvedReviewId))
+    || (value.deletionWithdrawal !== undefined && !validWithdrawal(value.deletionWithdrawal))
+    || (value.deletionWithdrawalReason !== undefined && typeof value.deletionWithdrawalReason !== "string")
+    || (value.deletionWithdrawalNeedsReview !== undefined && typeof value.deletionWithdrawalNeedsReview !== "boolean")
   )
     throw new Error(t("projects.executionStorage.invalid"));
   return value;
@@ -229,6 +240,37 @@ export function ProjectExecutionStorageDialog({
     finally { pending.current = false; setBusy(false); }
   }
 
+  async function withdrawDeletion(): Promise<void> {
+    const selected = storage?.deletionWithdrawal;
+    if (pending.current || !selected || selected.status === "withdrawn") return;
+    pending.current = true;
+    setBusy(true);
+    setError(undefined);
+    try {
+      assertProjectCanvasDraftsSaved(project.id);
+      const latest = checkedState(await getProjectExecutionStorage(project.id), project.id);
+      const current = latest.deletionWithdrawal;
+      setStorage(latest);
+      if (!current || current.reviewId !== selected.reviewId || current.generation !== selected.generation)
+        throw new Error(t("projects.executionStorage.changed"));
+      if (current.status === "withdrawn") return;
+      if (current.status === "available" && !window.confirm(t("projects.executionStorage.withdrawConfirm", {
+        name: project.name, count: current.paths.length, paths: current.paths.join("\n"),
+      }))) return;
+      assertProjectCanvasDraftsSaved(project.id);
+      const response = await withdrawProjectSourceDeletion(project.id, current.generation, current.reviewId);
+      if (!validWithdrawal(response) || response.reviewId !== current.reviewId || response.generation !== current.generation || response.status !== "withdrawn")
+        throw new Error(t("projects.executionStorage.invalid"));
+      await load();
+    } catch (cause) {
+      await load();
+      setError(message(cause));
+    } finally {
+      pending.current = false;
+      setBusy(false);
+    }
+  }
+
   return (
     <div
       className="project-create-backdrop"
@@ -272,6 +314,9 @@ export function ProjectExecutionStorageDialog({
             </p>
           ) : null}
           {storage?.reason ? <p>{storage.reason}</p> : null}
+          {storage?.deletionWithdrawalReason ? <p>{storage.deletionWithdrawalReason}</p> : null}
+          {storage?.deletionWithdrawalNeedsReview ? <p>{t("projects.executionStorage.withdrawNeedsReview")}</p> : null}
+          {storage?.deletionWithdrawal?.status === "withdrawn" ? <p role="status">{t("projects.executionStorage.withdrawn")}</p> : null}
           {error ? (
             <p className="error" role="alert">
               {error}
@@ -305,6 +350,11 @@ export function ProjectExecutionStorageDialog({
             >
               {t("projects.executionStorage.refresh")}
             </button>
+            {storage?.deletionWithdrawal && storage.deletionWithdrawal.status !== "withdrawn" ? (
+              <button type="button" disabled={busy || loading || storage.state === "busy"} onClick={() => void withdrawDeletion()}>
+                {t(storage.deletionWithdrawal.status === "pending" ? "projects.executionStorage.withdrawResume" : "projects.executionStorage.withdraw")}
+              </button>
+            ) : null}
             <button
               className="project-create-submit"
               type="button"

@@ -9,11 +9,12 @@ import type { ProjectExecutionStorage } from "../src/renderer/api.js";
 import type { ProjectState } from "../src/shared/contracts.js";
 
 const getStorage = vi.fn(),
-  restore = vi.fn(), openStorage = vi.fn(), getCover = vi.fn();
+  restore = vi.fn(), withdraw = vi.fn(), openStorage = vi.fn(), getCover = vi.fn();
 vi.doMock(path.resolve("src/renderer/api.ts"), async (original) => ({
   ...(await original<object>()),
   getProjectExecutionStorage: getStorage,
   recoverProjectExecutionStorage: restore,
+  withdrawProjectSourceDeletion: withdraw,
   openProjectExecutionStorage: openStorage,
   getProjectCover: getCover,
 }));
@@ -55,6 +56,7 @@ beforeEach(() => {
     state = { ...state, dirty: false, recoverable: false };
     return { changed: ["src/game.ts"] };
   });
+  withdraw.mockReset();
   close.mockReset();
   vi.spyOn(window, "confirm").mockReturnValue(true);
   focus = document.createElement("button");
@@ -113,6 +115,23 @@ function deferred<T>() {
 }
 
 describe("project execution storage recovery", () => {
+  it("can withdraw a reviewed deletion even though ordinary recovery is unavailable", async () => {
+    const withdrawal = { reviewId: "f".repeat(64), generation: "1", paths: ["src/_t.mjs"], status: "available" };
+    Object.assign(state, { recoverable: false, deletionWithdrawal: withdrawal });
+    withdraw.mockImplementation(async () => {
+      Object.assign(state, { dirty: false, deletionWithdrawal: { ...withdrawal, status: "withdrawn" } });
+      return { ...withdrawal, status: "withdrawn" };
+    });
+    await render();
+    expect(button("projects.executionStorage.recover").disabled).toBe(true);
+    const action = [...container.querySelectorAll("button")].find(x => x.textContent === "Withdraw deletion, keep local files");
+    expect(action).toBeDefined();
+    await act(async () => action!.click());
+    expect(withdraw).toHaveBeenCalledExactlyOnceWith(project.id, "1", withdrawal.reviewId);
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("src/_t.mjs"));
+    expect(restore).not.toHaveBeenCalled();
+  });
+
   it("opens a stopped execution store only on an explicit click and never starts recovery", async () => {
     getStorage.mockRejectedValueOnce(new Error("VM is stopped"));
     await render();

@@ -49,6 +49,7 @@ interface ProjectMetadata extends ProjectPreviewSettings {
   integration?: ProjectState["integration"];
   updatedAt: string;
   webPreviewEnabled?: boolean;
+  inkStudioEnabled?: boolean;
   /** Present only when a Web Game starts from a directory below its workspace root. */
   startupDirectory?: string;
   /** Present only when a Web Game starts with a script other than `dev`. */
@@ -65,7 +66,7 @@ interface ProjectMetadata extends ProjectPreviewSettings {
   mediaModelDefaults?: MediaModelDefaults;
   modelSelections?: ProjectState["modelSelections"];
 }
-type ProjectMetadataChanges = Partial<Pick<ProjectMetadata, "integration" | "name" | "nameSource" | "updatedAt" | "webPreviewEnabled" | "startupDirectory" | "startupScript" | "packageManager" | "previewPath" | "previewViewport" | "publication" | "mediaModelDefaults" | "modelSelections" | keyof ProjectPreviewSettings>>;
+type ProjectMetadataChanges = Partial<Pick<ProjectMetadata, "integration" | "name" | "nameSource" | "updatedAt" | "webPreviewEnabled" | "inkStudioEnabled" | "startupDirectory" | "startupScript" | "packageManager" | "previewPath" | "previewViewport" | "publication" | "mediaModelDefaults" | "modelSelections" | keyof ProjectPreviewSettings>>;
 
 export class ProjectLibraryReferenceError extends Error {}
 
@@ -199,6 +200,16 @@ export class ProjectManager {
   }
 
   get(id: string): ProjectState | undefined { return this.#projects.get(id); }
+
+  async setInkStudioEnabled(id: string, enabled: boolean): Promise<ProjectState> {
+    const project = this.#projects.get(id);
+    if (!project) throw new ProjectAssetError("Project not found", 404);
+    if (project.type !== "web-game") throw new ProjectAssetError("Ink Studio is available for Web Game projects", 400);
+    if (Boolean(project.inkStudioEnabled) !== enabled) {
+      if (!await this.#save(project, { inkStudioEnabled: enabled || undefined })) throw new ProjectAssetError("Project not found", 404);
+    }
+    return project;
+  }
 
   prepareThreeRuntime(id: string) {
     return this.#mutateWorkspace(id, async () => {
@@ -1259,6 +1270,8 @@ export class ProjectManager {
       if (metadata.nameSource) project.nameSource = metadata.nameSource;
       project.updatedAt = metadata.updatedAt;
       if (project.type === "general") project.webPreviewEnabled = metadata.webPreviewEnabled ?? false;
+      if (metadata.inkStudioEnabled) project.inkStudioEnabled = true;
+      else delete project.inkStudioEnabled;
       if (metadata.startupDirectory) project.startupDirectory = metadata.startupDirectory;
       else delete project.startupDirectory;
       if (metadata.startupScript) project.startupScript = metadata.startupScript;
@@ -1351,6 +1364,7 @@ function projectState(
     type: metadata.type,
     ...(metadata.integration ? { integration: metadata.integration } : {}),
     ...(metadata.type === "general" ? { webPreviewEnabled: metadata.webPreviewEnabled ?? false } : {}),
+    ...(metadata.type === "web-game" && metadata.inkStudioEnabled ? { inkStudioEnabled: true } : {}),
     updatedAt: metadata.updatedAt,
     workspacePath,
     ...previewSettings(metadata),
@@ -1536,6 +1550,7 @@ function parseMetadata(value: unknown, id: string, fallbackUpdatedAt: string): L
     (parsed.type === undefined || isProjectType(parsed.type)) &&
     (parsed.integration === undefined || (typeof parsed.integration?.pluginId === "string" && !!parsed.integration.pluginId && (parsed.integration.preview === undefined || parsed.integration.preview === "external"))) &&
     (parsed.webPreviewEnabled === undefined || typeof parsed.webPreviewEnabled === "boolean") &&
+    (parsed.inkStudioEnabled === undefined || typeof parsed.inkStudioEnabled === "boolean") &&
     (parsed.startupDirectory === undefined || isValidStartupDirectory(parsed.startupDirectory)) &&
     (parsed.startupScript === undefined || normalizeStartupScript(parsed.startupScript) !== undefined) &&
     (parsed.packageManager === undefined || isProjectPackageManager(parsed.packageManager)) &&
@@ -1566,6 +1581,7 @@ function parseMetadata(value: unknown, id: string, fallbackUpdatedAt: string): L
         type,
         ...(parsed.integration ? { integration: parsed.integration } : {}),
         ...(type === "general" ? { webPreviewEnabled: parsed.webPreviewEnabled ?? false } : {}),
+        ...(type === "web-game" && parsed.inkStudioEnabled ? { inkStudioEnabled: true } : {}),
         updatedAt,
         ...(startupDirectory ? { startupDirectory } : {}),
         ...(startupScript && startupScript !== "dev" ? { startupScript } : {}),
@@ -1595,6 +1611,7 @@ function metadataFor(project: ProjectState): ProjectMetadata {
     type: project.type,
     ...(project.integration ? { integration: project.integration } : {}),
     ...(project.type === "general" ? { webPreviewEnabled: project.webPreviewEnabled ?? false } : {}),
+    ...(project.type === "web-game" && project.inkStudioEnabled ? { inkStudioEnabled: true } : {}),
     updatedAt: project.updatedAt,
     ...(project.startupDirectory ? { startupDirectory: project.startupDirectory } : {}),
     ...(project.startupScript ? { startupScript: project.startupScript } : {}),

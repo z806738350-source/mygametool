@@ -36,7 +36,8 @@ import type { UpdateOnboardingRequest } from "../shared/onboarding.js";
 import path from "node:path";
 import { isWebStory } from "./story-web-project.js";
 import { fileURLToPath } from "node:url";
-import { ModelRuntime, SettingsManager, type SessionEntry, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { defineTool, ModelRuntime, SettingsManager, type SessionEntry, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import Fastify, { LogController, type FastifyReply, type FastifyRequest } from "fastify";
 import { daemonLoggerOptions, logFailedRequests } from "./request-log.js";
 import { ActivityLog } from "./activity-log.js";
@@ -81,7 +82,8 @@ import { RemotePublisher, RemotePublishError } from "./publish/client.js";
 import { registerCommunityRoutes } from "./publish/community-routes.js";
 import { LOCAL_DEBUG_ACCESS_TOKEN } from "../shared/local-debug.js";
 import { PreviewManager, PreviewCancelledError } from "./preview.js";
-import { ProjectAssetError, ProjectManager, ProjectLibraryReferenceError, ProjectWorkspaceError } from "./projects.js";
+import { ProjectAssetError, ProjectManager, ProjectLibraryReferenceError, ProjectWorkspaceError, resolvePreviewWorkspace } from "./projects.js";
+import { prepareInkRuntime } from "./ink-runtime.js";
 import { ExampleError, ExampleStore } from "./examples.js";
 import { MODEL_CATALOG_REFRESH_ERROR, ModelCatalogRefresh } from "./model-catalog-refresh.js";
 import { ModelAuthError, ModelAuthManager } from "./model-auth.js";
@@ -136,7 +138,7 @@ import { PreinstalledPluginManager } from "./preinstalled-plugins.js";
 import { registerPluginPortabilityRoutes } from "./plugin-portability.js";
 import { PluginSkillContentError, pluginSkillFolders, readPluginSkillContent, resolvePluginSkillFile, resolvePluginSkills } from "./plugin-runtime.js";
 import { LegacyMcpConfiguration } from "./legacy-mcp.js";
-import { hasPluginMentionToken, pluginMentionToken, type InstallPluginRequest, type PluginSettings, type PluginSummary, type PluginDetail } from "../shared/plugins.js";
+import { hasPluginMentionToken, INK_STUDIO_PLUGIN_ID, pluginMentionToken, type InstallPluginRequest, type PluginSettings, type PluginSummary, type PluginDetail } from "../shared/plugins.js";
 import { getWorkspaceMedia, listWorkspaceFiles, locateWorkspaceEntry, readWorkspaceFile, validateWorkspaceFile, workspaceMediaInfo, WorkspaceError } from "./workspace.js";
 import { listWorkspaceGitChanges, readWorkspaceGitFile } from "./workspace-git.js";
 import { AssetLibrary, AssetLibraryError, isLibraryAssetDerivation } from "./asset-library.js";
@@ -694,14 +696,15 @@ export function createApp(options: AppOptions = {}) {
   const piAgentDirectory = options.piAgentDirectory ?? process.env.PI_CODING_AGENT_DIR ?? path.join(dataDirectory, "pi-agent");
   const mediaSnapshots = new CheckedMediaSnapshotStore(path.join(dataDirectory, "cache", "checked-media"));
   const library = new AssetLibrary(dataDirectory, mediaSnapshots);
-  const projects = new ProjectManager(dataDirectory, library, [piAgentDirectory], async project => {
+  const projectSourceProfile = async (project: ProjectState) => {
     if (!options.projectExecution || typeof options.projectExecution.storageOverview !== "function" || project.workspaceLocation === "external") return undefined;
     // An explicit current guest record can widen the host inventory bound; stopped/stale state cannot.
     const overview = await options.projectExecution.storageOverview([project]);
     if (overview.dataStatus !== "current" || !overview.snapshot?.countsTrusted || overview.snapshot.capacityOverviewVersion !== 1 || overview.snapshot.capacityReservations?.length !== 0) return undefined;
     const entry = overview.snapshot.projects.find(item => item.namespace === options.projectExecution!.namespace && item.projectId === project.id);
     return (entry?.volumeProfileVersion === 2 && entry.sourceProfileId === "capacity-128-v2") || (entry?.volumeProfileVersion === 3 && entry.sourceProfileId === "capacity-128-media64-v3") ? entry.sourceProfileId : undefined;
-  });
+  };
+  const projects = new ProjectManager(dataDirectory, library, [piAgentDirectory], projectSourceProfile);
   const projectLifecycle = new ProjectLifecycle(dataDirectory);
   const conversationImages = new ConversationImageStore(
     path.join(dataDirectory, "cache", "conversation-images"),
@@ -1042,8 +1045,12 @@ export function createApp(options: AppOptions = {}) {
       catch (error) { inspectionError = [inspectionError, error instanceof Error ? error.message : "Retained file inspection is unavailable"].filter(Boolean).join(" "); }
     }
     const blocked = inspectionError || inspection && (!inspection.complete || inspection.blockers > 0 && !approved);
+    const withdrawal = !busy && !hostPending && !projectLifecycle.pending(project.id)
+      ? await options.projectExecution!.deletionWithdrawalStatus?.(project, entry, inspection) : undefined;
     return { supported: true, projectId: project.id, state: hostPending && !entry?.dirty ? "unavailable" : !entry || entry.state === "deleted" ? "absent" : busy ? "busy" : entry.dirty ? "recovery-pending" : entry.state,
-      dirty: !!entry?.dirty || hostPending, recoverable: !!entry?.dirty && !busy && !blocked,
+      dirty: !!entry?.dirty || hostPending || withdrawal?.deletionWithdrawal?.status === "pending",
+      recoverable: !!entry?.dirty && !busy && !blocked && withdrawal?.deletionWithdrawal?.status !== "pending",
+      ...withdrawal,
       ...(entry ? { generation: String(entry.generation) } : {}),
       ...(inspection ? { inspection } : {}),
       ...(inspection ? { recoveryValidation: "metadata-only" as const } : {}),
@@ -1129,6 +1136,61 @@ export function createApp(options: AppOptions = {}) {
     await options.projectExecution?.assertSourceReviewSettled?.(project);
     return operation();
   });
+  const inkStudioGloballyEnabled = () => {
+    const bundled = bundledPlugins.read(INK_STUDIO_PLUGIN_ID);
+    const plugin = bundled && pluginSettings.decorate(bundled);
+    return !!plugin?.enabled && plugin.skills.some(skill => skill.id === "skills/ink-studio/SKILL.md" && skill.enabled);
+  };
+  const inkStudioEnabled = (project: ProjectState) => {
+    const current = projects.get(project.id);
+    return current?.type === "web-game" && current.inkStudioEnabled === true && inkStudioGloballyEnabled();
+  };
+  const setProjectInkStudio = (project: ProjectState, enabled: boolean) => mutateWorkspace(project, () => pluginSettings.duringSettings(async () => {
+    projectLifecycle.assertAvailable(project.id);
+    if (enabled && !inkStudioGloballyEnabled()) throw new ProjectAssetError("Enable Ink Studio and its workflow guide in Plugins first", 409);
+    const changed = Boolean(projects.get(project.id)?.inkStudioEnabled) !== enabled;
+    const updated = await projects.setInkStudioEnabled(project.id, enabled);
+    if (changed) {
+      agents.invalidateProjectSessions(project.id);
+      events.publish(project.id, "project.updated", { project: structuredClone(updated) });
+    }
+    return updated;
+  }));
+  const inkStudioTools = (project: ProjectState) => !inkStudioEnabled(project) ? [] : [defineTool({
+    name: "ensure_ink_runtime",
+    label: "Prepare Ink Studio",
+    description: "Prepare the bundled, offline Ink Studio bake and WebGL 2 modules for this enabled Web Game. Returns project-relative browser paths. Follow read_workflow_guide({guide: 'ink-studio'}) before using the modules.",
+    executionMode: "sequential",
+    parameters: Type.Object({}, { additionalProperties: false }),
+    execute: async (_id, _input, signal) => {
+      const requireEnabled = () => {
+        signal?.throwIfAborted();
+        projectLifecycle.assertAvailable(project.id);
+        if (!inkStudioEnabled(project)) throw new ProjectAssetError("Ink Studio is disabled for this project", 409);
+      };
+      const result = await mutateWorkspace(project, async () => {
+        requireEnabled();
+        const preview = await resolvePreviewWorkspace(project);
+        if (preview.mode !== "static" && (preview.runnable || project.previewMode && project.previewMode !== "auto")) {
+          throw new ProjectAssetError("Ink Studio needs a static Web Game startup directory. Use a static HTML project or its static preview mode.", 409);
+        }
+        const bundled = bundledPlugins.installedPath(INK_STUDIO_PLUGIN_ID);
+        if (!bundled) throw new ProjectAssetError("Bundled Ink Studio runtime is unavailable", 503);
+        return prepareInkRuntime({
+          workspace: project.workspacePath,
+          startupDirectory: preview.relativePath,
+          bundledDirectory: path.join(bundled, "runtime"),
+          profile: await projectSourceProfile(project),
+          signal,
+          publish: commit => pluginSettings.duringSettings(async () => {
+            requireEnabled();
+            await commit();
+          }),
+        });
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result) }], details: { inkRuntime: result } };
+    },
+  })];
   const blenderWorkflows = new Map<string, BlenderWorkflow>();
   const tripoModelReviews = new TripoModelReviews(path.join(dataDirectory, "blender-jobs"), projects, library);
   const blenderTools = (project: ProjectState) => {
@@ -1174,12 +1236,12 @@ export function createApp(options: AppOptions = {}) {
       return authorizeConversationAttachment(conversations.open(project, conversation), reference);
     };
     const inspection = createTurnaroundInspection(project, authorizeAttachment);
-    return [...fileTools, inspection.tool, ...workflowGuideTools(project, bundledPlugins, pluginSettings), ...blenderTools(project), createProjectMediaCapabilitiesTool(() => projects.get(project.id), {
+    return [...fileTools, inspection.tool, ...workflowGuideTools(project, bundledPlugins, pluginSettings, () => inkStudioEnabled(project)), ...inkStudioTools(project), ...blenderTools(project), createProjectMediaCapabilitiesTool(() => projects.get(project.id), {
       images: providerImages, videos: providerVideos, models3D: providerModels3D, audio: providerAudio, defaultModel: mediaDefaultModel,
     }), ...(options.projectExecution && project.workspaceLocation !== "external" ? [createIsolatedShellTool(async (command, timeout, signal) => {
       signal?.throwIfAborted();
       return previews.withExecutionSlot(project, () => options.projectExecution!.shell(project, command, timeout, (operation) => projectWrites.exclusive(project.id, operation), signal));
-    }), createIsolatedRecoveryTool(() => isolatedStorageStatus(project), (generation, signal) =>
+    }, target => options.projectExecution!.sourceDeletionDisposition?.(project, target) ?? Promise.resolve(undefined)), createIsolatedRecoveryTool(() => isolatedStorageStatus(project), (generation, signal) =>
       previews.withExecutionSlot(project, () => recoverIsolatedChanges(project, generation, signal)), {
       capacity: signal => projectWrites.snapshot(project.id, () => withCanvasLock(project.workspacePath, () => projectCapacity(project, signal))),
       planCapacity: (profileId, signal) => projectWrites.snapshot(project.id, () => withCanvasLock(project.workspacePath, async () => proposeExecutionCapacity(await projectCapacity(project, signal), profileId))),
@@ -1986,6 +2048,18 @@ export function createApp(options: AppOptions = {}) {
 
   app.get("/projects", async () => projects.list());
 
+  app.put<{ Params: { projectId: string }; Body: { enabled: boolean } }>("/projects/:projectId/settings/ink-studio", {
+    schema: { body: { type: "object", additionalProperties: false, required: ["enabled"], properties: { enabled: { type: "boolean" } } } },
+  }, async (request, reply) => {
+    const project = projects.get(request.params.projectId);
+    if (!project) return reply.code(404).send({ error: "Project not found" });
+    try { return await setProjectInkStudio(project, request.body.enabled); }
+    catch (cause) {
+      if (cause instanceof ProjectAssetError) return reply.code(cause.statusCode).send({ error: cause.message });
+      throw cause;
+    }
+  });
+
   app.get("/projects/activity", async () => ({
     activity: agents.projectActivity(),
     names: projects.list().map(({ id, name, nameSource }) => ({ id, name, nameSource })),
@@ -2507,7 +2581,20 @@ export function createApp(options: AppOptions = {}) {
     if (!options.projectExecution?.openRecoveryStorage || project.workspaceLocation === "external") return reply.code(409).send({ error: "Controlled execution storage is unavailable for this project" });
     if (agents.isProjectBusy(project.id) || tools.isProjectBusy(project.id) || canvasStore.isProjectBusy(project.id)) return reply.code(409).send({ error: "Wait for project tasks to finish before opening recovery storage" });
     try {
-      await projectLifecycle.inspectRecovery(project.id, () => options.projectExecution!.openRecoveryStorage());
+      await projectLifecycle.inspectRecovery(project.id, async () => {
+        const execution = options.projectExecution!;
+        await execution.openRecoveryStorage();
+        if (!execution.deletionWithdrawalStatus || !execution.inspectSource || !execution.reviewSource) return;
+        const entry = await execution.inventoryProject(project);
+        if (!entry?.dirty || entry.active) return;
+        const inspection = await execution.inspectSource(project, entry.generation).catch(() => undefined);
+        if (!inspection) return;
+        const withdrawal = await execution.deletionWithdrawalStatus(project, entry, inspection);
+        if (!withdrawal.deletionWithdrawalNeedsReview) return;
+        await execution.reviewSource(project, String(entry.generation), operation => projectWrites.snapshot(project.id, operation));
+        if (!(await execution.deletionWithdrawalStatus(project, entry, inspection)).deletionWithdrawal)
+          throw new Error("The review does not prove an exact batch of source deletions from a completed command and a verified common baseline. Keep both copies.");
+      });
       return reply.code(204).send();
     } catch (error) { return reply.code(409).send({ error: error instanceof Error ? error.message : String(error) }); }
   });
@@ -2530,6 +2617,44 @@ export function createApp(options: AppOptions = {}) {
         (publication) => reply.header("x-workspace-version", publication.version));
     } catch (error) { return reply.code(409).send({ error: error instanceof Error ? error.message : String(error),
       code: error && typeof error === "object" && "recoveryNotStarted" in error && error.recoveryNotStarted === true ? "execution_recovery_not_started" : "execution_recovery_required" }); }
+  });
+
+  app.post<{ Params: { projectId: string }; Body: { generation: string; reviewId: string } }>("/projects/:projectId/execution-storage/withdraw-deletion", {
+    preValidation: async (request, reply) => {
+      const body = request.body;
+      if (!body || Array.isArray(body) || typeof body.generation !== "string" || typeof body.reviewId !== "string" ||
+        Object.keys(body).some(key => key !== "generation" && key !== "reviewId"))
+        return reply.code(400).send({ error: "Choose the reviewed execution generation before withdrawing its deletion." });
+    },
+    schema: { body: { type: "object", additionalProperties: false, required: ["generation", "reviewId"], properties: {
+      generation: { type: "string", pattern: "^[0-9]{1,32}$" }, reviewId: { type: "string", pattern: "^[a-f0-9]{64}$" },
+    } } },
+  }, async (request, reply) => {
+    const project = projects.get(request.params.projectId);
+    if (!project) return reply.code(404).send({ error: "Project not found" });
+    if (!options.projectExecution?.withdrawSourceDeletion || project.workspaceLocation === "external")
+      return reply.code(409).send({ error: "Deletion withdrawal is unavailable for this project" });
+    try {
+      projectLifecycle.assertAvailable(project.id);
+      const idle = () => {
+        if (agents.isProjectBusy(project.id) || tools.isProjectBusy(project.id) || canvasStore.isProjectBusy(project.id))
+          throw new ProjectLifecycleError("Wait for project tasks to finish before withdrawing a deletion.");
+      };
+      idle();
+      return await previews.withExecutionSlot(project, () => projectLifecycle.inspectRecovery(project.id, async () => {
+        await checkpoints.settled(project);
+        return projectWrites.exclusive(project.id, async () => {
+          idle();
+          if (await checkpoints.unfinished(project)) throw new ProjectLifecycleError("Resolve the interrupted file restore before withdrawing a deletion.");
+          const { generation, reviewId } = request.body;
+          const result = await options.projectExecution!.withdrawSourceDeletion(project, generation, reviewId);
+          agents.invalidateProjectSessions(project.id);
+          return result;
+        });
+      }));
+    } catch (error) {
+      return reply.code(409).send({ error: error instanceof Error ? error.message : String(error), code: "execution_deletion_withdrawal_unsettled" });
+    }
   });
 
   registerCommunityRoutes(app, publisher, projects);
@@ -3929,6 +4054,7 @@ export function createApp(options: AppOptions = {}) {
       if (selectedModel && !modelProviderEnabled(selectedModel.provider)) return reply.code(409).send({ error: "The selected provider is disabled. Enable it in Settings to continue." });
       if (!request.body?.prompt?.trim() && !request.body?.images?.length && !request.body?.attachments?.length) return reply.code(400).send({ error: "Prompt or attachment is required" });
       let mentions;
+      let enableInkStudio = false;
       try {
         mentions = await plugins.validateMentions(request.body.mentions ?? []);
         if (mentions.some((mention) => !hasPluginMentionToken(request.body.prompt, mention))) {
@@ -3943,6 +4069,7 @@ export function createApp(options: AppOptions = {}) {
           const plugin = catalog!.plugins.find(item => item.name === mention.name && item.marketplace.id === mention.marketplaceId);
           if (plugin?.projectTypes?.length && !plugin.projectTypes.includes(project.type)) throw new LocalPluginError("A referenced plugin requires a different project type", 409);
           if (plugin?.integration && project.integration?.pluginId !== plugin.id) throw new LocalPluginError("Connect this plugin to the project before sending a prompt", 409);
+          if (plugin?.id === INK_STUDIO_PLUGIN_ID) enableInkStudio = true;
         }
         if (project.integration && LOCAL_EXECUTION_ENABLED) {
           const plugin = await requireIntegrationPlugin(plugins, project.integration.pluginId, project);
@@ -4019,6 +4146,7 @@ export function createApp(options: AppOptions = {}) {
       await projects.touch(project.id);
       let turn;
       try {
+        if (enableInkStudio) await setProjectInkStudio(project, true);
         turn = agents.prompt(
           project,
           conversation,

@@ -1,0 +1,23 @@
+{
+  "upstreamCommit": "f4b5644a26f4a0d2a707b1c74dc58ea4f5ba692c",
+  "profile": "bake",
+  "distributionRevision": 1,
+  "files": {
+    "ink-toolkit.min.mjs": {
+      "size": 1314880,
+      "sha256": "74c1640b6d291aba7ed42055f11c0b7e47c7e616d8e62fb9072d985e2dff5ca3"
+    },
+    "ink-renderer.min.mjs": {
+      "size": 476986,
+      "sha256": "4942eefa881eea5dbba6ae9af461bb6008d46ebcb85bd34075cc0d65b0e56e6d"
+    },
+    "LICENSE.txt": {
+      "size": 1070,
+      "sha256": "03a4f2b7e23019bd7e7816d3e2777229c3c6dc6a3f4823d532c1424e5236412b"
+    },
+    "NOTICE.md": {
+      "size": 700,
+      "sha256": "b4ffd72edac70be307e4008322845f2bab5093fc87a43f8e5592ad53619eed8b"
+    }
+  }
+}

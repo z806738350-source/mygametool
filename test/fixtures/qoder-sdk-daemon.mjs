@@ -367,10 +367,26 @@ async function prompt(frame) {
     tool_use_id: "blocked-native-tool",
   });
   record({ permission: "native", response: denied });
-  if (model === "fixture-edit-preflight-recover") {
+  if (model === "fixture-game-use-recover") {
+    const open = { operation: "open" };
+    const first = { callId: "game-open-first", arguments: open };
+    const operations = promptCount === 1 ? [first, first,
+      { ...first, arguments: { ...open, path: "/different" }, conflict: true },
+      { callId: "game-close-first", arguments: { operation: "close", sessionId: "fixture-playtest-1" } }, first,
+    ] : [first, { callId: "game-open-second", arguments: open }];
+    for (const operation of operations) {
+      const name = "mcp__ohmygame__game_use";
+      await request({ subtype: "hook_callback", callback_id: hookId, tool_use_id: operation.callId,
+        input: { hook_event_name: "PreToolUse", tool_name: name, tool_input: operation.arguments, tool_use_id: operation.callId, session_id: session, cwd } });
+      const response = await request({ subtype: "can_use_tool", tool_name: name, input: operation.arguments, tool_use_id: operation.callId });
+      record({ permission: "controlled", callId: operation.callId, response });
+      const called = await mcp({ jsonrpc: "2.0", id: ++sequence, method: "tools/call", params: { name: "game_use", arguments: operation.arguments } });
+      record({ ...(operation.conflict ? { conflictingToolResult: called } : { toolResult: called }), callId: operation.callId });
+    }
+  } else if (model === "fixture-edit-preflight-recover") {
     for (const operation of [
-      { callId: "rejected-edit", arguments: { path: "fixture.txt", oldText: "absent", newText: "after" } },
-      { callId: promptCount === 1 ? "corrected-edit" : "continuation-edit", arguments: { path: "fixture.txt", oldText: "before", newText: "after" } },
+      { callId: "rejected-edit", arguments: { path: "fixture.txt", edits: [{ oldText: "absent", newText: "after" }] } },
+      { callId: promptCount === 1 ? "corrected-edit" : "continuation-edit", arguments: { path: "fixture.txt", edits: [{ oldText: "before", newText: "after" }] } },
     ]) {
       const name = "mcp__ohmygame__edit";
       await request({ subtype: "hook_callback", callback_id: hookId, tool_use_id: operation.callId,
@@ -464,7 +480,7 @@ async function prompt(frame) {
     usage: { input_tokens: 0, output_tokens: 0 },
     modelUsage: {},
     permission_denials: [],
-    ...((workerArgs.includes("fixture-result-turn-limit") || (workerArgs.includes("fixture-result-turn-limit-recover") || model === "fixture-edit-preflight-recover") && promptCount === 1) ? { subtype: "error_max_turns", is_error: true, num_turns: 64, terminal_reason: "max_turns", stop_reason: "tool_use", errors: ["PRIVATE_TERMINAL_CANARY"], error_message: "PRIVATE_TERMINAL_CANARY" } : {}),
+    ...((workerArgs.includes("fixture-result-turn-limit") || (workerArgs.includes("fixture-result-turn-limit-recover") || ["fixture-edit-preflight-recover", "fixture-game-use-recover"].includes(model)) && promptCount === 1) ? { subtype: "error_max_turns", is_error: true, num_turns: 64, terminal_reason: "max_turns", stop_reason: "tool_use", errors: ["PRIVATE_TERMINAL_CANARY"], error_message: "PRIVATE_TERMINAL_CANARY" } : {}),
   });
 }
 

@@ -1,0 +1,21 @@
+{
+  "name": "ink-studio",
+  "version": "0.1.0",
+  "enabledByDefault": false,
+  "description": "Prototype playable pixel-art web games with Ink Studio.",
+  "skills": "./skills/",
+  "interface": {
+    "beta": true,
+    "displayName": "Ink Studio",
+    "shortDescription": "Prototype playable pixel-art web games with Ink Studio.",
+    "longDescription": "Describe a game mechanic. The Agent builds an editable browser game with procedural pixel-art scenes and checks the controls in OhMyGame's playtest.",
+    "icon": {
+      "type": "asset",
+      "path": "./assets/icon.svg"
+    },
+    "defaultPrompt": [
+      "Use Ink Studio to build an original 30-second dodging game in one arena. Give the player a clear warning before each expanding wave, movement with WASD or the arrow keys, a win for surviving, and a restart button. Playtest it before handing it over."
+    ],
+    "projectTypes": ["web-game"]
+  }
+}

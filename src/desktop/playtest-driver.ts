@@ -13,6 +13,7 @@ import {
   type PlaytestFailedRequest,
   type PlaytestLog,
   type PlaytestRequest,
+  type PlaytestResourceStatus,
   type PlaytestResult,
   type PlaytestSnapshot,
   type PlaytestTarget,
@@ -56,12 +57,14 @@ const MAX_TEXT = 4_000;
 const CAPTURE_JPEG_QUALITY = 80;
 
 class TargetLookupError extends Error {}
+class SessionUnavailableError extends Error {}
 
 export class ElectronPlaytestDriver implements GameRuntimeAdapter {
   readonly available = true;
   readonly capabilities = WEB_GAME_USE_CAPABILITIES;
   readonly #sessions = new Map<string, PlaytestSession>();
   readonly #closingSessions = new Set<string>();
+  readonly #closedSessions = new Set<string>();
   #visible = false;
 
   constructor(
@@ -93,11 +96,12 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
     switch (request.operation) {
       case "open": return { operation: "open", snapshot: await this.#open(request.target, request.viewport, signal) };
       case "inspect": return this.#withSession(request.sessionId, async (state) => ({ operation: "inspect", snapshot: await this.#inspect(state, signal) }));
-      case "act": return this.#withSession(request.sessionId, async (state) => ({ operation: "act", snapshot: await this.#act(state, request.actions, signal) }));
+      case "act": return this.#actRequest(request.sessionId, request.actions, signal);
       case "capture": return this.#withSession(request.sessionId, async (state) => ({ operation: "capture", capture: await this.#capture(state, signal) }));
+      case "sessionStatus": return { operation: "sessionStatus", sessionId: request.sessionId, resourceStatus: this.#resourceStatus(request.sessionId) };
       case "close":
         this.#close(request.sessionId);
-        return { operation: "close" };
+        return { operation: "close", resourceStatus: this.#resourceStatus(request.sessionId) };
       case "closeAll":
         this.close();
         return { operation: "closeAll" };
@@ -159,6 +163,7 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
     window.once("closed", () => {
       clearTimeout(state.idleTimer);
       this.#closingSessions.delete(id);
+      this.#rememberClosed(id);
       if (this.#sessions.delete(id)) this.#publishWatchState();
     });
     window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
@@ -260,14 +265,34 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
     };
   }
 
+  async #actRequest(sessionId: string, actions: PlaytestAction[], signal?: AbortSignal): Promise<PlaytestResult> {
+    let started = false;
+    try {
+      return await this.#withSession(sessionId, async state => {
+        started = true;
+        return { operation: "act", snapshot: await this.#act(state, actions, signal) };
+      });
+    } catch (cause) {
+      if (started || signal?.aborted || !actions[0]) throw cause;
+      throw playtestActionError("Game session could not accept input", { version: 1, sessionId,
+        completedActions: 0, failedAction: 1, actionType: actions[0].type, phase: "session_unavailable", inputDispatched: false });
+    }
+  }
+
   async #act(state: PlaytestSession, actions: PlaytestAction[], signal?: AbortSignal): Promise<PlaytestSnapshot> {
     if (actions.length < 1 || actions.length > 20) throw new Error("Provide 1 to 20 playtest actions");
     for (const [index, action] of actions.entries()) {
       signal?.throwIfAborted();
-      this.#assertLive(state);
-      try { await this.#runAction(state, action, signal); }
+      try {
+        this.#assertLive(state);
+        await this.#runAction(state, action, signal);
+      }
       catch (cause) {
         signal?.throwIfAborted();
+        if (cause instanceof SessionUnavailableError) {
+          throw playtestActionError(cause.message, { version: 1, sessionId: state.id,
+            completedActions: index, failedAction: index + 1, actionType: action.type, phase: "session_unavailable", inputDispatched: false });
+        }
         if (action.type === "click" && cause instanceof TargetLookupError) {
           throw playtestActionError(`Action ${index + 1} (click) failed: ${cause.message}`, {
             version: 1, sessionId: state.id, completedActions: index, failedAction: index + 1, actionType: "click",
@@ -287,7 +312,11 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
     const debuggerApi = state.window.webContents.debugger;
     switch (action.type) {
       case "click": {
-        const point = await this.#targetPoint(state, action.target, signal);
+        const point = await this.#targetPoint(state, action.target, signal).catch(cause => {
+          this.#assertLive(state);
+          throw cause;
+        });
+        this.#assertLive(state);
         await debuggerApi.sendCommand("Input.dispatchMouseEvent", { type: "mouseMoved", ...point });
         await debuggerApi.sendCommand("Input.dispatchMouseEvent", { type: "mousePressed", ...point, button: "left", clickCount: 1 });
         await debuggerApi.sendCommand("Input.dispatchMouseEvent", { type: "mouseReleased", ...point, button: "left", clickCount: 1 });
@@ -301,6 +330,7 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
           focused = await abortableResult(frame.frame.executeJavaScript(`(${FOCUS_TARGET_SCRIPT})(${target})`, true), signal).catch(() => false) === true;
           if (focused) break;
         }
+        this.#assertLive(state);
         if (!focused) throw new Error("Playtest target was not found or is not editable");
         await debuggerApi.sendCommand("Input.insertText", { text: action.text });
         await abortableDelay(50, signal);
@@ -477,21 +507,39 @@ export class ElectronPlaytestDriver implements GameRuntimeAdapter {
   #assertLive(state: PlaytestSession): void {
     if (state.window.isDestroyed() || state.window.webContents.isDestroyed()) {
       this.#sessions.delete(state.id);
-      throw new Error(`Game session is no longer available: ${state.id}`);
+      this.#rememberClosed(state.id);
+      throw new SessionUnavailableError(`Game session is no longer available: ${state.id}`);
     }
+    if (this.#closingSessions.has(state.id)) throw new SessionUnavailableError(`Game session is closing: ${state.id}`);
   }
 
   #close(id: string): void {
     const state = this.#sessions.get(id);
     if (!state) return;
     clearTimeout(state.idleTimer);
+    const destroyed = state.window.isDestroyed();
+    if (destroyed) this.#rememberClosed(id);
+    else this.#closingSessions.add(id);
     this.#sessions.delete(id);
     this.#publishWatchState();
-    if (!state.window.isDestroyed()) {
+    if (!destroyed) {
       if (state.window.webContents.debugger.isAttached()) state.window.webContents.debugger.detach();
-      this.#closingSessions.add(id);
       state.window.destroy();
     }
+  }
+
+  #resourceStatus(id: string): PlaytestResourceStatus {
+    if (this.#closingSessions.has(id)) return "closing";
+    if (this.#closedSessions.has(id)) return "closed";
+    const state = this.#sessions.get(id);
+    if (!state) return "unknown";
+    if (state.window.isDestroyed() || state.window.webContents.isDestroyed()) return "closed";
+    return state.ready ? "live" : "unknown";
+  }
+
+  #rememberClosed(id: string): void {
+    this.#closedSessions.add(id);
+    if (this.#closedSessions.size > 64) this.#closedSessions.delete(this.#closedSessions.values().next().value!);
   }
 
   #publishWatchState(): PlaytestWatchState {

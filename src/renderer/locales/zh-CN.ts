@@ -690,6 +690,11 @@ const zhCN: typeof en = {
       confirm: "要将保留的源码改动恢复到“{{name}}”吗？与本机编辑冲突时会拒绝写入，不发起模型请求。",
       success: "恢复完成，源码改动 {{count}} 个文件。",
       recoveryPath: "原文件恢复位置：{{path}}",
+      withdraw: "撤回删除，保留本机文件",
+      withdrawResume: "核实或继续撤回",
+      withdrawNeedsReview: "先打开执行存储检查这批删除，再确认是否撤回。",
+      withdrawConfirm: "保留「{{name}}」的本机文件，并将 {{count}} 个缺失文件补回隔离执行副本？原删除命令不会重跑。\n\n{{paths}}",
+      withdrawn: "已撤回删除，本机文件已保留。",
       invalid: "执行存储返回了未知状态，请刷新核对后再继续。",
       changed: "执行副本已变化，请刷新状态后再恢复。",
       uncertain: "上次恢复的结果尚未确认。请刷新核对；结果不明时不会重复提交恢复。",
@@ -1046,6 +1051,8 @@ const zhCN: typeof en = {
   },
   projectSettings: {
     title: "项目设置",
+    inkStudio: "Ink Studio",
+    inkStudioSaved: "Ink Studio 设置已保存",
     argumentsInvalid: "参数必须是字符串组成的 JSON 数组。",
     project: "项目",
     previewAccess: "预览访问",
@@ -2252,6 +2259,11 @@ const zhCN: typeof en = {
     },
   },
   plugins: {
+    inkStudio: {
+      description: "用 Ink Studio 快速制作可试玩的像素风网页游戏。",
+      about: "描述一个玩法，Agent 会用程序化像素场景搭出可编辑的网页游戏，并在 OhMyGame 中试玩检查操作。",
+      example: "用 Ink Studio 制作一个原创的 30 秒躲避游戏。冲击波出现前给出预警，支持 WASD 和方向键移动，存活即获胜，并可重开。交付前先试玩。",
+    },
     blender: {
       description: "用 Blender 在后台制作游戏模型，在画布上审阅成品。",
       about: "Agent 在后台运行本机 Blender，可以精修已有模型，也可以按尺寸搭建道具。制作新角色时，Tripo 可根据你已确认的三视图生成初模。Agent 会保存可编辑的 .blend 文件并验证导出的 GLB。你可以在画布上旋转模型、播放已有动画，再确认交付或提出修改。",

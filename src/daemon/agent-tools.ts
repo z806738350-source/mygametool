@@ -57,7 +57,7 @@ const CANVAS_MEDIA_TOOLS: Partial<Record<import("../shared/contracts.js").AssetC
 };
 
 export function activePiToolNames(enabledTools: readonly ToolId[], registeredToolNames: readonly string[] = []): string[] {
-  const extensionTools = registeredToolNames.filter((name) => ["tool_search", "read_workflow_guide", "inspect_3d_views", "blender_status", "run_blender", "recover_blender_run", "review_tripo_model", "list_media_capabilities", "list_animation_actions", "optimize_image_asset", "get_model_asset", "use_canvas_asset", "prepare_three_runtime", "isolated_shell", "recover_isolated_changes", "read_project_file", "build_game", "canvas_check", "canvas_initialize", "playable_add_node", "playable_check", "game_use", "read_attachment", "recall_image", "recall_tool_text"].includes(name));
+  const extensionTools = registeredToolNames.filter((name) => ["tool_search", "read_workflow_guide", "inspect_3d_views", "blender_status", "run_blender", "recover_blender_run", "review_tripo_model", "list_media_capabilities", "list_animation_actions", "optimize_image_asset", "get_model_asset", "use_canvas_asset", "prepare_three_runtime", "ensure_ink_runtime", "isolated_shell", "recover_isolated_changes", "read_project_file", "build_game", "canvas_check", "canvas_initialize", "playable_add_node", "playable_check", "game_use", "read_attachment", "recall_image", "recall_tool_text"].includes(name));
   const mediaTools = registeredToolNames.filter(name => ["recover_media", "recover_canvas_media"].includes(name)
     || (enabledTools.length > 0 && ["generate_canvas_media", "replace_canvas_media"].includes(name)));
   const aliases = mediaToolAliases.filter(([name, id]) => enabledTools.includes(id) && registeredToolNames.includes(name)).map(([name]) => name);

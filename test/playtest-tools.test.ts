@@ -48,11 +48,40 @@ class FakeDriver implements GameRuntimeAdapter {
       };
     }
     if (request.operation === "close" || request.operation === "closeAll") return { operation: request.operation };
+    if (request.operation === "sessionStatus") return { ...request, resourceStatus: "live" };
     return { operation: request.operation, snapshot };
   }
 }
 
 describe("game use tool", () => {
+  it("coalesces one in-flight open while preserving new opens and observations with identical arguments", async () => {
+    const driver = new FakeDriver(), opened = { ...snapshot, sessionId: "session-2" };
+    let finish!: (result: PlaytestResult) => void;
+    const opening = new Promise<PlaytestResult>(resolve => { finish = resolve; });
+    const requests = vi.spyOn(driver, "request").mockReturnValueOnce(opening)
+      .mockResolvedValueOnce({ operation: "open", snapshot: opened });
+    const guard = new AutoContinueTools([createGameUseTool(driver, async () => ({ runtime: "web", url: snapshot.url }))]);
+    guard.reset();
+    const tool = guard.wrap()[0]!;
+    const call = (id: string, args: object) => tool.execute(id, args, undefined, undefined, {} as never);
+    const first = call("first-open", { operation: "open" });
+    await vi.waitFor(() => expect(requests).toHaveBeenCalledTimes(1));
+    const duplicate = call("first-open", { operation: "open" });
+    await expect(call("first-open", { operation: "open", path: "another" })).rejects.toThrow("CALL_ID_CONFLICT");
+    finish({ operation: "open", snapshot });
+    await expect(first).resolves.toMatchObject({ details: { playtest: { sessionId: "session-1" } } });
+    await expect(duplicate).resolves.toMatchObject({ details: { playtestReplay: { resourceStatus: "unknown", actionsReexecuted: false } } });
+    await guard.prepare(new AbortController().signal);
+    await expect(call("new-open", { operation: "open" })).resolves.toMatchObject({ details: { playtest: { sessionId: "session-2" } } });
+    for (const operation of ["act", "inspect", "capture"]) {
+      const args = { operation, sessionId: snapshot.sessionId, ...(operation === "act" ? { actions: [{ type: "press", key: "Enter" }] } : {}) };
+      await call(`${operation}-first`, args);
+      await expect(call(`${operation}-first`, args)).resolves.toMatchObject({ details: { playtestReplay: { actionsReexecuted: false } } });
+      await expect(call(`${operation}-second`, args)).resolves.not.toMatchObject({ details: { playtestReplay: expect.anything() } });
+    }
+    expect(requests.mock.calls.map(([input]) => input.operation)).toEqual(["open", "open", "act", "act", "inspect", "inspect", "capture", "capture"]);
+  });
+
   it("uses a provider-compatible object schema at the function root", () => {
     const tool = createGameUseTool(new FakeDriver(), async () => ({ runtime: "web", url: "http://127.0.0.1:43210/" }));
 
@@ -164,6 +193,29 @@ describe("game use tool", () => {
     }
   });
 
+  it("admits an independently owned session while guarding an unconfirmed input in the same task", async () => {
+    const shared = new FakeDriver(), second = { ...snapshot, sessionId: "session-2" };
+    const requests = vi.spyOn(shared, "request").mockResolvedValueOnce({ operation: "open", snapshot })
+      .mockResolvedValueOnce({ operation: "open", snapshot: second });
+    const owned = new OwnedPlaytestDriver(shared);
+    const target = { runtime: "web" as const, url: snapshot.url };
+    const guard = new AutoContinueTools([createGameUseTool(owned, async () => target)]);
+    guard.reset();
+    const tool = guard.wrap()[0]!;
+    const call = (id: string, args: object) => tool.execute(id, args, undefined, undefined, {} as never);
+    for (const id of ["open-1", "open-2"]) await call(id, { operation: "open" });
+    const act = { operation: "act", sessionId: snapshot.sessionId, actions: [{ type: "press", key: "Enter" }] };
+    requests.mockRejectedValueOnce(new Error("Transport disconnected during input"));
+    await expect(call("unknown-action", act)).rejects.toThrow("Do not replay");
+    await call("inspect-1", { operation: "inspect", sessionId: snapshot.sessionId });
+    requests.mockResolvedValueOnce({ operation: "sessionStatus", sessionId: second.sessionId, resourceStatus: "live" })
+      .mockResolvedValueOnce({ operation: "act", snapshot: second });
+    await expect(call("independent-action", { ...act, sessionId: second.sessionId })).resolves.toMatchObject({ details: { playtest: { sessionId: second.sessionId } } });
+    await expect(call("fresh-id-same-session", act)).rejects.toThrow("unconfirmed");
+    expect(requests.mock.calls.map(([input]) => input.operation)).toEqual(["open", "open", "act", "inspect", "sessionStatus", "act"]);
+    await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("unconfirmed");
+  });
+
   it("corrects a session-limit rejection through owned inspection and cleanup without replaying the rejected open", async () => {
     const shared = new FakeDriver();
     const request = vi.spyOn(shared, "request").mockResolvedValueOnce({ operation: "open", snapshot })
@@ -183,7 +235,9 @@ describe("game use tool", () => {
     await tool.execute("close-finished", { operation: "close", sessionId: snapshot.sessionId }, undefined, undefined, {} as never);
     await tool.execute("new-open", args, undefined, undefined, {} as never);
     expect(request.mock.calls.map(([call]) => call.operation)).toEqual(["open", "open", "open", "inspect", "close", "open", "act"]);
-    await expect(tool.execute("open-full", args, undefined, undefined, {} as never)).rejects.toBe(failure);
+    const replay = await tool.execute("open-full", args, undefined, undefined, {} as never);
+    expect(replay).toMatchObject({ isError: true, details: { playtestReplay: { originalOutcome: "not_executed", actionsReexecuted: false } } });
+    expect(getToolPreflightFailure(replay)).toEqual(getToolPreflightFailure(failure));
     await expect(owned.request({ operation: "close", sessionId: "foreign-session" })).rejects.toThrow("belong");
   });
   it.each(["text", "properties", "isolated-effects"])("keeps %s open failures unknown rather than trusting a false no-effect claim", async variant => {

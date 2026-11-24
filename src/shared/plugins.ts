@@ -9,6 +9,7 @@ export type PluginOrigin =
   | { type: "claude-marketplace"; marketplace: string; repository?: string };
 
 export const PLUGIN_MANIFEST_PATH = ".ohmygame-plugin/plugin.json";
+export const INK_STUDIO_PLUGIN_ID = "ohmygame:ink-studio";
 export const PLUGIN_FORMAT_VERSION = 1;
 export const PLUGIN_ARCHIVE_MAX_ENTRIES = 5_000;
 export const PLUGIN_ARCHIVE_MAX_BYTES = 50 * 1024 * 1024;

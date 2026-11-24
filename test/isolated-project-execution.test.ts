@@ -1,6 +1,6 @@
 import { ChildProcess } from "node:child_process";
 import { getToolConfirmedFailure } from "../src/daemon/agent-tool-errors.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { createConnection, type AddressInfo } from "node:net";
 import {
@@ -1164,6 +1164,83 @@ it("source manifest v1 reconstructs an inline source raster as a media working t
     rawManifestId: raw.manifestId, preparedManifestId: manifests.prepared!.manifestId });
   await sourceReview.assertRetainedReviewArtifacts(restored);
   expect(spawn).not.toHaveBeenCalled();
+});
+
+it.each([["restore-response", 1], ["confirm-response", 1], ["confirm-response", 2]] as const)("withdraws exactly the old source deletion across a lost %s (manifest v%s)", async (lost, version) => {
+  const f = await fixture();
+  const deleted = sourceFile("_t.mjs", "export const temporary = true;");
+  const keep = sourceFile("index.html", "unchanged");
+  for (const item of [deleted, keep]) await writeFile(path.join(f.workspacePath, item.path), Buffer.from(item.data, "base64"));
+  const hostBefore = await stat(path.join(f.workspacePath, deleted.path), { bigint: true });
+  const manifest = version === 1 ? fixtureSourceManifest : fixtureProfileManifest;
+  const baseline = manifest([deleted, keep]), raw = manifest([keep]);
+  const sourceScope = version === 1 ? { sourceManifestVersion: 1 as const } : { sourceManifestVersion: 2 as const, sourceProfileId: "capacity-128-v2" as const };
+  const snapshotId = reviewSnapshotDigest([keep]);
+  const original = { operationId: "f".repeat(32), mode: "shell", phase: "released", snapshotId, acknowledged: false,
+    ...sourceScope, sourceBaseManifestId: baseline.manifestId, sourceResultManifestId: raw.manifestId };
+  const record = await sourceReview.buildRetainedSourceReview(f.workspacePath, "test", f.project.id, 37, {
+    reviewVersion: 2, rasterReturnVersion: 2, files: [keep], baselineFiles: [deleted, keep], retainedRasters: [], originOperations: [original],
+    snapshotId, ...sourceScope, sourceBaselineManifest: baseline, sourceManifest: raw,
+    sourceResultManifestId: raw.manifestId, sourceDelta: planSourceDelta(baseline, raw).summary,
+  }, new Map());
+  f.handlers.set("health", () => ({ protocolVersion: 2, ready: true, limits: resourceLimits, runtimeMediaVersion: 1, buildMediaVersion: 1,
+    rasterInspectionVersion: 2, captureVersion: 2, manifestCaptureVersion: 3, sourceManifestVersion: 1,
+    retainedReviewVersion: 2, sourceDeletionWithdrawalVersion: 1,
+    ...(version === 2 ? { capacityProfileVersion: 2, profileManifestVersion: 2, profileCaptureVersion: 4, profileUploadVersion: 1,
+      volumeMigrationVersion: 1, capacityProfiles: [getRuntimeCapacityProfile("capacity-128-v2")] } : {}) }));
+  const storage = { projectId: f.project.id, namespace: "test", generation: 37, state: "recovery-pending", dirty: true, active: false,
+    ...sourceScope, sourceBaseManifestId: baseline.manifestId };
+  f.projects.set(f.project.id, storage);
+  let phase = "absent";
+  const reviewID = record.review.reviewId;
+  f.handlers.set("inspect-source-deletion-withdrawal", binding => ({ ...binding, phase }));
+  f.handlers.set("restore-source-deletions", ({ files, ...binding }) => {
+    expect(files).toEqual([deleted]); expect(binding.originalOperationId).toBe(original.operationId);
+    phase = "restored";
+    if (lost === "restore-response") throw new Error("Lost restore response");
+    return { ...binding, phase };
+  });
+  f.handlers.set("confirm-source-deletion-withdrawal", async binding => {
+    const saved = await readSourceReview(f.workspacePath, f.project.id, "test", reviewID);
+    expect(saved.deletionWithdrawal).toEqual({ id: binding.withdrawalId, phase: "disposed" });
+    phase = "confirmed"; storage.dirty = false; storage.state = "resident";
+    if (lost === "confirm-response") throw new Error("Lost confirm response");
+    return { ...binding, phase };
+  });
+  const status = async () => f.execution.deletionWithdrawalStatus(f.project, await f.execution.inventoryProject(f.project));
+  const run = (execution = f.execution) => execution.withdrawSourceDeletion(f.project, "37", reviewID);
+  const inspection = { projectId: f.project.id, namespace: "test" as const, generation: 37, complete: true, blockers: 1,
+    excluded: 0, changes: [{ path: deleted.path, kind: "deleted" as const }] };
+  await expect(f.execution.deletionWithdrawalStatus(f.project, await f.execution.inventoryProject(f.project), inspection))
+    .resolves.toEqual({ deletionWithdrawalNeedsReview: true });
+  await sourceReview.saveSourceReview(record);
+  await expect(status()).resolves.toMatchObject({ deletionWithdrawal: { reviewId: reviewID, status: "available", paths: [deleted.path] } });
+  await expect(run()).rejects.toThrow(/Lost .* response/);
+  await expect(f.execution.assertSourceReviewSettled(f.project)).rejects.toThrow();
+  await expect(status()).resolves.toMatchObject({ deletionWithdrawal: { status: "pending" } });
+  const restarted = Reflect.construct(IsolatedProjectExecution, [path.dirname(path.dirname(f.workspacePath)), undefined, "test"]) as IsolatedProjectExecution;
+  executions.push(restarted);
+  await expect(run(restarted)).resolves.toMatchObject({ generation: "37", status: "withdrawn", paths: [deleted.path] });
+  await expect(run(restarted)).resolves.toMatchObject({ status: "withdrawn" });
+  await expect(restarted.assertSourceReviewSettled(f.project)).resolves.toBeUndefined();
+  await expect(status()).resolves.toMatchObject({ deletionWithdrawal: { reviewId: reviewID, status: "withdrawn" } });
+  expect(f.requests.filter(request => request.operation === "restore-source-deletions")).toHaveLength(1);
+  expect(f.requests.filter(request => request.operation === "confirm-source-deletion-withdrawal")).toHaveLength(1);
+  expect(f.requests.some(request => ["run", "acknowledge", "recover"].includes(request.operation))).toBe(false);
+  const hostAfter = await stat(path.join(f.workspacePath, deleted.path), { bigint: true });
+  expect([hostAfter.ino, hostAfter.mode, hostAfter.mtimeNs, hostAfter.ctimeNs]).toEqual([hostBefore.ino, hostBefore.mode, hostBefore.mtimeNs, hostBefore.ctimeNs]);
+  const nextRaw = manifest([deleted]);
+  const nextSnapshotId = reviewSnapshotDigest([deleted]);
+  const nextOriginal = { ...original, operationId: randomUUID().replaceAll("-", ""), snapshotId: nextSnapshotId, sourceResultManifestId: nextRaw.manifestId };
+  const nextReview = await sourceReview.buildRetainedSourceReview(f.workspacePath, "test", f.project.id, 37, {
+    reviewVersion: 2, rasterReturnVersion: 2, files: [deleted], baselineFiles: [deleted, keep], retainedRasters: [], originOperations: [nextOriginal],
+    snapshotId: nextSnapshotId, ...sourceScope, sourceBaselineManifest: baseline, sourceManifest: nextRaw,
+    sourceResultManifestId: nextRaw.manifestId, sourceDelta: planSourceDelta(baseline, nextRaw).summary,
+  }, new Map());
+  await sourceReview.saveSourceReview(nextReview);
+  storage.dirty = true; storage.state = "recovery-pending";
+  await expect(status()).resolves.toMatchObject({ deletionWithdrawal: { reviewId: nextReview.review.reviewId, status: "available", paths: [keep.path] } });
+  await expect(restarted.assertSourceReviewSettled(f.project)).rejects.toThrow();
 });
 
 it("source manifest v1 leaves a blocked working batch without a prepared identity or approval", async () => {

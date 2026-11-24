@@ -384,6 +384,128 @@ class SourcePublication(unittest.TestCase):
     def baseline(self):
         return storage.lifecycle.source_map(storage.source_tree(self.workspace))
 
+    def deletion_withdrawal_fixture(self, mixed=False, source=b'export const one = 1;'):
+        from test_lifecycle import FakeBackend
+
+        class ReviewBackend(FakeBackend):
+            snapshot = storage.Backend.snapshot
+            snapshot_rasters = storage.Backend.snapshot_rasters
+            review_snapshot = storage.Backend.review_snapshot
+            assert_deletion_destinations = staticmethod(storage.Backend.assert_deletion_destinations)
+            sync_deletion_destinations = staticmethod(storage.Backend.sync_deletion_destinations)
+            clean_source_withdrawal_stage = staticmethod(storage.Backend.clean_source_withdrawal_stage)
+            restore_deleted_source = staticmethod(storage.Backend.restore_deleted_source)
+
+        backend = ReviewBackend()
+        root = self.mount / 'volumes'
+        make = lambda: storage.lifecycle.Store(root, backend, volume_bytes=4096, total_bytes=65536, reserve_bytes=0)
+        deleted = [self.incoming('src/one.mjs', source),
+                   self.incoming('src/two.mjs', b'export const two = 2;', executable=True)]
+        files = [self.incoming('main.mjs', b'baseline')] + deleted
+        request = {'namespace': 'manual', 'projectId': '5e849fb8-9236-4f0e-a58a-76cb223b8a74', 'operationId': '1' * 32,
+                   'mode': 'shell', 'files': files, 'packages': [], 'rasterReturnVersion': 2,
+                   'sourceManifestVersion': 1, 'sourceManifest': storage.lifecycle.snapshot_source_manifest(files)}
+        binding = make().prepare(request)
+        make().claim({**binding, 'mode': 'shell'})
+        workspace = root / ('manual-' + request['projectId']) / 'root/workspace'
+        for item in deleted:
+            (workspace / item['path']).unlink()
+        if mixed:
+            (workspace / 'main.mjs').write_bytes(b'guest edit')
+        make().finish(binding, True)
+        capture_scope = {key: binding[key] for key in ('namespace', 'projectId', 'operationId', 'generation',
+                         'leaseToken', 'captureVersion', 'sourceManifestVersion', 'sourceBaseManifestId')}
+        raw = make().capture_media(capture_scope)
+        make().release(binding)
+        spec = {key: binding[key] for key in ('namespace', 'projectId', 'generation')}
+        spec.update(originalOperationId=binding['operationId'], withdrawalId='2' * 32, reviewId='c' * 64,
+                    rawSnapshotId=raw['snapshotId'], rawManifestId=raw['sourceResultManifestId'],
+                    baseManifestId=raw['sourceBaselineManifest']['manifestId'])
+        return make, backend, workspace, request, spec, deleted
+
+    def test_deletion_withdrawal_restores_complete_baseline_before_an_explicit_confirmation(self):
+        make, _, workspace, request, spec, deleted = self.deletion_withdrawal_fixture()
+        before = make().file.read_bytes()
+        self.assertEqual(make().inspect_source_deletion_withdrawal(spec), {**spec, 'phase': 'absent'})
+        self.assertEqual(make().file.read_bytes(), before)
+        with self.assertRaises(storage.lifecycle.LifecycleError):
+            make().confirm_source_deletion_withdrawal(spec)
+        self.assertEqual(make().restore_source_deletions({**spec, 'files': deleted}), {**spec, 'phase': 'restored'})
+        self.assertEqual(make().inspect_source_deletion_withdrawal(spec), {**spec, 'phase': 'restored'})
+        self.assertEqual((workspace / 'src/one.mjs').read_bytes(), b'export const one = 1;')
+        self.assertTrue((workspace / 'src/two.mjs').stat().st_mode & 0o111)
+        self.assertTrue(make().inventory('manual')['projects'][0]['dirty'])
+        with self.assertRaises(storage.lifecycle.LifecycleError):
+            make().prepare({**request, 'operationId': '3' * 32})
+        with self.assertRaises(storage.lifecycle.LifecycleError):
+            make().recover({'namespace': spec['namespace'], 'projectId': spec['projectId'],
+                            'generation': spec['generation'], 'operationId': '4' * 32})
+        self.assertEqual(make().restore_source_deletions({**spec, 'files': list(reversed(deleted))}), {**spec, 'phase': 'restored'})
+        self.assertEqual(make().confirm_source_deletion_withdrawal(spec), {**spec, 'phase': 'confirmed'})
+        saved = make().file.read_bytes()
+        self.assertEqual(make().confirm_source_deletion_withdrawal(spec), {**spec, 'phase': 'confirmed'})
+        self.assertEqual(make().file.read_bytes(), saved)
+        self.assertFalse(make().inventory('manual')['projects'][0]['dirty'])
+        self.assertTrue(make().prepare({**request, 'operationId': '3' * 32})['prepared'])
+        self.assertEqual(make().inspect_source_deletion_withdrawal(spec), {**spec, 'phase': 'confirmed'})
+
+    def test_deletion_withdrawal_retries_only_the_original_partial_restoration(self):
+        make, _, workspace, _, spec, deleted = self.deletion_withdrawal_fixture()
+        # A process exit directly after the publish leaves its private staging name linked.
+        with mock.patch.object(storage.Backend, 'clean_source_withdrawal_stage', side_effect=OSError('interrupted after link')):
+            with self.assertRaises(OSError):
+                make().restore_source_deletions({**spec, 'files': deleted})
+        self.assertEqual(make().inspect_source_deletion_withdrawal(spec), {**spec, 'phase': 'restoring'})
+        self.assertEqual((workspace / 'src/one.mjs').stat().st_nlink, 2)
+        self.assertFalse((workspace / 'src/two.mjs').exists())
+        for other in ({**spec, 'withdrawalId': '4' * 32, 'files': deleted}, {**spec, 'files': deleted[1:]},
+                      {**spec, 'projectId': '3a32c5b5-d908-426c-a27e-5e510297b570', 'files': deleted}):
+            with self.assertRaises(storage.lifecycle.LifecycleError):
+                make().restore_source_deletions(other)
+        self.assertEqual(make().restore_source_deletions({**spec, 'files': deleted}), {**spec, 'phase': 'restored'})
+        self.assertEqual((workspace / 'src/one.mjs').stat().st_nlink, 1)
+        self.assertEqual(make().confirm_source_deletion_withdrawal(spec), {**spec, 'phase': 'confirmed'})
+
+    def test_deletion_withdrawal_refuses_a_mixed_delta_without_writing(self):
+        make, _, workspace, _, spec, deleted = self.deletion_withdrawal_fixture(mixed=True)
+        before = make().file.read_bytes()
+        with self.assertRaises(storage.lifecycle.LifecycleError):
+            make().restore_source_deletions({**spec, 'files': deleted})
+        self.assertEqual(make().inspect_source_deletion_withdrawal(spec), {**spec, 'phase': 'absent'})
+        self.assertEqual(make().file.read_bytes(), before)
+        self.assertEqual((workspace / 'main.mjs').read_bytes(), b'guest edit')
+        self.assertFalse((workspace / 'src/one.mjs').exists())
+
+    def test_deletion_withdrawal_refuses_binary_even_when_registered_as_source(self):
+        make, _, workspace, _, spec, deleted = self.deletion_withdrawal_fixture(source=b'\xff\x00')
+        with self.assertRaisesRegex(ValueError, 'requires UTF-8 source text'):
+            make().restore_source_deletions({**spec, 'files': deleted})
+        self.assertEqual(make().inspect_source_deletion_withdrawal(spec), {**spec, 'phase': 'absent'})
+        self.assertFalse((workspace / 'src/one.mjs').exists())
+
+    def test_deletion_withdrawal_leaves_a_destination_or_late_edit_untouched(self):
+        make, backend, workspace, _, spec, deleted = self.deletion_withdrawal_fixture()
+        target = workspace / 'src/one.mjs'
+        target.mkdir()
+        before = make().file.read_bytes()
+        with self.assertRaises(storage.lifecycle.LifecycleError):
+            make().restore_source_deletions({**spec, 'files': deleted})
+        self.assertEqual(make().file.read_bytes(), before)
+        self.assertTrue(target.is_dir())
+        target.rmdir()
+        backend.busy.add(storage.lifecycle.project_key(spec['namespace'], spec['projectId']))
+        with self.assertRaisesRegex(ValueError, 'Fixture task is still active'):
+            make().restore_source_deletions({**spec, 'files': deleted})
+        self.assertEqual(make().file.read_bytes(), before)
+        backend.busy.clear()
+        make().restore_source_deletions({**spec, 'files': deleted})
+        target.write_text('changed in guest')
+        with self.assertRaises(storage.lifecycle.LifecycleError):
+            make().confirm_source_deletion_withdrawal(spec)
+        self.assertEqual(target.read_text(), 'changed in guest')
+        self.assertTrue(make().inventory('manual')['projects'][0]['dirty'])
+        self.assertEqual(make().inspect_source_deletion_withdrawal(spec), {**spec, 'phase': 'restored'})
+
     def test_registered_mount_identity_refuses_nonloop_sources_and_foreign_images(self):
         folder = self.mount / 'volume'; folder.mkdir()
         (folder / 'root').mkdir()
@@ -1622,9 +1744,9 @@ class RuntimeProfileContracts(unittest.TestCase):
         plan, approval = self.native_authorize(profile_id)
         result = self.store().migrate_capacity({**self.scope, 'planId': plan['planId'], 'authorizationId': approval['authorizationId']})
         return plan, approval, result
-    def begin(self, files, op='1', profile_id=storage.PROFILE_ID):
+    def begin(self, files, op='1', profile_id=storage.PROFILE_ID, mode='build'):
         manifest = storage.lifecycle.snapshot_source_manifest(files, profile_id)
-        request = {**self.scope, 'operationId': op * 32, 'mode': 'build', 'files': files, 'packages': [], 'rasterReturnVersion': 2,
+        request = {**self.scope, 'operationId': op * 32, 'mode': mode, 'files': files, 'packages': [], 'rasterReturnVersion': 2,
             'sourceManifestVersion': 2, 'sourceProfileId': profile_id, 'sourceManifest': manifest}
         return self.store().prepare_begin(request)
     def window_binding(self, prepared):
@@ -2055,6 +2177,30 @@ class RuntimeProfileContracts(unittest.TestCase):
         with image.open('xb') as stream:stream.truncate(storage.RUNTIME_PROFILE['volumeBytes'])
         image.chmod(0o600);previous.unlink()
         with self.assertRaises(ValueError):self.store().inspect_capacity_plan(inspect)
+    def test_profile_source_deletion_withdrawal_uses_the_original_manifest_contract(self):
+        self.native_create()
+        code = b'export const kept = 1;'
+        deleted = {'path': 'main.mjs', 'data': base64.b64encode(code).decode(),
+                   'sha256': hashlib.sha256(code).hexdigest(), 'executable': False}
+        binding = self.window_binding(self.begin([deleted], mode='shell'))
+        self.store().prepare_commit({**binding, 'uploadVersion': 1})
+        self.store().claim({**binding, 'mode': 'shell'})
+        key = storage.lifecycle.project_key('test', self.project)
+        record = self.store()._read()['records'][key]
+        workspace = self.store()._workspace(key, record)
+        (workspace / deleted['path']).unlink()
+        self.assertTrue(self.store().finish(binding, True)['dirty'])
+        captured = self.store().capture_media({k: v for k, v in binding.items() if k != 'rasterReturnVersion'})
+        self.store().release(binding)
+        spec = {**self.scope, 'generation': binding['generation'], 'originalOperationId': binding['operationId'],
+                'withdrawalId': '2' * 32, 'reviewId': 'c' * 64, 'rawSnapshotId': captured['snapshotId'],
+                'rawManifestId': captured['sourceResultManifestId'], 'baseManifestId': binding['sourceBaseManifestId']}
+        self.assertEqual(self.store().restore_source_deletions({**spec, 'files': [deleted]})['phase'], 'restored')
+        self.assertEqual((workspace / deleted['path']).read_bytes(), code)
+        self.assertTrue(self.store().inventory('test')['projects'][0]['dirty'])
+        self.assertEqual(self.store().confirm_source_deletion_withdrawal(spec)['phase'], 'confirmed')
+        self.assertFalse(self.store().inventory('test')['projects'][0]['dirty'])
+
     def test_profile_retained_review_ack_and_clean_ack_loss_use_exact_recovery_origin(self):
         self.native_create(); prepared=self.begin([{'path':'main.js','data':base64.b64encode(b'x').decode(),'sha256':hashlib.sha256(b'x').hexdigest(),'executable':False}])
         binding=self.window_binding(prepared);self.store().prepare_commit({**binding,'uploadVersion':1});self.store().claim({**binding,'mode':'build'})

@@ -288,7 +288,7 @@ interface Turn {
   streams: StreamMessage[];
   frameKeys: Map<string, string[]>;
   text: Map<string, string>;
-  calls: Map<string, { input: string; result: Promise<unknown> }>;
+  calls: Map<string, { name: string; input: string; result: ReturnType<DriverContext["bridge"]["call"]> }>;
   steering: Map<string, { commandId: string; signature: string; admission?: Promise<void> }>;
   assistantError?: string;
 }
@@ -534,7 +534,14 @@ export class QoderDriver implements NativeDriver {
       }
       const signature = JSON.stringify([name, args]);
       let call = turn.calls.get(callId);
+      const replay = !!call && name === "game_use";
       if (call && call.input !== signature) {
+        this.#connection?.respond(message.id, name === "game_use" || call.name === "game_use" ? {
+          isError: true, content: [{ type: "text", text: "CALL_ID_CONFLICT: The Qoder tool call ID was reused with different arguments" }],
+        } : failure);
+        return;
+      }
+      if (params.replay === true && !replay) {
         this.#connection?.respond(message.id, failure);
         return;
       }
@@ -551,17 +558,15 @@ export class QoderDriver implements NativeDriver {
           if (this.#turn === turn && !turn.controller.signal.aborted)
             turn.sink.toolResult(callId, outcome.result, outcome.isError);
           else turn.sink.toolSettled?.(callId, outcome.result, outcome.isError);
-          return {
-            content: outcome.result.content,
-            isError: outcome.isError || turn.controller.signal.aborted,
-          };
+          return outcome;
         })();
-        call = { input: signature, result };
+        call = { name, input: signature, result };
         turn.calls.set(callId, call);
       }
-      const result = await call.result;
+      const original = await call.result;
+      const outcome = replay ? await this.context.bridge.replayPlaytest(args, callId, original, turn.controller.signal) : original;
       if (this.#turn === turn && !turn.controller.signal.aborted)
-        this.#connection?.respond(message.id, result);
+        this.#connection?.respond(message.id, { content: outcome.result.content, isError: outcome.isError });
       return;
     }
     if (message.method === "sdk/error") {

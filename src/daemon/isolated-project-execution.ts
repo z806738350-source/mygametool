@@ -44,7 +44,7 @@ import type {
   ExecutionStorageOverview,
   ExecutionStorageSnapshot,
 } from "../shared/execution-storage.js";
-import type { IsolatedSourceReview, RetainedImageVariant } from "../shared/execution-storage.js";
+import type { IsolatedSourceReview, RetainedImageVariant, SourceDeletionWithdrawal } from "../shared/execution-storage.js";
 import {
   approvedSourceReview,
   assertNoUnapprovedSourceReview,
@@ -62,6 +62,8 @@ import {
   retainReviewRaster,
   preparedRasterArtifactPath,
   saveSourceReview,
+  sourceDeletionReview,
+  sourceReviews,
   supersedeUnapprovedSourceReviews,
   type ReviewSnapshot,
   type RetainedReviewSnapshot,
@@ -123,6 +125,7 @@ import {
   isolatedInputBudgetError,
   isIsolatedInputBudgetError,
   reportIsolatedOperation,
+  type IsolatedRepairTarget,
 } from "./isolated-tool-receipts.js";
 import {
   containsKnownSensitiveValue,
@@ -560,6 +563,7 @@ export class IsolatedProjectExecution {
   #runtimeMedia = false;
   #buildMedia = false;
   #sourceInspection = false;
+  #sourceDeletionWithdrawal = false;
   #rasterReturns = false;
   #retainedReview = false;
   #captureMedia = false;
@@ -866,6 +870,7 @@ export class IsolatedProjectExecution {
       runtimeMediaVersion?: unknown;
       buildMediaVersion?: unknown;
       sourceInspectionVersion?: unknown;
+      sourceDeletionWithdrawalVersion?: unknown;
       rasterReturnVersion?: unknown;
       retainedReviewVersion?: unknown;
       captureVersion?: unknown;
@@ -891,6 +896,7 @@ export class IsolatedProjectExecution {
     this.#runtimeMedia = value.runtimeMediaVersion === 1;
     this.#buildMedia = value.buildMediaVersion === 1;
     this.#sourceInspection = value.sourceInspectionVersion === 1;
+    this.#sourceDeletionWithdrawal = value.sourceDeletionWithdrawalVersion === 1;
     this.#rasterReturns = value.rasterReturnVersion === 1;
     this.#captureMedia =
       value.captureVersion === 2 &&
@@ -1997,6 +2003,116 @@ export class IsolatedProjectExecution {
         reviewId,
       ),
     );
+  }
+
+  async deletionWithdrawalStatus(project: ProjectState, storage: IsolatedProjectStorage | undefined, inspection?: IsolatedSourceInspection): Promise<{
+    deletionWithdrawal?: SourceDeletionWithdrawal;
+    deletionWithdrawalReason?: string;
+    deletionWithdrawalNeedsReview?: boolean;
+  }> {
+    if (!storage || project.workspaceLocation === "external") return {};
+    const workspace = await this.#workspaceRoot(project);
+    const reviews = await sourceReviews(workspace, project.id, this.namespace);
+    const current = reviews.filter(record => Number(record.review.generation) === storage.generation);
+    const pending = reviews.find(record => record.deletionWithdrawal && record.deletionWithdrawal.phase !== "withdrawn");
+    const deletions = inspection?.complete && inspection.changes.length > 0 && inspection.changes.every(change => change.kind === "deleted")
+      ? new Set(inspection.changes.map(change => change.path)) : undefined;
+    const record = pending ?? current
+      .filter(record => {
+        if (!storage.dirty) return record.deletionWithdrawal?.phase === "withdrawn";
+        const selection = sourceDeletionReview(record);
+        return !record.deletionWithdrawal && selection && selection.source.baseManifestId === storage.sourceBaseManifestId &&
+          (!inspection || deletions?.size === selection.deleted.length && selection.deleted.every(file => deletions.has(file.path)));
+      })
+      .sort((a, b) => b.review.expiresAt.localeCompare(a.review.expiresAt))[0];
+    const selection = record && sourceDeletionReview(record);
+    if (!record || !selection) {
+      if (pending) return { deletionWithdrawalReason: "The saved deletion withdrawal needs review; its original source evidence is unavailable." };
+      if (!storage.dirty || !deletions) return {};
+      if (!this.#sourceDeletionWithdrawal) return { deletionWithdrawalReason: "This isolated component needs its reviewed deletion withdrawal update before this batch can be withdrawn." };
+      if (!storage.sourceManifestVersion) return { deletionWithdrawalReason: "This retained deletion has no verified shared source manifest. Keep both copies for review." };
+      return { deletionWithdrawalNeedsReview: true };
+    }
+    if (!this.#sourceDeletionWithdrawal && record.deletionWithdrawal?.phase !== "withdrawn")
+      return { deletionWithdrawalReason: "This isolated component needs its reviewed deletion withdrawal update before this batch can be withdrawn." };
+    return { deletionWithdrawal: {
+      reviewId: record.review.reviewId, generation: record.review.generation,
+      paths: selection.deleted.map(file => file.path),
+      status: record.deletionWithdrawal?.phase === "withdrawn" ? "withdrawn" : record.deletionWithdrawal ? "pending" : "available",
+    } };
+  }
+
+  async sourceDeletionDisposition(project: ProjectState, target: IsolatedRepairTarget): Promise<{ reviewId: string; withdrawalId: string } | undefined> {
+    if (target.projectId !== project.id || target.namespace !== this.namespace || target.mode !== "shell") return undefined;
+    const workspace = await this.#workspaceRoot(project);
+    for (const record of await sourceReviews(workspace, project.id, this.namespace)) {
+      if (record.deletionWithdrawal?.phase !== "withdrawn" || Number(record.review.generation) !== target.generation) continue;
+      const source = sourceDeletionReview(record);
+      if (source?.original.operationId === target.operationId && source.original.snapshotId === target.rawSnapshotId)
+        return { reviewId: record.review.reviewId, withdrawalId: record.deletionWithdrawal.id };
+    }
+  }
+
+  /** A user-confirmed source disposition. The project write guard is held by the caller. */
+  async withdrawSourceDeletion(project: ProjectState, generation: string, reviewId: string): Promise<SourceDeletionWithdrawal> {
+    const workspace = await this.#workspaceRoot(project);
+    const records = await sourceReviews(workspace, project.id, this.namespace);
+    const record = records.find(candidate => candidate.review.reviewId === reviewId);
+    const selection = record && sourceDeletionReview(record);
+    if (!record || !selection || record.review.generation !== generation)
+      throw new Error("This review does not prove that the retained source batch contains only ordinary file deletions.");
+    const result = { reviewId, generation, paths: selection.deleted.map(file => file.path), status: "withdrawn" as const };
+    if (record.deletionWithdrawal?.phase === "withdrawn") return result;
+    if (records.some(other => other !== record && other.deletionWithdrawal && other.deletionWithdrawal.phase !== "withdrawn"))
+      throw new Error("Finish the existing deletion withdrawal before starting another one.");
+    await assertSourcePublicationSettled(workspace);
+    const entry = await this.inventoryProject(project);
+    if (!this.#sourceDeletionWithdrawal) throw new Error("The isolated component does not support deletion withdrawal.");
+    if (!entry || entry.active || entry.operation || entry.state === "busy" || entry.state === "deleting" ||
+      (!record.deletionWithdrawal && (!entry.dirty || entry.generation !== Number(generation) || entry.sourceBaseManifestId !== selection.source.baseManifestId)))
+      throw new Error("The retained execution copy has changed or is busy; refresh its state before withdrawing a deletion.");
+    await assertReviewedHost(workspace, record, "before");
+    if (!record.deletionWithdrawal) {
+      record.deletionWithdrawal = { id: randomUUID().replaceAll("-", ""), phase: "restoring" };
+      await saveSourceReview(record);
+    }
+    const journal = record.deletionWithdrawal;
+    const binding = {
+      namespace: this.namespace, projectId: project.id, generation: Number(generation), reviewId,
+      originalOperationId: selection.original.operationId, withdrawalId: journal.id,
+      rawSnapshotId: selection.original.snapshotId, rawManifestId: selection.source.rawManifestId, baseManifestId: selection.source.baseManifestId,
+    };
+    const command = async (operation: string, allowed: readonly string[], files?: TransferFile[]) => {
+      const value = await this.#control(operation, [], files ? { ...binding, files } : binding) as Record<string, unknown>;
+      if (!value || Object.entries(binding).some(([key, expected]) => value[key] !== expected) || !allowed.includes(String(value.phase)))
+        throw new Error("The isolated deletion withdrawal receipt could not be verified. Check the same withdrawal before continuing.");
+      return String(value.phase);
+    };
+    let phase = await command("inspect-source-deletion-withdrawal", ["absent", "restoring", "restored", "confirmed"]);
+    if (journal.phase === "restoring") {
+      if (phase === "confirmed") throw new Error("The isolated copy reported a completed withdrawal before the host disposition was saved.");
+      if (phase !== "restored") {
+        const files: TransferFile[] = [];
+        for (const entry of selection.deleted) {
+          const bytes = await readSafeProjectFile(workspace, path.join(workspace, entry.path), entry.size!);
+          if (bytes.length !== entry.size || createHash("sha256").update(bytes).digest("hex") !== entry.sha256)
+            throw new Error("A local source file changed before its isolated copy could be restored.");
+          files.push({ path: entry.path, sha256: entry.sha256, data: bytes.toString("base64"), executable: !!entry.executable });
+        }
+        phase = await command("restore-source-deletions", ["restored"], files);
+      }
+      await assertReviewedHost(workspace, record, "before");
+      journal.phase = "disposed";
+      await saveSourceReview(record);
+    }
+    if (phase !== "confirmed") {
+      if (phase !== "restored") throw new Error("The isolated copy has no matching restoration receipt. The original protection remains in effect.");
+      await command("confirm-source-deletion-withdrawal", ["confirmed"]);
+    }
+    await assertReviewedHost(workspace, record, "before");
+    journal.phase = "withdrawn";
+    await saveSourceReview(record);
+    return result;
   }
 
   async readRetainedImage(

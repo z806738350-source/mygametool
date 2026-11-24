@@ -488,9 +488,10 @@ def launch(identifier):
 
 def main():
     operation = sys.argv[1]
-    if operation not in ('run', 'guardian', 'proxy', 'relay', 'probe', 'health', 'overview', 'inspect-source', 'review-source', 'review-source-media', 'prepare', 'prepare-media', 'prepare-begin', 'prepare-append', 'prepare-commit', 'plan-capacity', 'inspect-capacity-plan', 'register-capacity-authorization', 'migrate-capacity', 'export', 'export-media', 'capture', 'capture-media', 'acknowledge', 'release', 'recover', 'retire', 'inventory', 'cancel'):
+    if operation not in ('run', 'guardian', 'proxy', 'relay', 'probe', 'health', 'overview', 'inspect-source', 'review-source', 'review-source-media', 'prepare', 'prepare-media', 'prepare-begin', 'prepare-append', 'prepare-commit', 'plan-capacity', 'inspect-capacity-plan', 'register-capacity-authorization', 'migrate-capacity', 'export', 'export-media', 'capture', 'capture-media', 'acknowledge', 'release', 'recover', 'retire', 'inventory', 'cancel',
+                         'restore-source-deletions', 'inspect-source-deletion-withdrawal', 'confirm-source-deletion-withdrawal'):
         raise SystemExit('Unsupported isolated control operation')
-    if operation not in ('health', 'inventory', 'overview', 'inspect-source', 'review-source', 'review-source-media'):
+    if operation not in ('health', 'inventory', 'overview', 'inspect-source', 'review-source', 'review-source-media', 'inspect-source-deletion-withdrawal'):
         state_ready()
     if operation in ('run', 'guardian', 'prepare', 'prepare-media', 'prepare-begin'):
         ensure_npm_config()
@@ -519,6 +520,15 @@ def main():
         spec = request()
         with storage.read_locked():
             print(json.dumps(storage.inspect_source(spec)))
+    elif operation == 'inspect-source-deletion-withdrawal':
+        spec = request()
+        # The volatile lock may be absent after VM reboot. Only the lock is initialized.
+        with storage.review_locked(initialize=True):
+            print(json.dumps(storage.inspect_source_deletion_withdrawal(spec)))
+    elif operation in ('restore-source-deletions', 'confirm-source-deletion-withdrawal'):
+        spec = request(storage.MAX_REQUEST if operation == 'restore-source-deletions' else MAX_LINE)
+        with storage.locked():
+            print(json.dumps(getattr(storage, operation.replace('-', '_'))(spec)))
     elif operation == 'review-source':
         spec = request()
         with storage.review_locked():

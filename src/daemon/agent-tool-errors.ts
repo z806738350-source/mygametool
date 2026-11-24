@@ -17,6 +17,7 @@ const dispositions = {
   authorization_denied: "blocked",
   approval_required: "blocked",
   source_review_required: "blocked",
+  invalid_recovery_input: "correctable",
 } as const;
 
 export type ToolPreflightReason = keyof typeof dispositions;

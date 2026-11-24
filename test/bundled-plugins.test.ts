@@ -98,7 +98,7 @@ describe("bundled plugins", () => {
     const store = new BundledPluginStore(path.resolve("plugins"));
     await store.load();
     expect(store.list().filter(plugin => plugin.beta).map(plugin => plugin.name)).toEqual([
-      "aseprite", "blender", "cocos-creator", "douyin-minigame", "godot",
+      "aseprite", "blender", "cocos-creator", "douyin-minigame", "godot", "ink-studio",
       "taptap-maker", "tiled", "unity", "unreal-engine", "wechat-minigame",
     ]);
     for (const plugin of store.list().filter(plugin => plugin.beta)) {
@@ -111,6 +111,12 @@ describe("bundled plugins", () => {
     expect(store.read("ohmygame:blender")).toMatchObject({
       enabled: true,
       skills: [{ id: "skills/blender-assets/SKILL.md", description: expect.stringContaining("final user review") }],
+      mcpServers: [],
+    });
+    expect(store.read("ohmygame:ink-studio")).toMatchObject({
+      enabled: false,
+      projectTypes: ["web-game"],
+      skills: [{ id: "skills/ink-studio/SKILL.md" }],
       mcpServers: [],
     });
     expect(store.read("ohmygame:godot")).toMatchObject({

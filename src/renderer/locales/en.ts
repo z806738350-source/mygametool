@@ -688,6 +688,11 @@ const en = {
       confirm: "Recover the preserved source changes into “{{name}}”? Conflicting host edits will be refused. This does not make a model request.",
       success: "Recovery completed. Changed source files: {{count}}.",
       recoveryPath: "Recoverable originals: {{path}}",
+      withdraw: "Withdraw deletion, keep local files",
+      withdrawResume: "Check or finish withdrawal",
+      withdrawNeedsReview: "Open the execution store to review these deletions before withdrawing them.",
+      withdrawConfirm: "Keep the local files in “{{name}}” and restore {{count}} missing files to its execution copy? The original deletion will not run again.\n\n{{paths}}",
+      withdrawn: "Deletion withdrawn. The local files were kept.",
       invalid: "Execution storage returned an unknown state. Refresh to check it before continuing.",
       changed: "The execution copy changed. Refresh its state before recovering.",
       uncertain: "The previous recovery result is not confirmed. Refresh to check its state; recovery will not be resent while that result is unknown.",
@@ -1048,6 +1053,8 @@ const en = {
   },
   projectSettings: {
     title: "Project settings",
+    inkStudio: "Ink Studio",
+    inkStudioSaved: "Ink Studio setting saved",
     argumentsInvalid: "Arguments must be a JSON array of strings.",
     project: "Project",
     previewAccess: "Preview access",
@@ -2282,6 +2289,11 @@ const en = {
     },
   },
   plugins: {
+    inkStudio: {
+      description: "Prototype playable pixel-art web games with Ink Studio.",
+      about: "Describe a game mechanic. The Agent builds an editable browser game with procedural pixel-art scenes and checks the controls in OhMyGame's playtest.",
+      example: "Use Ink Studio to build an original 30-second dodging game in one arena. Give the player a clear warning before each expanding wave, movement with WASD or the arrow keys, a win for surviving, and a restart button. Playtest it before handing it over.",
+    },
     blender: {
       description: "Build game models in the background with Blender and review them on the Canvas.",
       about: "The Agent runs local Blender headlessly to refine a model or build a prop to size. For a new character, Tripo can generate the starting mesh after you approve the turnaround views. The Agent saves an editable .blend file and checks the exported GLB. On the Canvas, rotate the model, play any animations and approve it or request changes.",

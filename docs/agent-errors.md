@@ -253,6 +253,21 @@ reasons or native terminal events remain interrupted streams even when the
 transport returned HTTP 200. The records cannot identify a gateway's internal
 connection failure without its operator's logs.
 
+### Playtest calls across Qoder continuation
+
+The controlled Qoder adapter retains its original `toolUseID`. Replaying that
+call can show a historical receipt and a host-verified window status. It does
+not open another window or send the same input again. A distinct `open`, sent
+after a confirmed `close`, resolves the current preview and creates a new
+session even if every argument matches the earlier `open`. A new `inspect` or
+`capture` reads the current session. The liveness check itself reads host window
+metadata without running the page's snapshot script or extending the idle timer.
+
+An input rejected before dispatch can report that no input was sent. If input
+was dispatched and its result is uncertain, inspect the current session before
+issuing new input. The existing protections against unconfirmed source and paid
+operations still apply.
+
 ## Pi compatibility patch
 
 The pinned `@earendil-works/pi-ai@1.2.0` loses nested connection causes when it

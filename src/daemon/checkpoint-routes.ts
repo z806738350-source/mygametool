@@ -101,6 +101,9 @@ export function registerCheckpointRoutes(
           );
         return;
       }
+      // The Ink setting and runtime publication acquire the same exclusive project lock.
+      // Enrolling this settings request in the drain set would make it wait for itself.
+      if (request.method === "PUT" && request.routeOptions.url === "/projects/:projectId/settings/ink-studio") return;
       // Wait before entering the drain set: a closing turn's snapshot needs
       // this set empty, while publish/build need that snapshot to finish.
       if (/\/(?:publish|interactive-story\/build)(?:\?|$)/.test(request.url))

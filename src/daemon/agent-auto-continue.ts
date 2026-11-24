@@ -22,6 +22,7 @@ import {
 import { getIsolatedOperationReceipts, inheritIsolatedOperationReceipts, isolatedCommandsNotSubmitted, isolatedInputBudgetError,
   isIsolatedInputBudgetError, retainedIsolatedOperationEvidence, withIsolatedOperationScope, type IsolatedOperationReceipt } from "./isolated-tool-receipts.js";
 import { getIsolatedRepairResolutions, inheritIsolatedRepairProof, inheritIsolatedRepairResolutions, createIsolatedRepairPending, inheritIsolatedRepairPending, getIsolatedRepairPending, retainedIsolatedRepairPending, retainedIsolatedRepairResolutions, parseIsolatedOperationReceipts, type IsolatedRepairPending, type IsolatedRepairProof, type IsolatedRepairResolution, type IsolatedRepairTarget } from "./isolated-tool-receipts.js";
+import { currentPlaytestStatus, replayPlaytestReceipt } from "./playtest-tools.js";
 
 export interface AgentInterruption {
   kind:
@@ -78,6 +79,7 @@ export type AutoContinueToolResult = Awaited<
   ReturnType<ToolDefinition["execute"]>
 >;
 type Result = AutoContinueToolResult;
+const SOURCE_WITHDRAWAL_DISPOSITION = "ohmygame-source-deletion-withdrawn";
 export interface AutoContinueAttemptSummary {
   taskId: string;
   userEntryId?: string;
@@ -104,6 +106,7 @@ type Attempt = {
   isolatedOperations?: readonly IsolatedOperationReceipt[];
   commandNotSubmitted?: boolean;
   effectsRecovered?: readonly IsolatedRepairResolution[];
+  deletionDisposition?: { reviewId: string; withdrawalId: string };
   repairResolutions?: readonly IsolatedRepairResolution[];
   repairMapped?: boolean;
   pendingVerification?: Readonly<IsolatedRepairPending>;
@@ -141,6 +144,7 @@ export interface AutoContinueToolOptions {
 }
 export type RecoverableTool = ToolDefinition & {
   recoverAfterHttp500?: (...call: Call) => Promise<Result>;
+  sourceDeletionDisposition?: (target: IsolatedRepairTarget) => Promise<{ reviewId: string; withdrawalId: string } | undefined>;
   /** A new call with identical arguments may depend on a newly saved input file. */
   canReuseResult?: (previous: Result, ...call: Call) => boolean;
 };
@@ -210,7 +214,7 @@ export class AutoContinueTools {
     if (this.#unrecorded.size || task.blocked && task.blockedKind !== "unknown") return false;
     if ([...task.attempts.values()].some(attempt => attempt.preflightFailure?.disposition === "blocked")) return false;
     try { this.#assertBranch(task); } catch { return false; }
-    const unknown = [...task.attempts.values()].filter(attempt => !attempt.observation && !attempt.result && !attempt.confirmedFailure && !attempt.preflightFailure && !attempt.commandNotSubmitted && !attempt.effectsRecovered?.length);
+    const unknown = [...task.attempts.values()].filter(attempt => !attempt.observation && !attempt.result && !attempt.confirmedFailure && !attempt.preflightFailure && !attempt.commandNotSubmitted && !attempt.effectsRecovered?.length && !attempt.deletionDisposition);
     return unknown.length > 0 && unknown.every(attempt => this.#targets(task, attempt).length > 0 || this.#pendingTargets(task, attempt).length > 0);
   }
 
@@ -224,7 +228,7 @@ export class AutoContinueTools {
   }
 
   #targets(task: Task, attempt: Attempt): IsolatedRepairTarget[] {
-    if (!task.userId || !attempt.repairMapped || !attempt.settled || attempt.result || attempt.preflightFailure || attempt.commandNotSubmitted || attempt.effectsRecovered?.length || !attempt.isolatedOperations?.length) return [];
+    if (!task.userId || !attempt.repairMapped || !attempt.settled || attempt.result || attempt.preflightFailure || attempt.commandNotSubmitted || attempt.effectsRecovered?.length || attempt.deletionDisposition || !attempt.isolatedOperations?.length) return [];
     const groups = new Map<string, IsolatedOperationReceipt[]>();
     for (const receipt of attempt.isolatedOperations) groups.set(receipt.operationId, [...groups.get(receipt.operationId) ?? [], receipt]);
     const targets: IsolatedRepairTarget[] = [];
@@ -263,7 +267,7 @@ export class AutoContinueTools {
         settled.push(...entries);
       }
       if (settled.length) {
-        task.repairOnly = [...task.attempts.values()].some(attempt => attempt !== repair && !attempt.observation && !attempt.result && !attempt.confirmedFailure && !attempt.preflightFailure && !attempt.commandNotSubmitted && !attempt.effectsRecovered?.length);
+        task.repairOnly = [...task.attempts.values()].some(attempt => attempt !== repair && !attempt.observation && !attempt.result && !attempt.confirmedFailure && !attempt.preflightFailure && !attempt.commandNotSubmitted && !attempt.effectsRecovered?.length && !attempt.deletionDisposition);
         task.verifyOnly = [...task.attempts.values()].some(attempt => this.#pendingTargets(task, attempt).length > 0);
         if (!task.repairOnly && task.blockedKind === "unknown") { task.blocked = undefined; task.blockedKind = undefined; }
         task.needsRead = true;
@@ -510,6 +514,26 @@ export class AutoContinueTools {
         attempt.unconfirmed = true;
       task.attempts.set(item.callId, attempt);
     }
+    if (task.userId && !ambiguous && this.tools.some(tool => tool.name === "game_use")) {
+      const observations = new Map<string, string>();
+      const currentBranch = branch.slice(branch.findIndex(entry => entry.id === task.userId) + 1);
+      for (const entry of currentBranch) {
+        if (entry.type !== "message") continue;
+        const message = entry.message;
+        if (message.role === "assistant") {
+          for (const part of message.content) {
+            if (part.type !== "toolCall" || part.name !== "game_use" || !validId(part.id) || observations.has(part.id)) continue;
+            if (part.arguments.operation === "inspect" || part.arguments.operation === "capture") observations.set(part.id, "game_use:" + identity(part.arguments));
+          }
+        } else if (message.role === "toolResult" && message.toolName === "game_use" && observations.has(message.toolCallId)) {
+          task.observations ??= new Map();
+          const id = message.toolCallId;
+          if (!task.observations.has(id)) task.observations.set(id, { key: observations.get(id)!, pending: Promise.resolve({
+            content: message.content, details: message.details, ...(message.isError ? { isError: true } : {}),
+          }) });
+        }
+      }
+    }
     let publication: { id: string; index: number } | undefined;
     for (const attempt of task.attempts.values()) {
       attempt.pendingVerification = retainedIsolatedRepairPending(branch, task.id, attempt.call[0], attempt.tool);
@@ -554,25 +578,41 @@ export class AutoContinueTools {
         await this.#assertCurrent(task, call[2]);
         if (!validId(call[0])) throw new Error("Invalid original tool call ID");
         const input = call[1] as Record<string, unknown>;
+        const playtest = tool.name === "game_use";
+        const playtestObservation = playtest && (input.operation === "inspect" || input.operation === "capture");
         const repairAction = tool.name === "recover_isolated_changes" && REPAIR_ACTIONS.has(String(input.action));
         const inspection = tool.name === "recover_isolated_changes" && OBSERVATION_ACTIONS.has(String(input.action));
         const verification = tool.name === "recover_isolated_changes" && input.action === "verify";
         const observed = task.observations?.get(call[0]);
-        if (observed && observed.key !== tool.name + ":" + identity(input)) throw new Error("A tool call ID was reused with different arguments");
+        const sameId = task.attempts.get(call[0]);
+        const key = tool.name + ":" + identity(input);
+        if ((observed && observed.key !== key) || (sameId && (playtest || sameId.tool === "game_use") && sameId.key !== key)) {
+          const conflict = playtest || sameId?.tool === "game_use" || observed?.key.startsWith("game_use:");
+          throw new Error(`${conflict ? "CALL_ID_CONFLICT: " : ""}A tool call ID was reused with different arguments`);
+        }
         if (task.verifyOnly && !REPAIR_READS.has(tool.name) && !inspection && !verification && !task.attempts.has(call[0]))
           throw new Error("Only controlled reads, inspect, capacity, read_image and verify are allowed while the original recovery publication awaits verification");
         if (task.repairOnly && !REPAIR_READS.has(tool.name) && !repairAction && !task.attempts.has(call[0]))
           throw new Error("Only controlled reads and retained-change repair actions are allowed until the original isolated effects are settled");
         if (
           READ_ONLY.has(tool.name) || inspection ||
-          (tool.name === "game_use" &&
-            ["inspect", "capture"].includes(String(input.operation)))
+          playtestObservation
         ) {
           const readEpoch = task.publicationEpoch;
           let result: Result;
           try {
-            if (inspection) {
-              const key = tool.name + ":" + identity(input);
+            if (playtestObservation) {
+              if (observed) {
+                const previous = await observed.pending;
+                result = await replayPlaytestReceipt(tool, call[0], input, previous, (previous as Result & { isError?: boolean }).isError === true, call[2]);
+              }
+              else {
+                task.observations ??= new Map();
+                const pending = tool.execute(...call);
+                task.observations.set(call[0], { key, pending });
+                result = await pending;
+              }
+            } else if (inspection) {
               task.observations ??= new Map();
               const previous = task.observations.get(call[0]);
               const attempted = task.attempts.get(call[0]);
@@ -595,26 +635,25 @@ export class AutoContinueTools {
           if (readEpoch === task.publicationEpoch && ["read", "read_project_file"].includes(tool.name) && typeof input.path === "string" && !input.path.startsWith("attachment:") && !(result as Result & { isError?: boolean }).isError) task.needsRead = false;
           return result;
         }
-        const key = tool.name + ":" + identity(input);
         const reusable = (attempt: Attempt) => attempt.key === key && attempt.result &&
-          !(task.publicationEpoch && attempt.publicationEpoch !== task.publicationEpoch &&
-            (tool.name === "build_game" || tool.name === "game_use" && input.operation === "open")) &&
+          !(playtest && (input.operation === "open" || input.operation === "act" || input.operation === "close")) &&
+          !(task.publicationEpoch && attempt.publicationEpoch !== task.publicationEpoch && tool.name === "build_game") &&
           ((tool as RecoverableTool).canReuseResult?.(attempt.result, ...call) ?? true);
-        const sameId = task.attempts.get(call[0]);
         if (sameId) {
           if (sameId.key !== key)
             throw new Error(
               "A tool call ID was reused with different arguments",
             );
-          if (sameId.pending) return sameId.pending;
-          return this.#reuse(task, sameId);
+          if (sameId.pending && !playtest) return sameId.pending;
+          if (sameId.pending) await sameId.pending.catch(() => {});
+          return this.#reuse(task, sameId, call[2]);
         }
         if ((task.blocked || this.#unrecorded.size) && !(task.repairOnly && task.blockedKind === "unknown" && repairAction && !this.#unrecorded.size))
           throw new Error(
             task.blocked ??
               "A late tool result could not be recorded. Review the original operation before continuing.",
           );
-        const recovered = [...task.attempts.values()].find(previous => previous.key === key && previous.effectsRecovered?.length);
+        const recovered = [...task.attempts.values()].find(previous => previous.key === key && (previous.effectsRecovered?.length || previous.deletionDisposition));
         if (recovered) throw new Error("The original failed command has recovered effects. Do not replay it under a new call ID; inspect current files and correct the requested operation");
         if (task.needsRead && !repairAction) throw new Error("Read the current project files after the controlled recovery publication before making another change");
         if (task.continuing && !repairAction) {
@@ -639,9 +678,9 @@ export class AutoContinueTools {
             const known = task.attempts.get(call[0]);
             if (known && known.key !== key)
               throw new Error(
-                "A tool call ID was reused with different arguments",
+                `${playtest || known.tool === "game_use" ? "CALL_ID_CONFLICT: " : ""}A tool call ID was reused with different arguments`,
               );
-            if (known) return this.#reuse(task, known);
+            if (known) return this.#reuse(task, known, call[2]);
             const completed = [...task.attempts.values()].findLast(reusable);
             if (completed?.result)
               return originalResult(completed.result, completed);
@@ -651,9 +690,29 @@ export class AutoContinueTools {
           (attempt) =>
             !attempt.result &&
             !attempt.confirmedFailure &&
-            !attempt.observation && attempt.preflightFailure?.disposition !== "correctable" && !attempt.commandNotSubmitted && !attempt.effectsRecovered?.length,
+            !attempt.observation && attempt.preflightFailure?.disposition !== "correctable" && !attempt.commandNotSubmitted && !attempt.effectsRecovered?.length && !attempt.deletionDisposition,
         );
         if (task.continuing && unknown && !(task.repairOnly && repairAction)) throw this.#stop(task, unknown);
+        if (playtest) {
+          const previous = [...task.attempts.values()].filter(attempt => attempt.tool === "game_use" && attempt.settled && !attempt.result && !attempt.preflightFailure && !attempt.confirmedFailure);
+          if (previous.length) {
+            const sessionId = input.operation !== "open" && typeof input.sessionId === "string" ? input.sessionId : undefined;
+            const related = previous.find(attempt => {
+              const original = attempt.call[1] as Record<string, unknown> | undefined;
+              return original?.operation === "open" || typeof original?.sessionId !== "string" || original.sessionId === sessionId;
+            });
+            if (!sessionId || related || await currentPlaytestStatus(tool, sessionId, call[2]) !== "live") throw this.#stop(task, related ?? previous[0]!);
+            await this.#assertCurrent(task, call[2]);
+            if (task.blocked || this.#unrecorded.size) this.assertSafe();
+            if (task.observations?.has(call[0])) throw new Error("CALL_ID_CONFLICT: A tool call ID was reused with different arguments");
+            const known = task.attempts.get(call[0]);
+            if (known) {
+              if (known.key !== key) throw new Error("CALL_ID_CONFLICT: A tool call ID was reused with different arguments");
+              if (known.pending) await known.pending.catch(() => {});
+              return this.#reuse(task, known, call[2]);
+            }
+          }
+        }
         if (task.continuing && paidTool(tool.name)) {
           task.blocked =
             "Automatic continuation stopped: a new media request cannot be proven to be the original operation. Recover the original call or job; no replacement was submitted.";
@@ -838,8 +897,22 @@ export class AutoContinueTools {
     }
   }
 
-  #reuse(task: Task, attempt: Attempt): Result {
-    if (attempt.result) return originalResult(attempt.result, attempt);
+  #reuse(task: Task, attempt: Attempt, signal?: AbortSignal): Result | Promise<Result> {
+    if (attempt.deletionDisposition) return {
+      content: [{ type: "text", text: "The retained source deletion was withdrawn and the isolated baseline was restored. The original command was not run again. Read the current project files before editing." }],
+      details: { sourceDeletionDisposition: attempt.deletionDisposition }, isError: true,
+    } as Result;
+    const tool = attempt.tool === "game_use" ? this.tools.find(item => item.name === attempt.tool) : undefined;
+    if (attempt.result) {
+      if (tool) return replayPlaytestReceipt(tool, attempt.call[0], attempt.call[1] as Record<string, unknown>, attempt.result, false, signal);
+      return originalResult(attempt.result, attempt);
+    }
+    if (tool) {
+      const failure = attempt.preflightFailure ? attempt.failure : this.#stop(task, attempt);
+      const retained = attempt.retainedResult ?? { content: [{ type: "text" as const, text: String(failure) }], details: {} };
+      const result = inheritToolPreflightFailure({ ...retained, isError: true }, failure ?? retained);
+      return replayPlaytestReceipt(tool, attempt.call[0], attempt.call[1] as Record<string, unknown>, result, true, signal);
+    }
     if (attempt.confirmedFailure || attempt.preflightFailure || attempt.commandNotSubmitted || attempt.effectsRecovered?.length || attempt.observation || this.#targets(task, attempt).length || this.#pendingTargets(task, attempt).length) {
       if (attempt.failure !== undefined) throw attempt.failure;
       if (attempt.retainedResult)
@@ -854,6 +927,55 @@ export class AutoContinueTools {
     throw this.#stop(task, attempt);
   }
 
+  #reconcileLegacyRecoveryRefusals(task: Task, target: IsolatedRepairTarget, reviewId: string): void {
+    const journal = this.options.sessionManager;
+    if (!journal || !task.userId) return;
+    const branch = journal.getBranch();
+    const origin = branch.findIndex(entry => entry.id === task.userId);
+    if (origin < 0) return;
+    const calls = new Map<string, Record<string, unknown>>();
+    let inspected: Record<string, unknown> | undefined, reviewed: Record<string, unknown> | undefined;
+    for (const entry of branch.slice(origin + 1)) {
+      if (entry.type !== "message") continue;
+      const { message } = entry;
+      if (message.role === "assistant") {
+        for (const part of message.content) if (part.type === "toolCall" && part.name === "recover_isolated_changes" && !calls.has(part.id)) calls.set(part.id, part.arguments);
+        continue;
+      }
+      if (message.role !== "toolResult" || message.toolName !== "recover_isolated_changes") continue;
+      const input = calls.get(message.toolCallId);
+      if (!input) continue;
+      if (!message.isError) {
+        const detail = message.details as Record<string, unknown> | undefined;
+        if (input.action === "inspect") inspected = detail;
+        if (input.action === "review") reviewed = detail;
+        continue;
+      }
+      const attempt = task.attempts.get(message.toolCallId);
+      if (!attempt?.settled || !attempt.unconfirmed || attempt.result || attempt.preflightFailure || attempt.isolatedOperations?.length || attempt.pendingVerification ||
+        attempt.key !== "recover_isolated_changes:" + identity(input)) continue;
+      const refusal = message.content.length === 1 && message.content[0]?.type === "text" ? message.content[0].text : undefined;
+      const adopt = input.action === "adopt" && input.reviewId === reviewId;
+      const recover = input.action === "recover" && input.generation === String(target.generation);
+      const invalidField = (adopt || recover) && ["path", "variant", "sha256"].some(key => input[key] !== undefined) &&
+        refusal === "path, variant and sha256 are valid only for read_image";
+      const blockedReview = adopt && reviewed?.reviewId === reviewId && reviewed.projectId === target.projectId &&
+        reviewed.rawSnapshotId === target.rawSnapshotId && Array.isArray(reviewed.blockers) && reviewed.blockers.length > 0 &&
+        refusal === "This review has blocked files; preserve every version and resolve the listed risks before adoption";
+      const refusedRecovery = recover && inspected?.projectId === target.projectId && inspected?.generation === input.generation && inspected.dirty === true && inspected.recoverable === false &&
+        refusal === "This inspected generation is not eligible for recovery. Keep both versions. Do not repeat inspect/recover or regenerate to clear the blocker. " +
+          (inspected.reason ?? "Review the listed blocked paths in Execution storage & recovery.");
+      if (!invalidField && !blockedReview && !refusedRecovery) continue;
+      const disposition = { taskId: task.id, userEntryId: task.userId, callId: message.toolCallId, reviewId, reason: invalidField ? "invalid-input" : blockedReview ? "blocked-review" : "recovery-ineligible" };
+      const type = "ohmygame-source-recovery-not-started";
+      if (!journal.getBranch().some(candidate => candidate.type === "custom" && candidate.customType === type && identity(candidate.data) === identity(disposition)))
+        journal.appendCustomEntry(type, disposition);
+      attempt.failure = toolPreflightError("The original recovery was refused before submission. Its reviewed deletion has been withdrawn.", "invalid_recovery_input");
+      attempt.preflightFailure = getToolPreflightFailure(attempt.failure);
+      attempt.unconfirmed = false;
+    }
+  }
+
   /** Query only the exact original calls; no recovery hook can authorize a replacement. */
   async prepare(
     signal: AbortSignal,
@@ -865,6 +987,26 @@ export class AutoContinueTools {
   ): Promise<void> {
     const task = this.#task;
     await this.#assertCurrent(task, signal);
+    for (const attempt of task.attempts.values()) {
+      if (attempt.tool !== "isolated_shell" || !attempt.key) continue;
+      const targets = this.#targets(task, attempt);
+      if (targets.length !== 1) continue;
+      const tool = this.tools.find(item => item.name === attempt.tool) as RecoverableTool | undefined;
+      const disposition = await tool?.sourceDeletionDisposition?.(targets[0]!);
+      if (!disposition) continue;
+      await this.#assertCurrent(task, signal);
+      const journal = this.options.sessionManager;
+      const entry = { ...targets[0]!, ...disposition };
+      if (journal && !journal.getBranch().some(item => item.type === "custom" && item.customType === SOURCE_WITHDRAWAL_DISPOSITION && identity(item.data) === identity(entry)))
+        journal.appendCustomEntry(SOURCE_WITHDRAWAL_DISPOSITION, entry);
+      attempt.deletionDisposition = disposition;
+      this.#reconcileLegacyRecoveryRefusals(task, targets[0]!, disposition.reviewId);
+      task.needsRead = true;
+    }
+    if (task.repairOnly && [...task.attempts.values()].some(attempt => attempt.deletionDisposition)) {
+      task.repairOnly = this.repairable;
+      if (!task.repairOnly) task.verifyOnly = false;
+    }
     if (this.repairable) { task.repairOnly = true; task.verifyOnly = [...task.attempts.values()].some(attempt => this.#pendingTargets(task, attempt).length > 0); task.continuing = true; return; }
     // An unknown local outcome may now have a retained terminal receipt. Only
     // the original tool's recovery hook can resolve it; execution is never retried.
@@ -875,7 +1017,7 @@ export class AutoContinueTools {
       if (attempt.observation) continue;
       if (attempt.preflightFailure?.disposition === "correctable") continue;
       if (attempt.commandNotSubmitted) continue;
-      if (attempt.effectsRecovered?.length) continue;
+      if (attempt.effectsRecovered?.length || attempt.deletionDisposition) continue;
       if (attempt.preflightFailure?.disposition === "blocked")
         throw this.#stop(task, attempt);
       const source = this.tools.find((tool) => tool.name === attempt.tool) as

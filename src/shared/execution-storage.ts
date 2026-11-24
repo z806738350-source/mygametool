@@ -1,5 +1,12 @@
 export type ExecutionStorageNamespace = "manual" | "test";
 
+export interface SourceDeletionWithdrawal {
+  reviewId: string;
+  generation: string;
+  paths: string[];
+  status: "available" | "pending" | "withdrawn";
+}
+
 /** Working-image costs; these estimates do not certify a device or a frame rate. */
 export interface IsolatedSourceImageCost {
   encodedBytes: number;

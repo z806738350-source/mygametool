@@ -20,6 +20,7 @@ import {
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import {
   pluginComponentKey,
+  INK_STUDIO_PLUGIN_ID,
   pluginCollection,
   type PluginComponentSummary,
   type PluginDetail,
@@ -38,7 +39,7 @@ import { t } from "./i18n.js";
 import { PluginDependencyPanel, PluginExportButton, PluginImportDialog } from "./plugin-portability.js";
 
 const PLUGIN_CATEGORIES = [
-  { id: "creation", plugins: ["ohmygame:game-studio", "ohmygame:web-game-studio", "ohmygame:threejs-world"] },
+  { id: "creation", plugins: ["ohmygame:game-studio", "ohmygame:web-game-studio", "ohmygame:threejs-world", INK_STUDIO_PLUGIN_ID] },
   { id: "engines", plugins: ["ohmygame:godot", "ohmygame:taptap-maker", "ohmygame:cocos-creator", "ohmygame:unity", "ohmygame:unreal-engine", "ohmygame:wechat-minigame", "ohmygame:douyin-minigame"] },
   { id: "assets", plugins: ["ohmygame:blender", "ohmygame:img2threejs", "ohmygame:aseprite", "ohmygame:tiled"] },
   { id: "other", plugins: [] },
@@ -50,10 +51,12 @@ function isBundledBlender(plugin: PluginSummary): boolean {
 }
 
 function pluginDescription(plugin: PluginSummary): string {
+  if (plugin.id === INK_STUDIO_PLUGIN_ID) return t("plugins.inkStudio.description");
   return isBundledBlender(plugin) ? t("plugins.blender.description") : plugin.description;
 }
 
 function exampleLabel(plugin: PluginSummary, prompt: string): string {
+  if (plugin.id === INK_STUDIO_PLUGIN_ID && prompt === t("plugins.inkStudio.example", { lng: "en" })) return t("plugins.inkStudio.example");
   if (isBundledBlender(plugin)) {
     for (const key of ["fromReference", "fromModel", "procedural"] as const) {
       if (prompt === t(`plugins.blender.${key}`, { lng: "en" })) return t(`plugins.blender.${key}`);
@@ -570,7 +573,7 @@ function PluginDetailView({ phase, plugin, updating, error, onRetry, onTogglePlu
         <button className="plugin-detail-secondary" type="button" disabled={updating} onClick={() => void openPluginBuilder(plugin.id, "edit").catch(cause => setProjectError(errorMessage(cause)))}><WandSparkles size={13} />{t("plugins.editWithAi")}</button>
         {projectError ? <p role="alert">{projectError}</p> : null}
       </div> : null}
-      {plugin.longDescription ? <section className="plugin-about"><h2>{t("plugins.about")}</h2><p>{isBundledBlender(plugin) ? t("plugins.blender.about") : plugin.longDescription}</p></section> : null}
+      {plugin.longDescription ? <section className="plugin-about"><h2>{t("plugins.about")}</h2><p>{plugin.id === INK_STUDIO_PLUGIN_ID ? t("plugins.inkStudio.about") : isBundledBlender(plugin) ? t("plugins.blender.about") : plugin.longDescription}</p></section> : null}
       {prompts.length ? <section className="plugin-prompts">
         <h2>{t("plugins.tryIt")}</h2>
         <div>{prompts.map((prompt) => <button type="button" key={prompt} onClick={() => choosePrompt(prompt)}>

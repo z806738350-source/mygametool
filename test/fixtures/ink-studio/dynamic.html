@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ink dynamic scene fixture</title>
+  </head>
+  <body
+    style="
+      margin: 0;
+      background: #102431;
+      color: #e8f1ce;
+      font: 16px sans-serif;
+    "
+  >
+    <main>
+      <h1>Ink dynamic scene fixture</h1>
+      <p>
+        Use the arrow keys to move the player. The projectile crosses the
+        ground.
+      </p>
+      <button type="button" data-testid="start">Start / restart</button>
+      <p id="status" role="status">Loading.</p>
+      <canvas
+        id="arena"
+        width="320"
+        height="200"
+        tabindex="0"
+        aria-label="Dynamic fixture arena"
+        style="width: min(90vw, 800px); image-rendering: pixelated"
+      ></canvas>
+    </main>
+    <script type="module" src="./dynamic-page.mjs"></script>
+  </body>
+</html>
