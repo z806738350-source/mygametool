@@ -644,7 +644,8 @@ function AgentErrorActivity({ error, retry, active = false }: { error: ThreadIte
   const failed = !retry || retry.status === "failed";
   const shimmering = active && retry?.status === "inProgress";
   const presentation = agentErrorPresentation(error);
-  const label = failed ? presentation.title : t("timeline.reconnecting", { attempt: retry.attempt, max: retry.maxAttempts });
+  const label = retry?.source === "manual-local-image" ? t(`timeline.localImageRetry.${retry.status}`)
+    : failed ? presentation.title : t("timeline.reconnecting", { attempt: retry.attempt, max: retry.maxAttempts });
   const preview = failed && !error.code ? error.message.replace(/\s+/g, " ").trim() : "";
   const summary = preview ? `${label} — ${preview}` : label;
   const Icon = failed ? (isConnectionError(error.code) || error.code === "stream_error" ? WifiOff : X) : Wifi;

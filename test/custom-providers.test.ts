@@ -222,7 +222,7 @@ describe("custom providers", () => {
 
   it("can edit and fetch again when manual overrides leave only catalog reasoning levels enabled", async () => {
     const request = vi.fn<typeof fetch>(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }] }));
-    const { app, create } = await fixture(undefined, request);
+    const { app, create, directory } = await fixture(undefined, request);
     const model = { ...firstModel, id: "gpt-6.1-sol", reasoning: true, thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: null } };
     const { id } = await create({ ...gateway, models: [model] });
     const update = await app.inject({ method: "PUT", url: `/settings/models/providers/${id}/custom`, payload: { ...gateway, apiKey: undefined, name: "Renamed gateway", models: [model] } });
@@ -231,6 +231,9 @@ describe("custom providers", () => {
     expect(fetched.statusCode, fetched.body).toBe(200);
     expect(request).toHaveBeenCalledOnce();
     expect((await app.inject({ method: "GET", url: "/models" })).json().models).toContainEqual(expect.objectContaining({ provider: id, reasoningLevels: ["xhigh", "max"] }));
+    const restored = new ProviderModelSettingsStore(directory, directory);
+    await restored.load();
+    expect((await restored.localRuntimeProviders()).find((provider) => provider.id === id)?.config.models).toContainEqual(expect.objectContaining({ id: model.id, thinkingLevelMap: model.thinkingLevelMap }));
   });
 
   it.each(["manual", "reported"])("saves disabled reasoning with no enabled %s levels and rejects re-enabling it", async (source) => {

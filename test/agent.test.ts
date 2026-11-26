@@ -14,6 +14,7 @@ import type { AgentReasoningLevel, ProjectState } from "../src/shared/contracts.
 import { RuntimeEventBus } from "../src/shared/events.js";
 import { createProviderFailureDiagnostic } from "@earendil-works/pi-ai/utils/provider-failure";
 import { AGENT_ERROR_ENTRY } from "../src/daemon/agent-errors.js";
+import { LOCAL_IMAGE_BUDGET_MESSAGE } from "../src/shared/agent-errors.js";
 import { CHECKPOINT_ENTRY, CHECKPOINT_UNDONE_ENTRY, TURN_END_ENTRY, turnRange } from "../src/daemon/checkpoint-extension.js";
 import { AssistantTextStreamNormalizer, normalizeAssistantText } from "../src/daemon/assistant-thinking.js";
 import { AUTO_CONTINUE_DELAYS, AUTO_CONTINUE_ENTRY, AUTO_CONTINUE_TOOL_ENTRY, AutoContinueTools, isRecoverableInterruption } from "../src/daemon/agent-auto-continue.js";
@@ -22,6 +23,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createIsolatedRepairPending, createIsolatedRepairProof, getIsolatedRepairPending, getIsolatedRepairResolutions, getRepairTargets, inheritIsolatedRepairPending, inheritIsolatedRepairProof, settleIsolatedRepair, getIsolatedOperationReceipts, isolatedInputBudgetError, reportIsolatedOperation, type IsolatedOperationReceipt, type IsolatedRepairProof } from "../src/daemon/isolated-tool-receipts.js";
 import { handoffSummary } from "../src/daemon/agent-runtimes/handoff.js";
 import { ToolBridge } from "../src/daemon/agent-runtimes/tool-bridge.js";
+import { createIsolatedRecoveryTool } from "../src/daemon/isolated-shell-tool.js";
 
 describe("continuation tool safety", () => {
   const result = { content: [{ type: "text" as const, text: "Existing result" }], details: {} };
@@ -148,6 +150,46 @@ describe("continuation tool safety", () => {
   }
   const repairProof: IsolatedRepairProof = { namespace: "test", projectId: isolated.projectId, generation: 1, rawSnapshotId: "b".repeat(64), preparedBatchId: "c".repeat(64), reviewId: "d".repeat(64), preparedSnapshotId: "e".repeat(64), hostTargetFingerprint: "f".repeat(64), publicationId: "22222222-2222-4222-8222-222222222222", recoveryOperationId: "c".repeat(32), originOperations: [], allOriginalsDurable: true, acknowledged: true, released: true };
   const pendingToken = () => { const { acknowledged: _, ...pending } = repairProof; return createIsolatedRepairPending({ ...pending, publicationVerified: true }); };
+  it("continues the same task's next character direction after a corrected review and adoption", async () => {
+    const manager = SessionManager.inMemory("/tmp/character-review-continuation");
+    const previous = manager.appendMessage({ role: "user", content: "Prepare the character set", timestamp: 1 });
+    manager.appendCustomEntry(AUTO_CONTINUE_TOOL_ENTRY, { version: 1, taskId: previous, userEntryId: previous,
+      callId: "old-review", tool: "recover_isolated_changes", state: "unknown" });
+    manager.appendMessage({ role: "user", content: "Continue the remaining directions", timestamp: 2 });
+    const file = "src/review/nw-clean.png", generation = String(repairProof.generation);
+    const shell = vi.fn<ToolDefinition["execute"]>(async () => {
+      for (const phase of ["input_preflight", "prepare_submitting", "prepared", "run_submitting", "running", "captured", "retained", "released"] as const) {
+        await report(phase, { mode: "shell", generation: repairProof.generation,
+          ...(["captured", "retained", "released"].includes(phase) ? { snapshotId: repairProof.rawSnapshotId } : {}) });
+      }
+      throw new Error("NW changes retained for review");
+    });
+    const review = vi.fn(async () => ({ reviewId: repairProof.reviewId, projectId: isolated.projectId, generation,
+      snapshotId: repairProof.rawSnapshotId, files: [], blockers: [], approved: false, expiresAt: "" }));
+    const adopt = vi.fn(async () => {
+      const publication = inheritIsolatedRepairProof({ changed: [file] }, createIsolatedRepairProof({
+        ...repairProof, originOperations: [{ operationId: isolated.operationId, mode: "shell", snapshotId: repairProof.rawSnapshotId }],
+      }));
+      expect(await settleIsolatedRepair(publication)).toBe(1);
+      return publication;
+    });
+    const generate = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(result);
+    const recovery = createIsolatedRecoveryTool(vi.fn(), vi.fn(), { review, adopt });
+    const guard = new AutoContinueTools([tool("isolated_shell", shell), recovery, tool("read_project_file"), tool("generate_canvas_media", generate)], { sessionManager: manager });
+    guard.reset();
+    const [source, repair, read, image] = guard.wrap(), east = { boardId: "character-board", nodeId: "east-r1" };
+    await expect(run(source!, "clean-nw", { command: "prepare NW" })).rejects.toThrow("NW changes retained");
+    await expect(run(image!, "too-early", east)).rejects.toThrow("Only controlled reads");
+    await expect(run(repair!, "invalid-review", { action: "review", generation, paths: [file] })).rejects.toThrow("only valid");
+    expect(review).not.toHaveBeenCalled();
+    await run(repair!, "corrected-review", { action: "review", generation });
+    await run(repair!, "adopt-nw", { action: "adopt", reviewId: repairProof.reviewId });
+    await expect(run(image!, "before-read", east)).rejects.toThrow("Read the current project files");
+    await run(read!, "read-nw", { path: file });
+    await expect(run(image!, "generate-east", east)).resolves.toEqual(result);
+    expect(generate).toHaveBeenCalledExactlyOnceWith("generate-east", east, undefined, undefined, expect.anything());
+    expect(shell).toHaveBeenCalledOnce();
+  });
   it.each(["pi-live", "pi-reloaded", "native-live", "native-reloaded"])("settles only exact pending recovery evidence through fresh verify calls (%s)", async scenario => {
     const manager = SessionManager.inMemory("/tmp/repair-pending-fixture"), user = manager.appendMessage({ role: "user", content: "Repair the existing outputs", timestamp: 1 });
     let verifyFails = true;
@@ -234,7 +276,10 @@ describe("continuation tool safety", () => {
       return result;
     });
     const mutation = vi.fn<ToolDefinition["execute"]>().mockResolvedValue(result);
-    const guard = new AutoContinueTools([tool("isolated_shell", shell), tool("recover_isolated_changes", capacity), tool("write", mutation)], { sessionManager: manager }); guard.reset(user);
+    const guard = new AutoContinueTools([
+      tool("isolated_shell", shell), tool("recover_isolated_changes", capacity), tool("write", mutation),
+      tool("repair_sprite_action"), tool("repair_sprite_walk"), tool("get_model_asset"), tool("game_use"), tool("update_plan"),
+    ], { sessionManager: manager }); guard.reset(user);
     manager.appendMessage({ role: "assistant", api: "ohmygame-native", content: [{ type: "toolCall", id: "source", name: "isolated_shell", arguments: { command: "original" } }], timestamp: 2 } as never);
     const failure = await run(guard.wrap()[0]!, "source", { command: "original" }).catch(cause => cause);
     manager.appendMessage({ role: "toolResult", toolName: "isolated_shell", toolCallId: "source", content: [{ type: "text", text: "Original failed" }], isError: true, timestamp: 3, isolatedOperations: getIsolatedOperationReceipts(failure) } as never);
@@ -242,6 +287,18 @@ describe("continuation tool safety", () => {
     await run(guard.wrap()[1]!, "capacity", { action: "capacity" });
     await run(guard.wrap()[1]!, "first-allocation", { action: "plan_first_allocation" });
     await run(guard.wrap()[1]!, "retained-image", { action: "read_image", reviewId: repairProof.reviewId, path: "public/retained.png", variant: "working", sha256: "a".repeat(64) });
+    const [, , , action, walk, model, game, plan] = guard.wrap();
+    for (const preview of [action!, walk!]) {
+      await run(preview, preview.name + "-preview", { setId: "knight" });
+      await expect(run(preview, preview.name + "-publish", { setId: "knight", candidateDigest: "a".repeat(64) })).rejects.toThrow("Only controlled reads");
+    }
+    await run(model!, "bindings", {});
+    await expect(run(model!, "prepare-model", { assetId: "bound" })).rejects.toThrow("Only controlled reads");
+    await run(game!, "inspect-game", { operation: "inspect", sessionId: "existing" });
+    await expect(run(game!, "act-game", { operation: "act", sessionId: "existing" })).rejects.toThrow("Only controlled reads");
+    await run(game!, "close-game", { operation: "close", sessionId: "existing" });
+    await run(plan!, "record-progress", {});
+    expect(guard.repairOnly).toBe(true);
     expect(guard.recoverySummary).not.toContain("effects_recovered");
     await expect(run(guard.wrap()[2]!, "write", { content: "blocked" })).rejects.toThrow("Only controlled reads");
     await run(guard.wrap()[1]!, "plan-capacity", { action: "plan_capacity", profileId: "capacity-128-v1" });
@@ -316,7 +373,12 @@ describe("continuation tool safety", () => {
     manager.appendMessage({ role: "toolResult", toolCallId: "source", toolName: "isolated_shell", content: [{ type: "text", text: "Original retained command failed" }], isError: true, timestamp: 3, isolatedOperations: getIsolatedOperationReceipts(failure) } as never);
     await guard.prepare(new AbortController().signal); await invoke("recover_isolated_changes", "adopt", { action: "adopt", reviewId: repairProof.reviewId });
     if (reload) { guard = new AutoContinueTools(tools, { sessionManager: manager }); guard.reset(user); await guard.prepare(new AbortController().signal); }
-    await expect(run(guard.wrap()[0]!, "build-new", {})).rejects.toThrow("Read the current project files");
+    await invoke("build_game", "build-new", {});
+    await invoke("game_use", "open-new", { operation: "open" });
+    expect(build).toHaveBeenCalledTimes(2);
+    expect(game.mock.calls.map(([id]) => id)).toContain("open-new");
+    await expect(run(guard.wrap()[1]!, "open-and-press", { operation: "open", actions: [{ type: "press", key: "J" }] })).rejects.toThrow("Read the current project files");
+    await expect(run(guard.wrap()[2]!, "new-paid-work", { prompt: "New" })).rejects.toThrow("Read the current project files");
     await run(guard.wrap()[5]!, "read", { path: "game.txt" });
     for (const [name, id, input] of [["build_game", "build-old", {}], ["game_use", "open-old", { operation: "open" }], ["game_use", "click-old", { operation: "click", x: 1 }], ["generate_image", "paid-old", { prompt: "Original" }], ["build_game", "build-new", {}], ["game_use", "open-new", { operation: "open" }], ["game_use", "click-new", { operation: "click", x: 1 }], ["generate_image", "paid-new", { prompt: "Original" }], ["build_game", "build-again", {}], ["game_use", "open-again", { operation: "open" }]] as const) await invoke(name, id, input);
     expect(build).toHaveBeenCalledTimes(2); expect(game.mock.calls.map(([id]) => id)).toEqual(["open-old", "click-old", "open-new", "open-again"]); expect(paid).toHaveBeenCalledOnce(); expect(shell).toHaveBeenCalledOnce();
@@ -699,17 +761,35 @@ describe("continuation tool safety", () => {
     await expect(guard.prepare(new AbortController().signal)).rejects.toThrow("Workspace changed");
     expect(write.execute).toHaveBeenCalledOnce();
   });
+  it.each([false, true])("binds a sprite preview call ID without caching the displayed result (reload=%s)", async reload => {
+    const manager = SessionManager.inMemory("/tmp/sprite-observation-identity");
+    const owner = manager.appendMessage({ role: "user", content: "Repair animation", timestamp: 1 });
+    const name = "repair_sprite_action", args = { setId: "knight" };
+    const preview = tool(name, vi.fn().mockResolvedValueOnce({ content: [], details: { revision: 1 } }).mockResolvedValueOnce({ content: [], details: { revision: 2 } }));
+    let guard = new AutoContinueTools([preview], { sessionManager: manager }); guard.reset(owner);
+    manager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "preview", name, arguments: args }], timestamp: 2 } as never);
+    const first = await run(guard.wrap()[0]!, "preview", args);
+    manager.appendMessage({ role: "toolResult", toolCallId: "preview", toolName: name, content: first.content, details: first.details, isError: false, timestamp: 3 } as never);
+    if (reload) { guard = new AutoContinueTools([preview], { sessionManager: manager }); guard.reset(owner); }
+    await expect(run(guard.wrap()[0]!, "preview", { ...args, candidateDigest: "a".repeat(64) })).rejects.toThrow("different arguments");
+    expect((await run(guard.wrap()[0]!, "preview", args)).details).toEqual({ revision: 2 });
+    expect(preview.execute).toHaveBeenCalledTimes(2);
+  });
   it("never buys changed media arguments during continuation or alters cached image bytes", async () => {
     const image = { type: "image" as const, mimeType: "image/png", data: "original-fixture-image-bytes" };
     const generated = { content: [image], details: { assetId: "original-asset" } };
-    const generate = tool("generate_image", vi.fn().mockResolvedValue(generated)), guard = new AutoContinueTools([generate]);
+    const generate = tool("generate_image", vi.fn().mockResolvedValue(generated)), build = tool("build_game");
+    const guard = new AutoContinueTools([generate, build]);
     const wrapped = guard.wrap()[0]!;
     await run(wrapped, "original", { prompt: "original intent" }); await guard.prepare(new AbortController().signal);
     const reused = await run(wrapped, "new-call", { prompt: "original intent" });
     expect(reused.content).toEqual([{ type: "text", text: expect.stringContaining("Original completed result") }, image]);
     expect(generated.content).toEqual([image]);
     await expect(run(wrapped, "replacement", { prompt: "slightly different intent" })).rejects.toThrow("cannot be proven");
-    expect(generate.execute).toHaveBeenCalledOnce(); expect(guard.stopRequested).toBe(true);
+    await expect(run(wrapped, "replacement", { prompt: "slightly different intent" })).rejects.toThrow("not submitted");
+    await expect(run(wrapped, "fresh-id", { prompt: "another request" })).rejects.toThrow("not submitted");
+    await run(guard.wrap()[1]!, "validate-original", {});
+    expect(generate.execute).toHaveBeenCalledOnce(); expect(build.execute).toHaveBeenCalledOnce(); expect(guard.stopRequested).toBe(false);
   });
   it("allows ordinary local argument correction but keeps the earlier failure unconfirmed for automatic recovery", async () => {
     const execute = vi.fn<ToolDefinition["execute"]>().mockRejectedValueOnce(new Error("oldText does not match")).mockResolvedValueOnce(result);
@@ -950,6 +1030,42 @@ describe("continuation tool safety", () => {
     expect(isRecoverableInterruption({ kind: "turn_limit", source: "qoder", terminalReason: "max_turns" })).toBe(true);
     expect(isRecoverableInterruption({ kind: "unknown", source: "codex" })).toBe(false);
   });
+});
+
+describe("explicit local image request retry", () => {
+  it.each(["workspace", "model", "user", "ordinary-413", "stopped", "native", "reserved"] as const)(
+    "makes no model request and preserves the journal on a %s conflict", async conflict => {
+      const journal = SessionManager.inMemory();
+      const checkpoint = journal.appendCustomEntry(CHECKPOINT_ENTRY, { version: 1, commit: "a".repeat(40) });
+      const user = journal.appendMessage({ role: "user", content: "Finish locally.", timestamp: Date.now() });
+      const message = conflict === "ordinary-413" ? "HTTP 413 provider payload limit" :
+        `Fixture API error (413): ${JSON.stringify({ code: "request_size_exceeded", message: LOCAL_IMAGE_BUDGET_MESSAGE })}`;
+      journal.appendMessage({ role: "assistant", api: "openai-responses", provider: "fixture", model: "original", content: [], stopReason: "error", errorMessage: message,
+        diagnostics: [{ type: "provider_failure", details: { status: 413, errorCode: "request_size_exceeded" } }] } as never);
+      journal.appendCustomEntry(AGENT_ERROR_ENTRY, { version: 1, error: { message, diagnostics: { statusCode: 413, errorCode: "request_size_exceeded" } } });
+      journal.appendCustomEntry(TURN_END_ENTRY, { version: 1, checkpoint, commit: "b".repeat(40), files: 0 });
+      if (conflict === "user") journal.appendMessage({ role: "user", content: "A newer request", timestamp: Date.now() });
+      if (conflict === "stopped") journal.appendCustomEntry("ohmygame-agent-stop", { version: 1, turnId: user, origin: "user" });
+      const prepare = vi.fn(), resume = vi.fn();
+      const session = Object.assign(new FakeSession(), { sessionManager: journal, prepareContinuation: prepare, resumeAfterInterruption: resume,
+        model: { provider: "fixture", id: conflict === "model" ? "other" : "original" } as RuntimeModel, ...(conflict === "native" ? { runtime: "codex-cli" as const } : {}) });
+      const checkpointWait = deferred<string>();
+      const snapshot = vi.fn(async () => conflict === "reserved" ? checkpointWait.promise : (conflict === "workspace" ? "c" : "b").repeat(40));
+      const manager = new AgentManager(new RuntimeEventBus(), { createSession: async () => session, checkpoints: { snapshot, changed: vi.fn() } });
+      const project = createProject(), conversation = createConversation(project);
+      const before = journal.getBranch().map(entry => entry.id);
+      try {
+        const admission = manager.retryLocalImageRequest(project, conversation, user);
+        if (conflict === "reserved") {
+          await vi.waitFor(() => expect(snapshot).toHaveBeenCalledOnce());
+          await expect(manager.retryLocalImageRequest(project, conversation, user)).rejects.toThrow("Wait for");
+          checkpointWait.resolve("c".repeat(40));
+        }
+        await expect(admission).rejects.toThrow(conflict === "reserved" || conflict === "workspace" ? "workspace changed" : conflict === "model" ? "model or reasoning" : "latest completed");
+        expect(journal.getBranch().map(entry => entry.id)).toEqual(before);
+        expect(prepare).not.toHaveBeenCalled(); expect(resume).not.toHaveBeenCalled(); expect(session.prompt).not.toHaveBeenCalled();
+      } finally { checkpointWait.resolve("c".repeat(40)); await manager.close(); }
+    });
 });
 
 describe("bounded automatic continuation", () => {

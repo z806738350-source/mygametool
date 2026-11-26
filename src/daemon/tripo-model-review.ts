@@ -26,7 +26,7 @@ export class TripoModelReviews {
 
   async requireApproval(projectId: string, assetId: string, sha256: string) {
     if (!await this.#approved(projectId, assetId, sha256))
-      throw toolPreflightError(`Blender did not start. Use review_tripo_model with sourceAssetId "${assetId}" and wait for the user to accept that exact model. Retain the original; a review does not require new generation.`, "approval_required");
+      throw toolPreflightError(`Blender did not start. Use review_tripo_model with sourceAssetId "${assetId}" and wait for the user to accept that exact model. Retain the original; a review does not require new generation.`, "model_review_required");
   }
 
   async checkDeclaredPaths(projectId: string, paths: readonly string[], signal?: AbortSignal) {

@@ -96,6 +96,12 @@ The built-in **OpenAI** page has an independent **Image models** section. Chat c
 use **Browser sign-in** while images use a separate API key. An image-only OpenAI
 connection also works when chat uses another provider.
 
+A separate image connection uses its saved endpoint and image key even when
+Kunpo chat is connected. Disabling the chat provider stops shared-key image
+requests and discovery. If the saved image settings become unreadable, the
+app keeps that file and disables this image connection until you restore the
+file or explicitly save a new configuration.
+
 Choose **Connect** (or the pencil beside a saved connection setting), then
 **Separate API key and Base URL**. Enter the key for that endpoint and use
 the default `https://api.openai.com/v1` or your compatible GPT Image relay's API

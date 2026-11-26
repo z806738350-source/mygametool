@@ -209,7 +209,7 @@ export class ProviderModelSettingsStore {
         const api = entry.api as "openai-completions" | "openai-responses" | "anthropic-messages";
         const baseUrl = normalizeEndpoint(entry.baseUrl);
         const models = (Array.isArray(entry.models) ? entry.models.filter(isObject) : []).filter((model) => !isRemovedKunpoAgent({ provider: id, id: String(model.id) }) && !isMeshyModelReference({ provider: id, id: model.id }) && !isMeshyEndpoint(model.baseUrl))
-          .map((model) => normalizeCustomProviderModel({ ...model, supportsImages: Array.isArray(model.input) && model.input.includes("image") }, api, baseUrl));
+          .map((model) => normalizeCustomProviderModel({ ...model, supportsImages: Array.isArray(model.input) && model.input.includes("image") }, api, baseUrl, undefined, "restore"));
         return [{ id, config: { name: typeof entry.name === "string" ? entry.name : id, api, baseUrl,
           models: this.#updatedKunpoModels(id, baseUrl, models).filter(model => modelUsages(model).language).map(runtimeModelDefinition) } }];
       } catch {
@@ -254,7 +254,7 @@ export class ProviderModelSettingsStore {
         const details = sanitized.usages[usage];
         if (isObject(details) && isMeshyEndpoint(details.baseUrl)) { endpoints[usage] = details.baseUrl as string; delete details.baseUrl; }
       }
-      const normalized = normalizeCustomProviderModel(sanitized, api, baseUrl, catalog);
+      const normalized = normalizeCustomProviderModel(sanitized, api, baseUrl, catalog, "restore");
       if (modelEndpoint) normalized.baseUrl = modelEndpoint;
       if (normalized.usages) for (const usage of ["image", "video", "3d"] as const) {
         const details = normalized.usages[usage];
@@ -569,7 +569,7 @@ export function normalizeCustomProvider(value: unknown, catalog: CustomModelCata
     ...(modelConfigurationVersion ? { modelConfigurationVersion } : {}), ...(apiKey ? { apiKey } : {}), ...(models ? { models } : {}), ...(hiddenModelIds ? { hiddenModelIds } : {}) };
 }
 
-export function normalizeCustomProviderModel(value: unknown, defaultApi: string, defaultBaseUrl?: string, catalog: CustomModelCatalog = new Map()): CustomProviderModel {
+export function normalizeCustomProviderModel(value: unknown, defaultApi: string, defaultBaseUrl?: string, catalog: CustomModelCatalog = new Map(), mode: "save" | "restore" = "save"): CustomProviderModel {
   if (!isObject(value)) throw new Error("Invalid custom model");
   const id = typeof value.id === "string" ? value.id.trim() : "";
   const name = typeof value.name === "string" ? value.name.trim() : "";
@@ -589,7 +589,8 @@ export function normalizeCustomProviderModel(value: unknown, defaultApi: string,
   if (detected !== undefined && (!isObject(detected) || !["provider", "catalog"].includes(String(detected.source)) || detected.thinkingLevelMap === undefined)) throw new Error("Invalid reasoning capabilities");
   const reported = isObject(detected) && detected.source === "provider" ? normalizeThinkingLevelMap(detected.thinkingLevelMap) : undefined;
   const reasoningCapabilities = language ? automaticCustomReasoning(id, api, catalog, reported) : undefined;
-  if (!supportedReasoningLevels({ reasoning, thinkingLevelMap: { ...reasoningCapabilities?.thinkingLevelMap, ...thinkingLevelMap } }).length) throw new Error("Enable at least one reasoning level");
+  // A saved override can rely on catalog levels that are resolved after loading.
+  if (mode === "save" && !supportedReasoningLevels({ reasoning, thinkingLevelMap: { ...reasoningCapabilities?.thinkingLevelMap, ...thinkingLevelMap } }).length) throw new Error("Enable at least one reasoning level");
   const baseUrl = typeof value.baseUrl === "string" && value.baseUrl.trim() ? normalizeEndpoint(value.baseUrl) : undefined;
   if (!baseUrl && !defaultBaseUrl) throw new Error("Model Base URL is required for this provider");
   return { id, name, api, ...(baseUrl ? { baseUrl } : {}), contextWindow, maxTokens, reasoning, ...(thinkingLevelMap ? { thinkingLevelMap } : {}), ...(reasoningCapabilities ? { reasoningCapabilities } : {}), supportsImages, ...(usages ? { usages } : {}) };

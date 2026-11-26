@@ -74,7 +74,9 @@ describe("desktop daemon access", () => {
     expect(String(allowed.headers["access-control-allow-headers"]).split(/\s*,\s*/)).toEqual(
       expect.arrayContaining(["authorization", "content-type", "x-workspace-version", "x-publish-access-token"]),
     );
-    expect(allowed.headers["access-control-expose-headers"]).toBe("x-workspace-version");
+    expect(String(allowed.headers["access-control-expose-headers"]).split(/\s*,\s*/).sort()).toEqual([
+      "accept-ranges", "content-length", "content-range", "etag", "x-workspace-version",
+    ]);
 
     const rejected = await app.inject({
       method: "OPTIONS",

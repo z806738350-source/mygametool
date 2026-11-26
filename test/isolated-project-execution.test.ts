@@ -36,6 +36,7 @@ import {
 import { IsolatedVmLifecycle } from "../src/daemon/isolated-vm-lifecycle.js";
 import { SessionManager, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { AutoContinueTools } from "../src/daemon/agent-auto-continue.js";
+import { getToolPreflightFailure } from "../src/daemon/agent-tool-errors.js";
 import { createIsolatedRecoveryTool, createIsolatedShellTool } from "../src/daemon/isolated-shell-tool.js";
 import { createLocalAgentFileTools } from "../src/daemon/agent-local-files.js";
 import { readSourceReview, reviewSnapshotDigest } from "../src/daemon/isolated-source-review.js";
@@ -46,7 +47,7 @@ import { prepareWorkingImage } from "../src/daemon/image-working-assets.js";
 import * as retainedDisplay from "../src/daemon/retained-image-display.js";
 import * as imagePreparation from "../src/daemon/image-working-assets.js";
 import { getIsolatedRepairProof, getIsolatedRepairPending } from "../src/daemon/isolated-tool-receipts.js";
-import { getIsolatedOperationReceipts, isolatedCommandsNotSubmitted, isIsolatedInputBudgetError, withIsolatedOperationScope, type IsolatedOperationReceipt } from "../src/daemon/isolated-tool-receipts.js";
+import { getIsolatedOperationReceipts, isolatedCommandsNotSubmitted, isIsolatedInputBudgetError, isolatedVmLeaseBusyError, withIsolatedOperationScope, type IsolatedOperationReceipt } from "../src/daemon/isolated-tool-receipts.js";
 import { reserveRecoverySpace } from "../src/daemon/recovery-space.js";
 import * as recoverySpace from "../src/daemon/recovery-space.js";
 import { inspectExecutionCapacity } from "../src/daemon/execution-capacity.js";
@@ -478,13 +479,14 @@ function fixtureSourceManifest(files: readonly ManifestFixtureFile[]): SourceMan
 async function manifestCaptureFixture(options: {
   image?: boolean;
   imageSize?: number;
+  unchanged?: boolean;
   lostAck?: boolean;
   originPhase?: "released" | "finished" | "active";
   prepareBinding?: (binding: any) => void;
   header?: (header: any, operation: string) => void;
 } = {}) {
   const f = await fixture();
-  const before = sourceFile("counter.txt", "before"), after = sourceFile("counter.txt", "after");
+  const before = sourceFile("counter.txt", "before"), after = options.unchanged ? before : sourceFile("counter.txt", "after");
   await writeFile(path.join(f.workspacePath, before.path), Buffer.from(before.data, "base64"));
   const raw = referencePng({ width: options.imageSize ?? 32, height: options.imageSize ?? 32, noise: true, level: 0 });
   const image = { path: "public/frame.png", size: raw.length, sha256: createHash("sha256").update(raw).digest("hex"), executable: false as const };
@@ -696,8 +698,14 @@ async function profileCaptureFixture(options: {
   });
   f.handlers.set("release", input => { releasedId = input.operationId; f.projects.get(f.project.id).dirty = !ackId; return { released: true, dirty: !ackId }; });
   const previous = spawn.getMockImplementation()!;
+  let completeOnInput = false;
   spawn.mockImplementation((...args) => {
     const operation = args[1][8];
+    if (operation === "run" && completeOnInput) {
+      const child = previous(...args);
+      child.stdin!.once("data", () => setImmediate(() => f.completeRun(args[1][9])));
+      return child;
+    }
     if (!["prepare-append", "capture-media", "review-source-media"].includes(operation)) return previous(...args);
     const child = new ChildProcess(); child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough(); children.push(child);
     if (operation === "prepare-append") {
@@ -750,8 +758,9 @@ async function profileCaptureFixture(options: {
     return child;
   });
   const run = async (signal?: AbortSignal) => {
-    const count = f.runs.size + 1, running = f.execution.shell(f.project, "fixture-only", 5, operation => operation(), signal).catch(cause => cause);
-    return Promise.race([running, vi.waitFor(() => expect(f.runs.size).toBe(count)).then(() => { f.completeRun(originalId); return running; })]);
+    completeOnInput = true;
+    try { return await f.execution.shell(f.project, "fixture-only", 5, operation => operation(), signal).catch(cause => cause); }
+    finally { completeOnInput = false; }
   };
   return { ...f, profile, before, after, media, raw, image, resultManifest, snapshotId, receivedMedia, run, originalId: () => originalId };
 }
@@ -967,6 +976,28 @@ it("source manifest v1 negotiates capture3 and sends the complete actual seed on
   expect(f.requests.some(request => request.operation === "capture")).toBe(false);
 });
 
+it.each([true, false])("settles a successful command after a concurrent host edit only for a verified unchanged guest capture (unchanged: %s)", async unchanged => {
+  const f = await manifestCaptureFixture({ unchanged });
+  const receipts: IsolatedOperationReceipt[] = [];
+  const running = withIsolatedOperationScope(async history => { receipts.splice(0, receipts.length, ...history); },
+    () => f.execution.shell(f.project, "fixture-only", 5, operation => operation())).catch(cause => cause);
+  await vi.waitFor(() => expect(f.runs.size).toBe(1));
+  await writeFile(path.join(f.workspacePath, f.before.path), "newer host version");
+  f.completeRun(f.originalId());
+  if (unchanged) {
+    expect(await running).toMatchObject({ changed: [] });
+    expect(receipts.map(r => r.phase).slice(-4)).toEqual(["captured", "published", "acknowledged", "released"]);
+    expect(f.requests.find(r => r.operation === "acknowledge")?.input).toMatchObject({
+      operationId: f.originalId(), snapshotId: f.snapshotId, sourceResultManifestId: f.resultManifest.manifestId,
+    });
+  } else {
+    expect((await running).message).toContain("Source conflict");
+    expect(receipts.map(r => r.phase).slice(-3)).toEqual(["captured", "retained", "released"]);
+    expect(f.requests.some(r => r.operation === "acknowledge")).toBe(false);
+  }
+  expect(await readFile(path.join(f.workspacePath, f.before.path), "utf8")).toBe("newer host version");
+});
+
 it.each(["sourceManifestVersion", "sourceBaseManifestId", "captureVersion", "wrong-base"])("source manifest v1 rejects an incompatible prepare binding before run: %s", async fault => {
   const f = await manifestCaptureFixture({ prepareBinding: binding => {
     if (fault === "wrong-base") binding.sourceBaseManifestId = "f".repeat(64);
@@ -1105,7 +1136,9 @@ it.each<ManifestHeaderFault>(["sourceManifestVersion", "sourceBaselineManifest",
     if (operation === "review-source-media") corruptManifestHeader(header, fault);
   } });
   expect(await f.run()).toBeInstanceOf(Error);
-  await expect(f.execution.reviewSource(f.project, "1", operation => operation())).rejects.toThrow();
+  await expect(f.execution.reviewSource(f.project, "1", operation => operation())).rejects.toSatisfy(error =>
+    error instanceof Error && !getToolPreflightFailure(error));
+  expect(f.requests.some(request => request.operation === "review-source-media")).toBe(true);
   expect(f.requests.some(request => ["recover", "acknowledge"].includes(request.operation))).toBe(false);
   expect(await readFile(path.join(f.workspacePath, f.before.path), "utf8")).toBe("before");
   await expect(stat(path.join(f.workspacePath, f.image.path))).rejects.toMatchObject({ code: "ENOENT" });
@@ -1738,6 +1771,11 @@ it.each([0, 1] as const)("runs a scripted Agent review/prepare/explicit-size/app
     manager.appendMessage({ role: "toolResult", toolCallId: id, toolName: name, content: output.content, details: output.details, isError: false, timestamp: 3 } as never);
     return output;
   };
+  const tool = tools.find(candidate => candidate.name === recovery.name)!;
+  await expect(tool.execute("stale-review", { action: "review", generation: "3" }, undefined, undefined, { sessionManager: manager } as never))
+    .rejects.toSatisfy(error => getToolPreflightFailure(error)?.reason === "invalid_recovery_input");
+  expect(f.requests.some(request => request.operation === "review-source-media")).toBe(false);
+  await guard.prepare(new AbortController().signal);
   await run(recovery.name, "inspect", { action: "inspect" });
   const initial = (await run(recovery.name, "review", { action: "review", generation: "4" })).details as IsolatedSourceReview;
   expect(initial.reviewVersion).toBe(2); expect(initial.blockers).toEqual([]); expect(initial.preparedSnapshotId).toMatch(/^[a-f0-9]{64}$/);
@@ -2059,6 +2097,38 @@ it.each([{ rasterInspectionVersion: 0 }, { rasterInspectionVersion: 1 }, { raste
   f.handlers.set("health", () => ({ protocolVersion: 2, ready: true, sourceInspectionVersion: 1, limits: resourceLimits }));
   f.handlers.set("inspect-source", () => ({ namespace: "test", projectId: f.project.id, generation: 4, complete: true, changes: [], excluded: 0, blockers: 0, ...rules }));
   await expect(f.execution.inspectSource(f.project, 4)).rejects.toThrow("inspection rule version");
+});
+
+it.each([true, false])("continues after a confirmed VM lease refusal and preserves unknown startup failures (confirmed=%s)", async confirmed => {
+  const message = "The isolated VM has an existing lifecycle lease";
+  const ready = vi.fn().mockRejectedValueOnce(confirmed ? isolatedVmLeaseBusyError(message) : new Error(message));
+  const f = await fixture("test", { ready, close: vi.fn() });
+  const shell = createIsolatedShellTool((command, timeout, signal) => f.execution.shell(f.project, command, timeout, fn => fn(), signal));
+  const manager = SessionManager.inMemory(f.workspacePath);
+  const user = manager.appendMessage({ role: "user", content: "Measure the standing images", timestamp: 1 });
+  const args = { command: "measure" };
+  manager.appendMessage({ role: "assistant", api: "ohmygame-native", content: [{ type: "toolCall", id: "original", name: shell.name, arguments: args }], timestamp: 2 } as never);
+  const guard = new AutoContinueTools([shell], { sessionManager: manager }); guard.reset(user);
+  const invoke = (tools: AutoContinueTools, id: string) => tools.wrap()[0]!.execute(id, args, undefined, undefined, {} as never);
+  const failure = await invoke(guard, "original").catch(cause => cause);
+  const isolatedOperations = getIsolatedOperationReceipts(failure);
+  manager.appendMessage({ role: "toolResult", toolName: shell.name, toolCallId: "original", content: [{ type: "text", text: message }], isError: true, timestamp: 3, isolatedOperations } as never);
+  expect(f.requests).toHaveLength(0);
+  expect(isolatedCommandsNotSubmitted(isolatedOperations)).toBe(confirmed);
+  const restored = new AutoContinueTools([shell], { sessionManager: manager }); restored.reset(user);
+  if (!confirmed) {
+    await expect(restored.prepare(new AbortController().signal)).rejects.toThrow("unconfirmed");
+    return;
+  }
+  expect(isolatedOperations?.at(-1)).toMatchObject({ phase: "input_rejected", rejection: "vm_lease_busy" });
+  expect(guard.stopRequested).toBe(false);
+  await restored.prepare(new AbortController().signal);
+  await expect(invoke(restored, "original")).rejects.toThrow(message);
+  expect(ready).toHaveBeenCalledOnce();
+  const next = invoke(restored, "after-release");
+  await vi.waitFor(() => expect(f.runs.size).toBe(1));
+  f.completeRun([...f.runs.keys()][0]!);
+  await expect(next).resolves.toMatchObject({ details: { changed: [] } });
 });
 
 it.each([false, true])("records only a command-scoped rejection for an initial budget and submits no prepare, command or cancellation; separate runtime=%s", async separated => {
@@ -2558,15 +2628,15 @@ it.each(["public-file", "public-directory", "linked-file", "hardlinked-file", "l
   },
 );
 
-it.each(["status", "start"])("latches a failed fresh %s without another attempt and keeps confirmed cleanup possible", async (failure) => {
+it("latches a failed fresh start without another attempt and keeps confirmed cleanup possible", async () => {
   const f = await lifecycle();
   await f.vm.ready();
-  f.setState(failure === "status" ? "Unknown" : "Stopped");
-  if (failure === "start") f.setFailStart(true);
+  f.setState("Stopped");
+  f.setFailStart(true);
   const rejected = f.vm.ready();
   await expect(rejected).rejects.toThrow(/unavailable|control command failed/);
   const receipt = path.join(f.directory, "manual-vm.lock/owner.json");
-  expect(JSON.parse(await readFile(receipt, "utf8")).state).toBe(failure === "start" ? "starting" : "owned");
+  expect(JSON.parse(await readFile(receipt, "utf8")).state).toBe("starting");
   const count = f.commands.length;
   f.setState("Running"); f.setFailStart(false);
   expect(f.vm.ready()).toBe(rejected);
@@ -2577,20 +2647,18 @@ it.each(["status", "start"])("latches a failed fresh %s without another attempt 
   await expect(stat(receipt)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
-it("latches a failed fresh status after borrowing without acquiring ownership or stopping that VM", async () => {
-  const f = await lifecycle("Running");
+it.each(["Running", "Stopped"])("rechecks a recovered read-only VM status without restarting it (initial=%s)", async initial => {
+  const f = await lifecycle(initial);
   await f.vm.ready();
   f.setState("Unknown");
-  const rejected = f.vm.ready();
-  await expect(rejected).rejects.toThrow("unavailable");
-  await expect(stat(path.join(f.directory, "manual-vm.lock"))).rejects.toMatchObject({ code: "ENOENT" });
-  const count = f.commands.length;
-  f.setState("Stopped");
-  expect(f.vm.ready()).toBe(rejected);
   await expect(f.vm.ready()).rejects.toThrow("unavailable");
+  if (initial === "Running") await expect(stat(path.join(f.directory, "manual-vm.lock"))).rejects.toMatchObject({ code: "ENOENT" });
+  const count = f.commands.length;
+  f.setState("Running");
+  await f.vm.ready();
+  expect(f.commands.slice(count)).toEqual([["list", "--json", "omg"]]);
   await f.vm.close();
-  expect(f.commands).toHaveLength(count);
-  expect(f.commands.some((args) => args[0] === "start" || args[0] === "stop")).toBe(false);
+  expect(f.commands.filter(args => args[0] === "start" || args[0] === "stop")).toHaveLength(initial === "Running" ? 0 : 2);
 });
 
 it.each(["Stopped", "Running"])("does not restart a previously successful %s VM after close begins during fresh status", async (initial) => {
@@ -2636,6 +2704,30 @@ it("fails closed for an old lifecycle lease or missing launch identity", async (
   expect(() => new IsolatedVmLifecycle(directory, "")).toThrow(
     "launch identity",
   );
+});
+
+it("can acquire a lease after a confirmed competing owner releases it", async () => {
+  const f = await lifecycle();
+  const next = new IsolatedVmLifecycle(f.directory, f.launchId);
+  await f.vm.ready();
+  const commands = f.commands.length;
+  await expect(next.ready()).rejects.toThrow("existing lifecycle lease");
+  expect(f.commands).toHaveLength(commands);
+  await f.vm.close();
+  await next.ready();
+  expect(f.commands.filter((args) => args[0] === "start")).toHaveLength(2);
+  await next.close();
+});
+
+it("retries VM readiness after the lease directory becomes available", async () => {
+  const f = await lifecycle();
+  await rename(f.directory, f.directory + "-unavailable");
+  try { await expect(f.vm.ready()).rejects.toThrow("lease could not be created"); }
+  finally { await rename(f.directory + "-unavailable", f.directory); }
+  expect(f.commands).toEqual([]);
+  await f.vm.ready();
+  expect(f.commands.filter(args => args[0] === "start")).toHaveLength(1);
+  await f.vm.close();
 });
 
 it("does not create an unavailable VM and retains an uncertain start receipt for confirmed cleanup", async () => {
@@ -2838,9 +2930,10 @@ it("refuses legacy guest health before preparing or running anything", async () 
   const { execution, project, workspacePath, handlers, requests } =
     await fixture();
   handlers.set("health", () => ({ backend: "lima-vz-cgroup-v1", node: true }));
-  await expect(
-    execution.start(project, "build", workspacePath),
-  ).rejects.toMatchObject({ code: "PROTOCOL_MISMATCH", changed: false });
+  const failure = await withIsolatedOperationScope(async () => {}, () => execution.start(project, "build", workspacePath)).catch(cause => cause);
+  expect(failure).toMatchObject({ code: "PROTOCOL_MISMATCH", changed: false });
+  expect(getIsolatedOperationReceipts(failure)?.at(-1)).toMatchObject({ phase: "input_rejected", rejection: "readiness_check" });
+  expect(isolatedCommandsNotSubmitted(getIsolatedOperationReceipts(failure))).toBe(true);
   expect(requests.map((r) => r.operation)).toEqual(["health"]);
 });
 
@@ -2945,14 +3038,14 @@ it("quiesces a prepare in flight without letting a late run start", async () => 
   f.execution.resumeProject(f.project.id);
 });
 
-it("deletion checks the exact stored generation and preserves typed guest refusal", async () => {
+it("deletion preserves a typed guest refusal even when preflight inventory is clean", async () => {
   const f = await fixture();
   f.projects.set(f.project.id, {
     projectId: f.project.id,
     namespace: "test",
     generation: 7,
-    state: "recovery-pending",
-    dirty: true,
+    state: "resident",
+    dirty: false,
     active: false,
   });
   f.handlers.set("retire", () => ({
@@ -2978,6 +3071,39 @@ it("deletion checks the exact stored generation and preserves typed guest refusa
   });
   expect(beforeRetire).toHaveBeenCalledOnce();
   f.execution.resumeProject(f.project.id);
+});
+
+it("only dispatches dirty storage retirement after confirmation of the current generation", async () => {
+  const f = await fixture();
+  const retained = {
+    projectId: f.project.id,
+    namespace: "test",
+    generation: 7,
+    state: "recovery-pending",
+    dirty: true,
+    active: false,
+  };
+  f.projects.set(f.project.id, retained);
+  await f.execution.quiesceProject(f.project.id);
+  const beforeRetire = vi.fn().mockResolvedValue(undefined);
+  await expect(f.execution.retireProject(f.project, beforeRetire)).rejects.toMatchObject({ generation: "7" });
+  f.projects.set(f.project.id, { ...retained, generation: 8 });
+  await expect(f.execution.retireProject(f.project, beforeRetire, "7")).rejects.toMatchObject({ generation: undefined });
+  f.projects.delete(f.project.id);
+  await expect(f.execution.retireProject(f.project, beforeRetire, "8")).rejects.toMatchObject({ generation: undefined });
+  expect(beforeRetire).not.toHaveBeenCalled();
+  expect(f.requests.filter(request => request.operation === "retire")).toEqual([]);
+
+  f.projects.set(f.project.id, { ...retained, generation: 8 });
+  await expect(f.execution.retireProject(f.project, beforeRetire, "8")).resolves.toEqual({ deleted: true });
+  expect(beforeRetire).toHaveBeenCalledOnce();
+  expect(f.requests.filter(request => request.operation === "retire").map(request => request.input)).toEqual([{
+    namespace: "test",
+    projectId: f.project.id,
+    generation: 8,
+    confirmation: "DELETE_PROJECT_VOLUME",
+    discardUnsynced: true,
+  }]);
 });
 
 it("prepares a stopped VM before fresh absence verification, then stages exactly one retirement", async () => {
@@ -3940,7 +4066,8 @@ it.each(["ready", "control"])("serializes first-allocation capacity control agai
   const planning = f.execution.planCapacityMigration(f.project, { namespace: "test", projectId: f.project.id, planId, capacityProfileVersion: 2, sourceProfileId: "capacity-128-v2" });
   try {
     await entered;
-    await expect(f.execution.start(f.project, "build", f.workspacePath)).rejects.toThrow("Stop the existing project operation");
+    await expect(f.execution.start(f.project, "build", f.workspacePath)).rejects.toSatisfy(
+      cause => getToolPreflightFailure(cause)?.reason === "project_execution_busy");
     await expect(f.execution.planCapacityMigration(f.project, { namespace: "test", projectId: f.project.id, planId, capacityProfileVersion: 2, sourceProfileId: "capacity-128-v2" })).rejects.toThrow("Wait for this project's isolated operations");
     await expect(f.execution.inspectCapacityPlan(f.project, { namespace: "test", projectId: f.project.id, planId })).rejects.toThrow("Wait for this project's isolated operations");
     expect(f.requests.some(item => item.operation.startsWith("prepare") || item.operation === "run")).toBe(false);

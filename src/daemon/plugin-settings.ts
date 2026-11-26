@@ -21,10 +21,18 @@ interface LegacyPluginSettings {
 
 export class InvalidPluginSettingsError extends Error {}
 
+export class PluginStoreUnavailableError extends Error {
+  readonly statusCode = 503;
+  constructor(files: string) {
+    super(`Could not read ${files}. Repair the saved plugin data and restart OhMyGame.`);
+  }
+}
+
 export class PluginSettingsStore {
   readonly #filePath: string;
   #settings = new Map<string, PluginSettings>();
   #writes: Promise<void> = Promise.resolve();
+  #loadError?: PluginStoreUnavailableError;
 
   constructor(dataDirectory: string) {
     this.#filePath = path.join(dataDirectory, "plugin-settings.json");
@@ -37,23 +45,31 @@ export class PluginSettingsStore {
       if (!stored) throw new Error(`Invalid plugin settings: ${this.#filePath}`);
       this.#settings = new Map(Object.entries(stored.plugins).map(([id, settings]) => [id, cloneSettings(settings)]));
     } catch (cause) {
-      if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
+      if ((cause as NodeJS.ErrnoException).code !== "ENOENT") {
+        this.#loadError = new PluginStoreUnavailableError("plugin-settings.json");
+        throw this.#loadError;
+      }
+      this.#settings.clear();
     }
+    this.#loadError = undefined;
   }
+
+  get available(): boolean { return !this.#loadError; }
+  assertAvailable(): void { if (this.#loadError) throw this.#loadError; }
 
   resolve(plugin: PluginDetail): PluginSettings {
     const stored = this.#settings.get(plugin.id);
     const components = componentEntries(plugin).map(([key, component]) => [key, component.enabled] as const);
-    const resolvedComponents = Object.fromEntries(components.map(([key, defaultEnabled]) => [key, stored?.components[key] ?? defaultEnabled]));
+    const resolvedComponents = Object.fromEntries(components.map(([key, defaultEnabled]) => [key, this.available && (stored?.components[key] ?? defaultEnabled)]));
     return {
-      enabled: stored?.enabled ?? plugin.enabled,
+      enabled: this.available && (stored?.enabled ?? plugin.enabled),
       components: resolvedComponents,
     };
   }
 
   decorateSummary(plugin: PluginSummary): PluginSummary {
     const stored = this.#settings.get(plugin.id);
-    return { ...plugin, enabled: stored?.enabled ?? plugin.enabled };
+    return { ...plugin, enabled: this.available && (stored?.enabled ?? plugin.enabled) };
   }
 
   decorate(plugin: PluginDetail): PluginDetail {
@@ -71,6 +87,7 @@ export class PluginSettingsStore {
   }
 
   async update(plugin: PluginDetail, next: PluginSettings): Promise<PluginSettings> {
+    this.assertAvailable();
     const validKeys = new Set(componentEntries(plugin).map(([key]) => key));
     if (Object.keys(next.components).some((key) => !validKeys.has(key)) || Object.values(next.components).some((enabled) => typeof enabled !== "boolean")) {
       throw new InvalidPluginSettingsError("Invalid plugin component settings");
@@ -88,6 +105,7 @@ export class PluginSettingsStore {
   }
 
   async updateComponent(plugin: PluginDetail, key: string, enabled: boolean): Promise<void> {
+    this.assertAvailable();
     if (!componentEntries(plugin).some(([valid]) => valid === key)) throw new InvalidPluginSettingsError("Invalid plugin component");
     await this.#enqueueMutation(async () => {
       const settings = this.resolve(plugin);
@@ -100,6 +118,7 @@ export class PluginSettingsStore {
   }
 
   async remove(pluginId: string): Promise<void> {
+    this.assertAvailable();
     await this.#enqueueMutation(async () => {
       const updated = new Map(this.#settings);
       if (!updated.delete(pluginId)) return;

@@ -128,7 +128,7 @@ it("reclaims idle private Codex history on shutdown without losing active rows, 
   expect(await readFile(auth, "utf8")).toBe("local auth fixture");
 });
 
-it("rewrites deleted row bytes on used Codex pages and retries a busy database on a later shutdown", async () => {
+it("rewrites deleted row bytes on used Codex pages after a restart and retries a busy database", async () => {
   const f = await historyFixture();
   const home = path.join(f.runtimes, "codex-home");
   await f.put(f.conversation, JSON.stringify(f.marker("codex-cli", f.codexId)));
@@ -164,13 +164,13 @@ it("rewrites deleted row bytes on used Codex pages and retries a busy database o
   const writer = new DatabaseSync(state);
   try {
     writer.exec("BEGIN IMMEDIATE");
-    await new AgentRuntimeService(f.root, () => undefined).close();
+    await new AgentRuntimeService(f.root, () => undefined).load();
     expect((await readFile(state)).includes(deleted)).toBe(true);
     expect((await readFile(history)).includes(deleted)).toBe(false);
   } finally {
     writer.close();
   }
-  await new AgentRuntimeService(f.root, () => undefined).close();
+  await new AgentRuntimeService(f.root, () => undefined).load();
   for (const file of files) {
     expect((await readFile(file)).includes(deleted)).toBe(false);
     const db = new DatabaseSync(file, { readOnly: true });

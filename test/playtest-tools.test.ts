@@ -1,10 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
+import { writeFile } from "node:fs/promises";
+import path from "node:path";
 import { createGameUseTool, previewUrl } from "../src/daemon/playtest-tools.js";
 import { WEB_GAME_USE_CAPABILITIES, playtestActionError, playtestOpenError, type GameRuntimeAdapter, type GameUseCapabilities, type PlaytestRequest, type PlaytestResult, type PlaytestSnapshot } from "../src/shared/playtest.js";
 import { AutoContinueTools } from "../src/daemon/agent-auto-continue.js";
 import { getToolPreflightFailure } from "../src/daemon/agent-tool-errors.js";
 import { OwnedPlaytestDriver } from "../src/daemon/owned-playtest.js";
 import { reportIsolatedOperation } from "../src/daemon/isolated-tool-receipts.js";
+import { PreviewManager } from "../src/daemon/preview.js";
+import type { ProjectState } from "../src/shared/contracts.js";
+import { RuntimeEventBus } from "../src/shared/events.js";
+import { temporaryTestDirectory } from "./temporary-test-directory.js";
 
 const snapshot: PlaytestSnapshot = {
   sessionId: "session-1",
@@ -54,6 +60,60 @@ class FakeDriver implements GameRuntimeAdapter {
 }
 
 describe("game use tool", () => {
+  it("records a walk input only in a window opened on the same published revision", async () => {
+    let revision = "before";
+    const walkReview = vi.fn(async () => ({ text:"Inspect the walk.", play:{ setId:"robot", revision } }));
+    const driver = new FakeDriver();
+    const tool = createGameUseTool(driver,async () => ({runtime:"web", url:snapshot.url}), { walkReview });
+    const actions = [{type:"press" as const, key:"ArrowRight"}];
+    const call = (operation:"open"|"act") => tool.execute(operation, {operation,sessionId:snapshot.sessionId,actions}, undefined, undefined, {} as never);
+    await expect(call("open")).resolves.toMatchObject({ details:{ spriteWalkPlay:{revision:"before"}, playtest:{sessionId:snapshot.sessionId} } });
+    revision = "after";
+    expect((await call("act")).details).not.toHaveProperty("spriteWalkPlay");
+    await expect(call("open")).resolves.toMatchObject({details:{spriteWalkPlay:{revision:"after"}}});
+  });
+  it("associates action input with the action opened in that session", async () => {
+    let actionId = "trot";
+    const driver = new FakeDriver(), actions = [{ type: "press" as const, key:"Space" }];
+    const tool = createGameUseTool(driver, async () => ({ runtime:"web", url:snapshot.url }),
+      { walkReview: async () => ({ text:"Trigger the action.", play:{setId:"wolf", actionId, revision:"same"} }) });
+    const call = (operation: "open" | "act") => tool.execute(operation,{operation,actions,sessionId:snapshot.sessionId},undefined,undefined,{} as never);
+    await expect(call("open")).resolves.toMatchObject({details:{spriteActionPlay:{actionId:"trot"}}});
+    actionId = "leap";
+    expect((await call("act")).details).not.toHaveProperty("spriteActionPlay");
+    await expect(call("open")).resolves.toMatchObject({details:{spriteActionPlay:{actionId:"leap"}}});
+  });
+  it("records a busy preview as unexecuted and allows a fresh open once the command completes", async () => {
+    const workspacePath = await temporaryTestDirectory("busy-playtest-");
+    await writeFile(path.join(workspacePath, "index.html"), "<p>Playable project</p>");
+    const project: ProjectState = { id: "busy-playtest", name: "Busy playtest", type: "web-game", workspacePath,
+      updatedAt: new Date(0).toISOString(), previewMode: "script", preview: { status: "stopped" } };
+    const preview = new PreviewManager(new RuntimeEventBus());
+    const driver = new FakeDriver();
+    const guard = new AutoContinueTools([createGameUseTool(driver, async () => ({ runtime: "web", url: await preview.ensureStarted(project, false) }))]);
+    guard.reset();
+    const tool = guard.wrap()[0]!;
+    const args = { operation: "open", actions: [{ type: "press", key: "Enter" }] };
+    const call = (id: string) => tool.execute(id, args, undefined, undefined, {} as never);
+    try {
+      await preview.withExecutionSlot(project, async () => {
+        const failure = await call("busy-open").catch(error => error);
+        expect(failure).toMatchObject({ statusCode: 409 });
+        expect(getToolPreflightFailure(failure)).toEqual({ effect: "none", reason: "playtest_project_busy", disposition: "correctable" });
+        expect(driver.requests).toEqual([]);
+      });
+      await expect(guard.prepare(new AbortController().signal)).resolves.toBeUndefined();
+      const replay = await call("busy-open");
+      expect(replay).toMatchObject({ isError: true, details: { playtestReplay: { originalOutcome: "not_executed", actionsReexecuted: false } } });
+      expect(driver.requests).toEqual([]);
+      project.previewMode = "static";
+      await expect(call("fresh-open")).resolves.toMatchObject({ details: { playtest: { sessionId: snapshot.sessionId } } });
+      expect(driver.requests.map(request => request.operation)).toEqual(["open", "act"]);
+    } finally {
+      await preview.stopAll();
+    }
+  });
+
   it("coalesces one in-flight open while preserving new opens and observations with identical arguments", async () => {
     const driver = new FakeDriver(), opened = { ...snapshot, sessionId: "session-2" };
     let finish!: (result: PlaytestResult) => void;
@@ -299,12 +359,19 @@ describe("game use tool", () => {
     expect(driver.requests).toHaveLength(0);
     const openTarget = vi.fn(async () => ({ runtime: "web" as const, url: snapshot.url }));
     const openTool = createGameUseTool(driver, openTarget);
-    await expect(openTool.execute("open-unsupported", {
+    const guard = new AutoContinueTools([openTool]);
+    guard.reset();
+    const open = guard.wrap()[0]!;
+    const refused = await open.execute("open-unsupported", {
       operation: "open",
       actions: [{ type: "press", key: "Enter" }, { type: "click", target: { x: 20, y: 20 } }],
-    }, undefined, undefined, {} as never)).rejects.toThrow("does not support pointer input");
+    }, undefined, undefined, {} as never).catch(cause => cause);
+    expect(getToolPreflightFailure(refused)?.reason).toBe("playtest_precondition");
     expect(openTarget).not.toHaveBeenCalled();
     expect(driver.requests).toHaveLength(0);
+    await guard.prepare(new AbortController().signal);
+    await open.execute("open-corrected", { operation: "open", actions: [{ type: "press", key: "Enter" }] }, undefined, undefined, {} as never);
+    expect(driver.requests.map(request => request.operation)).toEqual(["open", "act"]);
   });
 
   it("does not apply web preview paths to non-web targets", async () => {

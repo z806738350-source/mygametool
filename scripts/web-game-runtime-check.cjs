@@ -7,6 +7,7 @@ const { pathToFileURL } = require('node:url');
 const root = path.resolve(__dirname, '..');
 const directory = process.argv[2];
 const nativeTransitions = !process.argv.includes('--skip-native-transitions');
+const nativeMinimize = nativeTransitions && !process.argv.includes('--skip-native-minimize');
 app.setPath('userData', path.join(directory, 'profile'));
 app.on('window-all-closed', () => {});
 const deadline = setTimeout(() => { console.error('Desktop game check timed out'); app.exit(2); }, 60000);
@@ -27,8 +28,9 @@ async function fullscreen(window, frame, enabled) {
     timer = setTimeout(() => reject(new Error(`Native fullscreen transition timed out: ${window.getTitle()} ${enabled}`)), 5000);
   });
   try {
-    await frame.executeJavaScript(enabled ? 'void document.body.requestFullscreen()' : 'void document.exitFullscreen()', true);
-    await transition;
+    const request = enabled ? 'document.body.requestFullscreen()' : 'document.exitFullscreen()';
+    await Promise.all([transition, frame.executeJavaScript(`${request}.then(() => null, error => error.message)`, true)
+      .then(error => assert.equal(error, null, `Fullscreen request: ${error}`))]);
   } finally { clearTimeout(timer); }
 }
 const backgroundSamples = [];
@@ -123,17 +125,20 @@ app.whenReady().then(async () => {
     assert.equal(await native.executeJavaScript('typeof window.ohMyGameDesktop'), 'undefined');
     const identity = await frame().executeJavaScript('game.id');
     console.log(nativeTransitions ? 'Checking native game fullscreen...' : 'Skipping native fullscreen/minimize transitions (--skip-native-transitions).');
+    if (nativeTransitions) {
+      const withoutGesture = await frame().executeJavaScript('document.body.requestFullscreen().then(() => true, () => false)');
+      assert.equal(withoutGesture, false, 'The game needs a user gesture to enter fullscreen');
+      assert.equal(editor.isFullScreen(), false);
+    }
     await fullscreen(editor, frame(), true);
-    await fullscreen(editor, frame(), false);
-    if (nativeTransitions) console.log('Native game fullscreen passed.');
     await frame().executeJavaScript('game.memory = 42; history.pushState({}, "", "/scene?level=2#boss")');
     await eventually(() => navigation.at(-1)?.path === '/scene?level=2#boss');
     const frameId = frame().frameTreeNodeId;
-    await fullscreen(editor, frame(), true);
     const editorExit = nativeTransitions ? new Promise(resolve => editor.once('leave-full-screen', resolve)) : Promise.resolve();
     await games.open('game', { path: '/', viewport: { width: 375, height: 667 } }, target);
     await editorExit;
     await eventually(() => !editor.isFullScreen());
+    if (nativeTransitions) console.log('Native editor fullscreen and exit on transfer passed.');
     assert.equal(resolves, 1, 'Opening Play reuses the existing server and game');
     assert.equal(frame().frameTreeNodeId, frameId, 'Opening Play retains the same frame');
     assert.equal(await frame().executeJavaScript('game.id'), identity);
@@ -163,7 +168,7 @@ app.whenReady().then(async () => {
     await eventually(async () => !native.isAudioMuted() && await frame().executeJavaScript('document.visibilityState') === 'visible');
     const shownPlay = await activity(frame(), 'shown Play', 400);
     assert.ok(shownPlay.frames >= 2 && shownPlay.ticks >= 2, 'Showing Play resumes animation and timers');
-    if (nativeTransitions) {
+    if (nativeMinimize) {
       player.minimize();
       await eventually(async () => player.isMinimized() && native.isAudioMuted() && await frame().executeJavaScript('document.visibilityState') === 'hidden');
       await sleep(100);
@@ -197,6 +202,8 @@ app.whenReady().then(async () => {
     games.layout('game', 'mount', layout);
     await eventually(async () => !native.isAudioMuted() && await frame().executeJavaScript('document.visibilityState') === 'visible');
     const shownPreview = await activity(frame(), 'shown Preview', 400);
+    await fullscreen(editor, frame(), true);
+    await fullscreen(editor, frame(), false);
     assert.ok(shownPreview.frames >= 2 && shownPreview.ticks >= 2, 'Showing Preview resumes animation and timers');
     assert.equal(frame().frameTreeNodeId, frameId, 'Showing Preview retains the game frame');
     assert.equal(await frame().executeJavaScript('game.id'), identity);
@@ -226,7 +233,10 @@ app.whenReady().then(async () => {
     games.close();
     await eventually(() => reloaded.isDestroyed());
     assert.equal(reloaded.isDestroyed(), true, 'Service shutdown releases game WebContents');
-    console.log(JSON.stringify({ electron: process.versions.electron, skippedChecks: nativeTransitions ? [] : ['native fullscreen transitions', 'native minimize/restore transitions'], nativeChecks: nativeTransitions ? ['fullscreen transitions', 'minimize/restore transitions'] : [], checks: 'view-lifetime localStorage/IndexedDB saves, legacy/default storage isolation, live frame identity, in-memory state, game frame focus, routing, source/diagnostics, window transfer, resizing, AI storage isolation, native hide/show, visibility/audio, background animation/timers, child-frame Canvas, native capture, reload, renderer crash recovery, project leave, shutdown', unsupportedStorageContracts, hiddenVisibility: hiddenState, backgroundSamples, result: 'passed' }, null, 2));
+    const transitions = [['fullscreen transitions', nativeTransitions], ['minimize/restore transitions', nativeMinimize]];
+    const skippedChecks = transitions.filter(([, enabled]) => !enabled).map(([name]) => 'native ' + name);
+    const nativeChecks = transitions.filter(([, enabled]) => enabled).map(([name]) => name);
+    console.log(JSON.stringify({ electron: process.versions.electron, skippedChecks, nativeChecks, checks: 'view-lifetime localStorage/IndexedDB saves, legacy/default storage isolation, live frame identity, in-memory state, game frame focus, routing, source/diagnostics, window transfer, resizing, AI storage isolation, native hide/show, visibility/audio, background animation/timers, child-frame Canvas, native capture, reload, renderer crash recovery, project leave, shutdown', unsupportedStorageContracts, hiddenVisibility: hiddenState, backgroundSamples, result: 'passed' }, null, 2));
   } catch (error) { console.error(error); process.exitCode = 1; }
   finally {
     clearTimeout(deadline);

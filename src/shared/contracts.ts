@@ -857,6 +857,7 @@ export type ThreadItem = (
       id: string;
       turnId: string;
       type: "retry";
+      source?: "manual-local-image";
       status: Extract<ItemStatus, "inProgress" | "completed" | "failed">;
       attempt: number;
       maxAttempts: number;
@@ -1337,6 +1338,8 @@ export interface AudioRequestDiagnostic {
 }
 
 export interface ToolJob {
+  /** Original retained pixels verified when observing a completed managed character direction. */
+  characterView?: { direction: import("./character-views.js").CharacterViewDirection; viewRevision: string; displayHeadToGround?: number; sha256: string };
   /** Immutable Library identities actually used by this request, independent of later node edits. */
   sources?: Array<{ assetId: string; name: string }>;
   /** Daemon-owned transport receipt; never an upstream ID, request body or credential. */

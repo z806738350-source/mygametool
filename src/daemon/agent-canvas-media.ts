@@ -81,6 +81,7 @@ export async function saveAgentCanvasMedia(
   boardId?: string,
   readImageAttachment?: (reference: string, signal?: AbortSignal) => Promise<PromptImage>,
   signal?: AbortSignal,
+  referenceMode?: "pinned",
 ) {
   const animation = toolId === "animate-3d" ? await resolveAgentAnimation(projects.get(projectId), tools, input, signal) : undefined;
   return store.createAgentMediaNode(
@@ -262,6 +263,7 @@ export async function saveAgentCanvasMedia(
       } as AssetCanvasNode;
     },
     boardId,
+    referenceMode,
   );
 }
 

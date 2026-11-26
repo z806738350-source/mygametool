@@ -39,7 +39,8 @@ Read only the specialist skills needed for the request:
 - Plain Three.js runtime work: `../three-webgl-game/SKILL.md`
 - React-hosted Three.js work: `../react-three-fiber-game/SKILL.md`
 - Visual direction, screen mockups, HUD, menus, responsive layout, or touch controls: `../game-ui-frontend/SKILL.md`
-- 2D sprite generation and normalization: `../sprite-pipeline/SKILL.md`
+- Eight static character directions from a reference, or a revision to one direction: use `read_workflow_guide` with guide `eight-direction-character`
+- Animated 2D characters and creatures: use `read_workflow_guide` with guide `sprite-pipeline` to create the action, check its visible parts and key poses, and repair the published atlas.
 - GLB or glTF preparation and optimization: `../web-3d-asset-pipeline/SKILL.md`
 - Browser smoke tests, gameplay regression checks, or visual QA: `../game-playtest/SKILL.md`
 

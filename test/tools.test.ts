@@ -22,6 +22,59 @@ const apps: ReturnType<typeof createApp>[] = [];
 afterEach(async () => { await Promise.all(apps.splice(0).map((app) => app.close())); });
 
 describe("tool runner", () => {
+  it("opens projects with unreadable generation history, preserves it across shutdown, and resumes after repair", async () => {
+    const directory = await temporaryData();
+    await mkdir(path.join(directory, "tools"));
+    const file = path.join(directory, "tools", "jobs.json");
+    const original = '[{"id":"retained","status":"failed"}';
+    await writeFile(file, original);
+    const generate = vi.fn(fakeGenerator().generate);
+    const app = createApp({ dataDirectory: directory, imageGenerator: { generate } });
+    await app.ready();
+    try {
+      const project = (await app.inject({ method: "POST", url: "/projects", payload: { name: "Healthy" } })).json();
+      expect((await app.inject(`/projects/${project.id}`)).statusCode).toBe(200);
+      expect((await app.inject("/tool-jobs")).statusCode).toBe(503);
+      expect((await app.inject({ method: "POST", url: "/tools/generate-image/jobs", payload: { prompt: "Blocked" } })).statusCode).toBe(503);
+      expect((await app.inject({ method: "POST", url: "/tool-jobs/retained/retry" })).statusCode).toBe(503);
+      expect((await app.inject({ method: "DELETE", url: `/projects/${project.id}` })).statusCode).toBe(503);
+      expect((await app.inject(`/projects/${project.id}`)).statusCode).toBe(200);
+      expect(generate).not.toHaveBeenCalled();
+    } finally { await app.close(); }
+    expect(await readFile(file, "utf8")).toBe(original);
+    const retained = { id: "retained", toolId: "generate-image", title: "Previous", status: "succeeded", createdAt: new Date(0).toISOString() };
+    await writeFile(file, JSON.stringify([retained]));
+    const repaired = createApp({ dataDirectory: directory, imageGenerator: { generate } });
+    apps.push(repaired);
+    expect((await repaired.inject("/tool-jobs")).json()).toMatchObject([retained]);
+    expect((await repaired.inject({ method: "POST", url: "/tools/generate-image/jobs", payload: { prompt: "After repair" } })).statusCode).toBe(202);
+    await vi.waitFor(() => expect(generate).toHaveBeenCalledTimes(1));
+  });
+
+  it("allows delivery of a recorded agent result but rejects fresh direct or prepared requests against an invalid history", async () => {
+    const directory = await temporaryData();
+    const generate = vi.fn(fakeGenerator().generate);
+    const first = new ToolRunner(directory, { generate });
+    await first.load();
+    const input = { prompt: "Original" }, agentCall = { scope: "b".repeat(64), callId: "saved-call" };
+    const recoveryId = "a".repeat(64);
+    const saved = await first.run("generate-image", input, undefined, "project", { recoveryId, agentCall });
+    await first.close();
+    const file = path.join(directory, "tools", "jobs.json");
+    const corrupt = '[{"id":"partial"}]';
+    await writeFile(file, corrupt);
+    const second = new ToolRunner(directory, { generate });
+    await expect(second.load()).rejects.toMatchObject({ statusCode: 503 });
+    await expect(second.run("generate-image", input)).rejects.toMatchObject({ statusCode: 503, notSubmitted: true });
+    await expect(second.runPrepared("generate-image", input, undefined, { videoRecoveryOnly: true })).rejects.toMatchObject({ statusCode: 503 });
+    await expect(second.removeProject("project")).rejects.toMatchObject({ statusCode: 503 });
+    const recovered = await second.run("generate-image", input, undefined, "project", { recoveryId, agentCall, imageRecoveryOnly: true });
+    expect(recovered.id).toBe(saved.id);
+    expect(generate).toHaveBeenCalledTimes(1);
+    await second.close();
+    expect(await readFile(file, "utf8")).toBe(corrupt);
+  });
+
   it("removes project media after reopening while preserving other owners, shared results and Library assets", async () => {
     const directory = await temporaryData(), runner = new ToolRunner(directory, fakeGenerator()); await runner.load();
     const ownedId = "a".repeat(64), scope = "b".repeat(64), sharedId = "c".repeat(64);

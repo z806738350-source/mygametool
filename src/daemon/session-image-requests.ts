@@ -16,7 +16,7 @@ function wrapInlineImageFetch(delegate: typeof fetch, images: SessionImages, sco
     }
     const body = await request.clone().text();
     const payload: unknown = JSON.parse(body);
-    try { images.budget(payload, scope); }
+    try { await images.budget(payload, scope, false, request.signal); }
     catch (error) { if (error instanceof ImageBudgetError) return localImageError(error); throw error; }
     const outgoing = images.withPreviousToolImages(payload, scope);
     const headers = new Headers(request.headers); headers.delete("content-length");
@@ -30,7 +30,7 @@ function wrapInlineImageFetch(delegate: typeof fetch, images: SessionImages, sco
     try {
       outgoing.discard();
       // Retry with the original visual working set if optional history alone can be dropped.
-      if (outgoing.payload === payload) images.budget(payload, scope, true);
+      if (outgoing.payload === payload) await images.budget(payload, scope, true, request.signal);
       await response.body?.cancel();
       const reduced = await delegate(new Request(request, { body: JSON.stringify(payload), redirect: "error" }));
       if (reduced.status !== 413) return reduced;

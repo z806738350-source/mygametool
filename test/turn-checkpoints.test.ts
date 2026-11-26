@@ -4,6 +4,7 @@ import path from "node:path";
 import { request as httpRequest } from "node:http";
 import Fastify from "fastify";
 import {
+  defineTool,
   ModelRuntime,
   SessionManager,
   type AgentSession,
@@ -315,6 +316,18 @@ async function fixture(
   };
 }
 
+it("continues a normally stopped Pi walk once from its host observation under the original user message", async () => {
+  const finishWalkReview = vi.fn().mockResolvedValueOnce("Check the missing NW walk").mockResolvedValue(undefined);
+  const tool = Object.assign(defineTool({ name: "review_sprite_walk", label: "Walk", description: "Review", parameters: Type.Object({}),
+    execute: async () => ({ content: [{type:"text" as const,text:"checked"}], details:{} }) }), { finishWalkReview });
+  const { manager, project, conversation, sessionManager, runtime } = await fixture(undefined, undefined, [tool]);
+  const infer = vi.fn(() => stream(assistant([{ type:"text", text:"Done" }])));
+  runtime.streamSimple = infer;
+  await expect(manager.prompt(project, conversation, "Repair the walk").result).resolves.toBe("completed");
+  expect(infer).toHaveBeenCalledTimes(2);
+  expect(JSON.stringify(infer.mock.calls[1])).toContain("Check the missing NW walk");
+  expect(sessionManager.getBranch().filter(e => e.type === "message" && e.message.role === "user")).toHaveLength(1);
+});
 it("answers a verified model count locally and preserves the answer for the next Pi turn", async () => {
   const { project, conversation, manager, sessionManager, runtime, events, snapshot } = await fixture();
   const runId = "c0000000-0000-4000-8000-000000000001";

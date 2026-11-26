@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { generateCanvasDocument, generateCanvasText, generateCanvasTable, getCanvasBoard } from "../src/renderer/canvas-api.js";
+import { generateCanvasDocument, generateCanvasText, generateCanvasTable, getCanvasBoard, listCanvasBoardJobs } from "../src/renderer/canvas-api.js";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -33,5 +33,13 @@ describe("canvas generation API", () => {
     await generateCanvasText("project", "Write", { provider: "openai", id: "test" });
     expect(fetchMock.mock.calls[0]![1]).toHaveProperty("signal");
     expect(fetchMock.mock.calls[1]![1]).not.toHaveProperty("signal");
+  });
+  it("reads managed revision states with the scoped board jobs", async () => {
+    vi.stubGlobal("window", {});
+    const snapshot = { jobs: [], characterViews: [{ state: "available", jobId: "original" }] };
+    const fetchMock = vi.fn(async () => Response.json(snapshot));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(listCanvasBoardJobs("project", "board")).resolves.toEqual(snapshot);
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith("/api/projects/project/canvas/boards/board/jobs", expect.objectContaining({ signal: expect.any(AbortSignal) }));
   });
 });

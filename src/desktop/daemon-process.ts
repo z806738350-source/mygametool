@@ -43,6 +43,7 @@ export interface StartDaemonOptions {
   handlePlaytestRequest?: (request: PlaytestRequest, signal: AbortSignal) => Promise<PlaytestResult>;
   resolveSystemProxy?: () => Promise<string>;
   onUnexpectedExit?: (error: Error) => void;
+  recoverExitedDaemonVm?: (pid: number) => Promise<void>;
   /** Keeps the daemon's output after the app closes. */
   log?: LogWriter;
   /** The folder of `log`, which the daemon reads for a diagnostics export. */
@@ -150,7 +151,12 @@ export async function startDaemon(options: StartDaemonOptions): Promise<ManagedD
     stdoutLog?.flush();
     stderrLog?.flush();
     options.log?.line(`OhMyGame service exited (${signal ?? code ?? "unknown"})`);
-    void cleanup().finally(() => {
+    void cleanup().then(async () => {
+      if (child.pid && options.recoverExitedDaemonVm) {
+        try { await options.recoverExitedDaemonVm(child.pid); }
+        catch (error) { options.log?.line(`Could not recover the exited daemon's local VM: ${error instanceof Error ? error.message : String(error)}`); }
+      }
+    }).finally(() => {
       resolve();
       if (unexpected) options.onUnexpectedExit?.(startupError(`The background service exited (${signal ?? code ?? "unknown"})`, startupOutput));
     });
@@ -163,7 +169,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<ManagedD
   } catch (error) {
     stopped = true;
     await stopChild(child, shutdownTimeout);
-    await cleanup();
+    await closed;
     throw error;
   }
 

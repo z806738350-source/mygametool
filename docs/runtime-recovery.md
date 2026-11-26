@@ -10,6 +10,14 @@ preinstalled plugin extraction and local state loading can exceed Fastify's
 default ten-second timeout on Windows; the longer budget keeps that work from
 aborting an otherwise healthy desktop startup.
 
+Optional plugin switches, credentials and saved image connections can fail
+independently at startup. An unreadable file disables the affected capabilities.
+The desktop keeps the original file for repair. A damaged chat record is
+excluded from the affected project’s list until its contents can be read again.
+A damaged Library index or generation history blocks operations that depend on
+that ledger, including new media submissions and project deletion. Project
+browsing and conversations remain available while the original ledger is repaired.
+
 ## Preview lifecycle
 
 See [startup configuration](preview-runtime.md#startup-configuration) for
@@ -52,6 +60,11 @@ is retained with an explicit **Send original message** action, including its
 attachment references. Newly requested messages remain available after recovery.
 The project preview shows **Start preview** after service recovery. Human game
 players and agent playtests attached to the old service are closed.
+
+In a local source launch, Electron waits for the old daemon to exit before
+restarting the service. It uses the launcher's VM cleanup only for a lease
+matching that child PID, the Electron PID and the launch ID. An unverified
+lease stays in place and the rest of the desktop service can still recover.
 
 Browser-only development retains its existing daemon address and reconnect
 behavior. It has no Electron supervisor or service-restart bridge.

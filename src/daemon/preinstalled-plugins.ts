@@ -26,11 +26,10 @@ export class PreinstalledPluginManager {
   }
 
   async load(): Promise<void> {
-    if (this.directory) {
-      const value = JSON.parse(await readFile(path.join(this.directory, "index.json"), "utf8")) as unknown;
-      if (!isPreparedPluginIndex(value)) throw new Error("Invalid preinstalled Plugin index");
-      this.#entries = value.plugins;
-    }
+    if (!this.directory) return;
+    const index = JSON.parse(await readFile(path.join(this.directory, "index.json"), "utf8")) as unknown;
+    if (!isPreparedPluginIndex(index)) throw new Error("Invalid preinstalled Plugin index");
+    this.#entries = index.plugins;
     try {
       const value = JSON.parse(await readFile(this.#statePath, "utf8")) as unknown;
       if (!isState(value)) throw new Error("Invalid preinstalled Plugin state");

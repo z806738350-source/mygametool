@@ -6,6 +6,7 @@ import {
 } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { PluginStoreUnavailableError } from "./plugin-settings.js";
 import type {
   PluginConfigurationValues,
   PluginConfigurationView,
@@ -46,33 +47,47 @@ export class PluginConfigurationStore {
   };
   #key!: Buffer;
   #writes: Promise<unknown> = Promise.resolve();
+  #loadError?: PluginStoreUnavailableError;
   constructor(private readonly directory: string) {}
   async load(): Promise<void> {
-    await mkdir(this.directory, { recursive: true });
-    const keyPath = path.join(this.directory, "plugin-credentials.key");
     try {
-      await writeFile(keyPath, randomBytes(32), { mode: 0o600, flag: "wx" });
-    } catch (cause) {
-      if ((cause as NodeJS.ErrnoException).code !== "EEXIST") throw cause;
+      await this.#read();
+      this.#loadError = undefined;
+    } catch {
+      this.#loadError = new PluginStoreUnavailableError("plugin-configuration.json or plugin-credentials.key");
+      throw this.#loadError;
     }
-    this.#key = await readFile(keyPath);
-    if (this.#key.length !== 32)
-      throw new Error("Invalid plugin credential key");
+  }
+  get available(): boolean { return !this.#loadError; }
+  assertAvailable(): void { if (this.#loadError) throw this.#loadError; }
+  suspendMigration(): void { this.#loadError = new PluginStoreUnavailableError("the plugin MCP migration data"); }
+  async #read(): Promise<void> {
+    await mkdir(this.directory, { recursive: true });
     try {
       const state = JSON.parse(
         await readFile(this.filePath, "utf8"),
       ) as StoredConfiguration;
       if (
         state.version !== 1 ||
-        !state.plugins ||
-        !state.credentials ||
-        !state.legacyOwners
+        [state.plugins, state.credentials, state.legacyOwners].some(value => !value || typeof value !== "object" || Array.isArray(value))
       )
         throw new Error("Invalid plugin configuration store");
       this.#state = state;
     } catch (cause) {
       if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
     }
+    const keyPath = path.join(this.directory, "plugin-credentials.key");
+    if (!Object.keys(this.#state.credentials).length) {
+      try {
+        await writeFile(keyPath, randomBytes(32), { mode: 0o600, flag: "wx" });
+      } catch (cause) {
+        if ((cause as NodeJS.ErrnoException).code !== "EEXIST") throw cause;
+      }
+    }
+    this.#key = await readFile(keyPath);
+    if (this.#key.length !== 32) throw new Error("Invalid plugin credential key");
+    // A valid-size key from a different backup must not break the next agent turn.
+    for (const entry of Object.values(this.#state.credentials)) this.#decrypt(entry);
   }
   get filePath(): string {
     return path.join(this.directory, "plugin-configuration.json");
@@ -89,6 +104,7 @@ export class PluginConfigurationStore {
     )?.[0];
   }
   override(pluginId: string, serverId: string): unknown {
+    this.assertAvailable();
     const ref = this.#state.serverOverrides?.[`${pluginId}/${serverId}`];
     return ref
       ? JSON.parse(this.#decrypt(this.#state.credentials[ref]!))
@@ -173,6 +189,7 @@ export class PluginConfigurationStore {
     return { ...plugin.configuration, ...this.#state.extraFields?.[plugin.id] };
   }
   view(plugin: PluginDetail): PluginConfigurationView {
+    this.assertAvailable();
     const fields = this.fields(plugin);
     const stored = this.#state.plugins[plugin.id];
     const values: Record<string, string | boolean> = {};
@@ -364,6 +381,7 @@ export class PluginConfigurationStore {
   }
   #mutate(operation: (next: StoredConfiguration) => void): Promise<void> {
     const result = this.#writes.then(async () => {
+      this.assertAvailable();
       const next = structuredClone(this.#state);
       operation(next);
       const temp = `${this.filePath}.${randomUUID()}.tmp`;

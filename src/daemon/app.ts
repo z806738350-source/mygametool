@@ -1,5 +1,5 @@
 import { GPT_IMAGE_26_SCHEMA, GPT_IMAGE_FORMATS } from "../shared/gpt-image-26.js";
-import { releaseRetiredProjectRecoverySpace, restoreLocalImageRecoverySpaces, restoreRecoverySpaceReservations } from "./recovery-space.js";
+import { assertNoVolumeMigrationSpace, releaseRetiredProjectRecoverySpace, restoreLocalImageRecoverySpaces, restoreRecoverySpaceReservations } from "./recovery-space.js";
 import { isMeshyIdentifier, isMeshyProviderConfiguration, MESHY_DISABLED_MESSAGE } from "../shared/disabled-media-providers.js";
 import { PluginIntegrationHost } from "./plugin-integration.js";
 import { matchesPluginProject, requireIntegrationPlugin, registerPluginIntegrationRoutes } from "./plugin-integration-routes.js";
@@ -7,9 +7,11 @@ import { isAllowedLocalOrigin, isLoopbackHostHeader } from "../shared/local-secu
 import { CodexImageProvider } from "./agent-runtimes/codex-image-provider.js";
 import { inspectPreviewConfiguration } from "./preview-configuration.js";
 import { CheckpointStore } from "./checkpoints.js";
-import { ProjectWrites } from "./project-writes.js";
+import { CharacterViewPublicationJournal } from "./character-view-publication.js";
+import { isConversationControlReply, isProjectMetadataRequest, ProjectWriteError, ProjectWrites, releasesPreview } from "./project-writes.js";
+import { isIndependentProjectControl, isProjectToolObservation } from "./agent-auto-continue.js";
 import { TripoModelReviews } from "./tripo-model-review.js";
-import { ProjectLifecycle, ProjectLifecycleError } from "./project-lifecycle.js";
+import { ProjectExecutionDiscardConflict, ProjectLifecycle, ProjectLifecycleError } from "./project-lifecycle.js";
 import type { ExecutionStorageOverview } from "../shared/execution-storage.js";
 import { registerCheckpointRoutes } from "./checkpoint-routes.js";
 import { registerStoryWebRoutes } from "./story-web-routes.js";
@@ -128,6 +130,11 @@ import { MinimaxSettingsStore } from "./minimax-settings.js";
 import { BundledPluginAdapter, LocalPluginAdapter, PluginCatalogService, pluginSummary } from "./plugin-catalog.js";
 import { BundledPluginStore } from "./bundled-plugins.js";
 import { workflowGuideTools } from "./workflow-guide.js";
+import { createSpriteWalkTool, createSpriteWalkRepairTool, createSpriteWalkFinishReview, spriteWalkBoundary } from "./sprite-walk-agent.js";
+import { repairPublishedSpriteWalk } from "./sprite-walk-publish.js";
+import { createSpriteActionReviewTool, createSpriteActionRepairTool } from "./sprite-action-agent.js";
+import { readPublishedSpriteActionIdentity, repairPublishedSpriteAction } from "./sprite-action-package.js";
+import { createCharacterViewTool } from "./character-view-tool.js";
 import { createTurnaroundInspection, hasTurnaroundAssessment } from "./turnaround-inspection.js";
 import { BlenderRunner } from "./blender-runner.js";
 import { BlenderWorkflow } from "./blender-tools.js";
@@ -712,7 +719,7 @@ export function createApp(options: AppOptions = {}) {
   );
   const events = new RuntimeEventBus(1_000, (event) => conversationImages.event(event));
   const attachments = new AgentAttachmentStore();
-  const conversations = new ConversationManager(conversationImages);
+  const conversations = new ConversationManager(conversationImages, file => app.log.warn({ file }, "Skipped an unreadable conversation"));
   let closing = false;
   const eventStreams = new Set<() => void>();
   const trackEventStream = (reply: FastifyReply, unsubscribe: () => void) => {
@@ -844,7 +851,7 @@ export function createApp(options: AppOptions = {}) {
     return generateProjectName(runtime, selected, prompt, signal);
   }), publishProjectRenamed);
   const openAIImages = new OpenAIImageSettingsStore(dataDirectory);
-  const imageConnection = openAIImageConnection(openAIImages, getModelRuntime);
+  const imageConnection = openAIImageConnection(openAIImages, getModelRuntime, () => providerEnabled("kunpo"));
   const modelAuth = new ModelAuthManager(getModelRuntime, {
     onCredentialsChanged: async (runtime, providerId) => {
       await syncOpenAIEndpoint(runtime);
@@ -860,9 +867,11 @@ export function createApp(options: AppOptions = {}) {
   const providerImages = new ProviderImages(getModelRuntime, options.imageFetch, () => undefined, providerEnabled, {
     codexImages,
     openAIConnection: async () => {
-      await getModelRuntime();
-      if (!kunpoApiKey || !providerEnabled("kunpo") || openAIImages.get().mode === "disabled") return imageConnection.resolve();
-      return { source: { baseUrl: KUNPO_BASE_URL, apiKey: kunpoApiKey }, models: openAIImages.models() ?? imageModelsForProvider("openai", "KunpoAPI", KUNPO_MODEL_OPTIONS.filter(model => model.role === "image").map(model => model.id)), connected: true };
+      if (openAIImages.get().mode === "connection" && providerEnabled("kunpo")) {
+        await getModelRuntime();
+        if (kunpoApiKey) return { source: { baseUrl: KUNPO_BASE_URL, apiKey: kunpoApiKey }, models: openAIImages.models() ?? imageModelsForProvider("openai", "KunpoAPI", KUNPO_MODEL_OPTIONS.filter(model => model.role === "image").map(model => model.id)), connected: true };
+      }
+      return imageConnection.resolve();
     },
     customProviders: () => providerModelSettings.customProviderCatalog(),
     migrateLegacyModels: (id, models) => providerModelSettings.migrateLegacyImageModels(id, models, async () => { await (await getModelRuntime()).refresh({ allowNetwork: false, providers: [id] }); }),
@@ -968,7 +977,7 @@ export function createApp(options: AppOptions = {}) {
   const summarizePlugin = (plugin: PluginDetail): PluginSummary => ({
     ...pluginSummary(plugin),
     mcpServerCount: plugin.mcpServers?.length ?? 0,
-    configurationStatus: pluginCapabilities.configuration.view(plugin).missing.length ? "needs-configuration" : "ready",
+    configurationStatus: !pluginCapabilities.configuration.available || pluginCapabilities.configuration.view(plugin).missing.length ? "needs-configuration" : "ready",
   });
   const plugins = new PluginCatalogService([
     new BundledPluginAdapter(bundledPlugins, summarizePlugin),
@@ -981,6 +990,14 @@ export function createApp(options: AppOptions = {}) {
     return operation();
   }));
   let agents: AgentManager;
+  const characterViewJournal = async (project: ProjectState) =>
+    new CharacterViewPublicationJournal(await projects.getLocalImageRecoveryAnchor(project.id, true));
+  const assertCharacterViewPublicationsSettled = async (project: ProjectState) => {
+    try { await (await characterViewJournal(project)).assertSettled(); }
+    catch {
+      throw new ProjectWriteError("Recover the interrupted character view publication before restoring or deleting this project.", "workspace_busy");
+    }
+  };
   const snapshotWorkspace = (project: ProjectState) => projectWrites.snapshot(project.id, async () => {
     if (!projects.get(project.id)) throw new Error("Project not found");
     if (await checkpoints.unfinished(project)) throw new Error("Recover the interrupted file restore before continuing.");
@@ -990,7 +1007,7 @@ export function createApp(options: AppOptions = {}) {
   // At most once a day, after a run, the snapshots that no conversation names any more are removed. Removing the
   // project, Undo and Restore hold the workspace exclusively; a prune whose turn comes then is left for later.
   const pruneCheckpoints = async (project: ProjectState) => {
-    const idle = () => !!projects.get(project.id) && !projectLifecycle.pending(project.id) && !agents.isProjectBusy(project.id) && !projectWrites.isMutating(project.id);
+    const idle = () => !closing && !!projects.get(project.id) && !projectLifecycle.pending(project.id) && !agents.isProjectBusy(project.id) && !projectWrites.isMutating(project.id);
     if (!idle()) return;
     try {
       await checkpoints.prune(project, () => referencedSnapshots(sessionDirectory(project)), {
@@ -1224,7 +1241,7 @@ export function createApp(options: AppOptions = {}) {
     return workflow.tools();
   };
   /** OhMyGame's own tools for a conversation, the same for Pi and for a coding agent. */
-  const projectAgentTools = (project: ProjectState, conversation: StoredConversation, fileTools: ToolDefinition[] = []) => {
+  const projectAgentTools = (project: ProjectState, conversation: StoredConversation, walkHistory: () => SessionEntry[], supportsImages: boolean, fileTools: ToolDefinition[] = []) => {
     const playtestKey = `${project.id}:${conversation.summary.id}`;
     let playtest = agentPlaytests.get(playtestKey);
     if (!playtest && options.playtestDriver) {
@@ -1236,7 +1253,52 @@ export function createApp(options: AppOptions = {}) {
       return authorizeConversationAttachment(conversations.open(project, conversation), reference);
     };
     const inspection = createTurnaroundInspection(project, authorizeAttachment);
-    return [...fileTools, inspection.tool, ...workflowGuideTools(project, bundledPlugins, pluginSettings, () => inkStudioEnabled(project)), ...inkStudioTools(project), ...blenderTools(project), createProjectMediaCapabilitiesTool(() => projects.get(project.id), {
+    const studioSkillEnabled = (skill: string) => {
+      const bundled = bundledPlugins.read("ohmygame:web-game-studio");
+      const studio = bundled && pluginSettings.decorate(bundled);
+      return !!studio?.enabled && studio.skills.some(item => item.enabled && item.id === `skills/${skill}/SKILL.md`);
+    };
+    const characterViewGate = (skill = "eight-direction-character") => {
+      projectLifecycle.assertAvailable(project.id);
+      const latest = projects.get(project.id);
+      if (latest?.type !== "web-game" || latest.workspacePath !== project.workspacePath || latest.startupDirectory !== project.startupDirectory) {
+        throw new ProjectAssetError("The character workflow context changed. Read the current Web Game project before continuing.", 409);
+      }
+      if (!studioSkillEnabled(skill)) throw new ProjectAssetError(skill === "sprite-pipeline"
+        ? "Enable the Sprite Pipeline guide in Web Game Studio before reviewing or repairing a character animation."
+        : "Enable the Eight Direction Character guide in Web Game Studio before preparing or publishing views.", 409);
+    };
+    const characterViewTools = project.type === "web-game" ? [createCharacterViewTool({
+      project, conversationId: conversation.summary.id, projects, canvas: canvasStore, tools, authorizeAttachment,
+      gate: characterViewGate, journal: () => characterViewJournal(project), sourceProfile: () => projectSourceProfile(project),
+      mutateWorkspace: operation => mutateWorkspace(project, () => pluginSettings.duringSettings(async () => {
+        characterViewGate();
+        return operation();
+      })),
+    })] : [];
+    const walkEnabled = project.type === "web-game" && studioSkillEnabled("sprite-pipeline");
+    const reviewWalk = (signal?: AbortSignal) => spriteWalkBoundary(project, walkHistory(), signal, undefined,
+      async before => checkpoints.diff(project, before, await snapshotWorkspace(project)), readPublishedSpriteActionIdentity);
+    function withSpriteRepair<T>(publish: boolean, run: (profile?: Awaited<ReturnType<typeof projectSourceProfile>>) => Promise<T>) {
+      if (!publish) return projectWrites.snapshot(project.id, () => {
+        characterViewGate("sprite-pipeline");
+        return run();
+      });
+      return mutateWorkspace(project, () => pluginSettings.duringSettings(async () => {
+        characterViewGate("sprite-pipeline");
+        await assertCharacterViewPublicationsSettled(project);
+        return run(await projectSourceProfile(project));
+      }));
+    }
+    const walkTools = walkEnabled ? [
+      Object.assign(createSpriteWalkTool(project, supportsImages, () => characterViewGate("sprite-pipeline")), { finishWalkReview: createSpriteWalkFinishReview(reviewWalk) }),
+      createSpriteWalkRepairTool(supportsImages, walkHistory, (input, signal) =>
+        withSpriteRepair(!!input.candidateDigest, profile => repairPublishedSpriteWalk(project, input, signal, profile))),
+      createSpriteActionReviewTool(project, supportsImages, () => characterViewGate("sprite-pipeline"), walkHistory),
+      createSpriteActionRepairTool(supportsImages, walkHistory, (input, signal) =>
+        withSpriteRepair(!!input.candidateDigest, profile => repairPublishedSpriteAction(project, input, signal, profile))),
+    ] : [];
+    return [...fileTools, ...walkTools, inspection.tool, ...workflowGuideTools(project, bundledPlugins, pluginSettings, () => inkStudioEnabled(project)), ...inkStudioTools(project), ...blenderTools(project), ...characterViewTools, createProjectMediaCapabilitiesTool(() => projects.get(project.id), {
       images: providerImages, videos: providerVideos, models3D: providerModels3D, audio: providerAudio, defaultModel: mediaDefaultModel,
     }), ...(options.projectExecution && project.workspaceLocation !== "external" ? [createIsolatedShellTool(async (command, timeout, signal) => {
       signal?.throwIfAborted();
@@ -1326,7 +1388,7 @@ export function createApp(options: AppOptions = {}) {
       tools,
       projects,
       (toolCallId, input, signal, paidMediaTool) => agents.askQuestionnaire(project.id, conversation.summary.id, toolCallId, input, signal, paidMediaTool),
-      playtest ? { driver: playtest, resolveOpenTarget: () => playtestTarget(project) } : undefined,
+      playtest ? { driver: playtest, resolveOpenTarget: () => playtestTarget(project), ...(walkEnabled ? { walkReview: reviewWalk } : {}) } : undefined,
       canvasStore,
       conversation.summary.id,
       enabledMediaTools,
@@ -1361,16 +1423,20 @@ export function createApp(options: AppOptions = {}) {
     )].map(tool => {
       if (tool.name === "recover_isolated_changes") return tool;
       const execute = (tool as ToolDefinition).execute;
-      const assertAllowed = async () => {
+      const assertAllowed = async (input: unknown) => {
+        if (isProjectToolObservation(tool.name, input) || isIndependentProjectControl(tool.name, input)) return;
         await assertSourcePublicationSettled(project.workspacePath);
-        if (!["read", "read_project_file", "ls", "find", "grep", "read_attachment", "recall_image", "read_workflow_guide", "inspect_3d_views", "blender_status", "list_media_capabilities", "canvas_check", "playable_check", "questionnaire", "update_plan"].includes(tool.name))
-          await options.projectExecution?.assertSourceReviewSettled?.(project);
+        await options.projectExecution?.assertSourceReviewSettled?.(project);
       };
       const recover = (tool as ToolDefinition & { recoverAfterHttp500?: ToolDefinition["execute"] }).recoverAfterHttp500;
       return { ...tool, execute: async (...args: Parameters<typeof execute>) => {
-        await assertAllowed(); return execute(...args);
+        try { await assertAllowed(args[1]); }
+        catch (cause) {
+          throw toolPreflightError(cause instanceof Error ? cause.message : "Inspect the retained workspace changes before making new changes.", "project_execution_busy");
+        }
+        return execute(...args);
       }, ...(recover ? { recoverAfterHttp500: async (...args: Parameters<typeof execute>) => {
-        await assertAllowed(); return recover(...args);
+        await assertAllowed(args[1]); return recover(...args);
       } } : {}) };
     });
   };
@@ -1384,6 +1450,7 @@ export function createApp(options: AppOptions = {}) {
   /** OhMyGame's tools for agents outside the app; playtest windows belong to their MCP session. */
   const externalMcp = new ExternalMcpService({
     dataDirectory,
+    onEndpointCleanupError: err => app.log.warn({ err }, "Could not remove the disabled external MCP endpoint file"),
     projects: () => projects.list(),
     tools: (project, sessionId) => {
       const playtestKey = `${project.id}:external:${sessionId}`;
@@ -1449,13 +1516,13 @@ export function createApp(options: AppOptions = {}) {
       ...(model?.contextWindow ? { contextWindow: model.contextWindow } : {}),
       workspacePath: project.workspacePath,
       sessionManager,
-      tools: projectAgentTools(project, conversation, [
+      tools: projectAgentTools(project, conversation, () => sessionManager.getBranch(), model?.supportsImages === true, [
         ...(runtime === "qoder-cli" ? createLocalAgentFileTools(project.workspacePath, (operation) => mutateWorkspace(project, operation), model?.supportsImages === true, authorizeAttachment) : []),
         ...(runtime === "codex-cli" ? [createProjectFileReadTool(project.workspacePath, model?.supportsImages === true)] : []),
         createAgentAttachmentReadTool(project.workspacePath, model?.supportsImages === true, authorizeAttachment),
         ...(model?.supportsImages ? [sessionImages.recallTool as ToolDefinition] : []),
       ]),
-      saveGeneratedImage: (fileName, bytes, prompt) => projects.addGeneratedAsset(project.id, fileName, bytes, { prompt }),
+      saveGeneratedImage: (fileName, bytes, prompt) => mutateWorkspace(project, () => projects.addGeneratedAsset(project.id, fileName, bytes, { prompt })),
       pluginMcp: { config: effectiveMcp, host: pluginCapabilities.host, agentDir: piAgentDirectory },
       skillDirectories: [...pluginSkillFolders(pluginSkills), ...ownSkills],
       instructions: appendSystemPromptForProject(project).join("\n\n"),
@@ -1478,7 +1545,6 @@ export function createApp(options: AppOptions = {}) {
       loadSkills: () => loadPiSkillCatalog(),
     }),
     createSession: options.createSession ?? (async (project, conversation) => {
-      await assertSourcePublicationSettled(project.workspacePath);
       const selected = await conversations.model(project, conversation);
       if (!selected) throw new Error("Select an available model before sending a prompt.");
       if (isRemovedKunpoAgent(selected)) throw new Error("This Kunpo Agent is no longer available. Select another model to continue this conversation.");
@@ -1493,10 +1559,11 @@ export function createApp(options: AppOptions = {}) {
       if (!model || !modelRuntime.hasConfiguredAuth(selected.provider)) {
         throw new Error(`The selected model ${selected.provider}/${selected.id} is not available`);
       }
+      const sessionManager = conversations.open(project, conversation);
       return createPiSession(
         project,
-        conversations.open(project, conversation),
-        kunpoModelOption("agent", selected)?.capabilities.tools === false ? [] : projectAgentTools(project, conversation),
+        sessionManager,
+        kunpoModelOption("agent", selected)?.capabilities.tools === false ? [] : projectAgentTools(project, conversation, () => sessionManager.getBranch(), model.input.includes("image")),
         modelRuntime,
         model,
         piAgentDirectory,
@@ -1516,6 +1583,7 @@ export function createApp(options: AppOptions = {}) {
     checkpoints: {
       snapshot: snapshotWorkspace,
       changed: (project, from, to) => checkpoints.summarize(project, from, to),
+      onlyCanvasViewportChanged: (project, from, to) => checkpoints.onlyCanvasViewportChanged(project, from, to),
     },
     onRunCompleted: (project) => {
       void previews.automatic(project, true).catch(() => {});
@@ -1604,14 +1672,22 @@ export function createApp(options: AppOptions = {}) {
     const route = request.routeOptions.url ?? "";
     if (request.method === "DELETE" && route === "/projects/:projectId" ||
       request.method === "GET" && route === "/projects/:projectId" ||
-      route.includes("/execution-storage") || /\/cancel$/.test(route) || /\/events$/.test(route)) return;
+      route.includes("/execution-storage") || /\/cancel$/.test(route) || /\/events$/.test(route) || releasesPreview(request.method, route)) return;
     try {
       projectLifecycle.assertAvailable(id);
-      const project = projects.get(id);
-      if (project && request.method !== "GET" && request.method !== "HEAD") await assertSourcePublicationSettled(project.workspacePath);
     }
     catch (error) {
       return reply.code(409).send({ error: (error as Error).message, code: "project_lifecycle_pending" });
+    }
+    const answer = request.body as { sourceConfirmation?: unknown } | undefined;
+    if (request.method === "GET" || request.method === "HEAD" || isProjectMetadataRequest(request.method, route) ||
+        isConversationControlReply(request, agents) ||
+        route === "/projects/:projectId/conversations/:conversationId/approvals/*" && answer?.sourceConfirmation !== undefined ||
+        route === "/projects/:projectId/preview/inspect" || route === "/projects/:projectId/conversations/:conversationId/turns") return;
+    const project = projects.get(id);
+    if (project) {
+      try { await assertSourcePublicationSettled(project.workspacePath); }
+      catch (error) { return reply.code(409).send({ error: (error as Error).message, code: "execution_recovery_required" }); }
     }
   });
   const canvasStore = registerCanvasRoutes(app, { projects, library, tools });
@@ -1661,17 +1737,40 @@ export function createApp(options: AppOptions = {}) {
     done(null, payload);
   });
 
-  // Damaged or newer image settings fall back to the default connection instead of blocking startup.
-  const loadOpenAIImages = () => openAIImages.load().catch((err) => app.log.warn({ err }, "Could not load OpenAI image settings"));
+  const loadOpenAIImages = () => openAIImages.load().catch(() => app.log.warn("Could not read openai-images.json; kept image generation disabled"));
+  // Retired credentials are read for local redaction and explicit cleanup only.
+  // A partial read cannot safely reconstruct a shared, multi-account file.
+  type OptionalStore = { load(): Promise<void> };
+  const unreadableSettings = new Map<OptionalStore, string>();
+  const loadOptionalSettings = async (store: OptionalStore, label: string) => {
+    try { await store.load(); }
+    catch {
+      unreadableSettings.set(store, label);
+      app.log.warn({ settings: label }, "Could not read optional settings; retained the saved file");
+    }
+  };
+  const requireReadableSettings = (store: OptionalStore) => {
+    const label = unreadableSettings.get(store);
+    if (label) throw Object.assign(new Error(`Could not read ${label}. Repair the saved file and restart OhMyGame.`), { statusCode: 503 });
+  };
   app.addHook("onReady", async () => {
     const skippedProjectDirectories = new Set<string>();
     await networkSettings.load();
     // A damaged welcome preference must not prevent projects from opening.
     await onboarding.load().catch((err) => app.log.warn({ err }, "Could not load onboarding state"));
-    await Promise.all([library.load(), projects.load((projectDirectory, cause) => {
+    await projectLifecycle.load();
+    await Promise.all([library.load().catch(() => app.log.warn("Asset Library unavailable; retained its files and paused dependent operations")), projects.load((projectDirectory, cause) => {
       skippedProjectDirectories.add(projectDirectory);
       app.log.warn({ err: cause, projectDirectory }, "Could not load project; skipped during startup");
-    }), tools.load(), pluginSettings.load(), pluginCapabilities.configuration.load(), bundledPlugins.load(), preinstalledPlugins.load(), webSearchSettings.load(), openAIEndpoint.load(), loadOpenAIImages(), meshySettings.load(), tripoSettings.load(), hyper3dSettings.load(), seedanceSettings.load(), minimaxSettings.load(), volcengineTtsSettings.load(), volcengineSeedAudioSettings.load(), providerModelSettings.load(), externalMcp.load(), agentRuntimes.load().catch((err) => app.log.warn({ err }, "Could not load coding agent settings"))]);
+    }), tools.load().catch(() => app.log.warn("Generation history is unavailable; saved jobs are retained and new media submissions are paused")),
+    bundledPlugins.load(), preinstalledPlugins.load(), openAIEndpoint.load(), loadOpenAIImages(),
+    pluginSettings.load().catch(err => app.log.warn({ err }, "Plugins disabled because their saved switches are unreadable")),
+    pluginCapabilities.configuration.load().catch(err => app.log.warn({ err }, "Plugin connections disabled because their saved configuration is unreadable")),
+    ...native3DProviders.map(([id, , store]) => loadOptionalSettings(store, `${id}.json`)),
+    loadOptionalSettings(webSearchSettings, "web-search-settings.json"), loadOptionalSettings(seedanceSettings, "seedance.json"),
+    loadOptionalSettings(minimaxSettings, "minimax.json"), loadOptionalSettings(volcengineTtsSettings, "volcengine-tts.json"),
+    loadOptionalSettings(volcengineSeedAudioSettings, "volcengine-seed-audio.json"),
+    providerModelSettings.load(), externalMcp.load(), agentRuntimes.load().catch((err) => app.log.warn({ err }, "Could not load coding agent settings"))]);
     const reservationWorkspaces = projects.list().map(project => project.workspacePath);
     // A damaged project card cannot hide a durable allocation promise from the
     // volume ledger. Inspect only its fixed private reservation location.
@@ -1682,12 +1781,19 @@ export function createApp(options: AppOptions = {}) {
     }
     await restoreRecoverySpaceReservations(reservationWorkspaces, projects.list().filter(project => project.workspaceLocation === "external").map(project => project.workspacePath)).catch(err => app.log.warn({ err }, "Recovery space reservations require review; new recovery allocations are blocked"));
     await restoreLocalImageRecoverySpaces(() => projects.localImageRecoveryAnchors()).catch(err => app.log.warn({ err }, "Local image reservations require review; new recovery allocations are blocked"));
-    await projectLifecycle.load();
-    await Promise.all(projects.list().map(async (project) => { projectWrites.initialize(project.id, await readWorkspaceVersion(project)); }));
+    for (const project of projects.list()) {
+      try { await (await characterViewJournal(project)).assertSettled(); }
+      catch (err) { app.log.warn({ err, projectId: project.id }, "Character view publication requires recovery"); }
+    }
+    await Promise.all(projects.list().map(project => projectWrites.initialize(project.id, requireExisting => readWorkspaceVersion(project, requireExisting))
+      .catch(err => app.log.warn({ err, projectId: project.id }, "Could not read the workspace version; versioned writes to this project must wait for recovery"))));
     await getModelRuntime();
     // Retain local catalogs without seeding external resources or modifying other tools' configurations.
     await localPlugins.list();
-    await pluginCapabilities.migrate(legacyMcp);
+    await pluginCapabilities.migrate(legacyMcp).catch(() => {
+      pluginCapabilities.configuration.suspendMigration();
+      app.log.warn("Plugin connections paused after an incomplete MCP migration; repair the saved MCP configuration and restart");
+    });
   });
 
   const allowedOrigins = new Set(options.allowedOrigins ?? []);
@@ -1738,11 +1844,12 @@ export function createApp(options: AppOptions = {}) {
   registerCheckpointRoutes(app, {
     store: checkpoints,
     snapshot: snapshotWorkspace, writes: projectWrites, projects, conversations, agents, previews, events,
-    busy: (id) => publishing.has(id) || canvasStore.isProjectBusy(id) || tools.jobs().some((job) => job.context?.projectId === id && job.status === "running"),
+    beforeRestore: assertCharacterViewPublicationsSettled,
+    busy: (id) => publishing.has(id) || canvasStore.isProjectBusy(id) || tools.isProjectBusy(id),
   });
   registerStoryWebRoutes(app, {
     projects, agents, writes: projectWrites, checkpoints, snapshot: snapshotWorkspace, library, events,
-    busy: (id) => publishing.has(id) || canvasStore.isProjectBusy(id) || tools.jobs().some((job) => job.context?.projectId === id && job.status === "running"),
+    busy: (id) => publishing.has(id) || canvasStore.isProjectBusy(id) || tools.isProjectBusy(id),
   });
 
   // The page Scenes run in. The desktop app loads its own pages from file://,
@@ -1779,7 +1886,7 @@ export function createApp(options: AppOptions = {}) {
     catch (cause) { return reply.code(400).send({ error: cause instanceof Error ? cause.message : String(cause) }); }
   });
 
-  app.get("/settings/web-search", async () => webSearchSettings.get());
+  app.get("/settings/web-search", async () => { requireReadableSettings(webSearchSettings); return webSearchSettings.get(); });
 
   app.get("/settings/external-agents", externalAgentSettings);
   app.put<{ Body: UpdateExternalAgentSettings }>("/settings/external-agents", { schema: externalAgentSettingsSchema }, async (request) => {
@@ -1801,7 +1908,7 @@ export function createApp(options: AppOptions = {}) {
 
   app.put("/settings/web-search", async (_request, reply) =>
     reply.code(410).send({ error: "Web search configuration has been retired in local secure mode." }));
-  app.delete("/settings/web-search/credentials", async () => webSearchSettings.clearCredentials());
+  app.delete("/settings/web-search/credentials", async () => { requireReadableSettings(webSearchSettings); return webSearchSettings.clearCredentials(); });
 
   const pluginInstallRequestSchema = {
     body: {
@@ -1959,6 +2066,7 @@ export function createApp(options: AppOptions = {}) {
           throw new ToolRunError("Project and node context must be provided together", 400);
         }
         if (projectId && !projects.get(projectId)) throw new ToolRunError("Project not found", 404);
+        tools.assertJobHistoryAvailable();
         await tools.assertMediaAvailable(request.params.toolId, input as RunToolRequest);
         return reply.code(202).send(tools.start(request.params.toolId, input as RunToolRequest, {
           title: title?.trim(),
@@ -2471,10 +2579,17 @@ export function createApp(options: AppOptions = {}) {
     }
   });
 
-  app.delete<{ Params: { projectId: string } }>("/projects/:projectId", async (request, reply) => {
+  app.delete<{ Params: { projectId: string }; Querystring: { discardExecutionGeneration?: string } }>("/projects/:projectId", {
+    schema: { querystring: { type: "object", properties: { discardExecutionGeneration: { type: "string", pattern: "^[1-9][0-9]{0,15}$" } } } },
+  }, async (request, reply) => {
     const project = projects.get(request.params.projectId);
     if (!project) return reply.code(404).send({ error: "Project not found" });
+    const { discardExecutionGeneration } = request.query;
+    let quiescing = false;
     try {
+      library.assertAvailable();
+      if (discardExecutionGeneration !== undefined && !options.projectExecution) throw new ProjectExecutionDiscardConflict();
+      tools.assertJobHistoryAvailable();
       await projectLifecycle.delete(project.id, async (stage) => {
         await assertSourcePublicationSettled(project.workspacePath);
         await projects.assertRecoveryPreserved(project.id);
@@ -2482,7 +2597,10 @@ export function createApp(options: AppOptions = {}) {
         await agents.turnsClosed(project.id);
         if (agents.isProjectBusy(project.id) || tools.isProjectBusy(project.id) || publishing.has(project.id))
           throw new ProjectLifecycleError("Wait for project tasks and generation cleanup to finish before deleting this project.");
-        await options.projectExecution?.quiesceProject(project.id);
+        if (options.projectExecution) {
+          quiescing = true;
+          await options.projectExecution.quiesceProject(project.id);
+        }
         await previews.forget(project);
         for (const [key, driver] of agentPlaytests) {
           if (!key.startsWith(`${project.id}:`)) continue;
@@ -2492,12 +2610,18 @@ export function createApp(options: AppOptions = {}) {
         await canvasStore.waitForProject(project.id);
         await checkpoints.settled(project);
         await projectWrites.exclusive(project.id, async () => {
+          // A restore already in flight can change the version before this lock is acquired.
+          projectWrites.assertVersion(project.id, request.headers["x-workspace-version"] as string | undefined);
           if (agents.isProjectBusy(project.id) || tools.isProjectBusy(project.id))
             throw new ProjectLifecycleError("A project task is still finishing; no project files were deleted.");
           if (await checkpoints.unfinished(project))
             throw new ProjectLifecycleError("Recover the interrupted file restore before deleting this project.");
+          await assertCharacterViewPublicationsSettled(project);
           // Journal guest retirement only after the VM and its current inventory are verified.
-          const retirement = await options.projectExecution?.retireProject(project, () => stage("retiring-volume"));
+          const retirement = await options.projectExecution?.retireProject(project, async () => {
+            if (discardExecutionGeneration !== undefined) await assertNoVolumeMigrationSpace(project.workspacePath);
+            await stage("retiring-volume");
+          }, discardExecutionGeneration);
           if (options.projectExecution && retirement?.deleted !== true)
             throw new ProjectLifecycleError("Isolated storage retirement is unconfirmed; project data was retained.");
           await stage("volume-retired");
@@ -2535,16 +2659,25 @@ export function createApp(options: AppOptions = {}) {
           await library.removeProjectCopies(project.id, async assetId =>
             (await projects.referencesLibraryAsset(assetId, project.id)).map(owner => owner.id));
           if (options.compactProjectBrowserStorageOnExit) await projectLifecycle.scheduleBrowserCleanup(project.id);
-          await projects.delete(project.id);
+          await projects.delete(project.id, () => stage("removing-project"));
           conversations.forget(project);
         });
       });
       return reply.code(204).send();
     } catch (error) {
+      if (error instanceof ProjectWriteError && error.code === "workspace_stale")
+        return reply.header("x-workspace-version", projectWrites.version(project.id))
+          .code(error.statusCode).send({ error: error.message, code: error.code });
+      if (error instanceof ProjectExecutionDiscardConflict) {
+        return reply.code(409).send(error.generation === undefined
+          ? { code: "execution_discard_state_changed", error: error.message }
+          : { code: "execution_discard_required", error: error.message, generation: error.generation });
+      }
+      if (error instanceof ToolRunError || error instanceof AssetLibraryError) return reply.code(error.statusCode).send({ error: error.message });
       const code = error && typeof error === "object" && "code" in error && error.code === "EXECUTION_RETIREMENT_UNAVAILABLE"
         ? "execution_retirement_unavailable" : "project_lifecycle_pending";
       return reply.code(409).send({ error: error instanceof Error ? error.message : String(error), code });
-    } finally { if (projects.get(project.id)) options.projectExecution?.resumeProject(project.id); }
+    } finally { if (quiescing && projects.get(project.id)) options.projectExecution?.resumeProject(project.id); }
   });
 
   app.get("/execution-storage", async (_request, reply): Promise<ExecutionStorageOverview> => {
@@ -3328,9 +3461,9 @@ export function createApp(options: AppOptions = {}) {
     catch (cause) { return reply.code(400).send({ error: cause instanceof Error ? cause.message : String(cause) }); }
   });
   const retiredMediaKeys = [
-    ...native3DProviders.map(([id, name, settings]) => ({ id, name, get: () => settings.get(), clear: () => settings.clear() })),
-    ...Object.values(SEEDANCE_PROVIDERS).map(({ id, name }) => ({ id, name: id === "volcengine-ark" ? "Volcengine Ark" : name, get: () => seedanceSettings.get(id), clear: () => seedanceSettings.clear(id) })),
-    ...Object.values(MINIMAX_PROVIDERS).map(({ id, name }) => ({ id, name, get: () => minimaxSettings.get(id), clear: () => minimaxSettings.clear(id) })),
+    ...native3DProviders.map(([id, name, store]) => ({ id, name, store, get: () => store.get(), clear: () => store.clear() })),
+    ...Object.values(SEEDANCE_PROVIDERS).map(({ id, name }) => ({ id, name: id === "volcengine-ark" ? "Volcengine Ark" : name, store: seedanceSettings, get: () => seedanceSettings.get(id), clear: () => seedanceSettings.clear(id) })),
+    ...Object.values(MINIMAX_PROVIDERS).map(({ id, name }) => ({ id, name, store: minimaxSettings, get: () => minimaxSettings.get(id), clear: () => minimaxSettings.clear(id) })),
   ];
   const removeProvider = async (providerId: string) => {
     const runtime = await getModelRuntime();
@@ -3338,6 +3471,9 @@ export function createApp(options: AppOptions = {}) {
     const retiredKey = retiredMediaKeys.find((key) => key.id === providerId);
     const volcengineTts = providerId === "volcengine-tts";
     const volcengineSeedAudio = providerId === "volcengine-seed-audio";
+    if (retiredKey) requireReadableSettings(retiredKey.store);
+    if (volcengineTts) requireReadableSettings(volcengineTtsSettings);
+    if (volcengineSeedAudio) requireReadableSettings(volcengineSeedAudioSettings);
     if (!retiredKey && !volcengineTts && !volcengineSeedAudio && !runtime.getProvider(providerId)) throw new ModelAuthError("Model provider not found", 404);
     catalogRefresh.invalidate(providerId);
     const previousEndpoint = providerId === "openai" ? openAIEndpoint.override() : undefined;
@@ -3379,13 +3515,14 @@ export function createApp(options: AppOptions = {}) {
   app.delete<{ Params: { providerId: string } }>("/settings/models/legacy-media-keys/:providerId", async (request, reply) => {
     const key = retiredMediaKeys.find(({ id }) => id === request.params.providerId);
     if (!key) return reply.code(404).send({ error: "Legacy provider not found" });
+    requireReadableSettings(key.store);
     await key.clear();
     return reply.code(204).send();
   });
 
   const retiredMediaKeyError = { error: "Independent credentials for this media provider are retired. Configure KunpoAPI or a supported custom provider in Models." };
   for (const [id, , settings] of native3DProviders) {
-    app.get(`/settings/models/providers/${id}`, async () => ({ configured: false, hasSavedKey: settings.get().configured }));
+    app.get(`/settings/models/providers/${id}`, async () => { requireReadableSettings(settings); return { configured: false, hasSavedKey: settings.get().configured }; });
     app.put(`/settings/models/providers/${id}`, { schema: apiKeySettingsSchema }, async (_request, reply) => reply.code(410).send(id === "meshy" ? { error: MESHY_DISABLED_MESSAGE } : retiredMediaKeyError));
   }
   for (const [suffix, accepts] of [["seedance-key", isSeedanceProviderId], ["minimax-key", isMinimaxProviderId]] as const) {
@@ -3398,6 +3535,7 @@ export function createApp(options: AppOptions = {}) {
       const id = request.params.providerId;
       const key = retiredMediaKeys.find((item) => item.id === id);
       if (!key || !accepts(id)) return reply.code(404).send({ error: "Legacy provider not found" });
+      requireReadableSettings(key.store);
       await key.clear();
       return reply.code(204).send();
     });
@@ -3408,6 +3546,7 @@ export function createApp(options: AppOptions = {}) {
   app.put("/settings/models/providers/volcengine-tts", async (_request, reply) => reply.code(410).send({ error: "Speech uses reference audio. Configure the shared KunpoAPI key and select audio in a speech node." }));
   app.post("/settings/models/providers/volcengine-tts/preview", async (_request, reply) => reply.code(410).send({ error: "Select reference audio in a speech node. This retired preview never generates audio." }));
   app.delete("/settings/models/providers/volcengine-tts", async (_request, reply) => {
+    requireReadableSettings(volcengineTtsSettings);
     await volcengineTtsSettings.clear();
     return reply.code(204).send();
   });
@@ -3420,6 +3559,7 @@ export function createApp(options: AppOptions = {}) {
     return reply.code(410).send({ error: "Native audio credentials are retired. Configure the shared KunpoAPI key instead." });
   });
   app.delete("/settings/models/providers/volcengine-seed-audio", async (_request, reply) => {
+    requireReadableSettings(volcengineSeedAudioSettings);
     await volcengineSeedAudioSettings.clear();
     return reply.code(204).send();
   });
@@ -4438,6 +4578,25 @@ export function createApp(options: AppOptions = {}) {
   );
 
   app.post<{ Params: { projectId: string; conversationId: string; turnId: string } }>(
+    "/projects/:projectId/conversations/:conversationId/turns/:turnId/retry-local-image-request",
+    async (request, reply) => {
+      const project = projects.get(request.params.projectId);
+      if (!project) return reply.code(404).send({ error: "Project not found" });
+      const conversation = await conversations.get(project, request.params.conversationId);
+      if (!conversation) return reply.code(404).send({ error: "Conversation not found" });
+      const selected = await conversations.model(project, conversation);
+      if (!selected || isAgentRuntimeId(selected.provider) || !modelProviderEnabled(selected.provider))
+        return reply.code(409).send({ error: "Select the same enabled Pi model before retrying the failed request." });
+      try {
+        const turn = await agents.retryLocalImageRequest(project, conversation, request.params.turnId);
+        return reply.code(202).send({ turnId: turn.turnId, queued: false });
+      } catch (cause) {
+        return reply.code(409).send({ error: cause instanceof Error ? cause.message : String(cause) });
+      }
+    },
+  );
+
+  app.post<{ Params: { projectId: string; conversationId: string; turnId: string } }>(
     "/projects/:projectId/conversations/:conversationId/turns/:turnId/cancel",
     async (request, reply) => {
       const project = projects.get(request.params.projectId);
@@ -4635,6 +4794,7 @@ export function createApp(options: AppOptions = {}) {
     await stop(() => artifacts.close());
     await stop(() => playableDrafts.close());
     await stop(() => examples.close());
+    await stop(() => checkpoints.settled());
     await stop(() => mediaSnapshots.close());
     await stop(() => closeRuntimeMediaSnapshots());
     if (closeFailures.length) throw new AggregateError(closeFailures, "Some local services could not close cleanly");

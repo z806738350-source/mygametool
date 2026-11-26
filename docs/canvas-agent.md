@@ -245,7 +245,9 @@ The Agent can use these tools alongside ordinary file editing:
   when generation is requested, including necessary media for a game-creation
   request unless the user limits its scope. It shares canvas jobs, cancellation and
   history, materializes output in the project, and writes the output ID back
-  to the node. Changing a file does not start generation.
+  to the node. Before submitting, it rechecks that node's settings, linked
+  prompt and selected references. Edits to independent nodes and board layout
+  can proceed during generation preparation or Tripo view approval.
 - New requests through the project Agent's image, reference-image, video,
   3D (including views, retexture and remesh), animation, speech, voice-design,
   sound-effect and music tools also save a generation node **before** submitting.
@@ -279,6 +281,9 @@ The Agent can use these tools alongside ordinary file editing:
   retain their diagnostics; an empty preview is not evidence of a rejected
   provider request. A synchronous image request cancelled before its response has
   no remote task ID to poll, and cannot be safely resubmitted automatically.
+  If a job's private original-input file is missing or mismatched, its history
+  stays available alongside other jobs. Restoring that file enables recovery of
+  the affected input without restarting the project.
   `recover_media` also resolves a direct-tool call that was routed to the Canvas
   to its original saved job, including after restart. Legacy direct generations
   keep their existing recovery path. This does not recreate missing historical

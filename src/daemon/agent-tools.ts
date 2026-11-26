@@ -16,13 +16,16 @@ import { assertSafeGenerationInput, type ToolRunner } from "./tools.js";
 import { getWorkspaceMedia } from "./workspace.js";
 import { readWebpModelReference } from "./image-working-assets.js";
 import type { GameRuntimeAdapter, GameUseOpenTarget } from "../shared/playtest.js";
-import { createGameUseTool } from "./playtest-tools.js";
+import { createGameUseTool, type WalkPlaytestReview } from "./playtest-tools.js";
 import { addPlayableNode } from "./playable-add-node.js";
 import { validatePlayableProject } from "./playable-project.js";
 import { PLAYABLE_PRESET_IDS, PLAYABLE_PRESETS } from "./playable-presets.js";
 import { checkCanvasWorkspace } from "./canvas-check.js";
 import type { CanvasStore } from "./canvas-workspace.js";
 import { readCanvasAssets } from "./canvas-assets.js";
+import { inspectCharacterViewRaster } from "./character-view-raster.js";
+import { MAX_CHARACTER_PREVIEW_SIZE } from "./raster-policy.js";
+import { readCharacterViewSource } from "./character-views.js";
 import { readAssetMetadata } from "./asset-metadata.js";
 import { MediaAlreadyDelivered } from "./agent-media-recovery.js";
 import { createAgentAttachmentReadTool } from "./agent-local-files.js";
@@ -57,7 +60,7 @@ const CANVAS_MEDIA_TOOLS: Partial<Record<import("../shared/contracts.js").AssetC
 };
 
 export function activePiToolNames(enabledTools: readonly ToolId[], registeredToolNames: readonly string[] = []): string[] {
-  const extensionTools = registeredToolNames.filter((name) => ["tool_search", "read_workflow_guide", "inspect_3d_views", "blender_status", "run_blender", "recover_blender_run", "review_tripo_model", "list_media_capabilities", "list_animation_actions", "optimize_image_asset", "get_model_asset", "use_canvas_asset", "prepare_three_runtime", "ensure_ink_runtime", "isolated_shell", "recover_isolated_changes", "read_project_file", "build_game", "canvas_check", "canvas_initialize", "playable_add_node", "playable_check", "game_use", "read_attachment", "recall_image", "recall_tool_text"].includes(name));
+  const extensionTools = registeredToolNames.filter((name) => ["tool_search", "read_workflow_guide", "inspect_3d_views", "blender_status", "run_blender", "recover_blender_run", "review_tripo_model", "list_media_capabilities", "list_animation_actions", "optimize_image_asset", "get_model_asset", "use_canvas_asset", "prepare_three_runtime", "ensure_ink_runtime", "prepare_character_views", "review_sprite_walk", "repair_sprite_walk", "review_sprite_action", "repair_sprite_action", "isolated_shell", "recover_isolated_changes", "read_project_file", "build_game", "canvas_check", "canvas_initialize", "playable_add_node", "playable_check", "game_use", "read_attachment", "recall_image", "recall_tool_text"].includes(name));
   const mediaTools = registeredToolNames.filter(name => ["recover_media", "recover_canvas_media"].includes(name)
     || (enabledTools.length > 0 && ["generate_canvas_media", "replace_canvas_media"].includes(name)));
   const aliases = mediaToolAliases.filter(([name, id]) => enabledTools.includes(id) && registeredToolNames.includes(name)).map(([name]) => name);
@@ -74,7 +77,7 @@ export function projectPiToolNames(
   registeredToolNames: readonly string[] = [],
 ): string[] {
   return mode === "planning"
-    ? [...planningPiToolNames(), ...["canvas_check", "read_project_file", "read_attachment", "recall_image", "recall_tool_text", "list_media_capabilities", "list_animation_actions", "read_workflow_guide", "blender_status"].filter(name => registeredToolNames.includes(name))]
+    ? [...planningPiToolNames(), ...["canvas_check", "read_project_file", "read_attachment", "recall_image", "recall_tool_text", "list_media_capabilities", "list_animation_actions", "read_workflow_guide", "review_sprite_walk", "review_sprite_action", "blender_status"].filter(name => registeredToolNames.includes(name))]
     : activePiToolNames(enabledTools, registeredToolNames);
 }
 
@@ -362,7 +365,7 @@ export function createAgentTools(
   tools: ToolRunner,
   projects: ProjectManager,
   askQuestionnaire?: AskQuestionnaire,
-  playtest?: { driver: GameRuntimeAdapter; resolveOpenTarget: () => Promise<GameUseOpenTarget> },
+  playtest?: { driver: GameRuntimeAdapter; resolveOpenTarget: () => Promise<GameUseOpenTarget>; walkReview?: WalkPlaytestReview },
   canvasStore?: CanvasStore,
   generationScope?: string,
   enabledMediaTools?: () => readonly ToolId[],
@@ -393,7 +396,7 @@ export function createAgentTools(
       for (const [index, file] of paths.entries()) {
         const current = await readProjectImage(project.workspacePath, file, "model", signal);
         if (current.mediaType !== images[index]?.mediaType || current.data !== images[index]?.data)
-          throw new Error("A reference image changed during review. Present the revised views for user review. No generation was submitted.");
+          throw toolPreflightError("A reference image changed during review. Present the revised views for user review. No generation was submitted.", "invalid_model_reference");
       }
       signal?.throwIfAborted();
       return "The user approved these reference views on the review card before they were submitted for 3D generation.";
@@ -662,6 +665,29 @@ export function createAgentTools(
       assetId: canvasId, path: asset.path, registered: true, canvasOnly: asset.canvasOnly === true,
       ...(["model/gltf-binary", "application/vnd.autodesk.fbx"].includes(file.mediaType) ? { sourceAssetId: asset.libraryAssetId ?? canvasId } : {}),
     }));
+    if (current.characterView && canvasAssets.length === 1) {
+      const { direction, viewRevision, displayHeadToGround, sha256 } = current.characterView;
+      const { assetId, path } = canvasAssets[0]!;
+      const source = { kind: "canvas" as const, reference: assetId, expectedSha256: sha256 };
+      const raster = await readCharacterViewSource(project.workspacePath, source)
+        .then(image => inspectCharacterViewRaster(image.bytes))
+        .catch(() => ({ error: "Pixel measurements unavailable. Inspect the retained original before using this candidate." }));
+      const boardId = current.context?.boardId;
+      const neighbors = canvasStore && boardId ? await canvasStore.characterReviewNeighbors(project.id, boardId, nodeId).catch(() => []) : [];
+      const seenPaths = new Set([path]);
+      const comparisons = neighbors.flatMap(neighbor => {
+        const image = registeredOutput(assets, neighbor.assetId)?.[1];
+        if (!image || seenPaths.has(image.path)) return [];
+        seenPaths.add(image.path);
+        return [{ direction: neighbor.direction, path: image.path }];
+      });
+      const reviewRead = { path, characterPreviewHeight: Math.min(MAX_CHARACTER_PREVIEW_SIZE, Math.max(1, Math.round(displayHeadToGround ?? 128))),
+        ...(comparisons.length ? { characterComparePaths: comparisons.map(view => view.path) } : {}) };
+      const reviewColumns = [direction, ...comparisons.map(view => view.direction)];
+      const characterView = { direction, viewRevision, source, path, raster, reviewRead, reviewColumns, boardId, nodeId, jobId: current.id };
+      return { content: [{ type: "text" as const, text: `Saved character view: ${JSON.stringify(characterView)}. Open reviewRead with the project image reader. ${comparisons.length ? "Directions from left to right: " + reviewColumns.join(", ") + ". " : ""}Compare the head, torso and feet against the intended heading before generating the next direction. If the turn is inconsistent, revise this candidate now. Read path alone for native landmarks.` }],
+        details: { canvasGeneration: current, canvasAssets, characterView } };
+    }
     const modelIds = canvasAssets.flatMap(asset => asset.sourceAssetId ? [asset.sourceAssetId] : []);
     const handoff = modelIds.length ? ` For Blender, use sourceAssetId with the original project model: ${modelIds.join(", ")}.` : "";
     const candidates = canvasAssets.filter(asset => asset.canvasOnly).map(asset => asset.assetId);
@@ -1136,22 +1162,27 @@ export function createAgentTools(
       const replacement = definition.name === "replace_canvas_media";
       const recoverJobId = recovery && "recoverJobId" in input && typeof input.recoverJobId === "string" ? input.recoverJobId : undefined;
       const confirmedAudioJobId = replacement && "confirmedAudioJobId" in input && typeof input.confirmedAudioJobId === "string" ? input.confirmedAudioJobId : undefined;
-      if (recovery && !usableRecoveryId(recoverJobId, 120)) throw new Error("recoverJobId requires the actual original ID. No generation was submitted.");
-      if (replacement && !usableRecoveryId(confirmedAudioJobId, 120)) throw new Error("confirmedAudioJobId requires the actual original ID. No generation was submitted.");
-      const { board } = await canvasStore.board(project.id, input.boardId);
-      const node = board.nodes.find((entry) => entry.id === input.nodeId);
-      const toolId = node && CANVAS_MEDIA_TOOLS[node.type];
-      if (!toolId) throw new Error("Choose a media generation node");
-      const previous = (await canvasStore.jobs(project.id)).find((job) => job.context?.boardId === input.boardId && job.context.nodeId === input.nodeId);
-      if (recovery && recoverJobId !== previous?.id) {
+      if (recovery && !usableRecoveryId(recoverJobId, 120)) throw toolPreflightError("recoverJobId requires the actual original ID. No generation was submitted.", "invalid_recovery_input");
+      if (replacement && !usableRecoveryId(confirmedAudioJobId, 120)) throw toolPreflightError("confirmedAudioJobId requires the actual original ID. No generation was submitted.", "invalid_recovery_input");
+      const managed = await canvasStore.managedCharacterViewJob(project.id, {
+        boardId: input.boardId, nodeId: input.nodeId, ...(recoverJobId ? { jobId: recoverJobId } : {}),
+      });
+      if (replacement && managed) throw toolPreflightError("Prepare a new managed direction revision before requesting a replacement. No generation was submitted.", "invalid_character_view_input");
+      const node = managed ? undefined : (await canvasStore.board(project.id, input.boardId)).board.nodes.find(entry => entry.id === input.nodeId);
+      const toolId = managed ? "generate-image" : node && CANVAS_MEDIA_TOOLS[node.type];
+      if (!toolId) throw toolPreflightError("Choose a media generation node", "invalid_media_options");
+      const previous = managed ?? (await canvasStore.jobs(project.id)).find((job) => job.context?.boardId === input.boardId && job.context.nodeId === input.nodeId);
+      if (recovery && !managed && recoverJobId !== previous?.id) {
         await rememberRecovery(toolId, toolCallId, true);
-        throw new Error("recoverJobId does not match the current job for this board and node. Refresh the node history and use its original job ID for recovery; stop if it is unavailable. No new generation was sent.");
+        throw toolPreflightError("recoverJobId does not match the current job for this board and node. Refresh the node history and use its original job ID for recovery; stop if it is unavailable. No new generation was sent.", "invalid_recovery_input");
       }
-      if (replacement && confirmedAudioJobId !== previous?.id) throw new Error("This canvas job no longer matches the node. Refresh its history before requesting confirmation. No generation was submitted.");
+      if (replacement && confirmedAudioJobId !== previous?.id) throw toolPreflightError("This canvas job no longer matches the node. Refresh its history before requesting confirmation. No generation was submitted.", "invalid_recovery_input");
       const pending = previous && (previous.status === "failed" || previous.status === "cancelled");
-      const recover = recoverJobId ?? (pending && !replacement && (previous.run || mediaGenerationNeedsConfirmation(previous)) ? previous.id : undefined);
+      const recover = recoverJobId ?? (!replacement && managed &&
+        (managed.status === "running" || managed.status === "succeeded" || managed.submissionOutcome === "unknown") ? managed.id
+        : pending && !replacement && (previous.run || mediaGenerationNeedsConfirmation(previous)) ? previous.id : undefined);
       if (!recover) {
-        if (enabledMediaTools && !enabledMediaTools().includes(toolId)) throw new Error("This media operation is unavailable. Use list_media_capabilities to check the project. No generation was submitted.");
+        if (enabledMediaTools && !enabledMediaTools().includes(toolId)) throw toolPreflightError("This media operation is unavailable. Use list_media_capabilities to check the project. No generation was submitted.", "invalid_media_options");
         await adoptBranchFailures(toolId, ctx?.sessionManager?.getBranch?.() ?? []);
       }
       const currentCall = recoveryOptions(toolId, toolCallId, signal);
@@ -1161,7 +1192,7 @@ export function createAgentTools(
       const confirmation = replacement ? confirmedAudioJobId : undefined;
       const canInspect = ctx?.model?.input?.includes("image");
       let approvalReceipt: string | undefined;
-      let submitNew = () => canvasStore.generateNode(project.id, input.boardId, input.nodeId, confirmation, "turnaround", canInspect, toolId);
+      let submitNew = () => canvasStore.generateNode(project.id, input.boardId, input.nodeId, confirmation, "turnaround", canInspect, toolId, currentCall.recoveryId);
       const prepareModel = toolId === "image-to-3d" && !recover ? async () => {
         submitNew = await canvasStore.prepareNode(project.id, input.boardId, input.nodeId, confirmation, "turnaround", canInspect,
           async (images, paths) => {
@@ -1176,7 +1207,10 @@ export function createAgentTools(
           .catch((cause) => { safeFailure = true; throw cause; });
         await save({ canvasJobId: job.id });
         // A recovery observer owns its wait, not the job started from the Canvas or another turn.
-        const cancel = () => { if (!observed) void canvasStore.cancel(project.id, job.id).catch(() => {}); };
+        const managedObserver = !observed && job.status === "running" &&
+          !!await canvasStore.managedCharacterViewJob(project.id, { jobId: job.id }) &&
+          !await canvasStore.managedCharacterViewJob(project.id, { jobId: job.id, recoveryId: currentCall.recoveryId });
+        const cancel = () => { if (!observed && !managedObserver) void canvasStore.cancel(project.id, job.id).catch(() => {}); };
         signal?.addEventListener("abort", cancel, { once: true });
         if (signal?.aborted) cancel();
         try {
@@ -1184,7 +1218,8 @@ export function createAgentTools(
           while (current.status === "running") {
             signal?.throwIfAborted();
             await new Promise((resolve) => setTimeout(resolve, 250));
-            const next = (await canvasStore.jobs(project.id)).find((candidate) => candidate.id === job.id);
+            const next = await canvasStore.managedCharacterViewJob(project.id, { jobId: job.id }) ??
+              (await canvasStore.jobs(project.id)).find((candidate) => candidate.id === job.id);
             if (!next) throw new Error("Generation job is no longer available");
             current = next;
           }
@@ -1198,7 +1233,7 @@ export function createAgentTools(
       }, () => safeFailure, confirmation ? previousCall ?? confirmation : undefined, prepareModel);
     },
   }))] : []), ...(playtest?.driver.available && playtest.driver.capabilities.projectTypes.includes(project.type) && (project.type !== "general" || supportsWebPreview(project))
-    ? [createGameUseTool(playtest.driver, playtest.resolveOpenTarget, { bridge: project.type === "interactive-story" ? "reset" : "full" })]
+    ? [createGameUseTool(playtest.driver, playtest.resolveOpenTarget, { bridge: project.type === "interactive-story" ? "reset" : "full", walkReview: playtest.walkReview })]
     : [])];
   const recover = defineTool({
     name: "recover_media",
@@ -1218,11 +1253,13 @@ export function createAgentTools(
       if (canvasStore) {
         const options = recoveryOptions(toolId, recoverCallId, signal);
         const jobId = await tools.agentMedia.canvasJob(options.agentCall, options.recoveryId);
-        if (jobId) {
-          const job = (await canvasStore.jobs(project.id)).find(job => job.id === jobId);
+        const managed = toolId === "generate-image" ? await canvasStore.managedCharacterViewJob(project.id,
+          jobId ? { jobId } : { recoveryId: options.recoveryId }) : undefined;
+        if (jobId || managed) {
+          const job = managed ?? (await canvasStore.jobs(project.id)).find(job => job.id === jobId);
           if (!job?.context?.boardId) throw new Error("The original Canvas job is unavailable. No generation was submitted.");
           const recover = registeredTools.find(tool => tool.name === "recover_canvas_media")!;
-          return directCanvasResult(await recover.execute(id, { boardId: job.context.boardId, nodeId: job.context.nodeId, recoverJobId: jobId }, signal, update, ctx));
+          return directCanvasResult(await recover.execute(id, { boardId: job.context.boardId, nodeId: job.context.nodeId, recoverJobId: jobId ?? job.id }, signal, update, ctx));
         }
       }
       let original: unknown = input.originalArguments;
@@ -1256,6 +1293,15 @@ export function createAgentTools(
         recoverAfterHttp500: async (...args: Parameters<PiToolDefinition["execute"]>) => {
           args[2]?.throwIfAborted();
           const input = args[1] as { boardId: string; nodeId: string };
+          const imageOptions = recoveryOptions("generate-image", args[0], args[2]);
+          const mappedImageJob = await tools.agentMedia.canvasJob(imageOptions.agentCall, imageOptions.recoveryId);
+          const original = await canvasStore.managedCharacterViewJob(project.id, { ...input, recoveryId: imageOptions.recoveryId }) ??
+            (mappedImageJob ? await canvasStore.managedCharacterViewJob(project.id, { jobId: mappedImageJob }) : undefined);
+          if (original?.context?.boardId === input.boardId && original.context.nodeId === input.nodeId) {
+            if (original.status === "succeeded") return canvasGenerationResult(input.nodeId, original, true);
+            const recover = registeredTools.find(tool => tool.name === "recover_canvas_media")!;
+            return recover.execute(args[0], { ...input, recoverJobId: original.id }, args[2], args[3], args[4]);
+          }
           const { board } = await canvasStore.board(project.id, input.boardId);
           const node = board.nodes.find(node => node.id === input.nodeId), toolId = node && CANVAS_MEDIA_TOOLS[node.type];
           if (!toolId) throw new Error("The original Canvas node is unavailable. No generation was submitted.");
@@ -1287,7 +1333,7 @@ export function createAgentTools(
           if (toolId && canvasStore && !Object.hasOwn(input, "recoverCallId")) {
             args[2]?.throwIfAborted();
             assertSafeGenerationInput(input);
-            if (enabledMediaTools && !enabledMediaTools().includes(toolId)) throw new Error("This media operation is unavailable. No generation was submitted.");
+            if (enabledMediaTools && !enabledMediaTools().includes(toolId)) throw toolPreflightError("This media operation is unavailable. No generation was submitted.", "invalid_media_options");
             const { agentCall, recoveryId } = recoveryOptions(toolId, args[0]);
             const previousId = await tools.agentMedia.canvasJob(agentCall, recoveryId);
             const previous = previousId ? (await canvasStore.jobs(project.id)).find(job => job.id === previousId) : undefined;

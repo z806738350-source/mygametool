@@ -4,7 +4,7 @@ import { lstat, mkdir, open, readdir, realpath, rename, rm } from "node:fs/promi
 import path from "node:path";
 import { PROJECT_BROWSER_CLEANUP_DIRECTORY } from "../shared/project-browser-storage.js";
 
-const PHASES = ["requested", "retiring-volume", "volume-retired", "deleting-host", "complete"] as const;
+const PHASES = ["requested", "retiring-volume", "volume-retired", "deleting-host", "removing-project", "complete"] as const;
 type Phase = typeof PHASES[number] | "aborted" | "unknown";
 interface DeletionRecord { version: 1; projectId: string; phase: Phase; updatedAt: string }
 const projectId = (id: string) => /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(id);
@@ -14,6 +14,14 @@ export class ProjectLifecycleError extends Error {
   readonly code = "project_lifecycle_pending";
 }
 
+export class ProjectExecutionDiscardConflict extends ProjectLifecycleError {
+  constructor(readonly generation?: string) {
+    super(generation === undefined
+      ? "The retained execution copy changed. Start project deletion again."
+      : "Confirm discarding unreturned execution changes before deleting this project.");
+  }
+}
+
 /** Admission closes synchronously; the journal survives a crash between guest and host deletion. */
 export class ProjectLifecycle {
   readonly #active = new Set<string>();
@@ -21,7 +29,8 @@ export class ProjectLifecycle {
   constructor(private readonly dataDirectory: string) {}
 
   deletingHost(id: string): boolean {
-    return this.#records.get(id)?.phase === "deleting-host";
+    const phase = this.#records.get(id)?.phase;
+    return phase === "deleting-host" || phase === "removing-project";
   }
 
   async scheduleBrowserCleanup(id: string): Promise<void> {
@@ -63,20 +72,57 @@ export class ProjectLifecycle {
     const files = await readdir(directory);
     if (files.length > 4096) throw new ProjectLifecycleError("Project deletion record budget requires review.");
     for (const name of files) {
+      const temporary = /^\.([^.]+)\.([^.]+)\.tmp$/.exec(name);
+      if (temporary && projectId(temporary[1]!) && projectId(temporary[2]!)) {
+        const file = path.join(directory, name);
+        const info = await lstat(file);
+        if (info.isFile() && info.nlink === 1) await rm(file, { force: true });
+        continue;
+      }
       if (!name.endsWith(".json") || !projectId(name.slice(0, -5))) continue;
       const id = name.slice(0, -5);
       let record: DeletionRecord = { version: 1, projectId: id, phase: "unknown", updatedAt: "" };
-      const handle = await open(path.join(directory, name), constants.O_RDONLY | constants.O_NOFOLLOW);
+      let handle;
       try {
+        handle = await open(path.join(directory, name), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
         const info = await handle.stat();
         if (!info.isFile() || info.nlink !== 1 || info.size > 4096 || process.platform !== "win32" &&
           (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0)) throw new Error("Invalid deletion record");
         const value = JSON.parse(await handle.readFile("utf8")) as DeletionRecord;
         if (value.version === 1 && value.projectId === id && [...PHASES, "aborted"].includes(value.phase as typeof PHASES[number])) record = value;
       } catch { /* A damaged record blocks this project, without deleting anything. */ }
-      finally { await handle.close(); }
-      if (record.phase === "complete") { await this.#removeComplete(id); continue; }
+      finally { await handle?.close(); }
+      if (record.phase === "complete" || record.phase === "aborted" ||
+        ((record.phase === "removing-project" || record.phase === "deleting-host") &&
+          await this.#finishProjectRemoval(id, record.phase === "removing-project"))) {
+        await this.#removeRecord(id);
+        continue;
+      }
       this.#records.set(id, record);
+    }
+  }
+  async #finishProjectRemoval(id: string, resume: boolean): Promise<boolean> {
+    const projects = path.join(await realpath(this.dataDirectory), "projects");
+    const absent = (cause: NodeJS.ErrnoException) => {
+      if (cause.code !== "ENOENT") throw cause;
+    };
+    try {
+      const root = await lstat(projects).catch(absent);
+      if (!root) return true;
+      if (!root.isDirectory() || (process.platform !== "win32" && root.uid !== process.getuid?.())) return false;
+      const target = path.join(projects, id);
+      const info = await lstat(target).catch(absent);
+      if (!info) return true;
+      if (!resume || !info.isDirectory() || (process.platform !== "win32" && info.uid !== root.uid)) return false;
+      await rm(target, { recursive: true, force: true });
+      if (process.platform !== "win32") {
+        const folder = await open(projects, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try { await folder.sync(); } finally { await folder.close(); }
+      }
+      return true;
+    } catch {
+      // Preserve the final journal so the next startup can retry.
+      return false;
     }
   }
   async #write(id: string, phase: Phase): Promise<void> {
@@ -85,9 +131,11 @@ export class ProjectLifecycle {
     const temporary = path.join(directory, `.${id}.${randomUUID()}.tmp`);
     const record: DeletionRecord = { version: 1, projectId: id, phase, updatedAt: new Date().toISOString() };
     const file = await open(temporary, "wx", 0o600);
-    try { await file.writeFile(JSON.stringify(record)); await file.sync(); }
-    finally { await file.close(); }
-    await rename(temporary, target);
+    try {
+      try { await file.writeFile(JSON.stringify(record)); await file.sync(); }
+      finally { await file.close(); }
+      await rename(temporary, target);
+    } finally { await rm(temporary, { force: true }); }
     if (process.platform !== "win32") {
       const folder = await open(directory, constants.O_RDONLY);
       try { await folder.sync(); } finally { await folder.close(); }
@@ -107,7 +155,7 @@ export class ProjectLifecycle {
         await this.#write(id, next); phase = next;
       });
       await this.#write(id, "complete");
-      await this.#removeComplete(id);
+      await this.#removeRecord(id);
       return result;
     } catch (error) {
       // Before requesting retirement, the project and its guest data are unchanged.
@@ -115,7 +163,7 @@ export class ProjectLifecycle {
       throw error;
     } finally { this.#active.delete(id); }
   }
-  async #removeComplete(id: string): Promise<void> {
+  async #removeRecord(id: string): Promise<void> {
     const directory = await this.#directory(false);
     await rm(path.join(directory, id + ".json"), { force: true });
     if (process.platform !== "win32") {

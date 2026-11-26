@@ -13,7 +13,7 @@ import { convertMessages as convertCompletionsMessages } from "@earendil-works/p
 import { convertMessages as convertGoogleMessages } from "@earendil-works/pi-ai/api/google-shared";
 import type { ImageContent, Message, ToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import { IMAGE_OFFLOAD_ENTRY, IMAGE_ORIGINS_ENTRY, ImageBudgetError, SessionImages, inlineImageScope, prepareSessionImageDisplay, wireImages, recordSessionImageOrigins, sessionImageOrigins, sessionImageReferences, sessionImageReferenceContext } from "../src/daemon/session-images.js";
+import { IMAGE_OFFLOAD_ENTRY, IMAGE_ORIGINS_ENTRY, INLINE_IMAGE_HIGH_BYTES, MODEL_REQUEST_HIGH_BYTES, ImageBudgetError, SessionImages, inlineImageScope, prepareSessionImageDisplay, wireImages, recordSessionImageOrigins, sessionImageOrigins, sessionImageReferences, sessionImageReferenceContext } from "../src/daemon/session-images.js";
 
 const dirs: string[] = [];
 afterEach(async () => { await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))); });
@@ -45,7 +45,7 @@ function visualCall(manager: SessionManager, timestamp: number, calls: Omit<Tool
 async function activeImagePayload(manager: SessionManager, images: SessionImages, canRecall = true) {
   const ctx = normalizeContext({ messages: context(manager).messages, tools: canRecall ? [images.recallTool] : [] });
   const result = { input: convertResponsesMessages(astra, await images.prepare(ctx, astra), new Set(["openai"])) };
-  images.budget(result, inlineImageScope(astra));
+  await images.budget(result, inlineImageScope(astra));
   return result;
 }
 
@@ -65,7 +65,7 @@ describe("session image projection", () => {
       const first = observe(1);
       const second = observe(2);
       const before = await projectedPayload(images, manager, astra);
-      images.budget(before, scope);
+      await images.budget(before, scope);
       const sent = images.withPreviousToolImages(before, scope);
       if (scenario !== "unaccepted") sent.commit();
       if (scenario === "new branch") { manager.branch(first); observe(4); }
@@ -73,7 +73,7 @@ describe("session image projection", () => {
       if (scenario === "offloaded") manager.appendCustomEntry(IMAGE_OFFLOAD_ENTRY, { scope, images:[`${first}:0`] });
       const last = observe(3, scenario === "inspection" ? "inspect_3d_views" : "read");
       const base = await projectedPayload(images, manager, astra);
-      images.budget(base, scope);
+      await images.budget(base, scope);
       if (scenario === "changed text" || scenario === "duplicate ID") {
         const item = base.input.find(item => item.type === "function_call_output" && item.call_id === "tool-1");
         if (item?.type !== "function_call_output" || typeof item.output !== "string") throw new Error("Missing original result");
@@ -295,20 +295,20 @@ describe("session image projection", () => {
     const original = structuredClone(manager.getEntries());
     const outgoing = await budgetPayload(images, manager);
     expect(wireImages(outgoing)).toHaveLength(70);
-    expect(images.budget(outgoing, "inline")).toBe(true);
+    expect(await images.budget(outgoing, "inline")).toBe(true);
     expect(wireImages(outgoing)).toHaveLength(32);
     expect(manager.getEntries().slice(0, original.length)).toEqual(original);
     const offload = manager.getBranch().findLast((entry) => entry.type === "custom" && entry.customType === IMAGE_OFFLOAD_ENTRY);
     expect(offload).toMatchObject({ data: { scope: "inline", images: ids.slice(0, 38).map((id) => `${id}:0`) } });
     const replayed = new SessionImages(manager, dir);
     const again = await budgetPayload(replayed, manager);
-    replayed.budget(again, "inline");
+    await replayed.budget(again, "inline");
     expect(again).toEqual(outgoing);
     expect(manager.getEntries()).toHaveLength(original.length + 1);
     const recall = await replayed.recallTool.execute("recall", { imageId: `${ids[0]}:0` }, undefined, undefined, {} as never);
     expect(recall.content[1]).toEqual(image);
     const reread = manager.appendMessage({ role: "toolResult", toolCallId: "recall", toolName: "recall_image", content: recall.content, isError: false, timestamp: 100 });
-    const recalled = await budgetPayload(replayed, manager); replayed.budget(recalled, "inline");
+    const recalled = await budgetPayload(replayed, manager); await replayed.budget(recalled, "inline");
     expect(wireImages(recalled).at(-1)?.id).toBe(`${reread}:0`);
     expect(wireImages(recalled)).toHaveLength(33);
   });
@@ -324,11 +324,11 @@ describe("session image projection", () => {
     const outgoing = await projectedPayload(images, manager, astra);
     expect(wireImages(outgoing)).toHaveLength(17);
     const scope = inlineImageScope(astra);
-    expect(images.budget(outgoing, scope)).toBe(false);
+    expect(await images.budget(outgoing, scope)).toBe(false);
     const retained = [...Array.from({ length: 13 }, (_, i) => `${current}:${i}`), ...batchIds.map(id => `${id}:0`)];
     expect(wireImages(outgoing).map(view => view.id)).toEqual(retained);
     const fresh = new SessionImages(manager, dir);
-    const replay = await projectedPayload(fresh, manager, astra); fresh.budget(replay, scope);
+    const replay = await projectedPayload(fresh, manager, astra); await fresh.budget(replay, scope);
     expect(wireImages(replay).map(view => view.id)).toEqual(retained);
     const recalled = await fresh.recallTool.execute("recall", { imageId: `${historyId}:0` }, undefined, undefined, {} as never);
     expect(recalled.content[1]).toEqual(image);
@@ -336,8 +336,59 @@ describe("session image projection", () => {
       expect(inlineImageScope(other)).toBe("inline");
     }
     const other = await projectedPayload(fresh, manager, model);
-    expect(fresh.budget(other, inlineImageScope(model))).toBe(false);
+    expect(await fresh.budget(other, inlineImageScope(model))).toBe(false);
     expect(wireImages(other).map(view => view.id)).toEqual(retained);
+  });
+
+  it("fits a full current batch of transparent reads against the actual request while retaining exact originals", async () => {
+    const { manager, images, dir } = await fixture();
+    const png = await sharp(randomBytes(512 * 512 * 4), { raw: { width: 512, height: 512, channels: 4 } }).png().toBuffer();
+    const original = { ...image, mimeType: "image/png", data: png.toString("base64") };
+    const calls = Array.from({ length: 8 }, (_, i) => ({ id: `view-${i}`, name: "read", arguments: {} }));
+    manager.appendMessage({ role: "user", timestamp: 1, content: "Compare every direction." });
+    visualCall(manager, 2, calls);
+    const ids = calls.map((call, i) => manager.appendMessage({ role: "toolResult", toolName: "read", toolCallId: call.id,
+      timestamp: i + 3, content: [original], isError: false }) + ":0");
+    const scope = inlineImageScope(astra);
+    // The eight read results fit the image-only limit, but their actual request also carries text.
+    const text = "x".repeat(26 * 1024 * 1024);
+    const request = { ...await projectedPayload(images, manager, astra), instructions: text };
+    expect(wireImages(request).reduce((sum,p) => sum + p.data.length, 0)).toBeLessThan(INLINE_IMAGE_HIGH_BYTES);
+    expect(Buffer.byteLength(JSON.stringify(request))).toBeGreaterThan(MODEL_REQUEST_HIGH_BYTES);
+    await images.budget(request, scope);
+    const sent = wireImages(request);
+    expect(sent.map(p => p.id)).toEqual(ids);
+    expect(request.instructions === text).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(request))).toBeLessThanOrEqual(MODEL_REQUEST_HIGH_BYTES);
+    const dimensions = await sharp(Buffer.from(sent[0]!.data, "base64")).metadata();
+    expect(dimensions.hasAlpha).toBe(true);
+    const output = request.input.find(item => item.type === "function_call_output" && item.call_id === calls[0]!.id);
+    expect(output?.type === "function_call_output" && Array.isArray(output.output) && output.output[0]).toMatchObject({
+      type: "input_text", text: expect.stringContaining(`Displayed at ${dimensions.width}x${dimensions.height} from the 512x512 source`),
+    });
+    for (const id of ids) {
+      const recall = await images.recallTool.execute("recall", { imageId: id }, undefined, undefined, {} as never);
+      expect((recall.content[1] as ImageContent).data === original.data).toBe(true);
+    }
+    const accepted = images.withPreviousToolImages(request, scope);
+    accepted.commit();
+    const unscaledImages = new SessionImages(manager, dir);
+    const exact = await unscaledImages.prepare(context(manager), astra, false);
+    const unscaled = { instructions: text, input: convertResponsesMessages(astra, exact, new Set(["openai"])) };
+    await expect(unscaledImages.budget(unscaled, scope)).rejects.toThrow(ImageBudgetError);
+
+    // As this batch ages out, the accepted prefix still carries its identical display copy and dimensions.
+    for (const n of [20, 22]) {
+      visualCall(manager, n, [{ id: `follow-${n}`, name: "read", arguments: {} }]);
+      manager.appendMessage({ role: "toolResult", toolName: "read", toolCallId: `follow-${n}`, timestamp: n + 1, content: [image], isError: false });
+    }
+    const later = await projectedPayload(images, manager, astra);
+    await images.budget(later, scope);
+    const restored = images.withPreviousToolImages(later, scope);
+    for (const call of calls) {
+      const matches = (item: typeof later.input[number]) => item.type === "function_call_output" && item.call_id === call.id;
+      expect(restored.payload.input.find(matches)).toEqual(accepted.payload.input.find(matches));
+    }
   });
 
   it("trims bulky Astra image history before the count watermark and still enforces the hard limit for current references", async () => {
@@ -346,11 +397,11 @@ describe("session image projection", () => {
     const picture = { ...image, data: "A".repeat(1024 * 1024) };
     for (let i = 0; i < 9; i++) manager.appendMessage({ role: "user", timestamp: i, content: [picture] });
     const outgoing = await budgetPayload(images, manager, astra);
-    expect(images.budget(outgoing, scope)).toBe(true);
+    expect(await images.budget(outgoing, scope)).toBe(true);
     expect(wireImages(outgoing)).toHaveLength(4);
     manager.appendMessage({ role: "user", timestamp: 10, content: Array(65).fill(image) });
     const oversized = await budgetPayload(images, manager, astra);
-    expect(() => images.budget(oversized, scope)).toThrow(ImageBudgetError);
+    await expect(images.budget(oversized, scope)).rejects.toThrow(ImageBudgetError);
   });
 
   it("keeps both large visual observations below the shared hard limit and can reduce the older one after an explicit 413", async () => {
@@ -359,11 +410,11 @@ describe("session image projection", () => {
     const first = screenshot(manager, 1, { ...image, data: "A".repeat(size) });
     const second = screenshot(manager, 2, { ...image, data: "B".repeat(size) });
     const outgoing = await projectedPayload(images, manager, astra), scope = inlineImageScope(astra);
-    expect(images.budget(outgoing, scope)).toBe(false);
+    expect(await images.budget(outgoing, scope)).toBe(false);
     expect(wireImages(outgoing).map(view => view.id)).toEqual([`${first}:0`, `${second}:0`]);
-    expect(images.budget(outgoing, scope, true)).toBe(true);
+    expect(await images.budget(outgoing, scope, true)).toBe(true);
     expect(wireImages(outgoing).map(view => view.id)).toEqual([`${second}:0`]);
-    expect(() => images.budget(outgoing, scope, true)).toThrow(ImageBudgetError);
+    await expect(images.budget(outgoing, scope, true)).rejects.toThrow(ImageBudgetError);
   });
 
   it("sends the current request and two visual observations below all watermarks, with originals available for later recall", async () => {
@@ -407,7 +458,7 @@ describe("session image projection", () => {
     for (let index = 1; index <= 8; index++) screenshot(manager, index, large);
     const user = manager.appendMessage({ role: "user", timestamp: 20, content: [large] });
     const outgoing = await budgetPayload(images, manager);
-    images.budget(outgoing, "inline");
+    await images.budget(outgoing, "inline");
     expect(wireImages(outgoing)).toHaveLength(3);
     expect(wireImages(outgoing).at(-1)?.id).toBe(`${user}:0`);
   });
@@ -419,10 +470,10 @@ describe("session image projection", () => {
     screenshot(manager, 2); screenshot(manager, 3);
     const outgoing = await budgetPayload(images, manager);
     expect(wireImages(outgoing).slice(0, 70).map((image) => image.id)).toEqual(Array.from({ length: 70 }, (_, index) => `${old}:${index}`));
-    images.budget(outgoing, "inline");
+    await images.budget(outgoing, "inline");
     expect(wireImages(outgoing)).toHaveLength(32);
     expect(wireImages(outgoing)[0].id).toBe(`${old}:40`);
-    images.budget(outgoing, "inline");
+    await images.budget(outgoing, "inline");
     expect(wireImages(outgoing)[0].id).toBe(`${old}:40`);
   });
 
@@ -436,10 +487,10 @@ describe("session image projection", () => {
       ? { messages: convertCompletionsMessages({ ...model, api: "openai-completions" }, prepared, {} as Parameters<typeof convertCompletionsMessages>[2]) }
       : { contents: convertGoogleMessages({ ...model, api: "google-generative-ai", compat: undefined, id: `${api}-pro` }, prepared) };
     expect(wireImages(outgoing).slice(0, 70).map((image) => image.id)).toEqual(Array.from({ length: 70 }, (_, index) => `${old}:${index}`));
-    images.budget(outgoing, "inline");
+    await images.budget(outgoing, "inline");
     expect(wireImages(outgoing)).toHaveLength(32);
     expect(wireImages(outgoing)[0].id).toBe(`${old}:40`);
-    const once = structuredClone(outgoing); images.budget(outgoing, "inline");
+    const once = structuredClone(outgoing); await images.budget(outgoing, "inline");
     expect(outgoing).toEqual(once);
     if (api === "gemini-3") {
       const serialized = outgoing as { contents: Array<{ parts: Array<{ functionResponse: { parts: unknown[]; response: { output: string } } }> }> };
@@ -455,18 +506,18 @@ describe("session image projection", () => {
     manager.appendMessage({ role: "user", timestamp: 1, content: [image] });
     const current = manager.appendMessage({ role: "user", timestamp: 2, content: [{ ...image, data: "a".repeat(12 * 1024 * 1024) }] });
     const outgoing = await budgetPayload(images, manager);
-    expect(images.budget(outgoing, "inline")).toBe(false);
-    expect(images.budget(outgoing, "inline", true)).toBe(true);
+    expect(await images.budget(outgoing, "inline")).toBe(false);
+    expect(await images.budget(outgoing, "inline", true)).toBe(true);
     expect(wireImages(outgoing).map((image) => image.id)).toEqual([`${current}:0`]);
-    expect(() => images.budget(outgoing, "inline", true)).toThrow(ImageBudgetError);
+    await expect(images.budget(outgoing, "inline", true)).rejects.toThrow(ImageBudgetError);
   });
 
   it("fails locally if current protected images or text alone cannot fit", async () => {
     const { manager, images } = await fixture();
     manager.appendMessage({ role: "user", timestamp: 1, content: [{ ...image, data: "a".repeat(21 * 1024 * 1024) }] });
-    expect(() => images.budget({ input: [] , text: "x".repeat(33 * 1024 * 1024) }, "inline")).toThrow(ImageBudgetError);
+    await expect(images.budget({ input: [] , text: "x".repeat(33 * 1024 * 1024) }, "inline")).rejects.toThrow(ImageBudgetError);
     const outgoing = await budgetPayload(images, manager);
-    expect(() => images.budget(outgoing, "inline")).toThrow(ImageBudgetError);
+    await expect(images.budget(outgoing, "inline")).rejects.toThrow(ImageBudgetError);
     expect(manager.getEntries()).toHaveLength(1);
   });
 
@@ -474,12 +525,12 @@ describe("session image projection", () => {
     const { manager, images } = await fixture();
     const root = manager.appendMessage({ role: "user", content: "Play", timestamp: 1 });
     Array.from({ length: 70 }, (_, index) => screenshot(manager, index + 2));
-    const outgoing = await budgetPayload(images, manager); images.budget(outgoing, "inline");
+    const outgoing = await budgetPayload(images, manager); await images.budget(outgoing, "inline");
     const otherPolicy = await budgetPayload(images, manager); images.applyOmissions(otherPolicy, "openai-inline");
     expect(wireImages(otherPolicy)).toHaveLength(70);
     manager.branch(root);
     const newImage = screenshot(manager, 200);
-    const branch = await budgetPayload(images, manager); images.budget(branch, "inline");
+    const branch = await budgetPayload(images, manager); await images.budget(branch, "inline");
     expect(wireImages(branch)).toHaveLength(1);
     expect(wireImages(branch)[0].id).toBe(`${newImage}:0`);
     await expect(images.recallTool.execute("call", { imageId: `${wireImages(otherPolicy)[0].id}` }, undefined, undefined, {} as never)).rejects.toThrow("branch");
@@ -511,13 +562,13 @@ describe("session image projection", () => {
     const { manager, images, dir } = await fixture();
     manager.appendMessage({ role: "user", content: "Play", timestamp: 1 });
     const ids = Array.from({ length: 70 }, (_, index) => screenshot(manager, index + 2));
-    const outgoing = await budgetPayload(images, manager); images.budget(outgoing, "inline");
+    const outgoing = await budgetPayload(images, manager); await images.budget(outgoing, "inline");
     const reopened = SessionManager.inMemory(dir, undefined, JSON.parse(JSON.stringify([manager.getHeader(), ...manager.getEntries()])));
     const fresh = new SessionImages(reopened, dir);
-    const replay = await budgetPayload(fresh, reopened); fresh.budget(replay, "inline");
+    const replay = await budgetPayload(fresh, reopened); await fresh.budget(replay, "inline");
     expect(replay).toEqual(outgoing);
     reopened.appendCompaction("Older playtest observations were summarized", ids[30], 10000);
-    const compacted = await budgetPayload(fresh, reopened); fresh.budget(compacted, "inline");
+    const compacted = await budgetPayload(fresh, reopened); await fresh.budget(compacted, "inline");
     expect(wireImages(compacted)).toHaveLength(32);
     expect(wireImages(compacted)[0].id).toBe(`${ids[38]}:0`);
     const recall = await fresh.recallTool.execute("recall", { imageId: `${ids[0]}:0` }, undefined, undefined, {} as never);
@@ -601,6 +652,8 @@ describe("session image projection", () => {
       { type: "input_image", file_id: "file-a" }, { type: "input_image", image_url: "https://example.com/image.png" },
     ] };
     const slots = wireImages(outgoing); expect(slots).toHaveLength(5);
+    slots.forEach((slot) => slot.replace({ type: "image", mimeType: "image/webp", data: "Yg==" }));
+    expect(wireImages(outgoing).map(slot => [slot.mime, slot.data])).toEqual(Array(5).fill(["image/webp", "Yg=="]));
     slots.forEach((slot) => slot.omit());
     expect(wireImages(outgoing)).toHaveLength(0);
     expect(outgoing.values.at(-2)).toEqual({ type: "input_image", file_id: "file-a" });
@@ -615,10 +668,10 @@ describe("session image projection", () => {
       ? message.content.map((block) => block.type === "image"
         ? { image: { format: "jpeg", source: { bytes: new Uint8Array(Buffer.from(block.data, "base64")) } } }
         : { text: block.type === "text" ? block.text : "" }) : [] })) };
-    images.budget(outgoing, "inline");
+    await images.budget(outgoing, "inline");
     expect(wireImages(outgoing)).toHaveLength(2);
     const single = { messages: [outgoing.messages.at(-1)] };
-    expect(() => images.budget(single, "inline")).not.toThrow();
+    await expect(images.budget(single, "inline")).resolves.toBe(false);
   });
 });
 

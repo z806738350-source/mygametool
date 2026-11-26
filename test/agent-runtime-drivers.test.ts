@@ -2967,7 +2967,7 @@ describe("controlled Codex adapter", () => {
     expect(JSON.stringify(recovery.inputSchema)).toContain('"const":"capacity"');
     expect(recovery.inputSchema.properties).toHaveProperty("reviewId");
     expect(recovery.inputSchema.properties).not.toHaveProperty("approved");
-    expect(manager.getBranch().some(e => e.type === "custom" && e.customType === "ohmygame-native-session" && (e.data as any).contextVersion === "controlled-codex-v16")).toBe(true);
+    expect(manager.getBranch().some(e => e.type === "custom" && e.customType === "ohmygame-native-session" && (e.data as any).contextVersion === "controlled-codex-v20")).toBe(true);
     expect(f.calls.find(m => m.method === "turn/start").params.input[0].text).toContain("Preserve the existing game and artwork");
     expect(manager.getBranch().some(e => e.type === "message" && e.message.role === "assistant")).toBe(true);
     const launches = f.children.map(c => c.env);
@@ -2978,8 +2978,8 @@ describe("controlled Codex adapter", () => {
 
 describe("native capacity context contract", () => {
   it.each([
-    { runtime: "codex-cli" as const, old: "controlled-codex-v15", current: "controlled-codex-v16" },
-    { runtime: "qoder-cli" as const, old: "controlled-qoder-v14", current: "controlled-qoder-v15" },
+    { runtime: "codex-cli" as const, old: "controlled-codex-v19", current: "controlled-codex-v20" },
+    { runtime: "qoder-cli" as const, old: "controlled-qoder-v18", current: "controlled-qoder-v19" },
   ])("rebuilds $runtime's previous tool schema and retains only capacity's read-only arguments", async ({ runtime, old, current }) => {
     const manager = SessionManager.inMemory("/tmp/native-capacity-context");
     manager.appendMessage({ role: "user", content: "Preserve the existing retained work", timestamp: 1 });

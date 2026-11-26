@@ -189,7 +189,7 @@ describe("Kunpo ToolRunner lifecycle", () => {
     const dataDirectory = await directory();
     const generate = vi.fn<AudioGenerator["generate"]>().mockResolvedValue({ bytes: Buffer.from("ID3"), mediaType: "audio/mpeg", model: { provider: "volcengine-seed-audio", id: "seed-audio-1.0" } });
     const audio: AudioGenerator = { catalog: () => ({ models: [], providers: [] }), generate };
-    const library = { add: vi.fn().mockRejectedValue(new Error("simulated local save failure")) } as unknown as AssetLibrary;
+    const library = { assertAvailable: () => {}, add: vi.fn().mockRejectedValue(new Error("simulated local save failure")) } as unknown as AssetLibrary;
     const original = new ToolRunner(dataDirectory, imageGenerator, undefined, undefined, library, undefined, audio);
     runners.push(original); await original.load();
     const first = original.start("generate-sound-effect", { prompt: "A bell" });

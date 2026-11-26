@@ -568,6 +568,19 @@ it.each(["codex-cli", "qoder-cli"] as const)("retains %s pure 3D-option rejectio
   } finally { await session.dispose(); await runner.close(); }
 });
 
+it("continues an early native walk finish under the same user task and rechecks before completion", async () => {
+  const log = SessionManager.inMemory("/tmp/project");
+  const driver = new ScriptedDriver([], undefined);
+  const finishWalkReview = vi.fn().mockResolvedValueOnce("Check the missing NW walk").mockResolvedValue(undefined);
+  const session = new NativeCodingSession({ runtime:"codex-cli", model:"fixture", sessionManager:log,
+    toolNames:["review_sprite_walk"], createDriver:() => driver, requestApproval:async () => "deny", finishWalkReview });
+  try {
+    await session.prompt("Repair the walk");
+    expect(driver.inputs.map(i => i.text)).toEqual([expect.stringContaining("Repair the walk"),"Check the missing NW walk"]);
+    expect(log.getBranch().filter(e => e.type === "message" && e.message.role === "user")).toHaveLength(1);
+    expect(finishWalkReview).toHaveBeenCalledTimes(2);
+  } finally { session.dispose(); }
+});
 class ScriptedDriver implements NativeDriver {
   readonly inputs: NativeTurnInput[] = [];
   disposed = false;

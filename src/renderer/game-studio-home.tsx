@@ -100,8 +100,8 @@ export function GameStudioHome({
   }
 
   async function remove(project: ProjectState): Promise<void> {
-    if (confirmProjectDeletion(project))
-      await runAction(() => deleteProject(project.id));
+    const confirmation = confirmProjectDeletion(project);
+    if (confirmation) await runAction(() => deleteProject(confirmation));
   }
 
   return (

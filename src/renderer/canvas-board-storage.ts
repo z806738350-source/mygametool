@@ -1,8 +1,8 @@
 import { assertWorkspaceVersion, workspaceVersion } from "./workspace-version.js";
 import type { AssetCanvasDocument, ToolJob } from "../shared/contracts.js";
 import { isAssetCanvasDocument, withoutContentNodeSizes } from "../shared/asset-canvas.js";
-import { mergeCanvasDocument, type CanvasBoardDetail } from "../shared/canvas-workspace.js";
-import { cancelCanvasJob, recoverCanvasImage, resumeCanvasVideo, generateCanvasMedia, getCanvasBoard, listCanvasJobs, saveCanvasBoard } from "./canvas-api.js";
+import { mergeCanvasDocument, type CanvasBoardDetail, type CanvasBoardJobs } from "../shared/canvas-workspace.js";
+import { cancelCanvasJob, recoverCanvasImage, resumeCanvasVideo, generateCanvasMedia, getCanvasBoard, listCanvasBoardJobs, listCanvasJobs, saveCanvasBoard } from "./canvas-api.js";
 import { t } from "./i18n.js";
 
 export interface CanvasBoardStorage {
@@ -14,6 +14,7 @@ export interface CanvasBoardStorage {
   reconcile(submitted: AssetCanvasDocument, current: AssetCanvasDocument, saved: AssetCanvasDocument): AssetCanvasDocument;
   resolveConflict(version: "local" | "remote", canvas: AssetCanvasDocument): Promise<AssetCanvasDocument>;
   jobs(): Promise<ToolJob[]>;
+  boardJobs?(): Promise<CanvasBoardJobs>;
   generate(nodeId: string, confirmedJobId?: string): Promise<ToolJob>;
   cancel(jobId: string): Promise<ToolJob>;
   recoverImage(jobId: string): Promise<ToolJob>;
@@ -152,6 +153,7 @@ export function createCanvasBoardStorage({ projectId, boardId, onConflict, flush
       return canvasOnly(base!.board);
     }),
     jobs: async () => (await listCanvasJobs(projectId)).filter((job) => job.context?.boardId === boardId),
+    boardJobs: () => listCanvasBoardJobs(projectId, boardId),
     generate: async (nodeId, confirmedJobId) => {
       assertWritable();
       await flushDocuments();

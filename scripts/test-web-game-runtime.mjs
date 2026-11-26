@@ -9,7 +9,7 @@ const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-desktop-game-"));
 const environment = { ...process.env };
 delete environment.ELECTRON_RUN_AS_NODE;
 try {
-  const child = spawn(require("electron"), [path.join(import.meta.dirname, "web-game-runtime-check.cjs"), directory], { stdio: "inherit", env: environment });
+  const child = spawn(require("electron"), [path.join(import.meta.dirname, "web-game-runtime-check.cjs"), directory, ...process.argv.slice(2)], { stdio: "inherit", env: environment });
   const code = await new Promise((resolve, reject) => {
     child.once("error", reject);
     child.once("exit", (code, signal) => resolve(code ?? (signal ? 1 : 0)));

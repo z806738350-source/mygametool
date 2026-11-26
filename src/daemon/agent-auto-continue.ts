@@ -9,6 +9,7 @@ import type {
 import {
   getToolPreflightFailure,
   confirmBlenderRunFailure,
+  confirmCharacterViewFailure,
   confirmIsolatedCommandFailure,
   getToolConfirmedFailure,
   inheritToolConfirmedFailure,
@@ -19,8 +20,8 @@ import {
   type ToolPreflightFailure,
   type ToolConfirmedFailure,
 } from "./agent-tool-errors.js";
-import { getIsolatedOperationReceipts, inheritIsolatedOperationReceipts, isolatedCommandsNotSubmitted, isolatedInputBudgetError,
-  isIsolatedInputBudgetError, retainedIsolatedOperationEvidence, withIsolatedOperationScope, type IsolatedOperationReceipt } from "./isolated-tool-receipts.js";
+import { getIsolatedOperationReceipts, inheritIsolatedOperationReceipts, isolatedCommandsNotSubmitted, isolatedCommandRejection,
+  getIsolatedCommandRejection, retainedIsolatedOperationEvidence, withIsolatedOperationScope, type IsolatedOperationReceipt } from "./isolated-tool-receipts.js";
 import { getIsolatedRepairResolutions, inheritIsolatedRepairProof, inheritIsolatedRepairResolutions, createIsolatedRepairPending, inheritIsolatedRepairPending, getIsolatedRepairPending, retainedIsolatedRepairPending, retainedIsolatedRepairResolutions, parseIsolatedOperationReceipts, type IsolatedRepairPending, type IsolatedRepairProof, type IsolatedRepairResolution, type IsolatedRepairTarget } from "./isolated-tool-receipts.js";
 import { currentPlaytestStatus, replayPlaytestReceipt } from "./playtest-tools.js";
 
@@ -130,7 +131,7 @@ type Task = {
   verifyOnly?: boolean;
   needsRead?: boolean;
   publicationEpoch?: string;
-  observations?: Map<string, { key: string; pending: Promise<Result> }>;
+  observations?: Map<string, { key: string; pending?: Promise<Result> }>;
 };
 export interface AutoContinueToolOptions {
   sessionManager?: Pick<SessionManager, "getBranch" | "appendCustomEntry"> &
@@ -158,22 +159,42 @@ const READ_ONLY = new Set([
   "recall_image",
   "recall_tool_text",
   "read_workflow_guide",
+  "review_sprite_walk",
+  "review_sprite_action",
   "inspect_3d_views",
   "blender_status",
   "list_media_capabilities",
   "list_animation_actions",
   "canvas_check",
   "playable_check",
-  "recover_media",
-  "recover_canvas_media",
 ]);
-const REPAIR_READS = new Set(["read", "read_project_file", "read_attachment", "ls", "find", "grep", "recall_image", "recall_tool_text", "read_workflow_guide", "inspect_3d_views", "blender_status", "list_media_capabilities", "list_animation_actions", "canvas_check", "playable_check"]);
 const REPAIR_ACTIONS = new Set(["inspect", "capacity", "plan_capacity", "plan_first_allocation", "inspect_capacity_migration", "review", "read_image", "prepare-review", "optimize", "adopt", "recover", "verify"]);
 const OBSERVATION_ACTIONS = new Set(["inspect", "capacity", "plan_capacity", "plan_first_allocation", "inspect_capacity_migration", "read_image"]);
 const BLENDER_TOOLS = new Set(["run_blender", "recover_blender_run"]);
 
+/** These operations inspect existing state without publishing project files or sending player input. */
+export function isProjectToolObservation(name: string, args: unknown): boolean {
+  if (READ_ONLY.has(name)) return true;
+  if (!args || typeof args !== "object" || Array.isArray(args)) return false;
+  const input = args as Record<string, unknown>;
+  switch (name) {
+    case "game_use": return input.operation === "inspect" || input.operation === "capture";
+    case "recover_isolated_changes": return OBSERVATION_ACTIONS.has(String(input.action));
+    case "repair_sprite_walk":
+    case "repair_sprite_action": return input.candidateDigest === undefined;
+    case "get_model_asset": return input.assetId === undefined && input.path === undefined && input.rebuildPreview !== true;
+    default: return false;
+  }
+}
+
+export function isIndependentProjectControl(name: string, args: unknown): boolean {
+  return name === "questionnaire" || name === "update_plan" ||
+    name === "game_use" && !!args && typeof args === "object" && "operation" in args && args.operation === "close";
+}
+
 function confirmedToolFailure(tool: string, failure: ToolConfirmedFailure | undefined, receipts?: readonly IsolatedOperationReceipt[]): ToolConfirmedFailure | undefined {
   if (failure?.reason === "blender_run_failed") return BLENDER_TOOLS.has(tool) ? failure : undefined;
+  if (failure?.reason === "character_view_publication_failed") return tool === "prepare_character_views" ? failure : undefined;
   if (failure?.reason !== "isolated_command_failed" || tool !== "isolated_shell") return;
   const history = parseIsolatedOperationReceipts(receipts);
   if (history && history.every(receipt => receipt.operationId === failure.operationId && receipt.mode === "shell" && receipt.phase !== "retained") &&
@@ -284,7 +305,8 @@ export class AutoContinueTools {
     summaries.push(...this.#unrecorded.values());
     if (!summaries.length) return undefined;
     return (
-      (this.#task.verifyOnly ? "Verification-only continuation: use controlled reads and recover_isolated_changes inspect/capacity/verify/read_image or read-only plan_capacity/plan_first_allocation only. Never retry adopt, recover, review, optimize or the original command while its publication is unconfirmed.\n" : this.#task.repairOnly ? "Repair-only continuation: use controlled reads and recover_isolated_changes inspect/capacity/review/read_image/prepare-review/optimize/adopt/recover/verify or read-only plan_capacity/plan_first_allocation only. Do not write, generate, build, run shell commands or control the game until exact recovery settlement. Never replay the original failed command; after settlement read current project files before corrected new work.\n" : "") +
+      (this.#task.verifyOnly ? "Verification-only continuation: use recover_isolated_changes inspect/capacity/verify and its read-only observations. Never retry adoption while its publication is unconfirmed.\n" : this.#task.repairOnly ? "Repair-only continuation: use recover_isolated_changes inspect/capacity/review/read_image/prepare-review/optimize/adopt/recover/verify for the original snapshots. Never replay the failed command. Read current project files before further changes after settlement.\n" : "") +
+      (this.#task.repairOnly ? "Controlled reads, project observations, plans, questions and closing owned playtests remain available during recovery.\n" : "") +
       "Original tool operations (these are historical results, not current file snapshots):\n" +
       summaries
         .slice(-100)
@@ -437,6 +459,14 @@ export class AutoContinueTools {
           content: message.content, details: message.details, isError: true,
         } as Result, confirmedFailure.runId);
       }
+      if (item.state === "failed_confirmed" && attempt.tool === "prepare_character_views" &&
+        original && !changedCall && message?.isError && confirmedFailure?.reason === "character_view_publication_failed") {
+        attempt.confirmedFailure = confirmedFailure;
+        attempt.unconfirmed = false;
+        attempt.retainedResult = confirmCharacterViewFailure({
+          content: message.content, details: message.details, isError: true,
+        } as Result, confirmedFailure.operationId);
+      }
       const rejection = parseToolPreflightFailure(item.preflightFailure);
       const canonicalRejection = parseToolPreflightFailure(
         (message as unknown as { preflightFailure?: unknown } | undefined)
@@ -498,9 +528,10 @@ export class AutoContinueTools {
         // A parser cannot authorize retry: the evidence loader requires the host journal and canonical failure.
         const evidence = retainedIsolatedOperationEvidence(branch, id, item.callId, item.tool!);
         const receipts = getIsolatedOperationReceipts(evidence);
-        if (!wasUnknown && !changedCall && item.state === "command_not_submitted" && receipts && isolatedCommandsNotSubmitted(receipts)) {
+        const reason = receipts?.at(-1)?.rejection;
+        if (!wasUnknown && !changedCall && item.state === "command_not_submitted" && reason && isolatedCommandsNotSubmitted(receipts)) {
           const text = message?.content.filter(part => part.type === "text").map(part => part.text).join("\n");
-          attempt.failure = inheritIsolatedOperationReceipts(isolatedInputBudgetError(text || "The original project command was rejected before submission"), evidence);
+          attempt.failure = inheritIsolatedOperationReceipts(isolatedCommandRejection(text || "The original project command was rejected before submission", reason), evidence);
           attempt.isolatedOperations = receipts;
           attempt.commandNotSubmitted = true;
           attempt.retainedResult = inheritIsolatedOperationReceipts({ content: message!.content, details: message!.details, isError: true } as Result, evidence);
@@ -514,23 +545,22 @@ export class AutoContinueTools {
         attempt.unconfirmed = true;
       task.attempts.set(item.callId, attempt);
     }
-    if (task.userId && !ambiguous && this.tools.some(tool => tool.name === "game_use")) {
-      const observations = new Map<string, string>();
+    if (task.userId && !ambiguous) {
       const currentBranch = branch.slice(branch.findIndex(entry => entry.id === task.userId) + 1);
       for (const entry of currentBranch) {
         if (entry.type !== "message") continue;
         const message = entry.message;
         if (message.role === "assistant") {
           for (const part of message.content) {
-            if (part.type !== "toolCall" || part.name !== "game_use" || !validId(part.id) || observations.has(part.id)) continue;
-            if (part.arguments.operation === "inspect" || part.arguments.operation === "capture") observations.set(part.id, "game_use:" + identity(part.arguments));
+            if (part.type !== "toolCall" || !validId(part.id) || !isProjectToolObservation(part.name, part.arguments)) continue;
+            task.observations ??= new Map();
+            if (!task.observations.has(part.id)) task.observations.set(part.id, { key: part.name + ":" + identity(part.arguments) });
           }
-        } else if (message.role === "toolResult" && message.toolName === "game_use" && observations.has(message.toolCallId)) {
-          task.observations ??= new Map();
-          const id = message.toolCallId;
-          if (!task.observations.has(id)) task.observations.set(id, { key: observations.get(id)!, pending: Promise.resolve({
+        } else if (message.role === "toolResult" && message.toolName === "game_use") {
+          const observed = task.observations?.get(message.toolCallId);
+          if (observed?.key.startsWith("game_use:") && !observed.pending) observed.pending = Promise.resolve({
             content: message.content, details: message.details, ...(message.isError ? { isError: true } : {}),
-          }) });
+          });
         }
       }
     }
@@ -579,30 +609,32 @@ export class AutoContinueTools {
         if (!validId(call[0])) throw new Error("Invalid original tool call ID");
         const input = call[1] as Record<string, unknown>;
         const playtest = tool.name === "game_use";
-        const playtestObservation = playtest && (input.operation === "inspect" || input.operation === "capture");
+        const observation = isProjectToolObservation(tool.name, input);
+        const playtestObservation = playtest && observation;
         const repairAction = tool.name === "recover_isolated_changes" && REPAIR_ACTIONS.has(String(input.action));
-        const inspection = tool.name === "recover_isolated_changes" && OBSERVATION_ACTIONS.has(String(input.action));
+        const independentControl = isIndependentProjectControl(tool.name, input);
+        const repairStep = repairAction || independentControl;
+        const inspection = tool.name === "recover_isolated_changes" && observation;
         const verification = tool.name === "recover_isolated_changes" && input.action === "verify";
         const observed = task.observations?.get(call[0]);
         const sameId = task.attempts.get(call[0]);
         const key = tool.name + ":" + identity(input);
-        if ((observed && observed.key !== key) || (sameId && (playtest || sameId.tool === "game_use") && sameId.key !== key)) {
+        if ((observed && observed.key !== key) || (sameId && sameId.key !== key)) {
           const conflict = playtest || sameId?.tool === "game_use" || observed?.key.startsWith("game_use:");
           throw new Error(`${conflict ? "CALL_ID_CONFLICT: " : ""}A tool call ID was reused with different arguments`);
         }
-        if (task.verifyOnly && !REPAIR_READS.has(tool.name) && !inspection && !verification && !task.attempts.has(call[0]))
-          throw new Error("Only controlled reads, inspect, capacity, read_image and verify are allowed while the original recovery publication awaits verification");
-        if (task.repairOnly && !REPAIR_READS.has(tool.name) && !repairAction && !task.attempts.has(call[0]))
-          throw new Error("Only controlled reads and retained-change repair actions are allowed until the original isolated effects are settled");
+        if (task.verifyOnly && !observation && !verification && !independentControl && !sameId)
+          throw new Error("Only controlled reads, verify, plans, questions and closing owned playtests are allowed while the original recovery publication awaits verification");
+        if (task.repairOnly && !observation && !repairStep && !sameId)
+          throw new Error("Only controlled reads, retained-change repair actions, plans, questions and closing owned playtests are allowed until the original isolated effects are settled");
         if (
-          READ_ONLY.has(tool.name) || inspection ||
-          playtestObservation
+          observation || tool.name === "recover_media" || tool.name === "recover_canvas_media"
         ) {
           const readEpoch = task.publicationEpoch;
           let result: Result;
           try {
             if (playtestObservation) {
-              if (observed) {
+              if (observed?.pending) {
                 const previous = await observed.pending;
                 result = await replayPlaytestReceipt(tool, call[0], input, previous, (previous as Result & { isError?: boolean }).isError === true, call[2]);
               }
@@ -613,24 +645,31 @@ export class AutoContinueTools {
                 result = await pending;
               }
             } else if (inspection) {
-              task.observations ??= new Map();
-              const previous = task.observations.get(call[0]);
-              const attempted = task.attempts.get(call[0]);
-              if (previous && previous.key !== key || attempted && attempted.key !== key) throw new Error("A tool call ID was reused with different arguments");
-              if (!previous) task.observations.set(call[0], { key, pending: withIsolatedOperationScope(async () => { throw new Error("A read-only recovery observation cannot submit project commands"); },
-                () => tool.execute(...call), { getTargets: () => this.#repairScope(task, { tool: tool.name, call, settled: false }).getTargets(), settle: async () => { throw new Error("Read-only observations cannot settle isolated effects"); } }) });
-              result = await task.observations.get(call[0])!.pending;
-            } else result = await tool.execute(...call);
+              let pending = observed?.pending;
+              if (!pending) {
+                pending = withIsolatedOperationScope(async () => { throw new Error("A read-only recovery observation cannot submit project commands"); },
+                  () => tool.execute(...call), { getTargets: () => this.#repairScope(task, { tool: tool.name, call, settled: false }).getTargets(), settle: async () => { throw new Error("Read-only observations cannot settle isolated effects"); } });
+                task.observations ??= new Map();
+                task.observations.set(call[0], { key, pending });
+              }
+              result = await pending;
+            } else {
+              if (observation && !observed) {
+                task.observations ??= new Map();
+                task.observations.set(call[0], { key });
+              }
+              result = await tool.execute(...call);
+            }
           } catch (cause) {
             if (getToolPreflightFailure(cause))
-              await this.#readRejection(task, tool, call, cause);
+              await this.#recordRejection(task, tool, call, cause);
             throw cause;
           }
           if (
             (result as Result & { isError?: boolean }).isError &&
             getToolPreflightFailure(result)
           )
-            await this.#readRejection(task, tool, call, result);
+            await this.#recordRejection(task, tool, call, result);
           await this.#assertCurrent(task, call[2]);
           if (readEpoch === task.publicationEpoch && ["read", "read_project_file"].includes(tool.name) && typeof input.path === "string" && !input.path.startsWith("attachment:") && !(result as Result & { isError?: boolean }).isError) task.needsRead = false;
           return result;
@@ -640,22 +679,20 @@ export class AutoContinueTools {
           !(task.publicationEpoch && attempt.publicationEpoch !== task.publicationEpoch && tool.name === "build_game") &&
           ((tool as RecoverableTool).canReuseResult?.(attempt.result, ...call) ?? true);
         if (sameId) {
-          if (sameId.key !== key)
-            throw new Error(
-              "A tool call ID was reused with different arguments",
-            );
           if (sameId.pending && !playtest) return sameId.pending;
           if (sameId.pending) await sameId.pending.catch(() => {});
           return this.#reuse(task, sameId, call[2]);
         }
-        if ((task.blocked || this.#unrecorded.size) && !(task.repairOnly && task.blockedKind === "unknown" && repairAction && !this.#unrecorded.size))
+        if ((task.blocked || this.#unrecorded.size) && !(task.repairOnly && task.blockedKind === "unknown" && repairStep && !this.#unrecorded.size))
           throw new Error(
             task.blocked ??
               "A late tool result could not be recorded. Review the original operation before continuing.",
           );
         const recovered = [...task.attempts.values()].find(previous => previous.key === key && (previous.effectsRecovered?.length || previous.deletionDisposition));
         if (recovered) throw new Error("The original failed command has recovered effects. Do not replay it under a new call ID; inspect current files and correct the requested operation");
-        if (task.needsRead && !repairAction) throw new Error("Read the current project files after the controlled recovery publication before making another change");
+        const validatesProject = tool.name === "build_game" || playtest && input.operation === "open" && input.actions === undefined;
+        if (task.needsRead && !repairStep && !validatesProject)
+          throw new Error("Read the current project files after the controlled recovery publication before making another change");
         if (task.continuing && !repairAction) {
           const previous = [...task.attempts.values()].findLast(reusable);
           if (previous?.result)
@@ -692,7 +729,7 @@ export class AutoContinueTools {
             !attempt.confirmedFailure &&
             !attempt.observation && attempt.preflightFailure?.disposition !== "correctable" && !attempt.commandNotSubmitted && !attempt.effectsRecovered?.length && !attempt.deletionDisposition,
         );
-        if (task.continuing && unknown && !(task.repairOnly && repairAction)) throw this.#stop(task, unknown);
+        if (task.continuing && unknown && !(task.repairOnly && repairStep)) throw this.#stop(task, unknown);
         if (playtest) {
           const previous = [...task.attempts.values()].filter(attempt => attempt.tool === "game_use" && attempt.settled && !attempt.result && !attempt.preflightFailure && !attempt.confirmedFailure);
           if (previous.length) {
@@ -714,9 +751,12 @@ export class AutoContinueTools {
           }
         }
         if (task.continuing && paidTool(tool.name)) {
-          task.blocked =
-            "Automatic continuation stopped: a new media request cannot be proven to be the original operation. Recover the original call or job; no replacement was submitted.";
-          throw new Error(task.blocked);
+          const cause = toolPreflightError(
+            "This media request cannot be proven to be the original operation and was not submitted. Recover the original call or job. Continue independent work with existing results.",
+            "new_media_requires_authorization",
+          );
+          await this.#recordRejection(task, tool, call, cause);
+          throw cause;
         }
         const attempt: Attempt = {
           tool: tool.name,
@@ -798,7 +838,8 @@ export class AutoContinueTools {
       attempt.retainedResult = inheritToolConfirmedFailure(inheritIsolatedOperationReceipts({ content: [{ type: "text", text: failure instanceof Error ? failure.message : "The original command failed without source changes" }], details: {}, isError: true } as Result, failure), failure);
     attempt.repairMapped = !!isolated;
     attempt.repairResolutions = getIsolatedRepairResolutions(result) ?? getIsolatedRepairResolutions(failure);
-    attempt.commandNotSubmitted = isIsolatedInputBudgetError(failure) && isolatedCommandsNotSubmitted(isolated);
+    const rejectionReason = getIsolatedCommandRejection(failure);
+    attempt.commandNotSubmitted = !!rejectionReason && rejectionReason === isolated?.at(-1)?.rejection && isolatedCommandsNotSubmitted(isolated);
     const rejection =
       !attempt.isolatedOperations?.length ? getToolPreflightFailure(failure) ??
       ((result as (Result & { isError?: boolean }) | undefined)?.isError
@@ -864,7 +905,7 @@ export class AutoContinueTools {
     return result!;
   }
 
-  async #readRejection(
+  async #recordRejection(
     task: Task,
     tool: ToolDefinition,
     call: Call,
@@ -1057,14 +1098,14 @@ export class AutoContinueTools {
               attempt.call[4],
             );
         if ((result as Result & { isError?: boolean }).isError &&
-          !(BLENDER_TOOLS.has(attempt.tool) && getToolConfirmedFailure(result)))
+          !confirmedToolFailure(attempt.tool, getToolConfirmedFailure(result)))
           throw new Error("Recovery did not confirm the original result");
       } catch {
         await this.#assertCurrent(task, signal);
         throw this.#stop(task, attempt);
       }
-      attempt.confirmedFailure = BLENDER_TOOLS.has(attempt.tool) &&
-        (result as Result & { isError?: boolean }).isError ? getToolConfirmedFailure(result) : undefined;
+      attempt.confirmedFailure = (result as Result & { isError?: boolean }).isError
+        ? confirmedToolFailure(attempt.tool, getToolConfirmedFailure(result)) : undefined;
       attempt.result = attempt.confirmedFailure ? undefined : result;
       attempt.failure = undefined;
       attempt.unconfirmed = false;

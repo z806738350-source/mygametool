@@ -21,6 +21,7 @@ import {
 import { annotatePlayableSourceLocations } from "../shared/playable-source-locations.js";
 import { isAllowedLocalOrigin, isLoopbackHostHeader, localPreviewCsp } from "../shared/local-security.js";
 import { containsKnownSensitiveValue } from "../shared/sensitive-values.js";
+import { ProjectLifecycleError } from "./project-lifecycle.js";
 
 const BRIDGE_PATH = "/__ohmygame_preview_bridge__.js";
 /** The web story editor bridge, served beside the preview bridge for Interactive Story pages. */
@@ -77,6 +78,16 @@ export async function createPreviewProxy(
   const closeReloadStream = (document: number) => {
     reloadStreams.get(document)?.end();
     reloadStreams.delete(document);
+  };
+  const recordActivity = (document: number, active: boolean, outgoing: ServerResponse) => {
+    try {
+      options.onActivity?.(String(document), active);
+      return true;
+    } catch (cause) {
+      // Project deletion can close admission while a page or heartbeat is in flight.
+      outgoing.writeHead(cause instanceof ProjectLifecycleError ? cause.statusCode : 500, { "cache-control": "no-store" }).end();
+      return false;
+    }
   };
   const upstreamHeaders = (incoming: IncomingMessage) => {
     const headers: IncomingHttpHeaders = { ...incoming.headers, host: target.host };
@@ -209,17 +220,13 @@ export async function createPreviewProxy(
           void receiveBridgeMessage(incoming)
             .then((message) => {
               const context = documents.get(document);
-              if (message.type === "resume" && context)
-                clients.set(context.client, document);
               if (
                 !closed &&
                 context &&
-                clients.get(context.client) === document
+                (message.type === "resume" || clients.get(context.client) === document)
               ) {
-                options.onActivity?.(
-                  String(document),
-                  message.type !== "close",
-                );
+                if (!recordActivity(document, message.type !== "close", outgoing)) return;
+                if (message.type === "resume") clients.set(context.client, document);
                 if (message.type === "source" && message.source) {
                   context.source = message.source;
                   for (const diagnostic of failures.values()) {
@@ -377,6 +384,10 @@ export async function createPreviewProxy(
             querySource === "external"
               ? querySource
               : (previous?.source ?? "external");
+          if (!recordActivity(documentId + 1, true, outgoing)) {
+            response.resume();
+            return;
+          }
           const old = clients.get(client);
           if (old !== undefined) {
             clearDiagnostics(old);
@@ -390,7 +401,6 @@ export async function createPreviewProxy(
             path: previewPagePath(incoming.url ?? "/"),
           });
           clients.set(client, document);
-          options.onActivity?.(String(document), true);
           while (documents.size > 64) {
             const oldest = documents.keys().next().value!;
             const oldContext = documents.get(oldest)!;

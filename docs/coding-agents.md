@@ -475,12 +475,11 @@ Agents are off by default. Enabling the switch offers their models in the conver
 detail page signs in, checks again, chooses the executable and permissions, and
 explains that the CLI loads the person's existing configuration.
 
-On macOS, discovery includes the CLIs bundled with Codex and ChatGPT in
-`/Applications` and `~/Applications`, as well as PATH, the login shell's PATH
-and usual CLI install folders. The detail page shows the resolved executable
-and where it was found. With several installations, the newest version wins;
-equal versions keep discovery order. A manually selected executable takes
-precedence even when another installation is newer.
+On macOS, Codex discovery checks the CLIs bundled with Codex and ChatGPT in
+`/Applications` and `~/Applications` before PATH and common CLI install
+folders. The detail page shows the resolved executable and where it was found.
+An explicit selection takes precedence. OhMyGame checks the selected executable
+and its bundled tool runner's OpenAI signatures before probing the CLI.
 
 On Windows, discovery also checks Codex's versioned desktop installations under
 `%LOCALAPPDATA%/OpenAI/Codex/bin` and the native executable inside npm installations
@@ -881,9 +880,9 @@ person's choice, PATH, the login shell's PATH, usual install folders, and known
 bundled copies such as ChatGPT's Codex. On Windows only native `.exe` programs
 are started; supported Codex npm shims resolve to the packaged executable because
 Node cannot start `.cmd`/`.bat` shims without a shell. An
-explicit path wins; automatic
-discovery chooses the newest SemVer, including prerelease ordering, and retries
-failed version probes. Recheck also invalidates successful probes. Catalog
+explicit path wins. Automatic Codex discovery uses the first candidate in
+discovery order. For runtimes that compare versions, discovery chooses the
+newest SemVer, including prerelease ordering. Recheck refreshes probe caches. Catalog
 refreshes honor their TTL and discard results from a superseded configuration.
 
 All three runtimes load the person's existing CLI configuration, including

@@ -1,3 +1,5 @@
+import { isUtf8 } from "node:buffer";
+import { constants } from "node:fs";
 import { cp, lstat, open, readdir, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { ClassicLevel } from "classic-level";
@@ -5,6 +7,9 @@ import { PROJECT_BROWSER_CLEANUP_DIRECTORY, storedBrowserProjectId } from "../sh
 
 const PROJECT_ID = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i;
 const RENDERER_KEY = Buffer.from("_file://\0");
+const LOG_PREFIX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z /;
+const MAX_LOG_CLEANUP_BYTES = 32 * 1024 * 1024;
+const DESKTOP_LOGS = ["daemon.log", "daemon.1.log", "daemon.2.log", "main.log", "main.1.log", "main.2.log"];
 
 async function entry(file: string) {
   const info = await lstat(file).catch((cause: NodeJS.ErrnoException) => {
@@ -63,6 +68,76 @@ async function rewriteDatabase(source: string, target: string, deleted: Readonly
   }
 }
 
+function retiredLogRecord(line: Buffer, deleted: ReadonlySet<string>): boolean {
+  if (!isUtf8(line)) return false;
+  const text = line.toString("utf8");
+  const prefix = LOG_PREFIX.exec(text);
+  if (!prefix) return false;
+  try {
+    const row: unknown = JSON.parse(text.slice(prefix[0].length));
+    if (!row || typeof row !== "object" || !Object.hasOwn(row, "projectId")) return false;
+    const { projectId } = row as { projectId: unknown };
+    return typeof projectId === "string" && deleted.has(projectId);
+  } catch { return false; }
+}
+
+/** The launcher holds its lock and Electron's append handles are closed. */
+async function pruneDesktopLogs(desktop: string, deleted: ReadonlySet<string>): Promise<void> {
+  const logs = path.join(desktop, "logs");
+  if (!(await directory(logs))) return;
+  for (const name of DESKTOP_LOGS) {
+    const file = path.join(logs, name);
+    const staged = file + ".project-cleanup-new";
+    const stale = await entry(staged);
+    if (stale && !stale.isFile()) throw new Error("Invalid diagnostic cleanup staging file");
+    if (stale) await rm(staged);
+    const listed = await entry(file);
+    if (!listed) continue;
+    if (!listed.isFile() || listed.size > MAX_LOG_CLEANUP_BYTES)
+      throw new Error("Invalid or oversized diagnostic log");
+    const source = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const before = await source.stat();
+      if (!before.isFile() || before.nlink !== 1 || before.dev !== listed.dev || before.ino !== listed.ino || before.size !== listed.size)
+        throw new Error("Diagnostic log changed before cleanup");
+      const bytes = Buffer.allocUnsafe(before.size + 1);
+      let size = 0;
+      while (size < bytes.length) {
+        const { bytesRead } = await source.read(bytes, size, bytes.length - size, size);
+        if (!bytesRead) break;
+        size += bytesRead;
+      }
+      if (size !== before.size) throw new Error("Diagnostic log changed during cleanup");
+      const input = bytes.subarray(0, size);
+      const kept = Buffer.allocUnsafe(size);
+      let written = 0;
+      for (let start = 0; start < size;) {
+        const newline = input.indexOf(10, start);
+        const end = newline < 0 ? size : newline + 1;
+        if (!retiredLogRecord(input.subarray(start, end), deleted)) {
+          input.copy(kept, written, start, end);
+          written += end - start;
+        }
+        start = end;
+      }
+      if (written === size) continue;
+      const replacement = await open(staged, "wx", 0o600);
+      try {
+        try {
+          await replacement.writeFile(kept.subarray(0, written));
+          await replacement.sync();
+        } finally { await replacement.close(); }
+        const current = await entry(file);
+        if (!current || current.dev !== before.dev || current.ino !== before.ino ||
+          current.size !== before.size || current.mtimeMs !== before.mtimeMs || current.ctimeMs !== before.ctimeMs)
+          throw new Error("Diagnostic log changed during cleanup");
+        await rename(staged, file);
+        await syncDirectory(logs);
+      } finally { await rm(staged, { force: true }); }
+    } finally { await source.close(); }
+  }
+}
+
 /** Run under the local launcher lock, before Electron starts or after it exits. */
 export async function compactProjectBrowserStorage(data: string): Promise<void> {
   const queue = path.join(data, PROJECT_BROWSER_CLEANUP_DIRECTORY);
@@ -79,9 +154,11 @@ export async function compactProjectBrowserStorage(data: string): Promise<void> 
   const desktop = path.join(data, "desktop");
   const browser = path.join(desktop, "browser");
   const storage = path.join(browser, "Local Storage");
-  if (!(await directory(desktop)) || !(await directory(browser))) return;
-  if (await entry(path.join(browser, "LocalStorage"))) throw new Error("Unsupported browser storage backend");
-  if (await directory(storage)) {
+  if (!(await directory(desktop))) return;
+  await pruneDesktopLogs(desktop, deleted);
+  const hasBrowser = await directory(browser);
+  if (hasBrowser && await entry(path.join(browser, "LocalStorage"))) throw new Error("Unsupported browser storage backend");
+  if (hasBrowser && await directory(storage)) {
     const live = path.join(storage, "leveldb");
     const previous = live + ".project-cleanup-previous";
     const snapshot = live + ".project-cleanup-source";

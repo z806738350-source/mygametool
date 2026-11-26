@@ -400,7 +400,7 @@ describe("controlled Blender project tools", () => {
   });
 
   it("requires user approval of the retained Tripo original before starting Blender", async () => {
-    const { root, library, project, projects, call, runner, buffers } = await fixture(undefined, false, "asset-canvas", true);
+    const { root, library, project, projects, call, guardedCall, guard, runner, buffers } = await fixture(undefined, false, "asset-canvas", true);
     const preview = buffers.get("model.glb")!;
     const generated = async (name: string, change: string, modelPreview?: Buffer) => {
       const original = Buffer.from(`; FBX 7.4.0 project file\n; ${change}`);
@@ -419,7 +419,8 @@ describe("controlled Blender project tools", () => {
     await vi.waitFor(() => expect(ask).toHaveBeenCalledWith(expect.objectContaining({
       assetId: first.asset.id, fbx: true, previewSha256: createHash("sha256").update(preview).digest("hex"),
     })));
-    await expect(call("run_blender", request)).rejects.toThrow(/Blender did not start/);
+    await expect(guardedCall("run_blender", request, "before-review")).rejects.toThrow(/Blender did not start/);
+    expect(guard.stopRequested).toBe(false);
     await expect(call("run_blender", pathRequest)).rejects.toThrow(/Blender did not start/);
     deny("deny");
     expect(await pending).toBe("changes-requested");
@@ -435,7 +436,7 @@ describe("controlled Blender project tools", () => {
     expect(await reviews().review(project.id, reviewed.asset.id, never)).toBe("approved");
     expect(never).not.toHaveBeenCalled();
     await expect(call("run_blender", request)).rejects.toThrow(/Blender did not start/);
-    await call("run_blender", { ...request, sourceAssetId: reviewed.asset.id });
+    await guardedCall("run_blender", { ...request, sourceAssetId: reviewed.asset.id }, "after-review");
     expect(runner.run).toHaveBeenCalledOnce();
     expect(runner.run.mock.calls[0]![0].boundSource?.bytes.equals(reviewed.original)).toBe(true);
   });

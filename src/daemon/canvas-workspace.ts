@@ -4,12 +4,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { validVideoReferencePreparation } from "../shared/video-reference-preparation.js";
 import { applyCanvasNodeLayout, canvasNodeContent, canvasNodeLayout, contentNodeSizeIssue, isResizableCanvasNodeType } from "../shared/canvas-node-layout.js";
 import { resolveVideoMentions } from "../shared/video-references.js";
-import { chmod, lstat, readFile, rm } from "node:fs/promises";
+import { chmod, lstat, readFile, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { readWebpModelReference } from "./image-working-assets.js";
 import type { AssetCanvasNode, AssetCanvasReference, Model3DOptions, PromptImage, RunToolRequest, ToolJob, ToolId } from "../shared/contracts.js";
-import { createCanvasBoard, fitCanvasLayout, isCanvasBoard, isCanvasIndex, CANVAS_INDEX_SCHEMA, CANVAS_BOARD_SCHEMA, CANVAS_LAYOUT_SCHEMA, type CanvasBoard, type CanvasBoardDetail, type CanvasWorkspaceDetail, type CanvasWorkspaceIndex } from "../shared/canvas-workspace.js";
+import { createCanvasBoard, fitCanvasLayout, isCanvasBoard, isCanvasIndex, CANVAS_INDEX_SCHEMA, CANVAS_BOARD_SCHEMA, CANVAS_LAYOUT_SCHEMA, type CanvasBoard, type CanvasBoardDetail, type CanvasBoardJobs, type CanvasCharacterViewStatus, type CanvasWorkspaceDetail, type CanvasWorkspaceIndex } from "../shared/canvas-workspace.js";
 import { CANVAS_ASSETS_SCHEMA, canvasNodeAssetIds } from "../shared/canvas-assets.js";
 import { combineAssetCanvasPrompt, createAssetCanvasDocument, resolveAssetCanvasAssetId, validateAssetCanvasDocument } from "../shared/asset-canvas.js";
 import { buildModel3DToolRequest, mediaGenerationNeedsConfirmation, resolveModel3D } from "../shared/generation-config.js";
@@ -23,7 +23,30 @@ import { ToolRunError, type ToolRunner } from "./tools.js";
 import { inheritToolPreflightFailure, toolPreflightError } from "./agent-tool-errors.js";
 import { CanvasError, canvasPath, parseCanvasJson, readCanvasFile, writeCanvasFile as writeAtomic, writeCanvasJson as writeJson } from "./canvas-files.js";
 import { canvasAssetCatalog, canvasLibraryAsset, ensureCanvasAssets, inspectCanvasAssets, readCanvasAssets } from "./canvas-assets.js";
+import { CharacterViewBindings, CharacterViewSealRejected, characterViewFingerprint, matchesCharacterViewFingerprint, recordCharacterViewJobAlias, sameCharacterViewRevision, type CharacterViewBinding, type CharacterViewNodeReservation, type CharacterViewNodeSeal } from "./character-view-bindings.js";
+import { readSafeProjectFile } from "./safe-project-file.js";
+import { RASTER_BYTES } from "./raster-policy.js";
 export { CanvasError } from "./canvas-files.js";
+
+type AgentCanvasSource = { path: string } | { assetId: string; audioReference?: true }
+  | { attachmentReference: string; image: PromptImage; signal?: AbortSignal };
+
+type CharacterViewAuthoringMarker = {
+  schemaVersion?: number;
+  setId?: string;
+  designRevision?: string;
+  views?: Partial<Record<CharacterViewBinding["direction"], Pick<CharacterViewBinding, "viewRevision" | "planFingerprint" | "boardId" | "nodeId"> & { accepted?: { assetId: string } }>>;
+};
+
+// Compare a diagonal against the straight view and its opposite turn at the same camera.
+const characterReviewDirections: Record<CharacterViewBinding["direction"], CharacterViewBinding["direction"][]> = {
+  N: ["S"], NE: ["N", "NW"], NW: ["N", "NE"], S: ["N"], SE: ["S", "SW"], SW: ["S", "SE"],
+  E: ["W", "NE", "SE"], W: ["E", "NW", "SW"],
+};
+
+function invalidMediaInput(message: string, statusCode = 400): CanvasError {
+  return inheritToolPreflightFailure(new CanvasError(message, statusCode), toolPreflightError(message, "invalid_media_options"));
+}
 
 function recoveryUnavailable(message: string): CanvasError {
   // This recovery stopped before start(). It says nothing about the original provider submission.
@@ -369,7 +392,12 @@ export async function removeCanvasAssetReferences(workspace: string, assetIds: s
     }
   });
 }
-type StoredJob = ToolJob & { input?: RunToolRequest; recoveryId?: string };
+type StoredJob = ToolJob & { input?: RunToolRequest; unreadInput?: { retainedInput: string }; recoveryId?: string };
+function managedImageNodeSettings(node: Extract<AssetCanvasNode, { type: "image" }>) {
+  const { assetId: _result, ...settings } = node.data;
+  return settings;
+}
+
 export class CanvasStore {
   readonly #executions = new Map<string, Set<Promise<void>>>();
 
@@ -536,8 +564,39 @@ export class CanvasStore {
       return { boardId: board.id, nodeIds: entries.map(entry => entry.nodeId), assetsByPath: Object.fromEntries(entries.map(entry => [entry.path, entry.assetId])) };
     });
   }
+  async #registerAgentCanvasSource(id: string, source: AgentCanvasSource, manifest: Awaited<ReturnType<typeof readCanvasAssets>>) {
+    const project = this.#project(id), workspace = project.workspacePath;
+    let assetId: string;
+    if ("path" in source) {
+      const file = await getWorkspaceMedia(workspace, source.path);
+      assetId = Object.entries(manifest.assets).find(([, asset]) => asset.path === file.relativePath)?.[0]
+        ?? await this.projects.ensureLibraryAsset(id, file.relativePath);
+    } else if ("attachmentReference" in source) {
+      source.signal?.throwIfAborted();
+      const bytes = Buffer.from(source.image.data, "base64"), digest = createHash("sha256").update(bytes).digest("hex");
+      if (!["image/png", "image/jpeg", "image/webp"].includes(source.image.mediaType)) throw new CanvasError("Attachment references require PNG, JPEG or WebP");
+      const extension = source.image.mediaType === "image/jpeg" ? "jpg" : source.image.mediaType.slice(6);
+      assetId = (await this.library.add(`attachment-${digest}.${extension}`, bytes, {
+        origin: "uploaded", purpose: "reference", signal: source.signal, saved: false,
+        sourceKey: `project:${id}:attachment:${createHash("sha256").update(JSON.stringify([id, source.attachmentReference, digest])).digest("hex")}`,
+      })).id;
+    } else assetId = source.assetId;
+    const assets = await ensureCanvasAssets(project, this.projects, this.library, [assetId]);
+    return { assetId, path: assets.assets[assetId]!.path };
+  }
+
+  /** Register project-owned or authorized attachment reference bytes without creating a generation node. */
+  async registerCharacterViewSource(id: string, source: AgentCanvasSource) {
+    const workspace = this.#project(id).workspacePath;
+    return withCanvasLock(workspace, async () => {
+      await ensureCanvasIndex(workspace);
+      await ensureCanvasContract(workspace);
+      return this.#registerAgentCanvasSource(id, source, await readCanvasAssets(workspace));
+    });
+  }
+
   /** Publish an agent request and its sources atomically before any provider call. */
-  async createAgentMediaNode(id: string, nodeId: string, create: (reference: (source: { path: string } | { assetId: string; audioReference?: true } | { attachmentReference: string; image: PromptImage; signal?: AbortSignal }) => Promise<AssetCanvasReference>) => Promise<AssetCanvasNode>, boardId?: string): Promise<{ boardId: string; nodeId: string }> {
+  async createAgentMediaNode(id: string, nodeId: string, create: (reference: (source: AgentCanvasSource) => Promise<AssetCanvasReference>) => Promise<AssetCanvasNode>, boardId?: string, referenceMode?: "pinned"): Promise<{ boardId: string; nodeId: string }> {
     const project = this.#project(id), workspace = project.workspacePath;
     return withCanvasLock(workspace, async () => {
       const index = await ensureCanvasIndex(workspace);
@@ -547,23 +606,9 @@ export class CanvasStore {
       if (board.nodes.some(node => node.id === nodeId)) return { boardId: selected, nodeId };
       const manifest = await readCanvasAssets(workspace);
       const node = await create(async source => {
-        let assetId: string;
-        if ("path" in source) {
-          const file = await getWorkspaceMedia(workspace, source.path);
-          assetId = Object.entries(manifest.assets).find(([, asset]) => asset.path === file.relativePath)?.[0]
-            ?? await this.projects.ensureLibraryAsset(id, file.relativePath);
-        } else if ("attachmentReference" in source) {
-          source.signal?.throwIfAborted();
-          const bytes = Buffer.from(source.image.data, "base64"), digest = createHash("sha256").update(bytes).digest("hex");
-          if (!["image/png", "image/jpeg", "image/webp"].includes(source.image.mediaType)) throw new CanvasError("Attachment references require PNG, JPEG or WebP");
-          const extension = source.image.mediaType === "image/jpeg" ? "jpg" : source.image.mediaType.slice(6);
-          assetId = (await this.library.add(`attachment-${digest}.${extension}`, bytes, {
-            origin: "uploaded", purpose: "reference", signal: source.signal, saved: false,
-            sourceKey: `project:${id}:attachment:${createHash("sha256").update(JSON.stringify([id, source.attachmentReference, digest])).digest("hex")}`,
-          })).id;
-        } else assetId = source.assetId;
-        await ensureCanvasAssets(project, this.projects, this.library, [assetId]);
+        const { assetId } = await this.#registerAgentCanvasSource(id, source, manifest);
         const existing = board.nodes.find(node => "assetId" in node.data && node.data.assetId === assetId
+          && (referenceMode !== "pinned" || node.type === "asset")
           && (!("audioReference" in source && source.audioReference) || node.type === "voice" || node.type === "asset" && node.data.mediaType === "audio"));
         if (existing) return { type: "node", nodeId: existing.id };
         const asset = (await canvasAssetCatalog(workspace, await readCanvasAssets(workspace), [assetId]))[0]!;
@@ -579,6 +624,212 @@ export class CanvasStore {
       await this.projects.touch(id);
       return { boardId: selected, nodeId };
     });
+  }
+
+  async #characterViewBindings(id: string) {
+    if (this.#project(id).type !== "web-game") return undefined;
+    const storage = new CharacterViewBindings(await this.projects.getLocalImageRecoveryAnchor(id));
+    return { storage, records: await storage.load() };
+  }
+
+  /** Reserve the address before the node can be observed through the Canvas. */
+  async reserveCharacterViewNode(id: string, input: CharacterViewNodeReservation): Promise<{ boardId: string; nodeId: string }> {
+    const workspace = this.#project(id).workspacePath;
+    return withCanvasLock(workspace, async () => {
+      const state = await this.#characterViewBindings(id);
+      if (!state) throw new CanvasError("Managed character views require a Web Game project", 409);
+      const index = await ensureCanvasIndex(workspace);
+      const boardId = validId(input.boardId ?? index.boards[0]!.id);
+      const nodeId = validId(input.nodeId);
+      const { setId, designRevision, direction, viewRevision, displayHeadToGround, planFingerprint } = input;
+      const candidate: CharacterViewBinding = { boardId, nodeId, setId, designRevision, direction, viewRevision, displayHeadToGround, planFingerprint };
+      const previous = state.records.find(record => record.boardId === boardId && record.nodeId === nodeId ||
+        sameCharacterViewRevision(record, candidate));
+      if (previous) {
+        if (previous.boardId !== boardId || previous.nodeId !== nodeId ||
+            !sameCharacterViewRevision(previous, candidate) || previous.planFingerprint !== candidate.planFingerprint)
+          throw new CanvasError("This managed character revision is already bound to different inputs or a different node", 409);
+        return { boardId, nodeId };
+      }
+      if ((await this.board(id, boardId)).board.nodes.some(node => node.id === nodeId))
+        throw new CanvasError("A different Canvas node already uses this managed direction's ID", 409);
+      state.records.push(candidate);
+      await state.storage.save(state.records);
+      return { boardId, nodeId };
+    });
+  }
+
+  async sealCharacterViewNodes(id: string, views: readonly CharacterViewNodeSeal[]): Promise<void> {
+    const workspace = this.#project(id).workspacePath;
+    await withCanvasLock(workspace, async () => {
+      const state = await this.#characterViewBindings(id);
+      if (!state) throw new CanvasError("Managed character views require a Web Game project", 409);
+      if (!views.length || views.length > 8) throw new CanvasError("Seal one through eight managed directions");
+      const manifest = await readCanvasAssets(workspace);
+      for (const view of views) {
+        const record = state.records.find(record => record.boardId === view.boardId && record.nodeId === view.nodeId);
+        if (!record || view.planFingerprint !== record.planFingerprint)
+          throw new CanvasError("This direction does not match its managed plan reservation", 409);
+        const { board } = await this.board(id, view.boardId);
+        const node = board.nodes.find(node => node.id === view.nodeId);
+        if (node?.type !== "image" || !node.data.model || node.data.outputFormat !== "png" ||
+            node.data.background !== "transparent" || !node.data.images.length)
+          throw new CanvasError("Managed directions require an explicit image model, references and transparent PNG settings");
+        for (const reference of [...node.data.images, node.data.mask, node.data.markup]) {
+          if (reference?.type === "node" && board.nodes.find(node => node.id === reference.nodeId)?.type !== "asset")
+            throw new CharacterViewSealRejected("Pin a saved image asset as the direction's reference");
+        }
+        const linkedText = await this.#linkedPrompt(id, board, node.data.promptSource?.nodeId);
+        const request = await this.#imageNodeInput(node, linkedText, reference => {
+          const assetId = resolveAssetCanvasAssetId(board.nodes, reference);
+          if (!assetId || !manifest.assets[assetId]) throw new CanvasError("A managed direction reference is missing");
+          return this.#readCanvasImage(id, manifest.assets[assetId]!.path, assetId, "image", true);
+        });
+        const prepared = await this.tools.prepare("generate-image", request, id);
+        await this.tools.assertMediaInputOptions("generate-image", prepared);
+        if (record.inputFingerprint && !matchesCharacterViewFingerprint(prepared, record.inputFingerprint))
+          throw new CharacterViewSealRejected("The managed direction no longer matches its frozen inputs. Use a new direction revision.");
+        record.inputFingerprint ??= characterViewFingerprint(prepared);
+        record.nodeFingerprint = characterViewFingerprint(managedImageNodeSettings(node));
+      }
+      // A batch becomes ready in one durable index replacement.
+      await state.storage.save(state.records);
+    });
+  }
+
+  async #managedResultDigest(job: ToolJob) {
+    const assetId = job.run?.files[0]?.assetId;
+    if (!assetId) throw new CanvasError("Managed character result has no retained original", 409);
+    const { snapshot } = await this.library.openSnapshot(assetId, RASTER_BYTES);
+    try { return snapshot.sha256; } finally { await snapshot.release(); }
+  }
+
+  #readCharacterViewAuthoring(root: string, setId: string): Promise<CharacterViewAuthoringMarker | undefined> {
+    const file = path.join(root, "assets", "generated", "character-sets", setId, "authoring.json");
+    return readSafeProjectFile(root, file, 2 * 1024 * 1024)
+      .then(bytes => JSON.parse(bytes.toString("utf8")))
+      .catch(error => {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        return undefined;
+      });
+  }
+
+  #matchesCharacterViewAuthoring(current: CharacterViewAuthoringMarker | undefined, record: CharacterViewBinding) {
+    const view = current?.views?.[record.direction];
+    return current?.schemaVersion === 1 && current.setId === record.setId &&
+      current.designRevision === record.designRevision && view?.viewRevision === record.viewRevision &&
+      view.planFingerprint === record.planFingerprint && view.boardId === record.boardId && view.nodeId === record.nodeId;
+  }
+
+  async #assertCharacterViewAuthoring(workspace: string, record: CharacterViewBinding) {
+    const current = await this.#readCharacterViewAuthoring(await realpath(workspace), record.setId);
+    if (!this.#matchesCharacterViewAuthoring(current, record))
+      throw new CanvasError("The managed direction plan has not been committed or has changed. No generation was submitted.", 409);
+  }
+
+  async #observeCharacterView(id: string, record: CharacterViewBinding): Promise<StoredJob | undefined> {
+    const attempt = record.attempt;
+    if (!attempt || attempt.phase === "prepared") return undefined;
+    if (attempt.phase === "succeeded") {
+      const sha256 = await this.#managedResultDigest(attempt.job);
+      if (sha256 !== attempt.resultSha256)
+        throw new CanvasError("The retained character direction result no longer matches its original", 409);
+      await ensureCanvasAssets(this.#project(id), this.projects, this.library, [attempt.job.run!.files[0]!.assetId!]);
+      return { ...attempt.job, recoveryId: attempt.recoveryId, characterView: { direction: record.direction, viewRevision: record.viewRevision, displayHeadToGround: record.displayHeadToGround, sha256 } };
+    }
+    const current = this.#jobs.get(id)?.find(job => job.id === attempt.job.id && job.recoveryId === attempt.recoveryId);
+    if (attempt.phase === "admitted" && current?.status === "running") return current;
+    if (attempt.phase === "not-submitted") return { ...attempt.job, recoveryId: attempt.recoveryId };
+    return {
+      ...attempt.job, recoveryId: attempt.recoveryId, status: "failed",
+      error: attempt.job.error ?? "The managed direction may already have been submitted. Recover its original result; no replacement was sent.",
+      submissionOutcome: "unknown",
+    };
+  }
+
+  async characterReviewNeighbors(id: string, boardId: string, nodeId: string) {
+    const workspace = this.#project(id).workspacePath;
+    return withCanvasLock(workspace, async () => {
+      const records = (await this.#characterViewBindings(id))?.records ?? [];
+      const candidate = records.find(record => record.boardId === boardId && record.nodeId === nodeId);
+      if (!candidate) return [];
+      const current = await this.#readCharacterViewAuthoring(await realpath(workspace), candidate.setId);
+      if (!this.#matchesCharacterViewAuthoring(current, candidate)) return [];
+      const neighbors = [];
+      for (const direction of characterReviewDirections[candidate.direction]) {
+        const view = current?.views?.[direction];
+        if (!view) continue;
+        const source = records.find(record => record.direction === direction && this.#matchesCharacterViewAuthoring(current, record));
+        const assetId = view.accepted?.assetId ?? (source?.attempt?.phase === "succeeded" ? source.attempt.job.run?.files[0]?.assetId : undefined);
+        if (assetId) neighbors.push({ direction, assetId });
+        if (neighbors.length === 2) break;
+      }
+      return neighbors;
+    });
+  }
+
+  /** Managed original lookup works even after checkpoint restore or Canvas job compaction. */
+  async managedCharacterViewJob(id: string, query: { boardId?: string; nodeId?: string; jobId?: string; recoveryId?: string }): Promise<ToolJob | undefined> {
+    return withCanvasLock(this.#project(id).workspacePath, async () => {
+      const state = await this.#characterViewBindings(id);
+      if (!state) return undefined;
+      const matchingNode = (record: CharacterViewBinding) =>
+        (query.boardId === undefined || record.boardId === query.boardId) &&
+        (query.nodeId === undefined || record.nodeId === query.nodeId);
+      const candidate = state.records.find(record => matchingNode(record) &&
+        (query.jobId === undefined || record.attempt?.job.id === query.jobId || record.attempt?.previousJobs.includes(query.jobId)) &&
+        (query.recoveryId === undefined || record.attempt?.recoveryId === query.recoveryId));
+      if (!candidate) {
+        if (query.jobId && query.boardId !== undefined && query.nodeId !== undefined && state.records.some(matchingNode))
+          throw recoveryUnavailable("This job does not belong to the managed direction. No replacement was submitted.");
+        return undefined;
+      }
+      const job = await this.#observeCharacterView(id, candidate);
+      return job ? this.#publicJob(job) : undefined;
+    });
+  }
+
+  async #readCanvasImage(id: string, relative: string, assetId: string, nodeType: AssetCanvasNode["type"], managed = false): Promise<PromptImage> {
+    const project = this.#project(id);
+    const source = await getWorkspaceMedia(project.workspacePath, relative);
+    if (nodeType === "model-3d" && source.contentType === "image/webp") {
+      try { return await readWebpModelReference(project.workspacePath, source); }
+      catch (cause) { throw new CanvasError(cause instanceof Error ? cause.message : String(cause)); }
+    }
+    if (nodeType === "model-3d" && source.contentType !== "image/png" && source.contentType !== "image/jpeg")
+      throw new CanvasError("3D generation requires PNG, JPEG or WebP reference images");
+    if (!(managed ? ["image/png", "image/jpeg", "image/webp"] : ["image/png", "image/jpeg", "image/webp", "image/gif"]).includes(source.contentType))
+      throw new CanvasError(managed ? "Managed direction references must be static PNG, JPEG or WebP" : "Reference images must be PNG, JPEG, WebP or GIF");
+    const bytes = managed
+      ? await readSafeProjectFile(project.workspacePath, source.absolutePath, RASTER_BYTES)
+      : await readFile(source.absolutePath);
+    return { mediaType: source.contentType as PromptImage["mediaType"], data: bytes.toString("base64"),
+      libraryAssetId: await canvasLibraryAsset(project, this.library, assetId) };
+  }
+
+  async #linkedPrompt(id: string, board: CanvasBoard, sourceId?: string): Promise<string | undefined> {
+    if (!sourceId) return;
+    const linked = board.nodes.find(node => node.id === sourceId);
+    if (linked?.type === "document") return (await this.read(id, linked.data.documentId))?.document.markdown;
+    if (linked?.type === "text") return linked.data.text;
+  }
+
+  async #imageNodeInput(node: Extract<AssetCanvasNode, { type: "image" }>, text: string | undefined,
+    image: (reference: AssetCanvasReference) => Promise<PromptImage>): Promise<RunToolRequest> {
+    const prompt = combineAssetCanvasPrompt(text, node.data.prompt);
+    if (!prompt) throw invalidMediaInput("Add a prompt before generating");
+    return {
+      prompt, resolution: node.data.resolution, aspectRatio: node.data.aspectRatio,
+      ...(node.data.model ? { imageModel: node.data.model } : {}),
+      ...(node.data.quality !== undefined ? { quality: node.data.quality } : {}),
+      ...(node.data.outputFormat !== undefined ? { outputFormat: node.data.outputFormat } : {}),
+      ...(node.data.outputCompression !== undefined ? { outputCompression: node.data.outputCompression } : {}),
+      ...(node.data.background !== undefined ? { background: node.data.background } : {}),
+      ...gptImage26Options(node.data),
+      ...(node.data.mask ? { mask: await image(node.data.mask) } : {}),
+      ...(node.data.markup ? { markup: await image(node.data.markup) } : {}),
+      images: await Promise.all(node.data.images.map(image)),
+    };
   }
   async recordAgentMediaFailure(id: string, boardId: string, nodeId: string, toolId: ToolId, error: string): Promise<void> {
     await withCanvasLock(this.#project(id).workspacePath, async () => {
@@ -635,36 +886,46 @@ export class CanvasStore {
     try {
       const value: unknown = JSON.parse(await readFile(await canvasPath(this.#project(id).workspacePath, "jobs.json"), "utf8"));
       if (!Array.isArray(value) || value.length > 1000 || value.some((job) => !job || typeof job.id !== "string" || job.context?.projectId !== id || typeof job.context?.boardId !== "string" || typeof job.context?.nodeId !== "string" || !["running", "succeeded", "failed", "cancelled"].includes(job.status))) throw new CanvasError("Invalid generation history");
-      jobs = await Promise.all(value.map(async (job) => ({ ...job,
-        ...(job.input?.retainedInput !== undefined ? { input: await this.#readJobInput(id, job) } : {}),
-        sources: Array.isArray(job.sources) && job.sources.length <= 64 && job.sources.every((source: unknown) => source && typeof source === "object" && "assetId" in source && typeof source.assetId === "string" && "name" in source && typeof source.name === "string") ? job.sources : undefined,
-        videoSubmission: ["not-submitted", "attempted"].includes(job.videoSubmission) ? job.videoSubmission : undefined,
-        videoReferencePreparation: validVideoReferencePreparation(job.videoReferencePreparation) ? job.videoReferencePreparation : undefined,
-        ...(job.status === "running" ? { status: "cancelled", error: "Generation was interrupted. Recover a saved result; unknown submissions are never resubmitted.",
-          ...(!job.run && ["generate-speech", "generate-sound-effect", "generate-music"].includes(job.toolId) ? { submissionOutcome: "unknown" as const } : {}) } : {}) })));
+      jobs = await Promise.all(value.map(async (job) => {
+        const { unreadInput: _, ...stored } = job;
+        let input = job.input, unreadInput: StoredJob["unreadInput"];
+        if (input?.retainedInput !== undefined) {
+          try { input = await this.#readJobInput(id, job); }
+          catch {
+            // Keep its exact disk binding. A damaged sidecar affects only this job.
+            unreadInput = input;
+            input = undefined;
+          }
+        }
+        return { ...stored, input, unreadInput,
+          sources: Array.isArray(job.sources) && job.sources.length <= 64 && job.sources.every((source: unknown) => source && typeof source === "object" && "assetId" in source && typeof source.assetId === "string" && "name" in source && typeof source.name === "string") ? job.sources : undefined,
+          videoSubmission: ["not-submitted", "attempted"].includes(job.videoSubmission) ? job.videoSubmission : undefined,
+          videoReferencePreparation: validVideoReferencePreparation(job.videoReferencePreparation) ? job.videoReferencePreparation : undefined,
+          ...(job.status === "running" ? { status: "cancelled", error: "Generation was interrupted. Recover a saved result; unknown submissions are never resubmitted.",
+            ...(!job.run && ["generate-speech", "generate-sound-effect", "generate-music"].includes(job.toolId) ? { submissionOutcome: "unknown" as const } : {}) } : {}),
+        };
+      }));
     } catch (cause) { if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause; }
     this.#jobs.set(id, jobs);
     try { await this.#saveJobs(id); }
     catch (cause) { this.#jobs.delete(id); throw cause; }
     return jobs;
   }
-  async #readJobInput(id: string, job: StoredJob & { input: { retainedInput: string } }): Promise<RunToolRequest> {
+  async #readJobInput(id: string, job: Omit<StoredJob, "input"> & { input: { retainedInput: string } }): Promise<RunToolRequest> {
     const key = revision(job.id);
-    if (job.input.retainedInput !== key) throw new CanvasError("Invalid retained generation input binding", 409);
+    if (job.input.retainedInput !== key) throw recoveryUnavailable("Invalid retained generation input binding");
     const file = await canvasPath(this.#project(id).workspacePath, `.job-inputs/${key}.json`);
     let saved;
     try { saved = JSON.parse(await readFile(file, "utf8")); }
-    catch (cause) {
-      if ((cause as NodeJS.ErrnoException).code === "ENOENT") throw new CanvasError("Original generation input is unavailable; history retained and no replacement was submitted", 409);
-      throw cause;
-    }
-    if (saved.version !== 1 || saved.jobId !== job.id || saved.boardId !== job.context?.boardId || saved.nodeId !== job.context?.nodeId || saved.toolId !== job.toolId || !saved.input || typeof saved.input !== "object" || Array.isArray(saved.input))
-      throw new CanvasError("The original generation input does not match this job; no replacement was submitted", 409);
+    catch { throw recoveryUnavailable("Original generation input is unavailable; history retained and no replacement was submitted"); }
+    if (saved?.version !== 1 || saved.jobId !== job.id || saved.boardId !== job.context?.boardId || saved.nodeId !== job.context?.nodeId || saved.toolId !== job.toolId || !saved.input || typeof saved.input !== "object" || Array.isArray(saved.input))
+      throw recoveryUnavailable("The original generation input does not match this job; no replacement was submitted");
     return saved.input as RunToolRequest;
   }
   async #saveJobs(id: string) {
     const workspace = this.#project(id).workspacePath;
-    const history = await Promise.all((this.#jobs.get(id) ?? []).map(async (job) => {
+    const history = await Promise.all((this.#jobs.get(id) ?? []).map(async ({ unreadInput, ...job }) => {
+      if (unreadInput) return { ...job, input: unreadInput };
       if (!job.input) return job;
       const key = revision(job.id), name = `.job-inputs/${key}.json`;
       const saved = { version: 1, jobId: job.id, boardId: job.context?.boardId, nodeId: job.context?.nodeId, toolId: job.toolId, input: job.input };
@@ -697,15 +958,16 @@ export class CanvasStore {
     try { await this.#saveJobs(id); }
     catch (cause) { this.#jobs.set(id, history); throw cause; }
   }
-  async #publicJob({ input, recoveryId, ...job }: StoredJob): Promise<ToolJob> {
+  async #publicJob({ input, unreadInput, recoveryId, ...job }: StoredJob): Promise<ToolJob> {
     const id = recoveryId ?? job.id, outputs = (input as { outputs?: number } | undefined)?.outputs ?? 1;
     const terminal = job.status === "cancelled" || job.status === "failed";
     return {
       ...structuredClone(job),
+      ...(unreadInput ? { error: [job.error, "The original generation input is unavailable. Restore it to recover this job."].filter(Boolean).join(" ") } : {}),
       ...(job.toolId === "generate-image" ? { canRecoverImage: await this.tools.hasSavedImageResult(id, outputs) } : {}),
       ...(job.toolId === "generate-video" ? { canRecoverVideo: await this.tools.hasSavedVideoTask(id) } : {}),
       ...(terminal && (job.toolId === "image-to-3d" || job.toolId === "animate-3d") ? { canRecoverModel3D: !!job.run || !!input && await this.#canRecover3D(job.toolId, input, id) } : {}),
-      ...(terminal && !job.run && await this.tools.mediaWasAttempted(job.toolId, id, outputs) ? { submissionOutcome: "unknown" as const } : {}),
+      ...(terminal && !job.run && (unreadInput || await this.tools.mediaWasAttempted(job.toolId, id, outputs)) ? { submissionOutcome: "unknown" as const } : {}),
     };
   }
   async #canRecover3D(toolId: string, input: RunToolRequest, recoveryId: string): Promise<boolean> {
@@ -717,36 +979,110 @@ export class CanvasStore {
   async jobs(id: string): Promise<ToolJob[]> {
     return withCanvasLock(this.#project(id).workspacePath, async () => Promise.all((await this.#loadJobs(id)).map((job) => this.#publicJob(job))));
   }
-  async start(id: string, boardId: string, nodeId: string, toolId: ToolId, input: RunToolRequest, expectedBoard?: string | ((current: CanvasBoard) => Promise<void>), recoveryId?: string, imageRecoveryOnly = false, videoRecoveryOnly = false, model3DRecoveryOnly = false, confirmedAudioJobId?: string, retryJobId?: string, agentCanInspectImages?: boolean): Promise<ToolJob> {
+
+  async boardJobs(id: string, boardId: string): Promise<CanvasBoardJobs> {
     const workspace = this.#project(id).workspacePath;
-    const { job, prepared } = await withCanvasLock(workspace, async () => {
+    return withCanvasLock(workspace, async () => {
+      validId(boardId);
+      const history = (await this.#loadJobs(id)).filter(job => job.context?.boardId === boardId);
+      const reserved = (await this.#characterViewBindings(id))?.records.filter(record => record.boardId === boardId) ?? [];
+      const characterViews: CanvasCharacterViewStatus[] = [];
+      if (reserved.length) {
+        const nodes = new Map((await this.board(id, boardId)).board.nodes.map(node => [node.id, node]));
+        const root = await realpath(workspace);
+        const markers = new Map<string, Promise<CharacterViewAuthoringMarker | undefined>>();
+        for (const record of reserved) {
+          const { nodeId, setId, designRevision, direction, viewRevision, attempt } = record;
+          const node = nodes.get(nodeId);
+          if (node?.type !== "image") continue;
+          const view = { nodeId, setId, designRevision, direction, viewRevision };
+          if (attempt && !["prepared", "not-submitted"].includes(attempt.phase)) {
+            const running = attempt.phase === "admitted" && history.some(job => job.id === attempt.job.id && job.status === "running");
+            let state: CanvasCharacterViewStatus["state"];
+            if (running) state = "running";
+            else if (attempt.phase === "succeeded") {
+              const assetId = attempt.job.run?.files[0]?.assetId;
+              const retained = assetId && await this.library.content(assetId).catch(() => undefined);
+              state = retained ? "available" : "unavailable";
+            } else {
+              const recoverable = attempt.job.run || await this.tools.hasSavedImageResult(attempt.recoveryId);
+              state = recoverable ? "recoverable" : "unknown";
+            }
+            characterViews.push({ ...view, state, jobId: attempt.job.id });
+            continue;
+          }
+          if (!record.inputFingerprint) { characterViews.push({ ...view, state: "preparing" }); continue; }
+          let marker = markers.get(setId);
+          if (!marker) {
+            marker = this.#readCharacterViewAuthoring(root, setId).catch(() => undefined);
+            markers.set(setId, marker);
+          }
+          const current = await marker;
+          const state = !current && !attempt ? "preparing"
+            : !this.#matchesCharacterViewAuthoring(current, record) || !matchesCharacterViewFingerprint(managedImageNodeSettings(node), record.nodeFingerprint) ? "changed"
+            : attempt?.phase === "not-submitted" ? "not-submitted" : "ready";
+          characterViews.push({ ...view, state });
+        }
+      }
+      return { jobs: await Promise.all(history.map(job => this.#publicJob(job))), characterViews };
+    });
+  }
+  async start(id: string, boardId: string, nodeId: string, toolId: ToolId, input: RunToolRequest, verifyInputs?: (current: CanvasBoard) => Promise<void>, recoveryId?: string, imageRecoveryOnly = false, videoRecoveryOnly = false, model3DRecoveryOnly = false, confirmedAudioJobId?: string, retryJobId?: string, agentCanInspectImages?: boolean): Promise<ToolJob> {
+    const workspace = this.#project(id).workspacePath;
+    const { job, prepared, managed } = await withCanvasLock(workspace, async () => {
       if (this.#closed) throw new CanvasError("Generation is shutting down", 503);
+      const state = await this.#characterViewBindings(id);
+      const record = state?.records.find(record => record.boardId === boardId && record.nodeId === nodeId);
+      if (record) {
+        if (toolId !== "generate-image" || imageRecoveryOnly || videoRecoveryOnly || model3DRecoveryOnly ||
+            retryJobId || confirmedAudioJobId)
+          throw recoveryUnavailable("Use the original managed direction job for recovery or prepare a new view revision.");
+        if (!record.inputFingerprint)
+          throw new CanvasError("This managed character direction is still preparing. No generation was submitted.", 409);
+        const observed = await this.#observeCharacterView(id, record);
+        if (observed && record.attempt?.phase !== "not-submitted") return { job: observed };
+        await this.#assertCharacterViewAuthoring(workspace, record);
+      }
       const detail = await this.board(id, boardId);
-      if (typeof expectedBoard === "function") await expectedBoard(detail.board);
-      else if (expectedBoard && detail.revision !== expectedBoard) throw new CanvasError("The node settings changed before generation. Read the current board and try again.", 409);
+      await verifyInputs?.(detail.board);
       const node = detail.board.nodes.find((node) => node.id === nodeId);
       const expectedNodeType = toolId === "generate-speech" && "voiceDesign" in input && input.voiceDesign ? "voice" : ({ "generate-image": "image", "generate-video": "video", "image-to-3d": "model-3d", "animate-3d": "animate-3d", "generate-speech": "speech", "generate-sound-effect": "sound-effect", "generate-music": "music" } as Partial<Record<ToolId, string>>)[toolId];
       if (!node || !expectedNodeType || expectedNodeType !== node.type) throw new CanvasError("Generation node not found", 404);
+      if (record && (node.type !== "image" || !matchesCharacterViewFingerprint(managedImageNodeSettings(node), record.nodeFingerprint)))
+        throw new CanvasError("The managed direction settings changed. No generation was submitted.", 409);
       const jobs = await this.#loadJobs(id);
+      // Agent submissions bring their original call identity; the Canvas Generate button does not.
+      if (state && record && recoveryId) {
+        const running = new Set(jobs.filter(job => job.status === "running").map(job => job.id));
+        const other = state.records.find(view => view.setId === record.setId && view.designRevision === record.designRevision &&
+          view.direction !== record.direction && view.attempt && running.has(view.attempt.job.id));
+        if (other) throw toolPreflightError(
+          `${record.direction} was not submitted. ${other.direction} is still generating for ${record.setId}. Inspect its saved image when it finishes, then request the next direction separately.`,
+          "invalid_character_view_input",
+        );
+      }
       if (jobs.some((job) => job.context?.boardId === boardId && job.context.nodeId === nodeId && job.status === "running")) throw new CanvasError("This node is already generating", 409);
       const previous = jobs.find((job) => job.context?.boardId === boardId && job.context.nodeId === nodeId);
       if (retryJobId && previous?.id !== retryJobId) throw new CanvasError("This recovery was superseded. Refresh the node before continuing.", 409);
       if (previous?.status === "cancelled" && this.#controllers.has(previous)) throw new CanvasError("Wait for the cancelled generation to finish recording its result.", 409);
-      if (previous?.run && previous.toolId === toolId && previous.status !== "succeeded" && (!recoveryId || recoveryId === (previous.recoveryId ?? previous.id))) {
+      if (!record && previous?.run && previous.toolId === toolId && previous.status !== "succeeded" && (!recoveryId || recoveryId === (previous.recoveryId ?? previous.id))) {
         if (!previous.input) throw new CanvasError("The saved output is in the Library. Restore it locally before generating again.", 409);
         const job = { ...previous, id: randomUUID(), createdAt: new Date().toISOString(), status: "running" as const, error: undefined, submissionOutcome: undefined };
         await this.#rememberJob(id, job, jobs);
         return { job, prepared: previous.input };
       }
       if (retryJobId && previous?.run) throw new CanvasError("This saved output cannot be restored. Recovery will not submit a new request.", 409);
-      await this.tools.assertMediaAvailable(toolId, input, model3DRecoveryOnly);
       const canSubmit = !imageRecoveryOnly && !videoRecoveryOnly && !model3DRecoveryOnly;
+      if (canSubmit) this.tools.assertJobHistoryAvailable();
+      await this.tools.assertMediaAvailable(toolId, input, model3DRecoveryOnly);
       if (canSubmit && previous && mediaGenerationNeedsConfirmation(await this.#publicJob(previous)) && confirmedAudioJobId !== previous.id) {
         throw new CanvasError("The previous request may have been billed. Explicitly confirm a new request or recover the previous result.", 409);
       }
       if (confirmedAudioJobId && confirmedAudioJobId !== previous?.id) throw new CanvasError("This confirmation is out of date. Refresh the node before continuing.", 409);
       const resolved = await this.tools.prepare(toolId, input, id, canSubmit ? agentCanInspectImages : undefined);
       if (canSubmit) await this.tools.assertMediaInputOptions(toolId, resolved);
+      if (record && !matchesCharacterViewFingerprint(resolved, record.inputFingerprint))
+        throw new CanvasError("The managed direction input has changed since it was prepared. No generation was submitted.", 409);
       const prepared = structuredClone(resolved);
       const model = "imageModel" in resolved ? resolved.imageModel : "model" in resolved ? resolved.model : undefined;
       if (toolId === "generate-video" && "references" in prepared) for (const reference of prepared.references ?? []) reference.assetId = await canvasLibraryAsset(this.#project(id), this.library, reference.assetId);
@@ -763,12 +1099,35 @@ export class CanvasStore {
         "referenceAssetId" in prepared ? prepared.referenceAssetId : undefined,
       ].filter((assetId): assetId is string => typeof assetId === "string");
       const sources = [...new Set(sourceIds)].map(assetId => ({ assetId, name: this.library.get(assetId)?.name ?? assetId }));
-      const job: StoredJob = { sources, imageRecoveryOnly, videoRecoveryOnly, model3DRecoveryOnly, recoveryId: recoveryId ?? randomUUID(), id: randomUUID(), toolId, ...(toolId === "generate-video" ? { videoSubmission: videoRecoveryOnly ? "attempted" as const : "not-submitted" as const } : {}), createdAt: new Date().toISOString(), status: "running", title: "prompt" in input ? (input.prompt ?? "Model 3D").slice(0, 200) : "text" in input ? (input.text.trim().slice(0, 200) || "Speech") : "Model 3D", context: { projectId: id, boardId, nodeId }, ...(model ? { model } : {}), input: structuredClone(resolved) };
-      await this.#rememberJob(id, job, jobs);
-      return { job, prepared };
+      const prior = record?.attempt;
+      const job: StoredJob = { sources, imageRecoveryOnly, videoRecoveryOnly, model3DRecoveryOnly, recoveryId: prior?.recoveryId ?? recoveryId ?? randomUUID(), id: prior?.phase === "prepared" ? prior.job.id : randomUUID(), toolId, ...(toolId === "generate-video" ? { videoSubmission: videoRecoveryOnly ? "attempted" as const : "not-submitted" as const } : {}), createdAt: new Date().toISOString(), status: "running", title: "prompt" in input ? (input.prompt ?? "Model 3D").slice(0, 200) : "text" in input ? (input.text.trim().slice(0, 200) || "Speech") : "Model 3D", context: { projectId: id, boardId, nodeId }, ...(model ? { model } : {}), input: structuredClone(resolved) };
+      if (state && record) {
+        const { input: _input, recoveryId: originalId, ...recordedJob } = job;
+        if (prior?.phase === "not-submitted") recordCharacterViewJobAlias(prior);
+        record.attempt = { recoveryId: originalId!, phase: "prepared", job: recordedJob, previousJobs: prior?.previousJobs ?? [] };
+        await state.storage.save(state.records);
+        await state.storage.retainInput(record, resolved);
+      }
+      await this.#rememberJob(id, job, record ? jobs.filter(entry => entry.id !== job.id) : jobs);
+      if (state && record) {
+        record.attempt!.phase = "admitted";
+        try { await state.storage.save(state.records); }
+        catch (error) {
+          job.status = "cancelled";
+          job.error = "The managed direction could not be admitted. No generation was submitted.";
+          await this.#saveJobs(id);
+          throw error;
+        }
+      }
+      return { job, prepared, managed: !!record };
     });
+    if (!prepared) return this.#publicJob(job);
+    return this.#launchCanvasJob(id, job, prepared, managed);
+  }
+
+  #launchCanvasJob(id: string, job: StoredJob, prepared: RunToolRequest, managed = false): ToolJob {
     const controller = new AbortController(); this.#controllers.set(job, controller);
-    const execution = this.#execute(id, job, prepared, controller);
+    const execution = this.#execute(id, job, prepared, controller, managed);
     let executions = this.#executions.get(id);
     if (!executions) { executions = new Set(); this.#executions.set(id, executions); }
     executions.add(execution);
@@ -779,52 +1138,69 @@ export class CanvasStore {
     const { input: _input, recoveryId: _recoveryId, ...publicJob } = job; return structuredClone(publicJob);
   }
   async generateNode(id: string, boardId: string, nodeId: string, confirmedAudioJobId?: string, defaultReferenceMode?: Model3DOptions["referenceMode"], agentCanInspectImages?: boolean,
-    expectedToolId?: ToolId): Promise<ToolJob> {
-    const submit = await this.prepareNode(id, boardId, nodeId, confirmedAudioJobId, defaultReferenceMode, agentCanInspectImages, undefined, expectedToolId);
+    expectedToolId?: ToolId, originalRecoveryId?: string): Promise<ToolJob> {
+    const submit = await this.prepareNode(id, boardId, nodeId, confirmedAudioJobId, defaultReferenceMode, agentCanInspectImages, undefined, expectedToolId, originalRecoveryId);
     return submit();
   }
-  /** Capture the inputs and board revision without creating a job or submitting to a provider. */
+  /** Capture the generation inputs without creating a job or submitting to a provider. */
   async prepareNode(id: string, boardId: string, nodeId: string, confirmedAudioJobId?: string, defaultReferenceMode?: Model3DOptions["referenceMode"], agentCanInspectImages?: boolean,
-    reviewViews?: (images: readonly PromptImage[], paths: readonly string[]) => Promise<void>, expectedToolId?: ToolId): Promise<() => Promise<ToolJob>> {
-    const project = this.#project(id), { board, revision } = await this.board(id, boardId);
-    const node = board.nodes.find((node) => node.id === nodeId);
-    const start = (toolId: ToolId, input: RunToolRequest, checkBoard?: (current: CanvasBoard) => Promise<void>) => {
-      if (expectedToolId && toolId !== expectedToolId) throw new CanvasError("The generation node changed type. Read the current board before generating.", 409);
-      return () => this.start(id, boardId, nodeId, toolId, input, checkBoard ?? revision, undefined, false, false, false, confirmedAudioJobId, undefined, agentCanInspectImages);
-    };
-    if (!node || !["image", "video", "model-3d", "animate-3d", "speech", "voice", "sound-effect", "music"].includes(node.type)) throw new CanvasError("Choose a media generation node");
-    const latest = await withCanvasLock(project.workspacePath, async () => (await this.#loadJobs(id)).find((job) => job.context?.boardId === boardId && job.context.nodeId === nodeId));
+    reviewViews?: (images: readonly PromptImage[], paths: readonly string[]) => Promise<void>, expectedToolId?: ToolId,
+    originalRecoveryId?: string): Promise<() => Promise<ToolJob>> {
+    const project = this.#project(id);
+    const managed = await withCanvasLock(project.workspacePath, async () => {
+      const record = (await this.#characterViewBindings(id))?.records.find(record => record.boardId === boardId && record.nodeId === nodeId);
+      if (!record) return undefined;
+      if (confirmedAudioJobId) throw new CanvasError("Prepare a new managed direction revision before requesting a replacement", 409);
+      if (!record.inputFingerprint)
+        throw new CanvasError("This managed character direction is still preparing. No generation was submitted.", 409);
+      const observed = await this.#observeCharacterView(id, record);
+      return { record, job: observed && record.attempt?.phase !== "not-submitted" ? await this.#publicJob(observed) : undefined };
+    });
+    if (managed?.job) {
+      const job = managed.job;
+      return () => job.status === "failed" && (job.run || job.canRecoverImage) ? this.retry(id, job.id, true) : Promise.resolve(job);
+    }
+    const { board } = await this.board(id, boardId);
+    const node = board.nodes.find(node => node.id === nodeId);
+    if (!node || !["image", "video", "model-3d", "animate-3d", "speech", "voice", "sound-effect", "music"].includes(node.type)) throw invalidMediaInput("Choose a media generation node");
+    const latest = managed ? undefined : await withCanvasLock(project.workspacePath, async () => (await this.#loadJobs(id)).find((job) => job.context?.boardId === boardId && job.context.nodeId === nodeId));
     if (latest?.run && (latest.status === "failed" || latest.status === "cancelled")) return () => this.retry(id, latest.id);
     const manifest = await readCanvasAssets(project.workspacePath);
-    const assetId = (reference: Parameters<typeof resolveAssetCanvasAssetId>[1]): string => {
+    const sourceAssets = new Map<AssetCanvasReference, string>();
+    const assetId = (reference: AssetCanvasReference): string => {
       const id = resolveAssetCanvasAssetId(board.nodes, reference);
-      if (!id || !manifest.assets[id]) throw new CanvasError("A referenced node has no saved output. Generate it first.");
+      if (!id || !manifest.assets[id]) throw invalidMediaInput("A referenced node has no saved output. Generate it first.");
+      sourceAssets.set(reference, id);
       return id;
     };
-    const image = async (reference: Parameters<typeof assetId>[0]): Promise<PromptImage> => {
-      const source = await getWorkspaceMedia(project.workspacePath, manifest.assets[assetId(reference)]!.path);
-      if (node.type === "model-3d" && source.contentType === "image/webp") {
-        try { return await readWebpModelReference(project.workspacePath, source); }
-        catch (cause) { throw new CanvasError(cause instanceof Error ? cause.message : String(cause)); }
-      }
-      if (node.type === "model-3d" && source.contentType !== "image/png" && source.contentType !== "image/jpeg") throw new CanvasError("3D generation requires PNG, JPEG or WebP reference images");
-      if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(source.contentType)) throw new CanvasError("Reference images must be PNG, JPEG, WebP or GIF");
-      return { mediaType: source.contentType as PromptImage["mediaType"], data: (await readFile(source.absolutePath)).toString("base64"),
-        libraryAssetId: await canvasLibraryAsset(project, this.library, assetId(reference)) };
+    const image = (reference: AssetCanvasReference) => {
+      const source = assetId(reference);
+      return this.#readCanvasImage(id, manifest.assets[source]!.path, source, node.type, !!managed);
+    };
+    const usesPrompt = node.type !== "model-3d" || node.data.operation === "text" || node.data.operation === "retexture";
+    const promptSource = usesPrompt && "promptSource" in node.data ? node.data.promptSource?.nodeId : undefined;
+    const linkedText = await this.#linkedPrompt(id, board, promptSource);
+    const start = (toolId: ToolId, input: RunToolRequest, reviewed = false) => {
+      if (expectedToolId && toolId !== expectedToolId) throw invalidMediaInput("The generation node changed type. Read the current board before generating.", 409);
+      return () => this.start(id, boardId, nodeId, toolId, input, async current => {
+        const target = current.nodes.find(item => item.id === nodeId);
+        const assets = sourceAssets.size ? await readCanvasAssets(project.workspacePath) : manifest;
+        if (target?.type === node.type && isDeepStrictEqual(target.data, node.data) &&
+          [...sourceAssets].every(([reference, source]) => resolveAssetCanvasAssetId(current.nodes, reference) === source && assets.assets[source]?.path === manifest.assets[source]?.path) &&
+          (!promptSource || await this.#linkedPrompt(id, current, promptSource) === linkedText)) return;
+        if (reviewed) throw toolPreflightError("Canvas settings or references changed during review. Show the current views and request approval again. No generation was submitted.", "invalid_model_reference");
+        throw invalidMediaInput("The node settings or references changed before generation. Read the current node and try again.", 409);
+      }, managed ? originalRecoveryId : undefined, false, false, false, confirmedAudioJobId, undefined, agentCanInspectImages);
     };
     if (node.type === "animate-3d") {
-      if (!node.data.source || !node.data.actionIds.length) throw new CanvasError("Choose a source model and animation actions first");
+      if (!node.data.source || !node.data.actionIds.length) throw invalidMediaInput("Choose a source model and animation actions first");
       return start("animate-3d", { model: node.data.model, options: node.data.options, assetId: assetId(node.data.source), actionIds: node.data.actionIds, heightMeters: node.data.heightMeters });
     }
     if (node.type === "model-3d") {
       const operation = node.data.operation ?? "image";
-      if (operation === "image" && !node.data.images.length) throw new CanvasError("Add a reference image before generating");
+      if (operation === "image" && !node.data.images.length) throw invalidMediaInput("Add a reference image before generating");
       let prompt: string | undefined;
-      if (operation === "text" || operation === "retexture") {
-        const linked = board.nodes.find((candidate) => candidate.id === node.data.promptSource?.nodeId);
-        const text = linked?.type === "text" ? linked.data.text : linked?.type === "document" ? (await this.read(id, linked.data.documentId))?.document.markdown : undefined;
-        prompt = combineAssetCanvasPrompt(text, node.data.prompt ?? "");
-      }
+      if (operation === "text" || operation === "retexture") prompt = combineAssetCanvasPrompt(linkedText, node.data.prompt ?? "");
       const images: PromptImage[] = [];
       for (const reference of node.data.images) images.push(await image(reference));
       const options = operation === "image" && defaultReferenceMode ? { referenceMode: defaultReferenceMode, ...node.data.options } : node.data.options;
@@ -834,32 +1210,23 @@ export class CanvasStore {
         const sourceIds = node.data.images.map(assetId);
         const paths = sourceIds.map(sourceId => manifest.assets[sourceId]!.path);
         await reviewViews(images, paths);
-        return start("image-to-3d", request, async current => {
-          const currentAssets = await readCanvasAssets(project.workspacePath);
-          if (!isDeepStrictEqual(canvasBoardContent(board), canvasBoardContent(current)) ||
-            sourceIds.some((sourceId, index) => currentAssets.assets[sourceId]?.path !== paths[index]))
-            throw toolPreflightError("Canvas settings or references changed during review. Show the current views and request approval again. No generation was submitted.", "approval_required");
-        });
+        return start("image-to-3d", request, true);
       }
       return start("image-to-3d", request);
     }
     if (node.type === "voice") {
-      if (!node.data.description.trim() || !node.data.sampleText.trim()) throw new CanvasError("Describe the voice and add sample text before generating", 400);
+      if (!node.data.description.trim() || !node.data.sampleText.trim()) throw invalidMediaInput("Describe the voice and add sample text before generating", 400);
       return start("generate-speech", { voiceDesign: true, voiceDescription: node.data.description, text: node.data.sampleText, output: node.data.output ?? { format: "wav", sampleRate: 48000 }, language: node.data.language, style: node.data.style, speed: node.data.speed, ...(node.data.model ? { model: node.data.model } : {}) });
     }
     if (node.type === "speech") {
-      const linked = board.nodes.find((candidate) => candidate.id === node.data.promptSource?.nodeId);
-      const linkedText = linked?.type === "text" ? linked.data.text : linked?.type === "document" ? (await this.read(id, linked.data.documentId))?.document.markdown : undefined;
       const text = combineAssetCanvasPrompt(linkedText, node.data.text);
-      if (!text) throw new CanvasError("Add text to synthesize before generating");
-      if (node.data.voiceId && !node.data.referenceAssetId) throw new CanvasError("The legacy voice is unavailable; explicitly select reference audio or no reference", 400);
+      if (!text) throw invalidMediaInput("Add text to synthesize before generating");
+      if (node.data.voiceId && !node.data.referenceAssetId) throw invalidMediaInput("The legacy voice is unavailable; explicitly select reference audio or no reference", 400);
       return start("generate-speech", { text, language: node.data.language, style: node.data.style, output: node.data.output, ...(node.data.referenceAssetId ? { referenceAssetId: node.data.referenceAssetId } : {}), ...(node.data.referenceSha256 ? { referenceSha256: node.data.referenceSha256 } : {}), ...(node.data.model ? { model: node.data.model } : {}), ...(node.data.speed !== undefined ? { speed: node.data.speed } : {}) });
     }
     if (node.type === "sound-effect" || node.type === "music") {
-      const linked = board.nodes.find((candidate) => candidate.id === node.data.promptSource?.nodeId);
-      const linkedText = linked?.type === "text" ? linked.data.text : linked?.type === "document" ? (await this.read(id, linked.data.documentId))?.document.markdown : undefined;
       const prompt = combineAssetCanvasPrompt(linkedText, node.data.prompt);
-      if (!prompt) throw new CanvasError(`Add a prompt before generating ${node.type === "music" ? "music" : "a sound effect"}`);
+      if (!prompt) throw invalidMediaInput(`Add a prompt before generating ${node.type === "music" ? "music" : "a sound effect"}`);
       if (node.type === "sound-effect") return start("generate-sound-effect", {
         prompt,
         ...(node.data.output ? { output: node.data.output } : {}),
@@ -878,36 +1245,43 @@ export class CanvasStore {
         ...(node.data.loop !== undefined ? { loop: node.data.loop } : {}),
       });
     }
-    if (node.type !== "image" && node.type !== "video") throw new CanvasError("Unsupported generation node");
-    const linked = board.nodes.find((candidate) => candidate.id === node.data.promptSource?.nodeId);
-    const text = linked?.type === "text" ? linked.data.text : linked?.type === "document" ? (await this.read(id, linked.data.documentId))?.document.markdown : undefined;
-    const prompt = combineAssetCanvasPrompt(text, node.data.prompt);
-    if (!prompt) throw new CanvasError("Add a prompt before generating");
-    if (node.type === "image") return start("generate-image", {
-      prompt, resolution: node.data.resolution, aspectRatio: node.data.aspectRatio,
-      ...(node.data.model ? { imageModel: node.data.model } : {}),
-      ...(node.data.quality !== undefined ? { quality: node.data.quality } : {}),
-      ...(node.data.outputFormat !== undefined ? { outputFormat: node.data.outputFormat } : {}),
-      ...(node.data.outputCompression !== undefined ? { outputCompression: node.data.outputCompression } : {}),
-      ...(node.data.background !== undefined ? { background: node.data.background } : {}),
-      ...gptImage26Options(node.data),
-      ...(node.data.mask ? { mask: await image(node.data.mask) } : {}),
-      ...(node.data.markup ? { markup: await image(node.data.markup) } : {}),
-      images: await Promise.all(node.data.images.map(image)),
-    });
+    if (node.type !== "image" && node.type !== "video") throw invalidMediaInput("Unsupported generation node");
+    if (node.type === "image") return start("generate-image", await this.#imageNodeInput(node, linkedText, image));
+    const prompt = combineAssetCanvasPrompt(linkedText, node.data.prompt);
+    if (!prompt) throw invalidMediaInput("Add a prompt before generating");
     const referenceIds = node.data.references.map(assetId);
     const catalog = await canvasAssetCatalog(project.workspacePath, manifest, referenceIds);
     const references = referenceIds.map((id) => {
       const asset = catalog.find((asset) => asset.id === id)!;
-      if (asset.mediaType !== "image") throw new CanvasError("Video generation currently accepts image references only");
+      if (asset.mediaType !== "image") throw invalidMediaInput("Video generation currently accepts image references only");
       return { type: "image" as const, assetId: id };
     });
     let resolvedPrompt: string;
     try { resolvedPrompt = resolveVideoMentions(prompt, node.data.references, node.data.referenceMentions); }
-    catch (cause) { throw new CanvasError(cause instanceof Error ? cause.message : String(cause)); }
+    catch (cause) { throw invalidMediaInput(cause instanceof Error ? cause.message : String(cause)); }
     return start("generate-video", { prompt: resolvedPrompt, model: node.data.model, resolution: node.data.resolution, aspectRatio: node.data.aspectRatio, duration: node.data.duration, references, ...(node.data.referenceMode ? { referenceMode: node.data.referenceMode } : {}) });
   }
-  async #execute(id: string, job: StoredJob, prepared: RunToolRequest, controller: AbortController) {
+  async #saveManagedJob(id: string, job: StoredJob, phase: NonNullable<CharacterViewBinding["attempt"]>["phase"], resultSha256?: string) {
+    const state = await this.#characterViewBindings(id);
+    const record = state?.records.find(record => record.boardId === job.context?.boardId && record.nodeId === job.context?.nodeId);
+    if (!state || !record?.attempt || record.attempt.recoveryId !== job.recoveryId || record.attempt.job.id !== job.id)
+      throw new CanvasError("Managed character view job no longer matches its original binding", 409);
+    // Keep the confirmed result if the previous durable write committed before reporting an error.
+    if (record.attempt.phase === "succeeded" && phase !== "succeeded") {
+      Object.assign(job, record.attempt.job);
+      delete job.input;
+      delete job.error;
+      delete job.submissionOutcome;
+      return;
+    }
+    const { input: _input, recoveryId: _recoveryId, ...recordedJob } = job;
+    record.attempt.job = recordedJob;
+    record.attempt.phase = phase;
+    record.attempt.resultSha256 = resultSha256;
+    await state.storage.save(state.records);
+  }
+
+  async #execute(id: string, job: StoredJob, prepared: RunToolRequest, controller: AbortController, managed = false) {
     try {
       const retained = job.run;
       const run = retained ? await this.tools.recoverCanvasRun(retained.id, job.toolId, job.context!) : await this.tools.runPrepared(job.toolId, prepared, controller.signal, { recoveryId: job.recoveryId ?? job.id, projectId: id, canvasContext: job.context,
@@ -928,7 +1302,10 @@ export class CanvasStore {
       job.run = run;
       if (!retained) {
         delete job.submissionOutcome;
-        await withCanvasLock(this.#project(id).workspacePath, () => this.#saveJobs(id));
+        await withCanvasLock(this.#project(id).workspacePath, async () => {
+          if (managed) await this.#saveManagedJob(id, job, "admitted");
+          await this.#saveJobs(id);
+        });
       }
       controller.signal.throwIfAborted();
       const output = run.files[0];
@@ -937,12 +1314,23 @@ export class CanvasStore {
         if (controller.signal.aborted) return;
         const workspace = this.#project(id).workspacePath, boardId = job.context!.boardId!;
         await ensureCanvasAssets(this.#project(id), this.projects, this.library, [output.assetId!]);
+        const resultSha256 = managed ? await this.#managedResultDigest(job) : undefined;
+        const bindings = managed ? await this.#characterViewBindings(id) : undefined;
+        const binding = bindings?.records.find(record => record.boardId === boardId && record.nodeId === job.context!.nodeId);
         if ((await readCanvasIndex(workspace))?.boards.some((board) => board.id === boardId)) {
           const detail = await readCanvasBoard(workspace, boardId), node = detail?.board.nodes.find((node) => node.id === job.context!.nodeId);
           const expectedType = job.toolId === "generate-speech" && "voiceDesign" in prepared && prepared.voiceDesign ? "voice" : ({ "generate-image": "image", "generate-video": "video", "image-to-3d": "model-3d", "animate-3d": "animate-3d", "generate-speech": "speech", "generate-sound-effect": "sound-effect", "generate-music": "music" } as Partial<Record<ToolId, string>>)[job.toolId];
-          if (detail && node && expectedType && node.type === expectedType) { Object.assign(node.data, { assetId: output.assetId }); await writeCanvasBoard(workspace, detail.board); }
+          if (detail && node && expectedType && node.type === expectedType &&
+              (!managed || node.type === "image" && matchesCharacterViewFingerprint(managedImageNodeSettings(node), binding?.nodeFingerprint) &&
+                (!node.data.assetId || node.data.assetId === output.assetId))) {
+            Object.assign(node.data, { assetId: output.assetId });
+            await writeCanvasBoard(workspace, detail.board);
+          }
         }
-        job.status = "succeeded"; delete job.input; await this.#saveJobs(id);
+        job.status = "succeeded";
+        delete job.input;
+        await this.#saveJobs(id);
+        if (managed) await this.#saveManagedJob(id, job, "succeeded", resultSha256);
       });
       if (job.status === "succeeded") await this.tools.removeRun(run.id).catch(() => {});
     } catch (cause) {
@@ -955,7 +1343,17 @@ export class CanvasStore {
       if (cause instanceof ToolRunError && cause.videoDiagnostic) job.videoDiagnostic = cause.videoDiagnostic;
       if (cause instanceof ToolRunError && cause.audioDiagnostic) job.audioDiagnostic = cause.audioDiagnostic;
       if (cause instanceof ToolRunError && cause.submissionOutcome === "unknown" || controller.signal.aborted && !job.run && ["generate-speech", "generate-sound-effect", "generate-music"].includes(job.toolId)) job.submissionOutcome = "unknown";
-      try { await withCanvasLock(this.#project(id).workspacePath, () => this.#saveJobs(id)); } catch { /* Removed projects have no history to update. */ }
+      try {
+        await withCanvasLock(this.#project(id).workspacePath, async () => {
+          if (managed) {
+            const notSubmitted = !job.imageRecoveryOnly && !job.run && cause instanceof ToolRunError &&
+              cause.notSubmitted === true && !await this.tools.mediaWasAttempted(job.toolId, job.recoveryId!);
+            if (!notSubmitted && !job.run) job.submissionOutcome = "unknown";
+            await this.#saveManagedJob(id, job, notSubmitted ? "not-submitted" : "uncertain");
+          }
+          await this.#saveJobs(id);
+        });
+      } catch { /* Removed projects have no history to update. */ }
     } finally { this.#controllers.delete(job); }
   }
   async cancel(id: string, jobId: string): Promise<ToolJob> {
@@ -963,12 +1361,46 @@ export class CanvasStore {
       const job = (await this.#loadJobs(id)).find((job) => job.id === jobId);
       if (!job) throw new CanvasError("Generation job not found", 404);
       if (job.status === "running") { job.status = "cancelled"; job.error = job.toolId === "image-to-3d" || job.toolId === "animate-3d" ? "Stopped waiting locally. Retry to resume; the provider task may still be running." : "Generation cancelled"; if (!job.run && ["generate-speech", "generate-sound-effect", "generate-music"].includes(job.toolId)) job.submissionOutcome = "unknown"; this.#controllers.get(job)?.abort(); await this.#saveJobs(id); }
-      const { input: _input, recoveryId: _recoveryId, ...result } = job; return structuredClone(result);
+      const { input: _input, unreadInput: _unreadInput, recoveryId: _recoveryId, ...result } = job; return structuredClone(result);
     });
   }
   async retry(id: string, jobId: string, recoveryOnly = false): Promise<ToolJob> {
+    const managed = await withCanvasLock(this.#project(id).workspacePath, async () => {
+      const state = await this.#characterViewBindings(id);
+      const record = state?.records.find(record => record.attempt?.job.id === jobId || record.attempt?.previousJobs.includes(jobId));
+      if (!state || !record?.attempt) return undefined;
+      const previous = await this.#observeCharacterView(id, record);
+      const attempt = record.attempt;
+      if (!previous || attempt.phase === "not-submitted")
+        throw recoveryUnavailable("The managed direction has no submitted result to recover. No replacement was submitted.");
+      if (previous.status === "succeeded" || previous.status === "running") return { job: previous };
+      const current = this.#jobs.get(id)?.find(job => job.id === attempt.job.id);
+      if (current && this.#controllers.has(current))
+        throw recoveryUnavailable("Wait for the original managed generation to finish recording its result.");
+      if (!previous.run && !await this.tools.hasSavedImageResult(attempt.recoveryId))
+        throw recoveryUnavailable("No saved managed image is available. The original may have been submitted; no replacement was sent.");
+      const input = await state.storage.originalInput(record);
+      const jobs = await this.#loadJobs(id);
+      const job: StoredJob = { ...previous, id: randomUUID(), createdAt: new Date().toISOString(), status: "running",
+        input, imageRecoveryOnly: true, error: undefined, submissionOutcome: undefined };
+      recordCharacterViewJobAlias(attempt);
+      const { input: _input, recoveryId: _recoveryId, ...recordedJob } = job;
+      attempt.job = recordedJob;
+      attempt.phase = "admitted";
+      await state.storage.save(state.records);
+      await this.#rememberJob(id, job, jobs);
+      return { job, prepared: input };
+    });
+    if (managed) return managed.prepared
+      ? this.#launchCanvasJob(id, managed.job, managed.prepared, true)
+      : this.#publicJob(managed.job);
     const job = await withCanvasLock(this.#project(id).workspacePath, async () => (await this.#loadJobs(id)).find((job) => job.id === jobId));
-    if (!job || !job.input || !["failed", "cancelled"].includes(job.status)) throw new CanvasError("This job cannot be retried", 409);
+    if (!job || !["failed", "cancelled"].includes(job.status)) throw recoveryUnavailable("This job cannot be retried");
+    if (job.unreadInput) {
+      job.input = await this.#readJobInput(id, { ...job, input: job.unreadInput });
+      delete job.unreadInput;
+    }
+    if (!job.input) throw recoveryUnavailable("This job has no saved generation input");
     if (job.run) return this.start(id, job.context!.boardId!, job.context!.nodeId, job.toolId, job.input, undefined, job.recoveryId ?? job.id, false, false, false, undefined, job.id);
     if (["generate-speech", "generate-sound-effect", "generate-music"].includes(job.toolId) && (recoveryOnly || job.submissionOutcome === "unknown" || /unknown|interrupted|cancelled/i.test(job.error ?? ""))) throw recoveryUnavailable("The previous audio request may have been billed. Its result is unknown; recovery cannot submit another paid request. Preserve this job and continue work that does not require a replacement.");
     if (job.toolId === "generate-image" && !await this.tools.hasSavedImageResult(job.recoveryId ?? job.id, (job.input as { outputs?: number }).outputs ?? 1)) throw recoveryUnavailable("No saved image result is available. Recovery never submits a new generation; check the provider record. The original submission may be unknown. Preserve this job and continue work that does not require a replacement.");

@@ -23,6 +23,8 @@ interface StoredSettings {
   models: OpenAIImageModelConfiguration[];
 }
 
+const disabledSettings = (): StoredSettings => ({ version: 1, mode: "disabled", baseUrl: OPENAI_IMAGE_BASE_URL, models: [] });
+
 /** A separate image connection never changes Pi's chat credential or endpoint. */
 export class OpenAIImageSettingsStore {
   readonly #filePath: string;
@@ -40,7 +42,10 @@ export class OpenAIImageSettingsStore {
         throw new Error("Invalid OpenAI image settings");
       this.#settings = this.#normalize(stored);
     } catch (cause) {
-      if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
+      if ((cause as NodeJS.ErrnoException).code !== "ENOENT") {
+        this.#settings = disabledSettings();
+        throw cause;
+      }
       this.#settings = undefined;
     }
   }
@@ -98,12 +103,7 @@ export class OpenAIImageSettingsStore {
   clear(disable = true): Promise<void> {
     return this.#enqueue(async () => {
       if (disable) {
-        const next: StoredSettings = {
-          version: 1,
-          mode: "disabled",
-          baseUrl: OPENAI_IMAGE_BASE_URL,
-          models: [],
-        };
+        const next = disabledSettings();
         await this.#write(next);
         this.#settings = next;
       } else {

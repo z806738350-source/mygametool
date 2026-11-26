@@ -44,12 +44,16 @@ export function workflowGuideTools(project: AgentPromptProject, store: BundledPl
       if (reference !== undefined && !/^[a-zA-Z0-9_-]+\.(md|txt)$/.test(reference))
         throw new Error("Choose a Markdown or text filename from the guide's references/ links.");
       const source = reference ? path.join(path.dirname(entry.skillId), "references", reference) : entry.skillId;
-      const file = await readSafeProjectFile(entry.root, path.join(entry.root, source), 64 * 1024).catch((cause: NodeJS.ErrnoException) => {
-        if (reference && cause.code === "ENOENT") throw new Error(`Unknown workflow reference. Call read_workflow_guide with only guide ${JSON.stringify(guide)} to read the guide and its links.`);
-        throw cause;
-      });
-      const content = file.toString("utf8");
-      return { content: [{ type: "text", text: content }], details: { guide, source } };
+      const readGuide = (file: string) => readSafeProjectFile(entry.root, path.join(entry.root, file), 64 * 1024);
+      try {
+        const file = await readGuide(source);
+        return { content: [{ type: "text", text: file.toString("utf8") }], details: { guide, source } };
+      } catch (cause) {
+        if (!reference || (cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
+        const main = await readGuide(entry.skillId);
+        return { content: [{ type: "text", text: `The guide has no reference named ${reference}. Here is its main workflow.\n\n${main.toString("utf8")}` }],
+          details: { guide, source: entry.skillId } };
+      }
     },
   })];
 }

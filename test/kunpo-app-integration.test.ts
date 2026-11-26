@@ -184,6 +184,11 @@ function kunpoAgentReply(model: string, reply: string | { name: string; argument
   const name = tool ? reply.name : "", args = tool ? JSON.stringify(reply.arguments) : "", id = tool ? reply.id ?? "call_guide" : "call_guide";
   const text = tool ? "" : reply;
   let events: Array<{ type: string } & Record<string, unknown>>;
+  if (model === "gpt-5.6-sol") {
+    const delta = tool ? { tool_calls: [{ index: 0, id, type: "function", function: { name, arguments: args } }] } : { content: text };
+    const chunk = { id: "chat_fixture", model, choices: [{ index: 0, delta, finish_reason: tool ? "tool_calls" : "stop" }] };
+    return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } });
+  }
   if (model.startsWith("claude-")) {
     const intro = tool && reply.textBeforeCall;
     const index = intro ? 1 : 0;
@@ -573,6 +578,39 @@ describe("Kunpo app integration", () => {
     await send("Look up the middle of that saved script.", "Recovered original text");
     expect(await wireHistory()).toContain("private middle marker");
     expect(await readFile(path.join(project.workspacePath, "model.py"), "utf8")).toBe(script);
+  });
+
+  it("keeps workflow and walk arguments optional through Kunpo Sol chat tool calls", async () => {
+    const id = "gpt-5.6-sol";
+    const { inject, connect, request } = await fixture(); await connect();
+    const project = (await inject("POST", "/projects", { type: "web-game", name: "Walk review" })).json();
+    const base = `/projects/${project.id}/conversations`;
+    const chat = (await inject("POST", base, { model: { provider: "kunpo", id } })).json();
+    await writeFile(path.join(project.workspacePath, "walk.json"), '{"name":"walk fixture"}');
+    request.mockClear()
+      .mockResolvedValueOnce(kunpoAgentReply(id, { name: "read_workflow_guide", arguments: { guide: "sprite-pipeline" }, id: "guide" }))
+      .mockResolvedValueOnce(kunpoAgentReply(id, { name: "read", arguments: { path: "walk.json" }, id: "manifest" }))
+      .mockResolvedValueOnce(kunpoAgentReply(id, "Read both"));
+    const started = await inject("POST", `${base}/${chat.id}/turns`, { prompt: "Read the sprite pipeline guide and walk.json." });
+    expect(started.statusCode, started.body).toBe(202);
+    await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(3), { timeout: 5000 });
+    const bodies = await Promise.all(request.mock.calls.map(([target, init]) =>
+      init?.body ? new Response(init.body).json() : (target as Request).clone().json()));
+    for (const { tools } of bodies) {
+      const declaration = (name: string) => tools.find((t: { function: { name: string } }) => t.function.name === name)?.function;
+      expect(declaration("read_workflow_guide")).toMatchObject({ strict: false, parameters: { required: ["guide"] } });
+      expect(declaration("read")).toMatchObject({ strict: false, parameters: { required: ["path"] } });
+      expect(declaration("review_sprite_action")).toMatchObject({ strict: false, parameters: { required: ["setId", "actionId", "direction"] } });
+      expect(declaration("repair_sprite_action")).toMatchObject({ strict: false, parameters: { required: ["setId", "actionId", "expectedRevision", "directions"] } });
+      expect(declaration("review_sprite_walk")).toMatchObject({ strict: false, parameters: { required: ["setId", "direction"] } });
+      expect(declaration("repair_sprite_walk")).toMatchObject({ strict: false, parameters: {
+        required: ["setId", "expectedRevision", "directions"], properties: { directions: { items: {
+          required: ["direction"], properties: { landmarks: { required: ["left", "right"] } },
+        } } },
+      } });
+    }
+    expect(bodies[1].messages).toContainEqual(expect.objectContaining({ role: "tool", tool_call_id: "guide", content: expect.stringContaining("# Sprite Pipeline") }));
+    expect(bodies[2].messages).toContainEqual(expect.objectContaining({ role: "tool", tool_call_id: "manifest", content: expect.stringContaining("walk fixture") }));
   });
 
   it("returns the selected Canvas JPEG to Astra after a read with text line arguments", async () => {

@@ -1,7 +1,7 @@
 import type { CanvasTableDetail, CanvasTableGenerationRequest, CanvasTableGenerationResponse } from "../shared/canvas-table.js";
 import type { AgentModelRef, AgentReasoningLevel, AssetCanvasTextGenerationResponse, AssetCanvasTextGenerationSource, ImageDownloadNetworkStatus, ToolJob } from "../shared/contracts.js";
 import type { CanvasDocumentDetail, CanvasDocumentGenerationRequest, CanvasDocumentGenerationResponse } from "../shared/canvas-document.js";
-import type { CanvasBoardDetail, CanvasWorkspaceDetail, CanvasWorkspaceIndex } from "../shared/canvas-workspace.js";
+import type { CanvasBoardDetail, CanvasBoardJobs, CanvasWorkspaceDetail, CanvasWorkspaceIndex } from "../shared/canvas-workspace.js";
 import { request } from "./api.js";
 import type { WorkspaceRequestInit } from "./workspace-version.js";
 import { t } from "./i18n.js";
@@ -22,6 +22,7 @@ export const getCanvasDocument = (id: string, documentId?: string): Promise<Canv
 export const saveCanvasDocument = (id: string, detail: CanvasDocumentDetail, documentId?: string, version?: string): Promise<CanvasDocumentDetail> => canvasRequest(`${base(id)}${query(documentId)}`, { method: "PUT", body: JSON.stringify(detail), workspaceVersion: version });
 export const insertCanvasImage = (id: string, documentId: string, assetId: string, version?: string): Promise<CanvasDocumentDetail> => canvasRequest(`${base(id)}/documents/${encodeURIComponent(documentId)}/images`, { method: "POST", body: JSON.stringify({ assetId }), workspaceVersion: version });
 export const listCanvasJobs = (id: string): Promise<ToolJob[]> => canvasRequest(`${base(id)}/jobs`);
+export const listCanvasBoardJobs = (id: string, boardId: string): Promise<CanvasBoardJobs> => canvasRequest(`${base(id)}/boards/${encodeURIComponent(boardId)}/jobs`);
 export const generateCanvasMedia = (id: string, boardId: string, nodeId: string, version?: string, confirmedJobId?: string): Promise<ToolJob> => request(`${base(id)}/boards/${encodeURIComponent(boardId)}/nodes/${encodeURIComponent(nodeId)}/generate`, { method: "POST", workspaceVersion: version, ...(confirmedJobId ? { body: JSON.stringify({ confirmedJobId }) } : {}) });
 export const cancelCanvasJob = (id: string, jobId: string): Promise<ToolJob> => canvasRequest(`${base(id)}/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
 export const recoverCanvasImage = (id: string, jobId: string, version?: string): Promise<ToolJob> => canvasRequest(`${base(id)}/jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST", workspaceVersion: version });

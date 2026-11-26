@@ -3,11 +3,61 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/daemon/app.js";
+import { temporaryTestDirectory } from "./temporary-test-directory.js";
 
 const apps: ReturnType<typeof createApp>[] = [];
 afterEach(async () => { await Promise.all(apps.splice(0).map((app) => app.close())); });
 
 describe("plugin catalog API", () => {
+  it("opens projects with unreadable plugin switches while preserving the file and withholding every plugin", async () => {
+    const directory = await temporaryTestDirectory("ohmygame-damaged-plugin-switches-");
+    const file = path.join(directory, "plugin-settings.json");
+    await writeFile(file, '{"version":3,"plugins":{}}');
+    const app = createApp({ dataDirectory: directory });
+    apps.push(app);
+    await app.ready();
+    expect((await app.inject("/projects")).statusCode).toBe(200);
+    const catalog = (await app.inject("/plugins")).json().plugins;
+    expect(catalog.length).toBeGreaterThan(0);
+    expect(catalog.every((plugin: { enabled: boolean }) => !plugin.enabled)).toBe(true);
+    const plugin = (await app.inject("/plugins/ohmygame%3Agodot")).json();
+    expect(plugin.mcpServers).toMatchObject([{ enabled: false, status: "disabled" }]);
+    expect((await app.inject("/composer/capabilities")).json().plugins).toEqual([]);
+    expect((await app.inject({ method: "PUT", url: "/plugins/ohmygame%3Agodot/settings", payload: { enabled: true, components: {} } })).statusCode).toBe(503);
+    expect(await readFile(file, "utf8")).toBe('{"version":3,"plugins":{}}');
+  });
+
+  it.each(["plugin-configuration.json", "plugin-credentials.key", "mcp.json"])("keeps projects and plugin guides available when %s cannot supply connection settings", async (name) => {
+    const directory = await temporaryTestDirectory("ohmygame-damaged-plugin-connections-");
+    const file = path.join(directory, name);
+    await writeFile(file, "damaged");
+    const app = createApp({ dataDirectory: directory, piAgentDirectory: directory });
+    apps.push(app);
+    await app.ready();
+    expect((await app.inject("/projects")).statusCode).toBe(200);
+    const plugin = (await app.inject("/plugins/ohmygame%3Agodot")).json();
+    expect(plugin.mcpServers).toMatchObject([{ enabled: false, status: "not-configured" }]);
+    const studio = (await app.inject("/plugins/ohmygame%3Agame-studio")).json();
+    expect(studio.enabled).toBe(true);
+    expect(studio.skills.some((skill: { enabled: boolean }) => skill.enabled)).toBe(true);
+    expect((await app.inject("/plugins/ohmygame%3Agodot/configuration")).statusCode).toBe(503);
+    expect((await app.inject({ method: "PUT", url: "/plugins/ohmygame%3Agodot/configuration", payload: { values: {} } })).statusCode).toBe(503);
+    expect(await readFile(file, "utf8")).toBe("damaged");
+  });
+
+  it("retains encrypted plugin data when its key is missing without creating a replacement key", async () => {
+    const directory = await temporaryTestDirectory("ohmygame-plugin-missing-key-");
+    const file = path.join(directory, "plugin-configuration.json");
+    const saved = JSON.stringify({ version: 1, plugins: {}, credentials: { token: "retained-ciphertext" }, legacyOwners: {}, migrated: true });
+    await writeFile(file, saved);
+    const app = createApp({ dataDirectory: directory, piAgentDirectory: directory });
+    apps.push(app);
+    expect((await app.inject("/projects")).statusCode).toBe(200);
+    expect((await app.inject("/plugins/ohmygame%3Agodot/configuration")).statusCode).toBe(503);
+    await expect(readFile(path.join(directory, "plugin-credentials.key"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(file, "utf8")).toBe(saved);
+  });
+
   it("installs a directory plugin enabled by default", async () => {
     const dataDirectory = await mkdtemp(path.join(tmpdir(), "ohmygame-plugin-install-api-"));
     const source = await mkdtemp(path.join(tmpdir(), "ohmygame-plugin-source-"));
@@ -162,6 +212,7 @@ describe("plugin catalog API", () => {
         { id: "ohmygame:douyin-minigame", installed: true, beta: true, enabled: false },
         { id: "ohmygame:game-studio", installed: true },
         { id: "ohmygame:godot", installed: true, beta: true },
+        { id: "ohmygame:ink-studio", installed: true, beta: true, enabled: false },
         { id: "ohmygame:taptap-maker", installed: true, beta: true, enabled: false },
         { id: "ohmygame:threejs-world", installed: true },
         { id: "ohmygame:tiled", installed: true, beta: true, enabled: false },

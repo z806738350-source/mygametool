@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { AgentManager } from "./agent.js";
 
 export class ProjectWriteError extends Error {
   readonly statusCode = 409;
@@ -13,6 +14,34 @@ export class ProjectWriteError extends Error {
 
 /** How long a request waits for a workspace operation before it is refused. */
 const ENTER_WAIT_MS = 120_000;
+
+/** These requests operate on project/session metadata outside the game workspace. */
+export function isProjectMetadataRequest(method: string, route: string): boolean {
+  const project = "/projects/:projectId";
+  const conversations = project + "/conversations";
+  const chat = conversations + "/:conversationId";
+  return method === "PATCH" && (route === project || route === chat) ||
+    method === "POST" && (route === conversations || route === chat + "/branch" || route === chat + "/plan/refine" || route === chat + "/queue/:turnId/steer") ||
+    method === "PUT" && (route === chat + "/model" || route === chat + "/reasoning") ||
+    method === "DELETE" && (route === chat + "/queue/:turnId" || route === chat + "/plan");
+}
+
+/** Only a live, matching question can resume an authorized generation. */
+export function isConversationControlReply(request: FastifyRequest, agents: AgentManager): boolean {
+  if (request.method !== "POST") return false;
+  const route = request.routeOptions.url;
+  const answer = request.body as { decision?: string; cancelled?: boolean; requestId?: string; answers?: { value: string }[] } | undefined;
+  if (route === "/projects/:projectId/conversations/:conversationId/approvals/*") return answer?.decision === "deny";
+  if (route !== "/projects/:projectId/conversations/:conversationId/questionnaire" || !answer) return false;
+  if (answer.cancelled || answer.answers?.length === 1 && answer.answers[0]?.value === "keep") return true;
+  const { projectId, conversationId } = request.params as { projectId: string; conversationId: string };
+  return agents.activeItems(projectId, conversationId).some(item =>
+    item.type === "userInputRequest" && item.status === "inProgress" && item.requestId === answer.requestId && !item.paidMediaTool);
+}
+
+export function releasesPreview(method: string, route: string): boolean {
+  return method === "DELETE" && (route === "/projects/:projectId/preview" || route === "/projects/:projectId/preview/leases/:leaseId");
+}
 
 /** HTTP requests already in flight drain before an exclusive workspace
  * operation. A snapshot only reads the workspace, so reads go on during one
@@ -31,6 +60,10 @@ export class ProjectWrites {
   }
   install(app: FastifyInstance): void {
     const writes = this;
+    app.addHook("preHandler", async (request) => {
+      const id = (request.params as { projectId?: string } | undefined)?.projectId;
+      if (id) await writes.#states.get(id)?.reloadVersion?.().catch(() => {});
+    });
     // A disconnected client does not cancel its handler. Drain the actual
     // operation before restoring, rather than releasing on socket abort.
     app.addHook("onRoute", (route) => {
@@ -56,6 +89,7 @@ export class ProjectWrites {
     string,
     {
       version: string;
+      reloadVersion?: () => Promise<void>;
       active: number;
       lock?: { kind: "snapshot" | "mutation"; done: Promise<void> };
       drained?: () => void;
@@ -75,14 +109,28 @@ export class ProjectWrites {
   version(id: string): string {
     return this.#state(id).version;
   }
-  initialize(id: string, version: string): void {
-    this.#state(id).version = version;
+  async initialize(id: string, readVersion: (requireExisting: boolean) => Promise<string>): Promise<void> {
+    const state = this.#state(id);
+    state.version = "";
+    const reload = async (requireExisting = true) => {
+      const version = await readVersion(requireExisting);
+      if (state.reloadVersion === reload) {
+        state.version = version;
+        delete state.reloadVersion;
+      }
+    };
+    state.reloadVersion = reload;
+    await reload(false);
   }
   changed(id: string): string {
-    return (this.#state(id).version = randomUUID());
+    const state = this.#state(id);
+    delete state.reloadVersion;
+    return (state.version = randomUUID());
   }
   assertVersion(id: string, version?: string): void {
     const state = this.#state(id);
+    if (!state.version)
+      throw new ProjectWriteError("Could not read this project's workspace version. Repair its workspace restore notice, then reload before saving.", "workspace_busy");
     if (
       (version !== undefined && version !== state.version) ||
       (version === undefined && state.version !== "0")

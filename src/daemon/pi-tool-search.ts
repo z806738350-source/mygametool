@@ -22,6 +22,7 @@ const specialistTools = new Set([
   "game_use",
   "prepare_three_runtime",
   "ensure_ink_runtime",
+  "prepare_character_views",
   "optimize_image_asset",
   "get_model_asset",
   "isolated_shell",

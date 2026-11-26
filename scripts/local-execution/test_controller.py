@@ -28,14 +28,18 @@ PROJECT = '5e849fb8-9236-4f0e-a58a-76cb223b8a74'
 BINDING = {'namespace': 'manual', 'projectId': PROJECT, 'operationId': IDENTIFIER, 'generation': 1, 'leaseToken': 'b' * 32}
 
 class GuardianContracts(unittest.TestCase):
-    def invoke(self, request, group='', launch=False, claim_error=None, finish_error=None, journal_error=None, active='inactive'):
+    def invoke(self, request, group='', launch=False, claim_error=None, finish_error=None, output_error=None, active='inactive', output=b'', exit_code=0):
         commands, writes = [], []
         self.order, self.events, self.cleanup_error = [], [], None
         request = {**BINDING, **request}
         def command(args, check=True):
             commands.append(args)
-            if args[0] == 'systemd-run' and not launch:
-                raise RuntimeError('test boundary: no service was launched')
+            if args[0] == 'systemd-run':
+                if not launch:
+                    raise RuntimeError('test boundary: no service was launched')
+                fifo = next(arg.removeprefix('--property=StandardOutput=file:') for arg in args if arg.startswith('--property=StandardOutput=file:'))
+                with open(fifo, 'wb', buffering=0) as writer:
+                    writer.write(output)
             return types.SimpleNamespace(returncode=0, stdout=b'')
         with tempfile.TemporaryDirectory(prefix='ohmygame-guardian-contract-') as directory:
             root = pathlib.Path(directory).resolve()
@@ -43,15 +47,16 @@ class GuardianContracts(unittest.TestCase):
             state = root / 'control'
             workspace.mkdir()
             state.mkdir()
+            runtime = root / ('ohmygame-control-' + IDENTIFIER)
+            runtime.mkdir(mode=0o700)
             launch_request = state / (IDENTIFIER + '.request')
             launch_request.write_text(json.dumps(request))
             launch_request.chmod(0o600)
             self.finish = mock.Mock(side_effect=finish_error or (lambda *args: self.order.append('finished')))
             self.claim = mock.Mock(side_effect=claim_error, return_value={'workspace': str(workspace), 'identity': {'name': 'omgjob5000', 'uid': 5000, 'gid': 5000}})
-            journal = mock.Mock(stdout=io.BytesIO())
-            journal.terminate.side_effect = journal_error
             selector = mock.Mock()
             selector.select.return_value = []
+            selector.register.side_effect = output_error
             def emit(kind, **values):
                 self.events.append((kind, values))
                 self.order.append(kind)
@@ -61,7 +66,7 @@ class GuardianContracts(unittest.TestCase):
                 return len(text) if str(p).startswith('/sys/fs/cgroup/') else original_write(p, text, *args, **kwargs)
             with mock.patch.object(controller, 'STATE', state), \
                  mock.patch.object(controller, 'run', side_effect=command), \
-                 mock.patch.object(controller, 'properties', return_value={'ControlGroup': group, 'ActiveState': active, 'MainPID': '0', 'Result': 'success', 'ExecMainStatus': '0'}), \
+                 mock.patch.object(controller, 'properties', return_value={'ControlGroup': group, 'ActiveState': active, 'MainPID': '0', 'Result': 'exit-code' if exit_code else 'success', 'ExecMainStatus': str(exit_code)}), \
                  mock.patch.object(controller, 'emit', side_effect=emit), \
                  mock.patch.object(controller.os, 'set_blocking'), \
                  mock.patch.object(controller.sys, 'stdin', types.SimpleNamespace(buffer=io.BytesIO(json.dumps(request).encode()))), \
@@ -70,17 +75,17 @@ class GuardianContracts(unittest.TestCase):
                  mock.patch.object(storage, 'validate_binding', create=True), \
                  mock.patch.object(storage, 'lookup', return_value=BINDING, create=True), \
                  mock.patch.object(storage, 'finish', self.finish, create=True), \
-                 mock.patch.object(controller.subprocess, 'Popen', return_value=journal), \
                  mock.patch.object(controller.selectors, 'DefaultSelector', return_value=selector), \
                  mock.patch.object(controller.io_select, 'select', return_value=([], [], [])), \
                  mock.patch.object(pathlib.Path, 'mkdir'), \
                  mock.patch.object(pathlib.Path, 'write_text', autospec=True, side_effect=write):
                 try:
-                    self.assertEqual(controller.guardian(IDENTIFIER), 0 if launch else 1)
+                    self.assertEqual(controller.guardian(IDENTIFIER), exit_code if launch and not output_error else 1)
                 except RuntimeError as error:
                     self.cleanup_error = str(error)
-                    if not finish_error and not journal_error and active == 'inactive' and group in ('', '/system.slice/' + controller.unit_name(IDENTIFIER)):
+                    if not finish_error and active == 'inactive' and group in ('', '/system.slice/' + controller.unit_name(IDENTIFIER)):
                         raise
+                self.assertEqual(list(runtime.iterdir()), [])
                 if not launch:
                     self.assertIn('error', [kind for kind, _ in self.events])
         return commands, writes
@@ -173,11 +178,49 @@ class GuardianContracts(unittest.TestCase):
         self.assertNotIn('exit', self.order)
 
     def test_logging_failure_cannot_skip_task_shutdown_and_finish(self):
-        commands, _ = self.invoke({'mode': 'build'}, launch=True, journal_error=RuntimeError('Log process failed'))
+        commands, _ = self.invoke({'mode': 'build'}, launch=True, output_error=RuntimeError('Cannot observe task output'))
         self.assertIn(['systemctl', 'stop', controller.unit_name(IDENTIFIER)], commands)
-        self.finish.assert_called_once_with(BINDING, True)
-        self.assertIsNotNone(self.cleanup_error)
+        self.finish.assert_called_once_with(BINDING, False)
+        self.assertIn('error', self.order)
         self.assertNotIn('exit', self.order)
+
+    def test_short_lived_commands_keep_all_output_before_their_exit(self):
+        for code in (0, 7):
+            with self.subTest(code=code):
+                payload = b'first\nTraceback: final bytes\x00\xff'
+                commands, _ = self.invoke({'mode': 'shell', 'args': ['test command', '2']}, launch=True, output=payload, exit_code=code)
+                task = next(args for args in commands if args[0] == 'systemd-run')
+                self.assertIn('--property=StandardError=inherit', task)
+                self.assertEqual([base64.b64decode(v['data']) for k, v in self.events if k == 'stdout'], [payload])
+                self.assertEqual(self.order, ['started', 'stdout', 'finished', 'exit'])
+                self.assertEqual(self.events[-1][1]['code'], code)
+
+    def test_live_output_limit_is_cumulative_and_eof_has_no_duplicate_tail(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            os.set_blocking(read_fd, False)
+            os.write(write_fd, b'first')
+            with mock.patch.object(controller, 'emit') as emit:
+                total, eof = controller.forward_output(read_fd, 512 * 1024 - 6)
+                self.assertFalse(eof)
+                self.assertEqual(total, 512 * 1024 - 1)
+                os.write(write_fd, b'!')
+                os.close(write_fd)
+                write_fd = None
+                self.assertEqual(controller.forward_output(read_fd, total, drain=True), (512 * 1024, True))
+                self.assertEqual([base64.b64decode(call.kwargs['data']) for call in emit.call_args_list], [b'first', b'!'])
+            with tempfile.TemporaryFile() as stream, mock.patch.object(controller, 'emit') as emit:
+                stream.write(b'x' * (512 * 1024 + 1))
+                stream.seek(0)
+                with self.assertRaisesRegex(RuntimeError, 'output exceeded'):
+                    controller.forward_output(stream.fileno(), 0, drain=True)
+                frames = [base64.b64decode(call.kwargs['data']) for call in emit.call_args_list]
+                self.assertEqual(sum(map(len, frames)), 512 * 1024)
+                self.assertLessEqual(max(map(len, frames)), 8192)
+        finally:
+            os.close(read_fd)
+            if write_fd is not None:
+                os.close(write_fd)
 
 
 class ControlCommands(unittest.TestCase):
@@ -587,6 +630,7 @@ class ControllerStoreContracts(unittest.TestCase):
         self.root = pathlib.Path(self.directory.name).resolve()
         self.state = self.root / 'control'
         self.state.mkdir(mode=0o700)
+        (self.root / ('ohmygame-control-' + IDENTIFIER)).mkdir(mode=0o700)
         self.backend = FakeBackend()
         self.store = lifecycle.Store(self.root / 'volumes', self.backend, volume_bytes=65536,
                                      total_bytes=16 * 65536, reserve_bytes=0)
@@ -616,8 +660,6 @@ class ControllerStoreContracts(unittest.TestCase):
         self.stack.enter_context(mock.patch.object(controller, 'run', side_effect=run))
         self.properties = self.stack.enter_context(mock.patch.object(controller, 'properties', return_value={
             'ActiveState': 'inactive', 'MainPID': '0', 'Result': 'success', 'ExecMainStatus': '0', 'ControlGroup': ''}))
-        journal = mock.Mock(stdout=io.BytesIO())
-        self.stack.enter_context(mock.patch.object(controller.subprocess, 'Popen', return_value=journal))
         selector = mock.Mock()
         selector.select.return_value = []
         self.stack.enter_context(mock.patch.object(controller.selectors, 'DefaultSelector', return_value=selector))

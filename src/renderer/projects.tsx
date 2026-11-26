@@ -110,8 +110,8 @@ export function ProjectsPage({ projectType = "all", query = "", sort = "updated"
   }
 
   async function remove(project: ProjectState): Promise<void> {
-    if (!confirmProjectDeletion(project)) return;
-    await runAction(() => deleteProject(project.id));
+    const confirmation = confirmProjectDeletion(project);
+    if (confirmation) await runAction(() => deleteProject(confirmation));
   }
 
   return (

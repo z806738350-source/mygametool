@@ -737,6 +737,37 @@ describe("agent tools", () => {
     expect(legacy.adopt).toHaveBeenCalledOnce();
   });
 
+  it.each(["adopt", "verify"])("reviews the next current generation after %s settles the previous batch in the same conversation", async settlement => {
+    let generation = "9";
+    const inspect = async () => ({ state: "resident", dirty: true, recoverable: false, generation });
+    const review = vi.fn(async (requested?: string) => {
+      if (requested !== undefined && requested !== generation) throw new Error("Retained generation changed; inspect its current state");
+      return { reviewId: generation.padStart(64, "0"), projectId: "fixture", generation, snapshotId: "b".repeat(64),
+        files: [], blockers: [], approved: false, expiresAt: "2099-01-01T00:00:00Z" };
+    });
+    const adopt = vi.fn(async () => ({ changed: ["attack.png"] }));
+    const verify = vi.fn(async () => ({ changed: ["attack.png"] }));
+    const tool = createIsolatedRecoveryTool(inspect, vi.fn(), { review, adopt, verify });
+    const call = (id: string, input: Parameters<typeof tool.execute>[1]) => tool.execute(id, input, undefined, undefined, {} as never);
+    await call("inspect", { action: "inspect" });
+    generation = "10";
+    await expect(call("unsettled-drift", { action: "review" })).rejects.toThrow("Retained generation changed");
+    generation = "9";
+    await call("review-east", { action: "review", generation });
+    const eastId = generation.padStart(64, "0");
+    if (settlement === "verify") {
+      adopt.mockRejectedValueOnce(new Error("Acknowledgement response lost"));
+      await expect(call("adopt-east", { action: "adopt", reviewId: eastId })).rejects.toThrow("response lost");
+      await call("verify-east", { action: "verify", reviewId: eastId });
+    } else {
+      await call("adopt-east", { action: "adopt", reviewId: eastId });
+    }
+    generation = "10";
+    await expect(call("review-west", { action: "review" })).resolves.toMatchObject({ details: { generation } });
+    await call("adopt-west", { action: "adopt", reviewId: generation.padStart(64, "0") });
+    expect(adopt).toHaveBeenCalledTimes(2);
+  });
+
   it("uses the shared Pi tools for every project type", () => {
     expect(projectPiToolNames(
       "normal",

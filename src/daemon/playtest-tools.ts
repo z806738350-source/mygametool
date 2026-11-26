@@ -124,11 +124,29 @@ function gameUseParameters<Action extends TSchema>(action: Action) {
   }, { additionalProperties: false });
 }
 
+type PlayedAnimation = { setId: string; actionId?: string; revision: string };
+export type WalkPlaytestReview = (signal?: AbortSignal) => Promise<{ text: string; sample?: unknown; play?: PlayedAnimation } | undefined>;
 export function createGameUseTool(
   driver: GameRuntimeAdapter,
   resolveOpenTarget: () => Promise<GameUseOpenTarget>,
-  { bridge = "full" }: { bridge?: "full" | "reset" } = {},
+  { bridge = "full", walkReview }: { bridge?: "full" | "reset"; walkReview?: WalkPlaytestReview } = {},
 ): ReturnType<typeof defineTool<typeof parameters>> & Pick<GameRuntimeAdapter, "sessionStatus"> {
+  const openedWalk = new Map<string, PlayedAnimation>();
+  async function reviewed<T extends { content: Array<{ type: "text"; text: string }>; details: unknown }>(result: T, signal?: AbortSignal, actions?: PlaytestAction[], opened = false) {
+    if (!walkReview || !result.details || typeof result.details !== "object" || !("playtest" in result.details)) return result;
+    const notice = await walkReview(signal).catch(error => {
+      signal?.throwIfAborted();
+      return { text: `The playtest succeeded. Character animation inspection could not finish: ${error instanceof Error ? error.message : "unavailable"}.`, sample: undefined, play: undefined };
+    });
+    if (!notice) return result;
+    const { sessionId } = result.details.playtest as GameUseSnapshot;
+    if (opened && notice.play) openedWalk.set(sessionId, notice.play);
+    const played = openedWalk.get(sessionId);
+    const current = notice.play && played?.setId === notice.play.setId && played.actionId === notice.play.actionId && played.revision === notice.play.revision;
+    return { ...result, content: [...result.content, { type: "text" as const, text: notice.text }],
+      details: { ...result.details as object, ...(notice.sample ? { spriteWalkReview: notice.sample } : {}),
+        ...(current && actions?.some(a => ["press", "click", "touch", "type"].includes(a.type)) ? { [notice.play?.actionId ? "spriteActionPlay" : "spriteWalkPlay"]: notice.play } : {}) } };
+  }
   return { ...defineTool<typeof parameters, unknown>({
     name: "game_use",
     label: "Game Use",
@@ -136,6 +154,7 @@ export function createGameUseTool(
     promptSnippet: "Use the current game with real player input, runtime inspection, and screenshots",
     promptGuidelines: [
       "Use game_use for game runtime or visual verification; a successful build alone is not a playtest",
+      "Open a playable page after project commands or builds finish. If open was rejected before startup because the project was busy, use a fresh open once it is idle and the page is ready.",
       "Batch player actions in open or act. Open waits for the initial game snapshot before running its actions. Successful batches return fresh state; stopped batches report progress and require inspect.",
       "A stopped action batch reports completedActions and whether the failed input was sent. Inspect that session before another act; do not replay completed actions. Ambiguous or hidden targets require a fresh snapshot and a unique selector or testId.",
       "Every open allocates an independent window. Reuse a current owned session for inspection, input or resizing; inspect/resize do not reload changed game code. Before opening a revised version, close finished owned sessions rather than accumulating revision windows. The native close button only hides a player; game_use close releases it. Preserve sessions the user wants to keep. If open reaches the session limit, no window or initial actions were started. Inspect owned references (which may have expired), then reuse a suitable session or close only finished owned sessions before a new open. Do not close another conversation's windows or repeatedly open until capacity changes.",
@@ -148,7 +167,7 @@ export function createGameUseTool(
     executionMode: "sequential",
     execute: async (_toolCallId, input, signal) => {
       signal?.throwIfAborted();
-      if (!driver.available) throw new Error("Game use is not available in this environment");
+      if (!driver.available) throw toolPreflightError("Game use is not available in this environment", "playtest_precondition");
       if (input.operation === "open") {
         const actions = input.actions && supportedActions(driver, input.actions);
         const target = await resolveOpenTarget();
@@ -171,8 +190,8 @@ export function createGameUseTool(
           throw toolPreflightError(`Playtest session limit ${failure.limit} reached before creating a window; no initial actions ran. Owned session references (may have expired): ${JSON.stringify(owned)}. Inspect and reuse a suitable session, or close only finished owned sessions before a new open. Other conversations' sessions are unavailable; do not replay the rejected call ID.`, "playtest_session_limit");
         });
         if (result.operation !== "open") throw new Error("Unexpected game use response");
-        if (actions) return act(driver, result.snapshot.sessionId, actions, signal);
-        return snapshotResult(result.snapshot);
+        if (actions) return reviewed(await act(driver, result.snapshot.sessionId, actions, signal), signal, actions, true);
+        return reviewed(snapshotResult(result.snapshot), signal, undefined, true);
       }
       if (input.operation === "capture") {
         requireCapability(driver, "screenshot", "observation");
@@ -195,6 +214,7 @@ export function createGameUseTool(
         const sessionId = requiredSessionId(input.operation, input.sessionId);
         const result = await driver.request({ operation: "close", sessionId }, signal);
         if (result.operation !== "close") throw new Error("Unexpected game use response");
+        openedWalk.delete(sessionId);
         inspections(driver).delete(sessionId);
         if (result.resourceStatus && result.resourceStatus !== "closed") {
           return { content: [{ type: "text", text: `Game session ${sessionId} closure is ${result.resourceStatus}; this response did not confirm disposal.` }],
@@ -205,7 +225,8 @@ export function createGameUseTool(
       const sessionId = requiredSessionId(input.operation, input.sessionId);
       if (input.operation === "act") {
         if (inspections(driver).has(sessionId)) throw toolPreflightError(`Inspect session ${JSON.stringify(sessionId)} before sending more actions. No new player input was sent.`, "playtest_inspection_required");
-        return act(driver, sessionId, supportedActions(driver, requiredActions(input.actions)), signal);
+        const actions = supportedActions(driver, requiredActions(input.actions));
+        return reviewed(await act(driver, sessionId, actions, signal), signal, actions);
       }
       const result = await driver.request({ operation: "inspect", sessionId }, signal);
       if (result.operation !== "inspect") throw new Error("Unexpected game use response");
@@ -246,12 +267,12 @@ async function act(driver: GameRuntimeAdapter, sessionId: string, actions: Playt
 }
 
 function requiredSessionId(operation: string, sessionId?: string): string {
-  if (!sessionId) throw new Error(`sessionId is required for ${operation}`);
+  if (!sessionId) throw toolPreflightError(`sessionId is required for ${operation}`, "playtest_precondition");
   return sessionId;
 }
 
 function requiredActions(actions?: PlaytestAction[]): PlaytestAction[] {
-  if (!actions?.length) throw new Error("actions are required for act");
+  if (!actions?.length) throw toolPreflightError("actions are required for act", "playtest_precondition");
   return actions;
 }
 
@@ -271,9 +292,9 @@ function supportedActions(driver: GameRuntimeAdapter, actions: PlaytestAction[])
   for (const action of actions) {
     const required = actionCapabilities(action);
     const missingInput = required.input.filter((capability) => !driver.capabilities.input.includes(capability));
-    if (missingInput.length > 0) throw new Error(`Game runtime does not support ${missingInput.join(" and ")} input for ${action.type}`);
+    if (missingInput.length > 0) throw toolPreflightError(`Game runtime does not support ${missingInput.join(" and ")} input for ${action.type}`, "playtest_precondition");
     const missingObservation = required.observation.filter((capability) => !driver.capabilities.observation.includes(capability));
-    if (missingObservation.length > 0) throw new Error(`Game runtime does not support ${missingObservation.join(" and ")} observation for ${action.type}`);
+    if (missingObservation.length > 0) throw toolPreflightError(`Game runtime does not support ${missingObservation.join(" and ")} observation for ${action.type}`, "playtest_precondition");
   }
   return actions;
 }
@@ -296,7 +317,7 @@ function requireCapability(
   kind: "input" | "observation",
 ): void {
   const available: readonly string[] = kind === "input" ? driver.capabilities.input : driver.capabilities.observation;
-  if (!available.includes(capability)) throw new Error(`Game runtime does not support ${capability} ${kind}`);
+  if (!available.includes(capability)) throw toolPreflightError(`Game runtime does not support ${capability} ${kind}`, "playtest_precondition");
 }
 
 function snapshotResult(snapshot: GameUseSnapshot) {

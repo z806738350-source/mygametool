@@ -549,8 +549,9 @@ describe("Markdown design workspace", () => {
     expect((await store.board(project.id, boardId)).board.nodes.find(entry => entry.id === node.id)).toEqual(node);
   });
 
-  it("leaves a rejected turnaround on the Canvas without a job and invalidates a saved node's review when its slots change", async () => {
-    const { directory, store, tools, projects, project, boardId } = await runtime();
+  it("leaves a rejected turnaround on the Canvas and rechecks only its selected generation inputs during review", async () => {
+    const generate = vi.fn(async () => ({ bytes: TEST_GLB, mediaType: "model/gltf-binary" as const }));
+    const { directory, store, tools, projects, project, boardId, node: sibling } = await runtime(fakeGenerator, "web-game", undefined, undefined, { generate });
     const imagePaths = ["front.png", "left.png", "back.png"];
     await Promise.all(imagePaths.map(async (file, index) => {
       const bytes = await sharp({ create: { width: 8, height: 8, channels: 3, background: ["red", "green", "blue"][index]! } }).png().toBuffer();
@@ -583,10 +584,22 @@ describe("Markdown design workspace", () => {
       await store.saveBoard(project.id, latest.board, latest.revision);
     });
     const saved = registered.find(tool => tool.name === "generate_canvas_media")!;
-    await expect(saved.execute("saved-views", { boardId, nodeId: node.id }, undefined, undefined, ctx)).rejects.toThrow("changed during review");
+    const stale = await saved.execute("saved-views", { boardId, nodeId: node.id }, undefined, undefined, ctx).catch(cause => cause);
+    expect(stale.message).toContain("changed during review");
+    expect(getToolPreflightFailure(stale)?.reason).toBe("invalid_model_reference");
     expect(review).toHaveBeenCalledTimes(2);
     expect(run).not.toHaveBeenCalled();
     expect(await store.jobs(project.id)).toEqual([]);
+    review.mockImplementationOnce(async () => {
+      const latest = await store.board(project.id, boardId);
+      const unrelated = latest.board.nodes.find(candidate => candidate.id === sibling.id);
+      if (unrelated?.type !== "image") throw new Error("Expected independent image node");
+      unrelated.data.prompt = "An unrelated garden";
+      await store.saveBoard(project.id, latest.board, latest.revision);
+    });
+    await saved.execute("approved-views", { boardId, nodeId: node.id }, undefined, undefined, ctx);
+    expect(generate).toHaveBeenCalledOnce();
+    expect((await store.jobs(project.id))[0]?.status).toBe("succeeded");
   });
 
   it.each([
@@ -1581,6 +1594,55 @@ describe("Markdown design workspace", () => {
     expect(job.status).toBe("succeeded"); expect(saved).toMatchObject({ position: image.position, data: { prompt: "New prompt", assetId: job.run!.files[0]!.assetId } });
     expect(library.get(job.run!.files[0]!.assetId!)).toBeDefined();
   });
+  it("submits a prepared node across another node's edits and rechecks its own linked input", async () => {
+    const { store, project, boardId, node } = await runtime();
+    const first = await store.board(project.id, boardId);
+    const source: AssetCanvasNode = { id: "sky", type: "text", position: { x: 10, y: 5 }, data: { text: "Blue sky", instruction: "" } };
+    first.board.nodes.push(source); first.board.editorLayout.nodes[source.id] = source.position;
+    const target = first.board.nodes.find(candidate => candidate.id === node.id);
+    if (target?.type !== "image") throw new Error("Expected image node");
+    target.data.promptSource = { type: "node", nodeId: source.id };
+    await store.saveBoard(project.id, first.board, first.revision);
+    const submit = await store.prepareNode(project.id, boardId, node.id);
+    const layout = await store.board(project.id, boardId);
+    const other = createAssetGenerationNode("image", { x: 350, y: 0 });
+    layout.board.nodes.push(other); layout.board.editorLayout.nodes[other.id] = other.position;
+    await store.saveBoard(project.id, layout.board, layout.revision);
+    await submit();
+    expect(await waitForJob(store, project.id)).toMatchObject({ status: "succeeded" });
+    const stale = await store.prepareNode(project.id, boardId, node.id);
+    const changed = await store.board(project.id, boardId);
+    const text = changed.board.nodes.find(candidate => candidate.id === source.id);
+    if (text?.type !== "text") throw new Error("Expected linked text");
+    text.data.text = "Red sky";
+    await store.saveBoard(project.id, changed.board, changed.revision);
+    const denied = await stale().catch(error => error);
+    expect(getToolPreflightFailure(denied)?.reason).toBe("invalid_media_options");
+    expect(await store.jobs(project.id)).toHaveLength(1);
+  });
+  it("continues a saved media request after its missing prompt is filled", async () => {
+    const generate = vi.fn(fakeGenerator.generate);
+    const { store, tools, projects, project, boardId, node } = await runtime({ generate });
+    const edit = async (prompt: string) => {
+      const latest = await store.board(project.id, boardId);
+      const image = latest.board.nodes.find(candidate => candidate.id === node.id);
+      if (image?.type !== "image") throw new Error("Expected image node");
+      image.data.prompt = prompt;
+      await store.saveBoard(project.id, latest.board, latest.revision);
+    };
+    const guard = new AutoContinueTools(createAgentTools(project, tools, projects, undefined, undefined, store, "correct-image"));
+    const request = guard.wrap().find(tool => tool.name === "generate_canvas_media")!;
+    const args = { boardId, nodeId: node.id };
+    await edit("");
+    const failure = await request.execute("empty", args, undefined, undefined, {} as never).catch(error => error);
+    expect(getToolPreflightFailure(failure)?.reason).toBe("invalid_media_options");
+    expect(guard.recoverySummary).toContain("not_executed (invalid_media_options)");
+    expect(await store.jobs(project.id)).toEqual([]);
+    await edit("A gardener");
+    await request.execute("filled", args, undefined, undefined, {} as never);
+    expect(generate).toHaveBeenCalledOnce();
+    expect(await waitForJob(store, project.id)).toMatchObject({ status: "succeeded" });
+  });
   it.each(["node", "board"] as const)("keeps output and history when its %s is removed", async (remove) => {
     let finish!: (value: Awaited<ReturnType<ImageGenerator["generate"]>>) => void;
     const { store, project, boardId, node, library } = await runtime({ generate: async () => new Promise((resolve) => { finish = resolve; }) });
@@ -1647,11 +1709,27 @@ describe("Markdown design workspace", () => {
     await writeFile(file, JSON.stringify([{ id, toolId: "generate-image", status: "cancelled", createdAt: "now", context: { projectId: project.id, boardId, nodeId: node.id }, input: { prompt: "Original request" } }]));
     const first = new CanvasStore(projects, library, tools); stores.push(first); await first.jobs(project.id);
     const before = await readFile(file, "utf8"), history = JSON.parse(before), privateFile = path.join(project.workspacePath, "canvas/.job-inputs", history[0].input.retainedInput + ".json");
+    const original = await readFile(privateFile);
     if (kind === "missing") await rm(privateFile);
     else { const saved = JSON.parse(await readFile(privateFile, "utf8")); saved.nodeId = "different-node"; await writeFile(privateFile, JSON.stringify(saved)); }
     const reopened = new CanvasStore(projects, library, tools); stores.push(reopened);
-    await expect(reopened.jobs(project.id)).rejects.toThrow(/Original generation input is unavailable|does not match this job/);
+    expect(await reopened.jobs(project.id)).toMatchObject([{ id, status: "cancelled", submissionOutcome: "unknown" }]);
     expect(await readFile(file, "utf8")).toBe(before);
+    const failure = await reopened.retry(project.id, id, true).catch(cause => cause);
+    expect(failure.message).toMatch(/Original generation input is unavailable|does not match this job/);
+    expect(getToolPreflightFailure(failure)?.reason).toBe("media_recovery_unavailable");
+    await expect(reopened.generateNode(project.id, boardId, node.id)).rejects.toThrow(/previous request may have been billed/);
+    const detail = await reopened.board(project.id, boardId);
+    const other = createAssetGenerationNode("image", { x: 256, y: 0 });
+    if (other.type !== "image") throw new Error("Expected image node");
+    other.data.prompt = "An independent sprite";
+    detail.board.nodes.push(other); detail.board.editorLayout.nodes[other.id] = other.position;
+    await reopened.saveBoard(project.id, detail.board, detail.revision);
+    await reopened.generateNode(project.id, boardId, other.id);
+    expect(await waitForJob(reopened, project.id)).toMatchObject({ status: "succeeded" });
+    expect(JSON.parse(await readFile(file, "utf8")).find((item: { id: string }) => item.id === id)).toEqual(history[0]);
+    await writeFile(privateFile, original);
+    await expect(reopened.retry(project.id, id, true)).rejects.toThrow(/No saved image result/);
   });
   it("retains the exact job binding of an unsuccessful recovery observer without another submission", async () => {
     const generate = vi.fn(fakeGenerator.generate);

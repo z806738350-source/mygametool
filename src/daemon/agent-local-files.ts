@@ -17,6 +17,7 @@ import { CANVAS_BOARD_SCHEMA } from "../shared/canvas-workspace.js";
 import { CanvasError, parseCanvasJson } from "./canvas-files.js";
 import { toolPreflightError } from "./agent-tool-errors.js";
 import { sniffImageType } from "./image-format.js";
+import { MAX_CHARACTER_PREVIEW_SIZE, RASTER_BATCH_BYTES, RASTER_BYTES } from "./raster-policy.js";
 import { readSafeProjectFile } from "./safe-project-file.js";
 import {
   isReadableAgentImageAttachment,
@@ -69,7 +70,7 @@ class FilePolicyError extends Error {
   constructor(
     message: string,
     readonly reason:
-      "unsafe_path" | "protected_content" | "authorization_denied",
+      "unsafe_path" | "protected_content" | "authorization_denied" | "invalid_text_file",
   ) {
     super(message);
   }
@@ -170,13 +171,13 @@ export async function localAgentPath(
           "unsafe_path",
         );
       if (index < parts.length - 1 && !entry.isDirectory())
-        throw new Error("A parent path is not a directory");
+        throw new FilePolicyError("A parent path is not a directory", "invalid_text_file");
     } catch (cause) {
       if (!writing || (cause as NodeJS.ErrnoException).code !== "ENOENT")
         throw cause;
     }
   }
-  if (writing && !parts.length) throw new Error("Choose a project file");
+  if (writing && !parts.length) throw new FilePolicyError("Choose a project file", "invalid_text_file");
   return current;
 }
 
@@ -188,7 +189,7 @@ async function readTextSnapshot(file: string): Promise<{ source: string; bytes: 
   try {
     const entry = await handle.stat({ bigint: true });
     if (!entry.isFile() || entry.size > MAX_FILE_BYTES)
-      throw new Error("Read supports ordinary UTF-8 project files up to 1 MiB");
+      throw new FilePolicyError("Read supports ordinary UTF-8 project files up to 1 MiB", "invalid_text_file");
     if (entry.nlink !== 1n)
       throw new FilePolicyError(
         "Hard-linked files are unavailable to the agent",
@@ -204,7 +205,7 @@ async function readTextSnapshot(file: string): Promise<{ source: string; bytes: 
     const current = await lstat(file, { bigint: true });
     if (offset !== bytes.length || current.dev !== entry.dev || current.ino !== entry.ino ||
         current.ctimeNs !== entry.ctimeNs || current.size !== entry.size)
-      throw new Error("Project file changed during the read; read it again");
+      throw new FilePolicyError("Project file changed during the read; read it again", "invalid_text_file");
     return { source: decodeFileText(bytes), bytes };
   } finally {
     await handle.close();
@@ -213,8 +214,10 @@ async function readTextSnapshot(file: string): Promise<{ source: string; bytes: 
 
 function decodeFileText(bytes: Buffer): string {
   if (bytes.includes(0))
-    throw new Error("Binary or oversized files cannot be read as text");
-  const source = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    throw new FilePolicyError("Binary or oversized files cannot be read as text", "invalid_text_file");
+  let source: string;
+  try { source = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { throw new FilePolicyError("Choose a UTF-8 project text file", "invalid_text_file"); }
   if (containsKnownSensitiveValue(source))
     throw new FilePolicyError(
       "Project file contains protected credential data",
@@ -230,15 +233,6 @@ async function writeText(
   signal?: AbortSignal,
   expectedSource?: Buffer,
 ): Promise<FileResultDetails> {
-  const media = mediaFileInfo(relative);
-  if (
-    (media && media.contentType !== "image/svg+xml") ||
-    OTHER_BINARY_FILES.test(relative)
-  )
-    throw toolPreflightError(
-      "Write is text-only and cannot replace media files. Preserve the original; use file import or use_canvas_asset for existing Canvas media, and a new text path for code.",
-      "unsafe_path",
-    );
   if (containsKnownSensitiveValue(content))
     throw toolPreflightError(
       "Project file contains protected credential data",
@@ -255,6 +249,12 @@ async function writeText(
   } catch (cause) {
     rethrowPreflightPolicyFailure(cause);
   }
+  const media = mediaFileInfo(relative);
+  if ((media && media.contentType !== "image/svg+xml") || OTHER_BINARY_FILES.test(relative))
+    throw toolPreflightError(
+      "Write is text-only and cannot replace media files. Preserve the original; use file import or use_canvas_asset for existing Canvas media, and a new text path for code.",
+      "invalid_text_file",
+    );
   // Validate before creating or truncating a board: an invalid Agent write otherwise
   // prevents the reader from loading it and blocks the editor's save/conflict recovery.
   const boardPath = path
@@ -406,16 +406,28 @@ export function createLocalAgentFileTools(
       name: "read",
       label: "Read project file",
       description: allowImages
-        ? "Read a non-private UTF-8 file or PNG/JPEG/WebP image by relative project path. For a chat attachment in the current conversation branch, pass its exact attachment: reference. Images are always read whole. Line offsets and limits apply only to text. Preserve original images and never replace them with text placeholders."
+        ? "Read a non-private UTF-8 file or PNG/JPEG/WebP image by relative project path. For a chat attachment in the current conversation branch, pass its exact attachment: reference. Pass characterPreviewHeight to review a character on light and dark backgrounds or omit it to read the original image. Line offsets and limits apply only to text. Preserve original images and never replace them with text placeholders."
         : "Read a non-private UTF-8 file by relative project path. For a text chat attachment in the current conversation branch, pass its exact attachment: reference. Image input is unavailable for this model. Preserve original media files.",
       parameters: Type.Object({
         path: Type.String(),
+        characterPreviewHeight: Type.Optional(Type.Integer({
+          minimum: 1, maximum: MAX_CHARACTER_PREVIEW_SIZE,
+          description: "Fit the visible silhouette within 384 px width and the requested height. Preview it on light (left) and dark (right) backgrounds. Omit for original pixels.",
+        })),
+        characterComparePaths: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), {
+          minItems: 1, maxItems: 2,
+          description: "With characterPreviewHeight, compare one or two other project image paths at the same height. Columns show path first, then these references in order. Top row light, bottom row dark. All views keep their original facing.",
+        })),
         offset: Type.Optional(Type.Integer({ minimum: 1, description: "First text line (1-based)." })),
         limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000, description: "Text line count. Read one range covering adjacent sections together." })),
       }),
-      execute: async (_id, input, signal) => {
+      execute: async (_id, input, signal, _update, context) => {
         signal?.throwIfAborted();
         const reference = parseAgentAttachmentReference(input.path);
+        const comparisons = input.characterComparePaths;
+        if (comparisons !== undefined && (input.characterPreviewHeight === undefined || reference ||
+            !Array.isArray(comparisons) || comparisons.length < 1 || comparisons.length > 2))
+          throw new Error("Use characterPreviewHeight with one or two comparison paths and a candidate from the current project");
         const assertAttachmentAllowed = async () => {
           signal?.throwIfAborted();
           if (
@@ -448,7 +460,7 @@ export function createLocalAgentFileTools(
             ? attachment.kind === "image"
             : RASTER_IMAGE.test(input.path)
         ) {
-          if (!allowImages)
+          if (!allowImages || (context?.model && !context.model.input.includes("image")))
             throw new FilePolicyError(
               "The selected connection does not have image input enabled; choose an image-enabled connection. Preserve the original image.",
               "authorization_denied",
@@ -460,7 +472,7 @@ export function createLocalAgentFileTools(
           const bytes = await readSafeProjectFile(
             workspace,
             file,
-            attachment ? INLINE_IMAGE_HIGH_BYTES : undefined,
+            attachment ? INLINE_IMAGE_HIGH_BYTES : input.characterPreviewHeight !== undefined ? RASTER_BYTES : undefined,
           );
           const mimeType = sniffImageType(bytes);
           if (
@@ -484,18 +496,44 @@ export function createLocalAgentFileTools(
               );
             }
           }
+          let display = bytes;
+          if (input.characterPreviewHeight !== undefined) {
+            const { renderCharacterViewPreview } = await import("./character-view-raster.js");
+            const images = [bytes];
+            const files = new Set([file]);
+            let remaining = RASTER_BATCH_BYTES - bytes.length;
+            for (const neighbor of comparisons ?? []) {
+              signal?.throwIfAborted();
+              const neighborFile = await localAgentPath(workspace, neighbor);
+              if (!RASTER_IMAGE.test(neighbor) || files.has(neighborFile))
+                throw new Error("Choose distinct project PNG, JPEG or WebP files for character comparison");
+              const image = await readSafeProjectFile(workspace, neighborFile, Math.min(remaining, RASTER_BYTES));
+              if (!sniffImageType(image)) throw new Error("A comparison file does not contain PNG, JPEG or WebP pixels");
+              files.add(neighborFile);
+              images.push(image);
+              remaining -= image.length;
+            }
+            try {
+              display = await renderCharacterViewPreview(images, input.characterPreviewHeight, signal);
+            } catch (cause) {
+              signal?.throwIfAborted();
+              throw new Error(`Character preview unavailable: ${cause instanceof Error ? cause.message : "image decoding failed"}. Read this path without characterPreviewHeight to inspect the saved original.`);
+            }
+          }
           await assertAttachmentAllowed();
           return {
             content: [
+              ...(comparisons ? [{ type: "text" as const, text: `Columns from left to right (candidate first): ${JSON.stringify([input.path, ...comparisons])}. Upper row: light background. Lower row: dark background. All silhouettes are ${input.characterPreviewHeight} px tall in their original facing.` }] : []),
               {
                 type: "image" as const,
-                mimeType,
-                data: bytes.toString("base64"),
+                mimeType: input.characterPreviewHeight === undefined ? mimeType : "image/png",
+                data: display.toString("base64"),
               },
             ],
             details: undefined,
           };
         }
+        if (input.characterPreviewHeight !== undefined) throw new Error("characterPreviewHeight requires a PNG, JPEG or WebP image path");
         const project = attachment ? undefined : await readTextSnapshot(file);
         const source = project?.source ?? decodeFileText(await readSafeProjectFile(workspace, file, MAX_FILE_BYTES));
         const lines = source
@@ -545,6 +583,8 @@ export function createLocalAgentFileTools(
         try {
           snapshot = await readTextSnapshot(await localAgentPath(workspace, input.path));
         } catch (cause) {
+          if (cause instanceof Error && ["ENOENT", "ENOTDIR", "EISDIR"].includes(String((cause as NodeJS.ErrnoException).code)))
+            throw toolPreflightError("Choose an existing project text file to edit. Use write to create a new file.", "invalid_text_file");
           rethrowPreflightPolicyFailure(cause);
         }
         const prior = observedFileVersion(ctx?.sessionManager, projectFileVersionPath(input.path));

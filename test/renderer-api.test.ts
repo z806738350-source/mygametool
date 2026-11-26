@@ -460,11 +460,74 @@ describe("renderer project API", () => {
   it("keeps a dispatched retirement's pending result distinct from a preflight failure", async () => {
     installWindow();
     emptyDraftStorage();
+    const confirm = vi.fn();
+    Object.assign(window, { confirm });
     const message = "The project deletion result is pending verification.";
-    const fetchMock = vi.fn<typeof fetch>(async () => Response.json({ code: "project_lifecycle_pending", message }, { status: 409 }));
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(deletionProjectVersionResponse())
+      .mockResolvedValueOnce(Response.json({ code: "project_lifecycle_pending", message }, { status: 409 }));
     vi.stubGlobal("fetch", fetchMock);
-    await expect(deleteProject("pending-delete")).rejects.toMatchObject({ code: "project_lifecycle_pending", status: 409, message });
-    expect(fetchMock).toHaveBeenCalledExactlyOnceWith("/api/projects/pending-delete", expect.objectContaining({ method: "DELETE" }));
+    await expect(deleteProject({ id: "pending-delete", name: "Game", draftStatus: "clear" })).rejects.toMatchObject({ code: "project_lifecycle_pending", status: 409, message });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/projects/pending-delete", expect.objectContaining({ method: "DELETE" }));
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it.each(["cancel", "confirm", "cancel late draft", "confirm late draft", "changed generation", "restored again"] as const)("handles explicit execution discard: %s", async choice => {
+    installWindow();
+    const storage = emptyDraftStorage();
+    const selected = "canvas-active:retained-project", other = "canvas-active:another-project";
+    storage.values.set(selected, "board");
+    storage.values.set(other, "board");
+    const lateDraft = choice === "cancel late draft" || choice === "confirm late draft";
+    const confirm = vi.fn().mockReturnValue(choice === "confirm late draft").mockImplementationOnce(() => {
+      if (lateDraft) storage.values.set("canvas-board:retained-project:board", dirtyCanvasDraft());
+      return choice !== "cancel";
+    });
+    Object.assign(window, { confirm });
+    const projectId = "retained-project";
+    const headers = expect.objectContaining({ "x-workspace-version": "current-workspace" });
+    const retry = choice === "changed generation" ? Response.json({ code: "execution_discard_state_changed" }, { status: 409 })
+      : choice === "restored again" ? Response.json({ code: "workspace_stale" }, { status: 409, headers: { "x-workspace-version": "newer-workspace" } })
+      : new Response(null, { status: 204 });
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(deletionProjectVersionResponse())
+      .mockResolvedValueOnce(Response.json({ code: "execution_discard_required", generation: "37" }, { status: 409 }))
+      .mockResolvedValueOnce(retry);
+    vi.stubGlobal("fetch", fetchMock);
+    observeWorkspaceVersion(projectId, "old-editor-version");
+    const deletion = deleteProject({ id: projectId, name: "Game", draftStatus: "clear" });
+    if (choice === "changed generation") await expect(deletion).rejects.toThrow(t("api.executionDiscardStateChanged"));
+    else if (choice === "restored again") await expect(deletion).rejects.toMatchObject({ code: "workspace_stale", message: t("projects.deleteWorkspaceChanged") });
+    else await deletion;
+    expect(workspaceVersion(projectId)).toBe("old-editor-version");
+    expect(confirm).toHaveBeenNthCalledWith(1, t("projects.confirmDiscardExecution", { name: "Game" }));
+    expect(confirm).toHaveBeenCalledTimes(lateDraft ? 2 : 1);
+    if (lateDraft) expect(confirm).toHaveBeenNthCalledWith(2, t("projects.confirmDiscardDrafts", { name: "Game", warning: t("projects.discardDraftWarning.pending") }));
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/projects/retained-project", expect.objectContaining({ cache: "no-store" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/projects/retained-project", expect.objectContaining({ method: "DELETE", headers }));
+    const deleted = choice === "confirm" || choice === "confirm late draft";
+    if (deleted || choice === "changed generation" || choice === "restored again") {
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/projects/retained-project?discardExecutionGeneration=37", expect.objectContaining({ method: "DELETE", headers }));
+    } else expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(storage.values.has(selected)).toBe(!deleted);
+    if (lateDraft) expect(storage.values.has("canvas-board:retained-project:board")).toBe(!deleted);
+    expect(storage.values.has(other)).toBe(true);
+  });
+
+  it("keeps project drafts when the current workspace version could not be read", async () => {
+    installWindow();
+    const storage = emptyDraftStorage();
+    const key = "canvas-active:workspace-version-missing";
+    storage.values.set(key, "board");
+    const fetchMock = vi.fn(async () => Response.json({ id: "workspace-version-missing" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(deleteProject({ id: "workspace-version-missing", name: "Game", draftStatus: "clear" }))
+      .rejects.toThrow(t("projects.deleteVersionUnavailable"));
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith("/api/projects/workspace-version-missing", expect.objectContaining({ cache: "no-store" }));
+    expect(storage.values.has(key)).toBe(true);
   });
 
   it("explains possible isolated environment startup in both confirmations and keeps cancellation request-free", async () => {
@@ -481,19 +544,19 @@ describe("renderer project API", () => {
         await i18next.changeLanguage(language);
         const managed = projectDeletionConfirmation(project);
         for (const promise of language === "en"
-          ? ["Unreturned changes must be recovered first.", "browser drafts", "This cannot be undone.", "Before deletion, the local isolated environment may start to verify execution volumes."]
-          : ["尚未回传的修改必须先恢复", "浏览器草稿", "此操作无法撤销", "删除前可能启动本地隔离环境，以核对执行卷。"])
+          ? ["browser drafts", "This cannot be undone.", "Before deletion, the local isolated environment may start to verify execution volumes."]
+          : ["浏览器草稿", "此操作无法撤销", "删除前可能启动本地隔离环境，以核对执行卷。"])
           expect(managed).toContain(promise);
-        expect(confirmProjectDeletion(project)).toBe(false);
+        expect(confirmProjectDeletion(project)).toBeUndefined();
         expect(confirm).toHaveBeenLastCalledWith(managed);
         const external = { ...project, workspaceLocation: "external" as const };
         const removal = projectDeletionConfirmation(external);
         expect(removal).toContain(project.workspacePath);
         for (const promise of language === "en"
-          ? ["will be permanently removed.", "browser drafts", "Unreturned execution changes must be recovered first.", "Before deletion, the local isolated environment may start to verify execution volumes."]
-          : ["将被永久移除", "中的文件会保留", "尚未回传的执行修改必须先恢复", "删除前可能启动本地隔离环境，以核对执行卷。"])
+          ? ["will be permanently removed.", "browser drafts", "Before deletion, the local isolated environment may start to verify execution volumes."]
+          : ["将被永久移除", "中的文件会保留", "删除前可能启动本地隔离环境，以核对执行卷。"])
           expect(removal).toContain(promise);
-        expect(confirmProjectDeletion(external)).toBe(false);
+        expect(confirmProjectDeletion(external)).toBeUndefined();
         expect(confirm).toHaveBeenLastCalledWith(removal);
       }
       expect(fetchMock).not.toHaveBeenCalled();
@@ -507,36 +570,73 @@ describe("renderer project API", () => {
     const storage = emptyDraftStorage();
     storage.values.set("canvas-board:another-project:board", "unreadable");
     const project = { id: "safe-delete", name: "Game", type: "web-game" as const, updatedAt: "", workspacePath: "/fixture", preview: { status: "stopped" as const } };
-    const confirm = vi.fn(() => { storage.values.set("canvas-board:safe-delete:board", dirtyCanvasDraft()); return true; });
-    Object.assign(window, { confirm, alert: vi.fn() });
-    const fetchMock = vi.fn(async () => {
+    const confirm = vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(false).mockReturnValueOnce(true);
+    Object.assign(window, { confirm });
+    const fetchMock = vi.fn<typeof fetch>(async (_url, init) => {
+      if (init?.method !== "DELETE") return deletionProjectVersionResponse();
       storage.values.set("ohmygame:composer-draft:v1:safe-delete:late", JSON.stringify({ version: 1, prompt: "late draft", mentions: [], planning: false }));
       return new Response(null, { status: 204 });
     });
     vi.stubGlobal("fetch", fetchMock);
-    expect(confirmProjectDeletion(project)).toBe(true);
+    const confirmation = confirmProjectDeletion(project);
+    expect(confirmation).toEqual({ id: project.id, name: project.name, draftStatus: "clear" });
+    storage.values.set("canvas-board:safe-delete:board", dirtyCanvasDraft());
     await expect(deleteProject(project.id)).rejects.toThrow();
     expect(fetchMock).not.toHaveBeenCalled();
-    storage.values.delete("canvas-board:safe-delete:board");
-    await deleteProject(project.id);
+    await deleteProject(confirmation!);
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith("/api/projects/safe-delete", expect.objectContaining({ cache: "no-store" }));
+    expect(storage.values.has("canvas-board:safe-delete:board")).toBe(true);
+    await deleteProject(confirmation!);
+    expect(confirm).toHaveBeenCalledTimes(3);
+    expect(storage.values.has("canvas-board:safe-delete:board")).toBe(false);
     expect(storage.values.has("ohmygame:composer-draft:v1:safe-delete:late")).toBe(false);
     expect(storage.values.has("canvas-board:another-project:board")).toBe(true);
   });
 
-  it("blocks deletion before confirmation when this project's state is unknown or pending", () => {
+  it.each(["pending", "unknown"] as const)("can cancel or explicitly delete a project with %s drafts", async draftStatus => {
     installWindow();
     const storage = emptyDraftStorage();
-    const confirm = vi.fn(), alert = vi.fn();
-    Object.assign(window, { confirm, alert });
-    const project = { id: "blocked-delete", name: "Game", type: "web-game" as const, updatedAt: "", workspacePath: "/fixture", preview: { status: "stopped" as const } };
-    storage.values.set("canvas-documents:blocked-delete", "corrupt");
-    expect(confirmProjectDeletion(project)).toBe(false);
-    expect(confirm).not.toHaveBeenCalled();
-    expect(alert).toHaveBeenCalledOnce();
-    storage.values.delete("canvas-documents:blocked-delete");
-    storage.values.set("ohmygame:composer-draft:v1:blocked-delete:chat", JSON.stringify({ version: 1, prompt: "keep me", mentions: [], planning: false }));
-    expect(confirmProjectDeletion(project)).toBe(false);
-    expect(confirm).not.toHaveBeenCalled();
+    const confirm = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
+    Object.assign(window, { confirm });
+    const project = { id: "draft-delete", name: "Game", type: "web-game" as const, updatedAt: "", workspacePath: "/fixture", preview: { status: "stopped" as const } };
+    const key = draftStatus === "pending" ? "ohmygame:composer-draft:v1:draft-delete:chat" : "canvas-documents:draft-delete";
+    storage.values.set(key, draftStatus === "pending" ? JSON.stringify({ version: 1, prompt: "keep me", mentions: [], planning: false }) : "corrupt");
+    const remove = vi.fn()
+      .mockResolvedValueOnce(Response.json({ code: "project_lifecycle_pending" }, { status: 409 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const fetchMock = vi.fn<typeof fetch>(async (_url, init) => init?.method === "DELETE" ? remove() : deletionProjectVersionResponse());
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(confirmProjectDeletion(project)).toBeUndefined();
+    expect(confirm).toHaveBeenLastCalledWith(expect.stringContaining(t(`projects.discardDraftWarning.${draftStatus}`)));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(storage.values.has(key)).toBe(true);
+
+    const confirmation = confirmProjectDeletion(project);
+    expect(confirmation?.draftStatus).toBe(draftStatus);
+    await expect(deleteProject(confirmation!)).rejects.toMatchObject({ status: 409 });
+    expect(storage.values.has(key)).toBe(true);
+    await deleteProject(confirmation!);
+    expect(remove).toHaveBeenCalledTimes(2);
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(storage.values.has(key)).toBe(false);
+  });
+
+  it("treats confirmed host deletion as successful if browser storage access fails", async () => {
+    installWindow();
+    vi.stubGlobal("localStorage", { get length() { throw new DOMException("Storage denied"); } });
+    Object.assign(window, { confirm: vi.fn(() => true) });
+    const project = { id: "inaccessible-drafts", name: "Game", type: "web-game" as const, updatedAt: "", workspacePath: "/fixture", preview: { status: "stopped" as const } };
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(deletionProjectVersionResponse())
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const confirmation = confirmProjectDeletion(project);
+    expect(confirmation?.draftStatus).toBe("unknown");
+    await deleteProject(confirmation!);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/projects/inaccessible-drafts", expect.objectContaining({ method: "DELETE" }));
   });
 
   it("reads the global execution volume overview without writes and forwards cancellation", async () => {
@@ -1193,6 +1293,10 @@ function emptyDraftStorage() {
     getItem: (key: string) => values.get(key) ?? null, removeItem: vi.fn((key: string) => values.delete(key)), setItem: vi.fn((key: string, value: string) => values.set(key, value)) };
   vi.stubGlobal("localStorage", storage);
   return storage;
+}
+
+function deletionProjectVersionResponse(): Response {
+  return new Response(null, { headers: { "x-workspace-version": "current-workspace" } });
 }
 
 function dirtyCanvasDraft() {

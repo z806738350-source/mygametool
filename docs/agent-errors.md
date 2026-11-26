@@ -50,6 +50,10 @@ the billing outcome. Interrupted or rejected streams are not automatically repla
 
 ## Local HTTP error diagnostics
 
+Project conversation lists skip unreadable session files and directories left with a `.jsonl` suffix. Healthy chats remain available, and fixing a damaged session file restores its listing on the next read.
+
+If the shared generation history in `tools/jobs.json` cannot be loaded, projects still open. New media submissions, changes to that history, and project deletion pause until the saved records are repaired and the service restarts. An explicit recovery request can still deliver an independently verified saved result.
+
 The guarded transport keeps the HTTP status, a bounded request ID and recognized structured error codes. It reads at most 8 KiB for one second, then cancels the error body. Free-form error messages, unknown codes, response bodies, cookies, URLs and other response headers are discarded. Request IDs must be short ASCII identifiers and must not contain registered credentials. Missing metadata remains missing; a 500 alone does not identify whether a gateway or its upstream rejected the request.
 
 When the SDK reports a connection error, the guarded transport retains a recognized native cause code through the SDK wrapper. Examples include `ECONNRESET`, `ENETUNREACH` and `UND_ERR_HEADERS_TIMEOUT`. The timeline labels the SDK message as connection details. A generic failure without a recognized cause stays unclassified for continuation. A local check that stops an outgoing request is distinguished from one that withholds a received response. Both stop automatic continuation.
@@ -84,24 +88,32 @@ unconfirmed effect during continuation. Exact completed operations reuse a saved
 receipt, explicitly described as historical rather than a current file snapshot.
 Reads, attachment authorization and runtime snapshots remain fresh. Existing media
 is recovered only by the original call ID or receipt-bound Canvas job. A new media
-submission with different arguments cannot be proved to be the original operation
-and pauses automatic continuation; this certainty check is not a fee ceiling.
+submission with different arguments cannot be proved to be the original operation.
+The guard refuses this request and allows independent work with existing results.
 Normal user-directed work retains the existing media approvals and recovery rules.
 
 A failed tool is not necessarily an uncertain effect. Trusted daemon branches may
 explicitly report a correctable rejection before any modification, such as an
-`edit` whose old text does not match exactly once, oversized text, or invalid
-Canvas input. These attempts keep their error receipts as `not_executed`, rather
+`edit` of a missing file, an unmatched edit, a media target supplied to the text
+writer, oversized text, or invalid Canvas input. These attempts keep their error receipts as `not_executed`, rather
 than becoming successful operations. Continuation may read current state and use
 a new call ID to correct the input. Reusing the original ID only returns its
 original failure; it never executes that edit again.
+
+When a character plan or publication rejects a stale source digest or view revision
+before writing, the Agent can reread the source and correct the request. An earlier
+rejection of this kind also allows a later retained shell result to enter its usual
+review. Once character preparation has started writing, the journal must verify
+the retained effects before continuation.
 
 The evidence is a private in-process brand, not error wording, duration, a model
 argument or a JSON property. Restoring this classification requires a new
 host-written stage record paired with the original call and canonical failure.
 Old `unknown` records are not reclassified, and conflicting call arguments or
 missing evidence remain uncertain. Permission, approval and protected-data
-rejections still block continuation even when no modification occurred. Once
+rejections still block continuation even when no modification occurred. A Blender
+request awaiting its first Tripo model review directs the Agent to the review
+tool. Blender starts only after the exact model has an approval receipt. Once
 `mkdir`, file creation or later write operations can have started, generic errors
 remain uncertain: a failed truncate, partial write or close cannot prove no effect.
 
@@ -109,10 +121,12 @@ Isolated project commands also keep host-owned operation phases in the original
 tool attempt. The task and call ID are bound to the project, namespace, operation
 ID and, once established, generation and captured snapshot. No lease token,
 command arguments or file payload enters this receipt. The host persists a phase
-before submitting preparation or a command. Before submission, only a privately
-identified input budget rejection permits a new corrected call; the failed call
-ID still returns its original failure. This says the project command was not
-submitted, not that a preview could not have paused or the VM could not have woken.
+before submitting preparation or a command. A host-confirmed input budget refusal,
+occupied VM lease, or failed read-only VM status, health or inventory check
+records the project command as unsubmitted. Once the cause clears, the agent
+can use a new call ID.
+The original ID returns the saved failure. The receipt covers the project command
+only. Earlier preview pauses or VM wake-ups keep their own effects.
 An executed command with retained output, an interrupted publication, missing
 confirmation or failed cleanup remains blocked. A later successful operation does
 not erase an earlier uncertain one, and a restart does not replay it.
@@ -190,7 +204,11 @@ Only a host-proven captured, retained and released operation with an exact origi
 task/call/operation/generation/raw snapshot mapping may enter bounded repair-only
 continuation. It uses the existing continuation attempts, permits controlled reads
 and the retained-result workflow, and blocks ordinary edits, execution and media
-generation until the matching effects are settled. Settlement records
+generation until the matching effects are settled. Sprite repair previews, model
+binding lists, live playtest inspection, session cleanup and planning are
+available during this period.
+After publication the Agent can immediately build or open a fresh playtest. It
+must read the current project files before making another change. Settlement records
 `effects_recovered`, preserving the original failure; it never converts that
 command into a successful execution or allows the same command to be replayed.
 Missing snapshots, unmapped old history and other uncertain effects remain blocked.

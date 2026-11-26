@@ -99,8 +99,9 @@ describe("provider deletion", () => {
     await expect(readFile(path.join(directory, `${id}.json`))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(path.join(directory, "models.json"))).rejects.toMatchObject({ code: "ENOENT" });
     expect((await preferences(directory)).defaultModel3D()).toBeUndefined();
+    expect(JSON.parse(await readFile(path.join(directory, "model-visibility.json"), "utf8")).disabled).toEqual([]);
     const restored = await restart();
-    expect((await preferences(directory)).isEnabled(id)).toBe(true);
+    expect((await preferences(directory)).isEnabled(id)).toBe(id === "tripo");
     expect(JSON.parse(await readFile(path.join(directory, `${other}.json`), "utf8"))).toMatchObject({ apiKey: `${other}-test-key` });
     expect((await restored.app.inject({ method: "GET", url: "/settings/providers" })).json()).not.toContainEqual(expect.objectContaining({ id: other }));
     expect((await restored.app.inject({ method: "PUT", url: `/settings/models/providers/${id}`, payload: { apiKey: "new-test-key" } })).statusCode).toBe(410);

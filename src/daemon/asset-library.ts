@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, link, lstat, mkdir, open, realpath, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, open, opendir, realpath, rename, rm, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
 import type { GenerationProvenance, LibraryAsset, LibraryAssetDerivation, LibraryAssetOrigin, LibraryAssetPurpose } from "../shared/contracts.js";
@@ -67,6 +67,7 @@ export class AssetLibrary {
   async close(): Promise<void> { if (this.#ownsSnapshots) await this.#snapshots.close(); }
 
   async load(): Promise<void> {
+    this.#loadedFilesDirectory = undefined;
     const directory = path.dirname(this.#filesDirectory);
     await mkdir(directory, { recursive: true, mode: 0o700 });
     if (!(await lstat(directory)).isDirectory()) throw new AssetLibraryError("Linked Library directories are unavailable", 409);
@@ -74,41 +75,62 @@ export class AssetLibrary {
     await mkdir(this.#filesDirectory, { recursive: true, mode: 0o700 });
     if (!(await lstat(this.#filesDirectory)).isDirectory()) throw new AssetLibraryError("Linked Library directories are unavailable", 409);
     await chmod(this.#filesDirectory, 0o700);
-    this.#loadedFilesDirectory = await realpath(this.#filesDirectory);
-    try {
-      const handle = await open(this.#metadataFile, constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW ?? 0));
-      let parsed: unknown;
-      try {
-        const info = await handle.stat();
-        if (!info.isFile() || info.nlink !== 1 || info.size > 64 * 1024 * 1024) throw new Error("Invalid Library metadata");
-        parsed = JSON.parse(await handle.readFile("utf8"));
-      } finally { await handle.close(); }
-      const parsedLibrary = parseLibrary(parsed);
-      if (!parsedLibrary) throw new Error("Invalid Library metadata");
-      if (containsKnownSensitiveValue(JSON.stringify(parsedLibrary))) throw new AssetLibraryError("Protected data in Library metadata", 409);
-      const assets: LibraryAsset[] = [];
-      // Sequential reads keep a large Library from exhausting file handles while older records gain dimensions.
-      for (const asset of parsedLibrary.assets) assets.push(await this.#withDimensions(asset));
-      const stored = { ...parsedLibrary, assets };
-      if (JSON.stringify(stored) !== JSON.stringify(parsed)) await this.#write(stored);
-      this.#state = stored;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-      if ((error as NodeJS.ErrnoException).code === "ELOOP") throw new AssetLibraryError("Linked Library metadata is unavailable", 409);
-      throw error;
+    const filesDirectory = await realpath(this.#filesDirectory);
+    const handle = await open(this.#metadataFile, constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW ?? 0))
+      .catch((cause: NodeJS.ErrnoException) => {
+        if (cause.code === "ENOENT") return undefined;
+        if (cause.code === "ELOOP") throw new AssetLibraryError("Linked Library metadata is unavailable", 409);
+        throw cause;
+      });
+    if (!handle) {
+      // A missing index alongside retained media or its private source receipts is not a new Library.
+      for (const folder of [filesDirectory, path.join(directory, "provider-image-sources")]) {
+        const entry = await lstat(folder).catch((cause: NodeJS.ErrnoException) => { if (cause.code !== "ENOENT") throw cause; });
+        if (!entry) continue;
+        if (!entry.isDirectory()) throw new AssetLibraryError("Linked Library directories are unavailable", 409);
+        const children = await opendir(folder);
+        try { if (await children.read()) throw new AssetLibraryError("Missing Library metadata for retained assets", 503); }
+        finally { await children.close(); }
+      }
+      this.#state = emptyLibrary();
+      this.#loadedFilesDirectory = filesDirectory;
+      return;
     }
+    let parsed: unknown;
+    try {
+      const info = await handle.stat();
+      if (!info.isFile() || info.nlink !== 1 || info.size > 64 * 1024 * 1024) throw new Error("Invalid Library metadata");
+      parsed = JSON.parse(await handle.readFile("utf8"));
+    } finally { await handle.close(); }
+    const parsedLibrary = parseLibrary(parsed);
+    if (!parsedLibrary) throw new Error("Invalid Library metadata");
+    if (containsKnownSensitiveValue(JSON.stringify(parsedLibrary))) throw new AssetLibraryError("Protected data in Library metadata", 409);
+    const assets: LibraryAsset[] = [];
+    // Sequential reads keep a large Library from exhausting file handles while older records gain dimensions.
+    for (const asset of parsedLibrary.assets) assets.push(await this.#withDimensions(asset));
+    const stored = { ...parsedLibrary, assets };
+    if (JSON.stringify(stored) !== JSON.stringify(parsed)) await this.#write(stored);
+    this.#state = stored;
+    this.#loadedFilesDirectory = filesDirectory;
+  }
+
+  assertAvailable(): void {
+    if (!this.#loadedFilesDirectory) throw new AssetLibraryError("The asset Library is unavailable. Repair the saved Library and restart OhMyGame.", 503);
   }
 
   list(): LibraryAsset[] {
+    this.assertAvailable();
     return [...this.#state.assets].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   }
 
   get(id: string): LibraryAsset | undefined {
+    this.assertAvailable();
     return this.#state.assets.find((asset) => asset.id === id);
   }
 
   async #assertDirectories(): Promise<void> {
-    if (!this.#loadedFilesDirectory || await realpath(this.#filesDirectory) !== this.#loadedFilesDirectory
+    this.assertAvailable();
+    if (await realpath(this.#filesDirectory) !== this.#loadedFilesDirectory
       || !(await lstat(path.dirname(this.#filesDirectory))).isDirectory() || !(await lstat(this.#filesDirectory)).isDirectory()) {
       throw new AssetLibraryError("Linked Library directories are unavailable", 409);
     }

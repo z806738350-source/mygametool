@@ -77,6 +77,7 @@ async function install(binary: string, version = "1.0.0") {
   await writeFile(
     binary,
     `#!/bin/sh
+printf x >> '${path.join(root, "candidate-ran")}'
 if [ "$1" = "--version" ]; then echo 'codex-cli ${version}'; else echo 'Logged in using ChatGPT'; fi
 `,
     { mode: 0o700 },
@@ -110,24 +111,21 @@ it.each([0, 1, 2, 3])(
   },
 );
 
-// These cases execute POSIX script fixtures; Windows cannot start them as native CLIs.
-it.skipIf(process.platform === "win32")("keeps Codex discovery order without executing candidates and respects manual selection", async () => {
+it.skipIf(process.platform === "win32")("uses the platform's Codex discovery order without executing candidates and respects manual selection", async () => {
+  const prefersApp = process.platform === "darwin";
   const onPath = await install(path.join(root, "bin", "codex"), "2.0.0");
-  const app = await install(bundledPath(0), "3.0.0");
+  const app = await install(bundledPath(0), prefersApp ? "1.0.0" : "3.0.0");
+  const automatic = prefersApp
+    ? { path: app, source: bundled![0]!.source }
+    : { path: onPath, source: "path" };
   vi.stubEnv("PATH", path.dirname(onPath));
-  expect(await resolveBinary("codex-cli")).toMatchObject({
-    path: onPath,
-    source: "path",
-  });
+  expect(await resolveBinary("codex-cli")).toMatchObject(automatic);
   expect(await resolveBinary("codex-cli", onPath)).toMatchObject({
     path: onPath,
     source: "manual",
   });
-  await install(onPath, "3.0.0");
-  expect(await resolveBinary("codex-cli", undefined, true)).toMatchObject({
-    path: onPath,
-    source: "path",
-  });
+  expect(await resolveBinary("codex-cli", undefined, true)).toMatchObject(automatic);
+  await expect(readFile(path.join(root, "candidate-ran"))).rejects.toHaveProperty("code", "ENOENT");
 });
 
 it("deduplicates symlinks and skips directories and non-executable files", async () => {
@@ -137,10 +135,9 @@ it("deduplicates symlinks and skips directories and non-executable files", async
   const link = path.join(bin, process.platform === "win32" ? "codex.exe" : "codex");
   await symlink(app, link);
   vi.stubEnv("PATH", bin);
-  expect(await resolveBinary("codex-cli")).toMatchObject({
-    path: link,
-    source: "path",
-  });
+  expect(await resolveBinary("codex-cli")).toMatchObject(process.platform === "darwin"
+    ? { path: app, source: bundled![0]!.source }
+    : { path: link, source: "path" });
   if (process.platform !== "win32") {
     await chmod(app, 0o600);
     expect(await resolveBinary("codex-cli")).toBeUndefined();
@@ -223,11 +220,17 @@ it("rejects an unaudited executable before version or authentication probes", as
 `,
   );
   const probe = vi.spyOn(discovery, "probeVersion");
+  const authenticate = vi.spyOn(discovery, "probeAuth");
   const status = await (await service()).status("codex-cli");
   expect(status).toMatchObject({ enabled: false, installed: true, auth: { status: "unknown", billing: "unknown" } });
   expect(status.binaryPath).toBe(binary);
-  expect(status.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: "runtime-incompatible" }), expect.objectContaining({ message: expect.stringContaining("has not passed") })]));
+  expect(status.diagnostics).toContainEqual(expect.objectContaining({
+    code: "runtime-incompatible",
+    capability: "controlled Codex executable",
+    message: expect.stringContaining("OpenAI signature"),
+  }));
   expect(probe).not.toHaveBeenCalled();
+  expect(authenticate).not.toHaveBeenCalled();
 });
 
 it.skipIf(process.platform !== "win32").each([

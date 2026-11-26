@@ -9,6 +9,8 @@ import * as agentRuntime from "../src/daemon/agent.js";
 import { createLocalModelRuntime, LocalApiKeyStore } from "../src/daemon/local-model-runtime.js";
 import { kunpoRuntimeProvider } from "../src/daemon/provider-model-settings.js";
 import { createApp } from "../src/daemon/app.js";
+import { ProjectExecutionDiscardConflict } from "../src/daemon/project-lifecycle.js";
+import { ProjectWrites } from "../src/daemon/project-writes.js";
 import { CheckpointStore, checkpointDirectory } from "../src/daemon/checkpoints.js";
 import { ConversationImageStore } from "../src/daemon/conversation-images.js";
 import { ProjectManager } from "../src/daemon/projects.js";
@@ -36,7 +38,7 @@ async function fixture(accessToken?: string, configured = true, agentReady = fal
     namespace: "test",
     dependenciesInGuest: true, setAdmission: vi.fn(), close: vi.fn().mockResolvedValue(undefined),
     quiesceProject: vi.fn().mockResolvedValue(undefined), resumeProject: vi.fn(),
-    retireProject: vi.fn(async (_project: ProjectState, beforeRetire: () => Promise<void>) => {
+    retireProject: vi.fn(async (_project: ProjectState, beforeRetire: () => Promise<void>, _discardGeneration?: string) => {
       await beforeRetire();
       return { deleted: true };
     }),
@@ -69,6 +71,41 @@ it("provides the global no-store overview with current ProjectManager names", as
   expect(execution.storageOverview).toHaveBeenCalledWith([expect.objectContaining({ id: project.id, name: project.name })]);
   expect(execution.inventoryProject).not.toHaveBeenCalled();
   expect(execution.recoverSource).not.toHaveBeenCalled();
+});
+
+it.each(["unreadable", "malformed"])("isolates an %s workspace version at startup and retries after repair", async issue => {
+  const { app, directory, project } = await fixture(undefined, false);
+  const sibling = (await app.inject({ method: "POST", url: "/projects", payload: { name: "Healthy project", type: "general" } })).json<ProjectState>();
+  await app.close();
+  const notice = (item: ProjectState) => path.join(item.storagePath ?? path.dirname(item.workspacePath), "workspace-restore-notice.txt");
+  if (issue === "unreadable") await mkdir(notice(project));
+  else await writeFile(notice(project), "[workspace-version:broken]\nRetained notice");
+  await writeFile(notice(sibling), issue === "unreadable" ? "A legacy restore notice" : "[workspace-version:0]\nOriginal workspace");
+  const reopened = createApp({ dataDirectory: directory, piAgentDirectory: path.join(directory, "agent") });
+  cleanups.push(() => reopened.close());
+  const createFile = (id: string, version?: string) => reopened.inject({ method: "POST", url: `/projects/${id}/files`,
+    headers: version === undefined ? {} : { "x-workspace-version": version }, payload: { name: "new.txt", kind: "file" } });
+  const projects = await reopened.inject({ method: "GET", url: "/projects" });
+  expect(projects.statusCode, projects.body).toBe(200);
+  expect(projects.json().map((item: ProjectState) => item.id)).toEqual(expect.arrayContaining([project.id, sibling.id]));
+  expect((await createFile(sibling.id, "0")).statusCode).toBe(201);
+  const current = await reopened.inject({ method: "GET", url: `/projects/${project.id}` });
+  expect(current.statusCode).toBe(200); expect(current.headers["x-workspace-version"]).toBeFalsy();
+  expect((await reopened.inject({ method: "GET", url: `/projects/${project.id}/checkpoints/unfinished` })).statusCode).toBe(200);
+  for (const header of [undefined, "", "0"])
+    expect((await createFile(project.id, header)).json()).toMatchObject({ code: "workspace_busy" });
+  await expect(lstat(path.join(project.workspacePath, "new.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+
+  await rm(notice(project), { recursive: true });
+  expect((await createFile(project.id, "0")).json()).toMatchObject({ code: "workspace_busy" });
+  await writeFile(notice(project), "");
+  expect((await createFile(project.id, "0")).json()).toMatchObject({ code: "workspace_busy" });
+  const restored = "11111111-2222-4333-8444-555555555555";
+  await writeFile(notice(project), `[workspace-version:${restored}]\nRecovered version`);
+  const stale = await createFile(project.id, "0");
+  expect(stale.json()).toMatchObject({ code: "workspace_stale" });
+  expect(stale.headers["x-workspace-version"]).toBe(restored);
+  expect((await createFile(project.id, restored)).statusCode).toBe(201);
 });
 
 it("reports capacity without allocating, inspecting retained bytes or inventing stopped-guest space", async () => {
@@ -216,16 +253,39 @@ it("opens storage only through an explicit authenticated project action and neve
 });
 
 it("keeps interrupted host publications behind a persistent admission gate while allowing inspection", async () => {
-  const { app, execution, project } = await fixture();
+  let complete!: () => void, fail!: (cause: unknown) => void;
+  const observed = new Promise<void>((resolve, reject) => { complete = resolve; fail = reject; });
+  const session = vi.spyOn(agentRuntime, "createPiSession").mockImplementation(async (_project, _manager, registered) => ({
+    messages: [], abort: async () => {}, dispose: () => {}, subscribe: () => () => {},
+    getAllTools: () => registered!.map(tool => ({ name: tool.name })),
+    prompt: async () => {
+      try {
+        const run = (name: string, input: Record<string, unknown>) => registered!.find(t => t.name === name)!.execute(name, input, undefined, undefined, {} as never);
+        expect((await run("read_workflow_guide", { guide: "ohmygame" })).content[0]?.type).toBe("text");
+        await run("recover_isolated_changes", { action: "inspect" });
+        await expect(run("generate_image", { prompt: "offline fixture" })).rejects.toThrow("interrupted host transaction");
+        complete();
+      } catch (error) { fail(error); }
+    },
+  }));
+  cleanups.push(async () => { session.mockRestore(); });
+  const { app, execution, project } = await fixture(undefined, true, true);
   const directory = path.join(path.dirname(project.workspacePath), "isolated-changes/fixture");
   await durablePublicationDirectory(directory);
   await savePublicationManifest(directory, { version: 2, state: "needs-review", context: { namespace: "test", projectId: project.id, generation: 22, snapshotId: "b".repeat(64) }, versions: [], published: [], steps: {} });
   for (const request of [
     { method: "POST" as const, url: "/tools/generate-image/jobs", payload: { prompt: "offline fixture", projectId: project.id, nodeId: "node-1" } },
-    { method: "PATCH" as const, url: `/projects/${project.id}`, payload: { name: "Must wait for publication" } },
-    { method: "POST" as const, url: `/projects/${project.id}/conversations`, payload: {} },
     { method: "DELETE" as const, url: `/projects/${project.id}` },
   ]) expect((await app.inject(request)).statusCode).toBe(409);
+  expect((await app.inject({ method: "PATCH", url: `/projects/${project.id}`, payload: { name: "Review retained files" } })).statusCode).toBe(200);
+  const chat = await app.inject({ method: "POST", url: `/projects/${project.id}/conversations`, payload: {} });
+  expect(chat.statusCode).toBe(201);
+  const turn = await app.inject({ method: "POST", url: `/projects/${project.id}/conversations/${chat.json().id}/turns`, payload: { prompt: "Inspect the interrupted publication" } });
+  expect(turn.statusCode).toBe(202);
+  await observed;
+  expect((await app.inject({ method: "DELETE", url: `/projects/${project.id}/preview/leases/inspector` })).statusCode).toBe(204);
+  const newWork = await app.inject({ method: "POST", url: `/projects/${project.id}/preview` });
+  expect(newWork.json().code).toBe("execution_recovery_required");
   expect(execution.retireProject).not.toHaveBeenCalled();
   const status = await app.inject({ method: "GET", url: `/projects/${project.id}/execution-storage` });
   expect(status.statusCode).toBe(200);
@@ -270,6 +330,7 @@ it("holds the host project until guest retirement succeeds, and denies new conte
   expect((await app.inject({ method: "POST", url: `/projects/${project.id}/conversations`, payload: {} })).statusCode).toBe(409);
   const duplicate = await app.inject({ method: "DELETE", url: `/projects/${project.id}` });
   expect(duplicate.statusCode).toBe(409);
+  expect(execution.resumeProject).not.toHaveBeenCalled();
   finish({ deleted: true });
   expect((await pending).statusCode).toBe(204);
   await expect(readFile(path.join(path.dirname(project.workspacePath), "project.json"))).rejects.toMatchObject({ code: "ENOENT" });
@@ -462,6 +523,60 @@ it("records retirement only after preparation, before allowing any host deletion
   await expect(readFile(record)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
+it("does not retire storage if the workspace version changed before deletion acquired its lock", async () => {
+  const { app, execution, project } = await fixture();
+  const original = ProjectWrites.prototype.exclusive;
+  const lock = vi.spyOn(ProjectWrites.prototype, "exclusive").mockImplementationOnce(function (this: ProjectWrites, id, operation) {
+    this.changed(id);
+    return original.call(this, id, operation);
+  });
+  try {
+    const url = `/projects/${project.id}`;
+    const refused = await app.inject({ method: "DELETE", url, headers: { "x-workspace-version": "0" } });
+    expect(refused.statusCode, refused.body).toBe(409);
+    expect(refused.json().code).toBe("workspace_stale");
+    expect(execution.retireProject).not.toHaveBeenCalled();
+    const current = await app.inject({ method: "GET", url });
+    expect(current.statusCode, current.body).toBe(200);
+    expect(current.headers["x-workspace-version"]).not.toBe("0");
+    expect(refused.headers["x-workspace-version"]).toBe(current.headers["x-workspace-version"]);
+    const removed = await app.inject({ method: "DELETE", url, headers: { "x-workspace-version": current.headers["x-workspace-version"] } });
+    expect(removed.statusCode, removed.body).toBe(204);
+    expect(execution.retireProject).toHaveBeenCalledOnce();
+  } finally { lock.mockRestore(); }
+});
+
+it.each([false, true])("requires explicit discard before deleting a project with retained execution changes (pending=%s)", async pending => {
+  const { app, execution, project, directory } = await fixture();
+  const record = path.join(directory, "project-lifecycle", project.id + ".json");
+  const url = `/projects/${project.id}`;
+  const deleteAt = (suffix = "") => app.inject({ method: "DELETE", url: url + suffix });
+  if (pending) {
+    execution.retireProject.mockImplementationOnce(async (_project, beforeRetire) => {
+      await beforeRetire();
+      throw new Error("Older retirement response was not confirmed");
+    });
+    expect((await deleteAt()).statusCode).toBe(409);
+  }
+  execution.retireProject.mockImplementation(async (_project, beforeRetire, generation) => {
+    if (generation === undefined) throw new ProjectExecutionDiscardConflict("7");
+    if (generation !== "7") throw new ProjectExecutionDiscardConflict();
+    await beforeRetire();
+    return { deleted: true };
+  });
+  expect((await deleteAt()).json()).toMatchObject({ code: "execution_discard_required", generation: "7" });
+  expect(JSON.parse(await readFile(record, "utf8")).phase).toBe(pending ? "retiring-volume" : "aborted");
+  expect((await app.inject({ method: "GET", url })).statusCode).toBe(200);
+  if (!pending) expect((await app.inject({ method: "PATCH", url, payload: { name: "Still editable" } })).statusCode).toBe(200);
+  expect((await deleteAt("?discardExecutionGeneration=true")).statusCode).toBe(400);
+  expect((await deleteAt("?discardExecutionGeneration=6")).json().code).toBe("execution_discard_state_changed");
+  expect((await app.inject({ method: "GET", url })).statusCode).toBe(200);
+  expect((await deleteAt("?discardExecutionGeneration=7")).statusCode).toBe(204);
+  expect(execution.retireProject).toHaveBeenLastCalledWith(expect.objectContaining({ id: project.id }), expect.any(Function), "7");
+  expect((await app.inject({ method: "GET", url })).statusCode).toBe(404);
+  await expect(readFile(record)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
 it.each(["start failed", "inventory could not be verified"])("does not strand a new deletion when preparation fails: %s", async (message) => {
   const { app, execution, project, directory } = await fixture();
   const original = await readFile(path.join(directory, "projects", project.id, "project.json"), "utf8");
@@ -619,6 +734,36 @@ it("reloads a partial host deletion as pending and preserves remaining files unt
   expect((await restarted.inject({ method: "DELETE", url: `/projects/${project.id}` })).statusCode).toBe(204);
   expect(execution.retireProject).toHaveBeenCalledTimes(2);
   await expect(readFile(path.join(directory, "project-lifecycle", project.id + ".json"))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+it("finishes an interrupted final directory removal before listing projects on restart", async () => {
+  const { app, execution, project, directory } = await fixture();
+  const sibling = (await app.inject({ method: "POST", url: "/projects", payload: { name: "Keep", type: "general" } })).json<ProjectState>();
+  const kept = path.join(sibling.workspacePath, "keep.txt");
+  await writeFile(kept, "still here");
+  const residue = path.join(project.workspacePath, "remaining.txt");
+  await writeFile(residue, "remaining bytes of the authorized deletion");
+  const record = path.join(directory, "project-lifecycle", project.id + ".json");
+  const removal = vi.spyOn(ProjectManager.prototype, "delete").mockImplementationOnce(async (id, beforeRemove) => {
+    expect(id).toBe(project.id);
+    await beforeRemove!();
+    await rm(path.join(project.storagePath!, "project.json"));
+    throw new Error("Interrupted after project metadata was removed");
+  });
+  try { expect((await app.inject({ method: "DELETE", url: `/projects/${project.id}` })).statusCode).toBe(409); }
+  finally { removal.mockRestore(); }
+  expect(JSON.parse(await readFile(record, "utf8")).phase).toBe("removing-project");
+  expect(await readFile(residue, "utf8")).toContain("authorized deletion");
+  await app.close();
+  const agentDirectory = path.join(directory, "agent");
+  const runtime = await ModelRuntime.create({ authPath: path.join(agentDirectory, "auth.json"), modelsPath: null, refreshOnCreate: false, allowModelNetwork: false });
+  const restarted = createApp({ dataDirectory: directory, piAgentDirectory: agentDirectory, createModelRuntime: async () => runtime, projectExecution: execution as never });
+  cleanups.push(() => restarted.close());
+  expect((await restarted.inject({ method: "GET", url: "/projects" })).json().map((item: ProjectState) => item.id)).toEqual([sibling.id]);
+  expect(await readFile(kept, "utf8")).toBe("still here");
+  await expect(lstat(project.storagePath!)).rejects.toMatchObject({ code: "ENOENT" });
+  await expect(lstat(record)).rejects.toMatchObject({ code: "ENOENT" });
+  expect(execution.retireProject).toHaveBeenCalledOnce();
 });
 
 it("rejects malformed recovery generations before invoking the execution backend", async () => {

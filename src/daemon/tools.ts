@@ -49,7 +49,7 @@ import type { Model3DExecution } from "./model3d.js";
 import { MAX_ANIMATION_ACTIONS, mediaGenerationNeedsConfirmation, resolveModel3D } from "../shared/generation-config.js";
 import { model3DOptionFields, remeshPolycount, requiresModelTurnaround } from "../shared/model3d-operations.js";
 import { VideoGenerationError, type VideoGenerator, type VideoReferenceAsset, type VideoExecution } from "./video-generation.js";
-import { normalizeGenerationProvenance, publicGenerationParameters, type AssetLibrary } from "./asset-library.js";
+import { AssetLibraryError, normalizeGenerationProvenance, publicGenerationParameters, type AssetLibrary } from "./asset-library.js";
 import { AudioGenerationError, type AudioGenerator } from "./audio-generation.js";
 import { AgentMediaRecovery, type AgentMediaCall, type ConfirmPaidMedia } from "./agent-media-recovery.js";
 import { containsKnownSensitiveValue } from "../shared/sensitive-values.js";
@@ -137,7 +137,8 @@ class PartialImageRunError extends ToolRunError {
 export class ToolRunner {
   readonly agentMedia: AgentMediaRecovery;
   readonly #runsDirectory: string;
-  readonly #jobs = new Map<string, ToolJobRecord>();
+  #jobs = new Map<string, ToolJobRecord>();
+  #historyUnavailable = false;
   #jobWrites = Promise.resolve();
   #closed = false;
   #log?: GenerationLogger;
@@ -169,19 +170,51 @@ export class ToolRunner {
   }
 
   async load(): Promise<void> {
-    await mkdir(this.#runsDirectory, { recursive: true });
     try {
-      const jobs: ToolJobRecord[] = JSON.parse(await readFile(path.join(this.#runsDirectory, "../jobs.json"), "utf8"));
-      for (const job of jobs) this.#jobs.set(job.id, { ...job, videoSubmission: ["not-submitted", "attempted"].includes(job.videoSubmission ?? "") ? job.videoSubmission : undefined, videoReferencePreparation: validVideoReferencePreparation(job.videoReferencePreparation) ? job.videoReferencePreparation : undefined, controller: new AbortController(),
-        ...(job.status === "running" ? { status: "cancelled", error: "Generation interrupted. Resume a saved task; never automatically submit an unknown request again.",
-          ...(!["image-to-3d", "animate-3d", "generate-video"].includes(job.toolId) ? { submissionOutcome: "unknown" as const } : {}) } : {}) });
-      for (const job of this.#jobs.values()) {
+      await mkdir(this.#runsDirectory, { recursive: true });
+      const saved = await readFile(path.join(this.#runsDirectory, "../jobs.json"), "utf8").catch((cause: NodeJS.ErrnoException) => {
+        if (cause.code !== "ENOENT") throw cause;
+        return "[]";
+      });
+      const jobs: ToolJobRecord[] = JSON.parse(saved);
+      const restored = new Map<string, ToolJobRecord>();
+      if (!Array.isArray(jobs)) throw new Error("Invalid generation history");
+      for (const job of jobs) {
+        if (!job || typeof job.id !== "string" || !job.id || restored.has(job.id) || !isToolId(job.toolId) ||
+          !["running", "succeeded", "failed", "cancelled"].includes(job.status) ||
+          (job.recoveryId !== undefined && (typeof job.recoveryId !== "string" || !job.recoveryId)) ||
+          (job.run !== undefined && (!job.run || typeof job.run.id !== "string" || !job.run.id || !Array.isArray(job.run.files))) ||
+          (job.context !== undefined && (!job.context || typeof job.context.projectId !== "string" || !job.context.projectId ||
+            typeof job.context.nodeId !== "string" || !job.context.nodeId))) throw new Error("Invalid generation history");
+        restored.set(job.id, { ...job, videoSubmission: ["not-submitted", "attempted"].includes(job.videoSubmission ?? "") ? job.videoSubmission : undefined, videoReferencePreparation: validVideoReferencePreparation(job.videoReferencePreparation) ? job.videoReferencePreparation : undefined, controller: new AbortController(),
+          ...(job.status === "running" ? { status: "cancelled", error: "Generation interrupted. Resume a saved task; never automatically submit an unknown request again.",
+            ...(!["image-to-3d", "animate-3d", "generate-video"].includes(job.toolId) ? { submissionOutcome: "unknown" as const } : {}) } : {}) });
+      }
+      for (const job of restored.values()) {
         if ((job.status === "failed" || job.status === "cancelled") && await this.mediaWasAttempted(job.toolId, job.recoveryId ?? job.id, (job.input as RunImageToolRequest | undefined)?.outputs)) job.submissionOutcome = "unknown";
       }
-    } catch (cause) { if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause; }
+      this.#jobs = restored;
+      this.#historyUnavailable = false;
+    } catch {
+      this.#historyUnavailable = true;
+      this.assertJobHistoryAvailable();
+    }
+  }
+  assertJobHistoryAvailable(): void {
+    if (!this.#historyUnavailable) return;
+    const message = "Generation history is unavailable. Repair tools/jobs.json and its saved task records, then restart OhMyGame.";
+    throw inheritToolPreflightFailure(new ToolRunError(message, 503, undefined, undefined, undefined, true), toolPreflightError(message, "media_recovery_unavailable"));
+  }
+  #requireHistoryForGeneration(toolId: string, options: { imageRecoveryOnly?: boolean; videoRecoveryOnly?: boolean; model3DRecoveryOnly?: boolean; audioRecoveryOnly?: boolean }): void {
+    // Explicit recovery can retrieve an independently saved result without submitting a new request.
+    if ((toolId === "generate-image" && options.imageRecoveryOnly) || (toolId === "generate-video" && options.videoRecoveryOnly) ||
+      (toolId === "image-to-3d" || toolId === "animate-3d") && options.model3DRecoveryOnly ||
+      (toolId === "generate-speech" || toolId === "generate-sound-effect" || toolId === "generate-music") && options.audioRecoveryOnly) return;
+    this.assertJobHistoryAvailable();
   }
   #saveJobs(): Promise<void> {
     this.#jobWrites = this.#jobWrites.catch(() => {}).then(async () => {
+      this.assertJobHistoryAvailable();
       const file = path.join(this.#runsDirectory, "../jobs.json");
       const temporary = `${file}.${randomUUID()}.tmp`;
       try {
@@ -196,6 +229,7 @@ export class ToolRunner {
   }
 
   start(toolId: string, input: RunToolRequest, metadata: ToolJobMetadata = {}, prepared = false, recoveryId: string = randomUUID(), imageRecoveryOnly = false, videoRecoveryOnly = false, model3DRecoveryOnly = false, previousImageRun?: ToolRun): ToolJob {
+    this.assertJobHistoryAvailable();
     if (this.#closed) throw new ToolRunError("Generation is shutting down", 503);
     if (metadata.context?.projectId) this.#projectAdmission?.(metadata.context.projectId);
     if (!isToolId(toolId)) throw new ToolRunError("Tool not found", 404);
@@ -245,6 +279,7 @@ export class ToolRunner {
   }
 
   jobs(): ToolJob[] {
+    this.assertJobHistoryAvailable();
     return [...this.#jobs.values()]
       .reverse()
       .map(publicJob);
@@ -286,6 +321,7 @@ export class ToolRunner {
   }
 
   cancelJob(jobId: string): ToolJob {
+    this.assertJobHistoryAvailable();
     const job = this.#jobs.get(jobId);
     if (!job) throw new ToolRunError("Generation job not found", 404);
     if (job.status === "running") {
@@ -299,6 +335,7 @@ export class ToolRunner {
   }
 
   async retryJob(jobId: string): Promise<ToolJob> {
+    this.assertJobHistoryAvailable();
     const job = this.#jobs.get(jobId);
     if (!job) throw new ToolRunError("Generation job not found", 404);
     if (job.status !== "failed" && job.status !== "cancelled") throw new ToolRunError("Only failed or cancelled jobs can be retried", 409);
@@ -403,6 +440,7 @@ export class ToolRunner {
     imageRecoveryOnly?: boolean; videoRecoveryOnly?: boolean; model3DRecoveryOnly?: boolean; audioRecoveryOnly?: boolean;
     agentCanInspectImages?: boolean;
   } = {}): Promise<ToolRun> {
+    this.#requireHistoryForGeneration(toolId, options);
     if (this.#closed) throw new ToolRunError("Generation is shutting down", 503);
     if (projectId) this.#projectAdmission?.(projectId);
     if (typeof input !== "function") assertSafeGenerationInput(input);
@@ -482,6 +520,11 @@ export class ToolRunner {
 
   /** Check disabled connections before changing job history or creating a task journal. */
   async assertMediaAvailable(toolId: string, input: RunToolRequest, recoveryOnly = false): Promise<void> {
+    try { this.assetLibrary?.assertAvailable(); }
+    catch (cause) {
+      if (!(cause instanceof AssetLibraryError)) throw cause;
+      throw inheritToolPreflightFailure(new ToolRunError(cause.message, cause.statusCode, undefined, undefined, undefined, true), toolPreflightError(cause.message, "media_recovery_unavailable"));
+    }
     assertAvailableMediaReference(input);
     if (recoveryOnly && ["image-to-3d", "animate-3d"].includes(toolId) && !(input as Run3DToolRequest).model) throw new ToolRunError("The saved 3D task has no explicit connection binding. Its original records are retained; recovery cannot select a replacement provider.", 409);
     try {
@@ -495,6 +538,11 @@ export class ToolRunner {
       }
     } catch (cause) {
       if (cause instanceof ImageGenerationError || cause instanceof VideoGenerationError) throw new ToolRunError(cause.message, cause.statusCode, undefined, undefined, undefined, true);
+      if (cause instanceof AudioGenerationError) {
+        const pending = cause.submissionOutcome === "unknown" ? "unknown" : undefined;
+        const rejected = cause.submissionOutcome === "not-submitted";
+        throw inheritToolPreflightFailure(new ToolRunError(cause.message, cause.statusCode, pending, undefined, cause.diagnostic, rejected), cause);
+      }
       model3DToolError(cause);
     }
   }
@@ -535,6 +583,7 @@ export class ToolRunner {
 
   /** Executes an input whose model and generation options have already been resolved. */
   async runPrepared(toolId: string, input: RunToolRequest, signal?: AbortSignal, options: { recoveryId?: string; projectId?: string; canvasContext?: ToolJobContext; imageRecoveryOnly?: boolean; videoRecoveryOnly?: boolean; model3DRecoveryOnly?: boolean } = {}, referencePrepared?: (summary: VideoReferencePreparation) => Promise<void>, submissionStarted?: () => Promise<void>): Promise<ToolRun> {
+    this.#requireHistoryForGeneration(toolId, options);
     if (this.#closed) throw new ToolRunError("Generation is shutting down", 503);
     if (options.projectId) this.#projectAdmission?.(options.projectId);
     assertSafeGenerationInput(input);
@@ -1129,6 +1178,7 @@ export class ToolRunner {
 
   /** Called after project admission is closed and Agent/Canvas work has settled. */
   async removeProject(projectId: string, options: { workspacePath?: string; generationScopes?: readonly string[] } = {}): Promise<void> {
+    this.assertJobHistoryAvailable();
     if (!/^[a-zA-Z0-9_-]{1,120}$/.test(projectId)) throw new ToolRunError("Invalid project media owner", 400);
     for (const job of this.#jobs.values()) if (job.context?.projectId === projectId && job.status === "running") this.cancelJob(job.id);
     await Promise.allSettled([...this.#pending].filter(([id]) => this.#jobs.get(id)?.context?.projectId === projectId).map(([, pending]) => pending));

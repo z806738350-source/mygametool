@@ -78,6 +78,21 @@ it("ignores a stale enabled setting and revokes its old endpoint before use", as
   await expect(stat(path.join(root, "external-mcp", "endpoint.json"))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
+it("keeps the server disabled and local lifecycle available after endpoint cleanup fails", async () => {
+  const root = await temporaryDirectory();
+  const endpoint = path.join(root, "external-mcp", "endpoint.json");
+  await mkdir(endpoint, { recursive: true });
+  await writeFile(path.join(endpoint, "retained"), "original");
+  const onEndpointCleanupError = vi.fn();
+  const service = new ExternalMcpService({ dataDirectory: root, projects: () => [], tools: () => [], catalog: () => [], onEndpointCleanupError });
+  await service.load();
+  await service.listening("http://127.0.0.1:1/external-mcp");
+  expect((await service.handle({ authorization: "Bearer old", sessionId: undefined, roots: undefined, body: { id: 1, method: "tools/list" } })).status).toBe(403);
+  await service.close();
+  expect(onEndpointCleanupError).toHaveBeenCalled();
+  expect(await readFile(path.join(endpoint, "retained"), "utf8")).toBe("original");
+});
+
 it("forgets the app's record only when it is still the app's own", async () => {
   const { root } = await fixture();
   const first = await markExternalMcpApp(root, 1);

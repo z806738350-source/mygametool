@@ -1,17 +1,26 @@
 /** Host-owned evidence that a tool rejected input before reaching an effect. */
 const dispositions = {
   edit_text_not_unique: "correctable",
+  invalid_text_file: "correctable",
   text_too_large: "correctable",
   invalid_canvas_document: "correctable",
   runtime_media_budget: "correctable",
   media_recovery_unavailable: "correctable",
+  new_media_requires_authorization: "correctable",
   playtest_inspection_required: "correctable",
   playtest_session_limit: "correctable",
+  playtest_project_busy: "correctable",
+  project_execution_busy: "correctable",
+  playtest_precondition: "correctable",
   audio_input_invalid: "correctable",
   invalid_animation_action: "correctable",
   invalid_model_reference: "correctable",
+  model_review_required: "correctable",
   invalid_media_options: "correctable",
   invalid_blender_input: "correctable",
+  invalid_character_view_input: "correctable",
+  invalid_sprite_walk_input: "correctable",
+  invalid_sprite_action_input: "correctable",
   unsafe_path: "blocked",
   protected_content: "blocked",
   authorization_denied: "blocked",
@@ -66,6 +75,9 @@ export type ToolConfirmedFailure = {
   readonly reason: "isolated_command_failed";
   readonly operationId: string;
   readonly exitCode: number;
+} | {
+  readonly reason: "character_view_publication_failed";
+  readonly operationId: string;
 };
 
 const confirmed = new WeakMap<object, ToolConfirmedFailure>();
@@ -86,6 +98,14 @@ export function confirmIsolatedCommandFailure<T extends object>(target: T, opera
   return target;
 }
 
+/** Only attach this to a verified terminal receipt from the character publication journal. */
+export function confirmCharacterViewFailure<T extends object>(target: T, operationId: string): T {
+  const failure = parseToolConfirmedFailure({ reason: "character_view_publication_failed", operationId });
+  if (!failure) throw new TypeError("Invalid retained character publication ID");
+  confirmed.set(target, failure);
+  return target;
+}
+
 export function getToolConfirmedFailure(value: unknown): ToolConfirmedFailure | undefined {
   return value !== null && (typeof value === "object" || typeof value === "function")
     ? confirmed.get(value as object) : undefined;
@@ -101,6 +121,8 @@ export function inheritToolConfirmedFailure<T extends object>(target: T, origina
 export function parseToolConfirmedFailure(value: unknown): ToolConfirmedFailure | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return;
   const input = value as Record<string, unknown>;
+  if (input.reason === "character_view_publication_failed" && typeof input.operationId === "string" && /^[a-f0-9]{64}$/.test(input.operationId))
+    return Object.freeze({ reason: "character_view_publication_failed", operationId: input.operationId });
   if (input.reason === "isolated_command_failed" && typeof input.operationId === "string" &&
     /^[a-f\d]{32}$/.test(input.operationId) && Number.isSafeInteger(input.exitCode) &&
     Number(input.exitCode) > 0 && Number(input.exitCode) <= 255)

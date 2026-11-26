@@ -197,11 +197,13 @@ export class WebGamePlayerWindows {
         const contents = view.webContents;
         restrictLocalGameNetwork(contents, () => game.origin, this.hostUrl);
         contents.setWindowOpenHandler(() => ({ action: "deny" }));
-        contents.session.setPermissionCheckHandler((_source, permission, requestingOrigin) => permission === "pointerLock" && requestingOrigin === game.origin);
-        contents.session.setPermissionRequestHandler((_source, permission, callback, details) => {
+        contents.session.setPermissionCheckHandler((source, permission, requestingOrigin, details) => requestingOrigin === game.origin &&
+          (permission === "pointerLock" || permission === "fullscreen" && source === contents && !details.isMainFrame));
+        contents.session.setPermissionRequestHandler((source, permission, callback, details) => {
           let sameOrigin = false;
           try { sameOrigin = new URL(details.requestingUrl).origin === game.origin; } catch { /* Invalid request. */ }
-          callback(sameOrigin && (permission === "pointerLock" || permission === "keyboardLock"));
+          callback(sameOrigin && (permission === "pointerLock" || permission === "keyboardLock" ||
+            permission === "fullscreen" && source === contents && !details.isMainFrame));
         });
         contents.session.on("will-download", (event) => event.preventDefault());
         contents.on("will-frame-navigate", (event) => {

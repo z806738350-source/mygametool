@@ -23,15 +23,29 @@ async function temporary() {
   return directory;
 }
 
-it("rewrites retired browser keys after the app closes and preserves binary data for live projects and other origins", async () => {
+it("rewrites retired browser keys and diagnostic rows and preserves unrelated bytes", async () => {
   const root = await temporary();
   const deleted = "11111111-1111-4111-8111-111111111111";
   const retained = "22222222-2222-4222-8222-222222222222";
   const projects = path.join(root, "projects");
   const queue = path.join(root, PROJECT_BROWSER_CLEANUP_DIRECTORY);
   const live = path.join(root, "desktop", "browser", "Local Storage", "leveldb");
+  const logs = path.join(root, "desktop", "logs");
   await mkdir(path.join(projects, retained), { recursive: true });
   await mkdir(path.dirname(live), { recursive: true });
+  await mkdir(logs);
+  const time = "2026-11-25T04:00:00.000Z ";
+  const retiredLine = `${time}${JSON.stringify({ projectId: deleted, err: "retired" })}\r\n`;
+  const keptLogs = Buffer.concat([
+    Buffer.from(`${time}${JSON.stringify({ projectId: retained, msg: deleted })}\n`),
+    Buffer.from(`${time}${JSON.stringify({ context: { projectId: deleted } })}\r\n`),
+    Buffer.from(`${time}plain output mentions ${deleted}\r\n${time}{unparseable json\n`),
+    Buffer.from([0, 165, 255]),
+  ]);
+  for (const name of ["daemon.log", "daemon.2.log", "main.1.log", "daemon.3.log", "third-party.log"])
+    await writeFile(path.join(logs, name), Buffer.concat([Buffer.from(retiredLine), keptLogs]));
+  // A previous process stopped after writing a candidate but before committing.
+  await writeFile(path.join(logs, "daemon.log.project-cleanup-new"), "partial rewrite");
   const openDatabase = () => new ClassicLevel<Buffer, Buffer>(live, { keyEncoding: "buffer", valueEncoding: "buffer" });
   const key = (value: string) => Buffer.from(`_file://\0\x01${value}`);
   const old = key(`canvas-active:${deleted}`);
@@ -60,11 +74,41 @@ it("rewrites retired browser keys after the app closes and preserves binary data
   expect(rewritten.includes(old)).toBe(false);
   expect(rewritten.includes(late)).toBe(false);
   expect(await readdir(queue)).toEqual([retained]);
+  for (const name of ["daemon.log", "daemon.2.log", "main.1.log"])
+    expect(await readFile(path.join(logs, name))).toEqual(keptLogs);
+  for (const name of ["daemon.3.log", "third-party.log"])
+    expect(await readFile(path.join(logs, name))).toEqual(Buffer.concat([Buffer.from(retiredLine), keptLogs]));
+  await expect(lstat(path.join(logs, "daemon.log.project-cleanup-new"))).rejects.toMatchObject({ code: "ENOENT" });
   const reopened = openDatabase();
   try {
     for (const k of keep) expect(await reopened.get(k)).toEqual(opaqueValue);
     expect(await reopened.get(late)).toBeUndefined();
   } finally { await reopened.close(); }
+});
+
+it("preserves the cleanup marker and linked diagnostic target when an exact allowlisted file is unsafe", async () => {
+  const root = await temporary();
+  const deleted = "11111111-1111-4111-8111-111111111111";
+  const logs = path.join(root, "desktop", "logs");
+  const queue = path.join(root, PROJECT_BROWSER_CLEANUP_DIRECTORY);
+  await mkdir(path.join(root, "projects"));
+  await mkdir(logs, { recursive: true });
+  const target = path.join(root, "other.log");
+  const record = `2026-11-25T04:00:00.000Z ${JSON.stringify({ projectId: deleted })}\n`;
+  await writeFile(target, record);
+  const file = path.join(logs, "daemon.log");
+  await symlink(target, file);
+  await new ProjectLifecycle(root).scheduleBrowserCleanup(deleted);
+
+  await expect(compactProjectBrowserStorage(root)).rejects.toThrow("Unexpected link");
+  expect(await readFile(target, "utf8")).toBe(record);
+  expect(await readdir(queue)).toEqual([deleted]);
+
+  await rm(file);
+  await writeFile(file, record);
+  await compactProjectBrowserStorage(root);
+  expect(await readFile(file, "utf8")).toBe("");
+  expect(await readdir(queue)).toEqual([]);
 });
 
 describe("local source launcher boundaries", () => {

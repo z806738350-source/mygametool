@@ -20,6 +20,13 @@ interface ImageJournalEntry {
 
 const submissions = new Map<string, Promise<unknown>>();
 
+// Canvas originally supplied mediaType before data. Its frozen recovery inputs sort object keys.
+function orderedImageFields(_key: string, value: unknown): unknown {
+  if (!value || typeof value !== "object" || !("mediaType" in value) || !("data" in value)) return value;
+  const { mediaType, data, ...metadata } = value;
+  return { mediaType, data, ...Object.fromEntries(Object.entries(metadata).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) };
+}
+
 export async function waitForImageRequests(directory: string, ids: ReadonlySet<string>): Promise<void> {
   const files = new Set([...ids].flatMap(id => Array.from({ length: 8 }, (_, index) => path.resolve(directory, `${id}-${index}.json`))));
   for (;;) {
@@ -94,10 +101,12 @@ export async function imageRequestJournal(directory: string, recoveryId: string,
     async submitted(scope, input, create, signal) {
       const pending = (submissions.get(file) ?? Promise.resolve()).catch(() => undefined).then(async () => {
         signal?.throwIfAborted();
-        const fingerprint = createHash("sha256").update(scope).update(JSON.stringify(input)).digest("hex");
+        const digest = (json: string) => createHash("sha256").update(scope).update(json).digest("hex");
+        const fingerprint = digest(JSON.stringify(input, orderedImageFields));
         const previous = await readImageEntry(file);
         if (previous) {
-          if (previous.fingerprint !== fingerprint) throw new ImageGenerationError("The image input or provider changed. Restore the original settings to recover, or start a new generation.", 409);
+          // Other callers may have created an older receipt using their original property order.
+          if (previous.fingerprint !== fingerprint && previous.fingerprint !== digest(JSON.stringify(input))) throw new ImageGenerationError("The image input or provider changed. Restore the original settings to recover, or start a new generation.", 409);
           if (previous.state === "ready") {
             const saved = safeSavedResult(previous.result);
             if ("url" in saved) return saved;

@@ -2,7 +2,8 @@ import type { CanvasTable } from "./canvas-table.js";
 import { Type } from "typebox";
 import { canvasNodeLayout } from "./canvas-node-layout.js";
 import { Check } from "typebox/value";
-import type { AssetCanvasDocument, AssetCanvasNode } from "./contracts.js";
+import type { AssetCanvasDocument, AssetCanvasNode, ToolJob } from "./contracts.js";
+import type { CharacterViewDirection } from "./character-views.js";
 import { createAssetCanvasDocument, isAssetCanvasDocument } from "./asset-canvas.js";
 import type { CanvasMarkdownDocument } from "./canvas-document.js";
 import type { CanvasAssetCatalogEntry, UnavailableCanvasAsset } from "./canvas-assets.js";
@@ -10,6 +11,16 @@ import { ASSET_CANVAS_SCHEMA, ASSET_CANVAS_EDITOR_LAYOUT_SCHEMA } from "./asset-
 
 export type CanvasBoard = AssetCanvasDocument & { id: string };
 export interface CanvasBoardDetail { board: CanvasBoard; revision: string }
+export interface CanvasCharacterViewStatus {
+  nodeId: string;
+  setId: string;
+  designRevision: string;
+  direction: CharacterViewDirection;
+  viewRevision: string;
+  state: "preparing" | "changed" | "ready" | "not-submitted" | "running" | "available" | "recoverable" | "unknown" | "unavailable";
+  jobId?: string;
+}
+export interface CanvasBoardJobs { jobs: ToolJob[]; characterViews: CanvasCharacterViewStatus[] }
 export interface CanvasWorkspaceIndex {
   version: 1;
   mainDocumentId?: string;

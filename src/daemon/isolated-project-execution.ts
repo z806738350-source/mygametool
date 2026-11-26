@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { confirmIsolatedCommandFailure, getToolConfirmedFailure } from "./agent-tool-errors.js";
+import { confirmIsolatedCommandFailure, getToolConfirmedFailure, toolPreflightError } from "./agent-tool-errors.js";
 import { isDeepStrictEqual } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
@@ -40,6 +40,7 @@ import {
   readIsolatedVmStatus,
 } from "./isolated-vm-lifecycle.js";
 import { executionStorageSnapshot } from "./execution-storage-overview.js";
+import { ProjectExecutionDiscardConflict } from "./project-lifecycle.js";
 import type {
   ExecutionStorageOverview,
   ExecutionStorageSnapshot,
@@ -122,7 +123,9 @@ import {
   inheritIsolatedRepairProof,
   createIsolatedRepairPending,
   inheritIsolatedRepairPending,
+  getIsolatedCommandRejection,
   isolatedInputBudgetError,
+  isolatedReadinessError,
   isIsolatedInputBudgetError,
   reportIsolatedOperation,
   type IsolatedRepairTarget,
@@ -1690,7 +1693,7 @@ export class IsolatedProjectExecution {
       (!/^[0-9]{1,32}$/.test(generation) ||
         !Number.isSafeInteger(Number(generation)))
     )
-      throw new Error("Invalid review generation");
+      throw toolPreflightError("Invalid review generation", "invalid_recovery_input");
     await this.openRecoveryStorage();
     const current = await this.inventoryProject(project);
     if (!current?.dirty) {
@@ -1708,10 +1711,10 @@ export class IsolatedProjectExecution {
         pending.recoveryOperationId
       )
         return publicSourceReview(pending);
-      throw new Error("There is no dirty retained generation to review");
+      throw toolPreflightError("There is no dirty retained generation to review", "invalid_recovery_input");
     }
     if (generation !== undefined && generation !== String(current.generation))
-      throw new Error("Retained generation changed; inspect its current state");
+      throw toolPreflightError("Retained generation changed; inspect its current state", "invalid_recovery_input");
     generation = String(current.generation);
     const snapshot = await this.#reviewSnapshot(
       project,
@@ -2341,7 +2344,7 @@ export class IsolatedProjectExecution {
   async #report(
     state: Operation,
     phase: Parameters<typeof reportIsolatedOperation>[0]["phase"],
-    budgetError?: unknown,
+    rejectionError?: unknown,
   ): Promise<void> {
     await state.report(
       {
@@ -2356,10 +2359,10 @@ export class IsolatedProjectExecution {
         ...(state.snapshotId ? { snapshotId: state.snapshotId } : {}),
         ...(state.mode ? { mode: state.mode } : {}),
         ...(phase === "input_rejected"
-          ? { rejection: "input_budget" as const }
+          ? { rejection: getIsolatedCommandRejection(rejectionError) }
           : {}),
       },
-      budgetError,
+      rejectionError,
     );
   }
 
@@ -2500,6 +2503,7 @@ export class IsolatedProjectExecution {
   async retireProject(
     project: ProjectState,
     beforeRetire: () => Promise<void>,
+    discardExecutionGeneration?: string,
   ): Promise<{ deleted: true; absent?: boolean }> {
     if (!this.#retiring.has(project.id) || this.#projects.has(project.id))
       throw new Error("Stop the isolated project before deleting its data");
@@ -2530,6 +2534,10 @@ export class IsolatedProjectExecution {
     } catch {
       throw unavailable();
     }
+    const retainedGeneration = current?.dirty && !current.active ? String(current.generation) : undefined;
+    if (retainedGeneration !== discardExecutionGeneration)
+      throw new ProjectExecutionDiscardConflict(discardExecutionGeneration === undefined ? retainedGeneration : undefined);
+
     await beforeRetire();
     assertCurrent();
     const value = (await this.#control("retire", [], {
@@ -2537,6 +2545,7 @@ export class IsolatedProjectExecution {
       projectId: project.id,
       ...(current ? { generation: current.generation } : {}),
       confirmation: "DELETE_PROJECT_VOLUME",
+      ...(retainedGeneration === undefined ? {} : { discardUnsynced: true }),
     })) as { deleted?: unknown; absent?: boolean };
     if (value.deleted !== true)
       throw new Error("Isolated storage deletion was not confirmed");
@@ -3777,8 +3786,13 @@ export class IsolatedProjectExecution {
         throw confirmIsolatedCommandFailure(commandFailure!, state.id, code);
       }
       const result = await guard(() =>
-        this.#withSpace(state, () =>
-          applySourceChanges(
+        this.#withSpace(state, async () => {
+          // The verified complete capture equals this operation's original seed. There is nothing to publish over a concurrent host edit.
+          if (state.sourceContract && state.sourceContract.rawManifestId === state.sourceContract.baseManifestId) {
+            await assertSourcePublicationSettled(project.workspacePath);
+            return { changed: [] };
+          }
+          return applySourceChanges(
             project.workspacePath,
             baseline,
             verifyCapturedMedia(value.files, media, value.rasterReturnVersion),
@@ -3794,8 +3808,8 @@ export class IsolatedProjectExecution {
                 ? { sourceContract: state.sourceContract }
                 : {}),
             },
-          ),
-        ),
+          );
+        }),
       );
       combined.throwIfAborted();
       await this.#report(state, "published");
@@ -3910,11 +3924,9 @@ export class IsolatedProjectExecution {
       throw new Error("Private values cannot be passed to isolated execution");
     this.#admit(project.id);
     if (this.#projects.has(project.id))
-      throw new Error(
-        "Stop the existing project operation before starting another",
-      );
+      throw toolPreflightError("Wait for the existing project operation to finish before starting another", "project_execution_busy");
     if (this.#projects.size >= 2)
-      throw new Error("Two isolated operations are already running");
+      throw toolPreflightError("Two isolated operations are already running", "project_execution_busy");
     this.#projects.add(project.id);
     const state = this.#operation(project.id, options.hold === true, port);
     state.mode = mode;
@@ -3932,9 +3944,15 @@ export class IsolatedProjectExecution {
     try {
       await this.#report(state, "input_preflight");
       combined.throwIfAborted();
+      let storage: IsolatedProjectStorage | undefined;
       await this.vm?.ready();
-      await this.#health();
-      const storage = this.#mediumProfile ? await this.inventoryProject(project) : undefined;
+      try {
+        await this.#health(combined);
+        if (this.#mediumProfile) storage = await this.inventoryProject(project);
+      } catch (cause) {
+        combined.throwIfAborted();
+        throw isolatedReadinessError(cause);
+      }
       const profile = storage?.sourceManifestVersion === 2 ? getRuntimeCapacityProfile(storage.sourceProfileId).id : undefined;
       this.#admit(project.id);
       combined.throwIfAborted();
@@ -3953,8 +3971,6 @@ export class IsolatedProjectExecution {
             profile ? { profile, signal: combined } : undefined,
           );
       } catch (cause) {
-        if (!state.submitted && isIsolatedInputBudgetError(cause))
-          await this.#report(state, "input_rejected", cause);
         if (
           !this.#runtimeMedia &&
           cause instanceof Error &&
@@ -3989,13 +4005,11 @@ export class IsolatedProjectExecution {
           );
         } catch (cause) {
           if (!state.submitted && isRecoverySpaceInputRefusal(cause)) {
-            const rejection = isolatedInputBudgetError(
+            throw isolatedInputBudgetError(
               cause instanceof Error
                 ? cause.message
                 : "Storage admission failed before command submission",
             );
-            await this.#report(state, "input_rejected", rejection);
-            throw rejection;
           }
           throw cause;
         }
@@ -4027,11 +4041,9 @@ export class IsolatedProjectExecution {
         Buffer.byteLength(JSON.stringify(prepareInput), "utf8") >
         24 * 1024 * 1024
       ) {
-        const cause = isolatedInputBudgetError(
+        throw isolatedInputBudgetError(
           "The complete isolated seed header exceeds 24 MiB; no operation was submitted. Source data is still fully inline; reduce the source/package header rather than repeating the request.",
         );
-        await this.#report(state, "input_rejected", cause);
-        throw cause;
       }
       await this.#report(state, "prepare_submitting");
       this.#admit(project.id);
@@ -4090,6 +4102,8 @@ export class IsolatedProjectExecution {
         this.#settle(state);
       }
       if (state.released) await this.#releaseSpaceIfSettled(state, workspace);
+      if (!state.submitted && getIsolatedCommandRejection(cause))
+        await this.#report(state, "input_rejected", cause);
       throw cause;
     } finally {
       this.#preparing.delete(project.id);

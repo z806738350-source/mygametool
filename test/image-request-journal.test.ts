@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import { link, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import sharp from "sharp";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { hasSavedImageResult, imageRequestJournal } from "../src/daemon/image-request-journal.js";
 import { OpenAIImageGenerator, type ImageSubmission } from "../src/daemon/openai-image.js";
@@ -143,6 +145,40 @@ describe("synchronous image recovery journal", () => {
     await expect(generator.generate({ ...input, execution: await imageRequestJournal(folder, "job-0") })).resolves.toMatchObject({ bytes: PNG, requestId: "image-request-1" });
     expect(request.mock.calls.filter(([, options]) => options?.method === "POST")).toHaveLength(1);
     expect(request.mock.calls.filter(([, options]) => options?.method === "GET")).toHaveLength(2);
+  });
+
+  it.each(["managed Canvas", "direct"] as const)("downloads a legacy %s reference-image result after reopening", async origin => {
+    const folder = await directory(), key = "fixture-reference-key", mediaType = "image/png" as const;
+    const [red, blue] = await Promise.all(["red", "blue"].map(background =>
+      sharp({ create: { width: 2, height: 2, channels: 4, background } }).png().toBuffer()));
+    const images = [red, blue].map((bytes, i) => {
+      const data = bytes.toString("base64"), libraryAssetId = `reference-${i}`;
+      return origin === "managed Canvas" ? { mediaType, data, libraryAssetId } : { libraryAssetId, mediaType, data };
+    });
+    const model = "gpt-image-2.6-flare", settings = { ...input, model, imageModel: { provider: "kunpo", id: model } };
+    const request = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json({ data: [{ url: artifact }] }))
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+      .mockResolvedValueOnce(new Response(red, { headers: { "content-type": mediaType } }));
+    const generate = new OpenAIImageGenerator(key, base, request);
+    await expect(generate.generate({ ...settings, images, execution: await imageRequestJournal(folder, "direction-0") })).rejects.toThrow("download");
+
+    // Recreate the v1 fingerprint from the original insertion order even when new submissions use a newer journal.
+    const file = path.join(folder, "direction-0.json"), saved = JSON.parse(await readFile(file, "utf8"));
+    const parameters = { size: input.size, quality: "auto", output_format: "png", background: "auto", n: 1, response_format: "url", complexity: "high" };
+    const fingerprint = createHash("sha256").update(JSON.stringify([base, "api_key", key, {}]))
+      .update(JSON.stringify({ provider: "kunpo", model, prompt: input.prompt, parameters, images })).digest("hex");
+    await writeFile(file, JSON.stringify({ version: 1, fingerprint, state: "ready", result: saved.result }));
+
+    // The managed snapshot sorts reference object keys. Direct recovery preserves its original order.
+    const restored = origin === "managed Canvas" ? images.map(({ data, libraryAssetId, mediaType }) => ({ data, libraryAssetId, mediaType })) : images;
+    const recover = async (refs: typeof images, credential = key) => new OpenAIImageGenerator(credential, base, request)
+      .generate({ ...settings, images: refs, execution: await imageRequestJournal(folder, "direction-0", true) });
+    await expect(recover(restored, "different-key")).rejects.toMatchObject({ statusCode: 409 });
+    await expect(recover(restored.toReversed())).rejects.toMatchObject({ statusCode: 409 });
+    await expect(recover([{ ...restored[0], data: restored[1].data }, restored[1]])).rejects.toMatchObject({ statusCode: 409 });
+    await expect(recover(restored)).resolves.toMatchObject({ bytes: red });
+    expect(request.mock.calls.map(([, options]) => options?.method)).toEqual(["POST", "GET", "GET"]);
   });
 
   it.each([403, 408, 502])("preserves the original HTTP %i outcome after reopen without a replacement POST", async status => {

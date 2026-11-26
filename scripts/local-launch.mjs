@@ -169,7 +169,7 @@ async function compactBrowserStorage(paths) {
     const { compactProjectBrowserStorage } = await import("../dist/desktop/project-browser-storage.js");
     await compactProjectBrowserStorage(paths.data);
   } catch {
-    console.warn("旧项目的浏览器存储清理尚未完成，原数据仍受保护，下次启动或退出将重试。");
+    console.warn("旧项目的浏览器存储或诊断日志清理尚未完成，下次启动或退出将重试。");
   }
 }
 
@@ -207,11 +207,19 @@ async function message(socket, command) {
   });
 }
 
-async function recoverOwnedVm(paths, owner) {
+export async function recoverOwnedVm(paths, owner, exitedDaemonPid) {
   const lock = path.join(paths.execution, "manual-vm.lock");
-  const receipt = await privateJson(path.join(lock, "owner.json")).catch((error) => { if (error.code === "ENOENT") return undefined; throw error; });
+  const directory = await lstat(lock).catch((error) => { if (error.code === "ENOENT") return undefined; throw error; });
+  if (!directory) return;
+  if (!directory.isDirectory() || directory.uid !== process.getuid() || (directory.mode & 0o7777) !== 0o700 || await realpath(lock) !== lock) throw new Error("VM 租约目录未通过检查，已保留原记录。");
+  const receipt = await privateJson(path.join(lock, "owner.json"), 4096).catch((error) => { if (error.code === "ENOENT") return undefined; throw error; });
   if (!receipt) return;
-  if (receipt.version !== 1 || receipt.instance !== "omg" || receipt.ownerLaunchId !== owner.launchId || receipt.ownerParentPid !== owner.electronPid || !UUID.test(receipt.sessionId ?? "")) throw new Error("VM 回执不属于本次启动；未擅自停止它。");
+  if (receipt.version !== 1 || receipt.instance !== "omg" || !UUID.test(receipt.sessionId ?? "") ||
+      !["starting", "owned"].includes(receipt.state) || !Number.isSafeInteger(receipt.ownerPid) || receipt.ownerPid <= 1 ||
+      receipt.ownerLaunchId !== owner.launchId || receipt.ownerParentPid !== owner.electronPid ||
+      (exitedDaemonPid !== undefined && receipt.ownerPid !== exitedDaemonPid))
+    throw new Error("VM 回执不属于本次启动或守护进程；已保留原记录。");
+  if (exitedDaemonPid !== undefined && alive(exitedDaemonPid)) throw new Error("原守护进程的 PID 仍在使用，已保留 VM 回执。");
   const deadline = Date.now() + 30_000;
   while (alive(receipt.ownerPid) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 200));
   if (alive(receipt.ownerPid)) throw new Error("本次守护进程仍在关闭，保留 VM 回执和启动记录；请等待退出后重试。");
@@ -219,7 +227,7 @@ async function recoverOwnedVm(paths, owner) {
   console.log("回收本次启动拥有的测试 VM…");
   await run(path.join(paths.execution, "tools/lima/bin/limactl"), ["stop", "--tty=false", "omg"], environment, paths.execution, 60_000);
   // Remove only records that are still byte-for-byte owned by this launch.
-  const current = await privateJson(path.join(lock, "owner.json"));
+  const current = await privateJson(path.join(lock, "owner.json"), 4096);
   if (JSON.stringify(current) !== JSON.stringify(receipt)) throw new Error("VM 所有权回执已改变，保留记录。");
   await unlink(path.join(lock, "owner.json"));
   await unlink(path.join(lock, `owner-${receipt.sessionId}.tmp`)).catch((error) => { if (error.code !== "ENOENT") throw error; });
@@ -290,6 +298,8 @@ export async function startLocal(root, action = "start") {
     await protectEnvMetadata(paths.envFile);
     const environment = launchEnvironment(paths);
     await ensureBuild(paths, environment, buildAbort.signal);
+    const { ProjectLifecycle } = await import("../dist/daemon/project-lifecycle.js");
+    await new ProjectLifecycle(paths.data).load();
     await compactBrowserStorage(paths);
     await writePrivateJson(path.join(paths.data, "isolated-execution.json"), { version: 1, projectsDirectory: path.join(paths.data, "projects") });
     let reuse = false, restarts = 0;

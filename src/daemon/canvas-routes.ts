@@ -84,6 +84,9 @@ export function registerCanvasRoutes(app: FastifyInstance, options: {
   app.get<{ Params: { projectId: string; boardId: string } }>(boardRoute, async (request, reply) => {
     try { return await store.board(request.params.projectId, request.params.boardId); } catch (cause) { return failure(cause, reply); }
   });
+  app.get<{ Params: { projectId: string; boardId: string } }>(`${boardRoute}/jobs`, async (request, reply) => {
+    try { return await store.boardJobs(request.params.projectId, request.params.boardId); } catch (cause) { return failure(cause, reply); }
+  });
   app.put<{ Params: { projectId: string; boardId: string }; Body: { board: CanvasBoard; revision: string } }>(boardRoute, { bodyLimit: 4 * 1024 * 1024 }, async (request, reply) => {
     if (!isCanvasBoard(request.body?.board) || request.body.board.id !== request.params.boardId || typeof request.body.revision !== "string") return reply.code(400).send({ error: "Invalid canvas board update" });
     try { return await store.saveBoard(request.params.projectId, request.body.board, request.body.revision); } catch (cause) { return failure(cause, reply); }

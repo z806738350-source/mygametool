@@ -18,7 +18,7 @@ import {
   CheckpointStore,
 } from "./checkpoints.js";
 import { CheckpointFileTooLargeError } from "./checkpoint-objects.js";
-import { ProjectWriteError, ProjectWrites } from "./project-writes.js";
+import { isConversationControlReply, isProjectMetadataRequest, ProjectWriteError, ProjectWrites, releasesPreview } from "./project-writes.js";
 import {
   turnRange,
   type StoredCheckpointUndone,
@@ -40,25 +40,27 @@ export function registerCheckpointRoutes(
     events: RuntimeEventBus;
     busy: (id: string) => boolean;
     snapshot: (project: ProjectState) => Promise<string>;
+    beforeRestore?: (project: ProjectState) => Promise<void>;
   },
 ) {
   const { store, writes, projects, conversations, agents, previews, events } =
     options;
   // Cancel remains available while a boundary waits for generation to settle.
   // Upgrading a story and copying its Library media take the workspace to themselves, as Undo does.
-  const exempt = (url: string) =>
-    /\/checkpoints\/|\/events(?:\?|$)/.test(url) ||
-    /\/execution-storage(?:\/|\?|$)/.test(url) ||
-    /\/cancel(?:\?|$)/.test(url) ||
-    /\/interactive-story\/(?:upgrade|library-media)(?:\/|\?|$)/.test(url);
+  const exempt = (route: string) =>
+    /\/checkpoints\/|\/events$/.test(route) ||
+    /\/execution-storage(?:\/|$)/.test(route) ||
+    /\/cancel$/.test(route) ||
+    /\/interactive-story\/(?:upgrade|library-media)(?:\/|$)/.test(route);
   app.addHook("preHandler", async (request, reply) => {
     const id = (request.params as { projectId?: string }).projectId;
     if (!id) return;
     reply.header("x-workspace-version", writes.version(id));
-    if (exempt(request.url)) return;
+    const route = request.routeOptions.url ?? "";
+    if (exempt(route) || releasesPreview(request.method, route)) return;
     if (
       request.method === "DELETE" &&
-      /^\/projects\/[^/?]+(?:\?|$)/.test(request.url)
+      route === "/projects/:projectId"
     ) {
       try {
         writes.assertVersion(
@@ -71,11 +73,13 @@ export function registerCheckpointRoutes(
       return;
     }
     try {
+      const metadata = isProjectMetadataRequest(request.method, route) || isConversationControlReply(request, agents);
       const project = projects.get(id);
+      const reading = request.method === "GET" || request.method === "HEAD";
+      const inspectPreview = route === "/projects/:projectId/preview/inspect";
       if (
-        project &&
-        (request.method !== "GET" ||
-          /\/(?:canvas|playable|preview)(?:\/|\?|$)/.test(request.url)) &&
+        project && !metadata && !inspectPreview &&
+        (!reading || /\/(?:canvas|playable|preview)(?:\/|$)/.test(route)) &&
         (await store.unfinished(project))
       ) {
         return reply.code(409).send({
@@ -84,7 +88,7 @@ export function registerCheckpointRoutes(
           code: "workspace_recovery",
         });
       }
-      if (/\/conversations(?:\/|\?|$)/.test(request.url)) {
+      if (/\/conversations(?:\/|$)/.test(route)) {
         if (
           request.method !== "GET" &&
           writes.isMutating(id) &&
@@ -94,7 +98,7 @@ export function registerCheckpointRoutes(
             "Another workspace operation is running.",
             "workspace_busy",
           );
-        if (request.method !== "GET")
+        if (request.method !== "GET" && !metadata)
           writes.assertVersion(
             id,
             request.headers["x-workspace-version"] as string | undefined,
@@ -106,14 +110,12 @@ export function registerCheckpointRoutes(
       if (request.method === "PUT" && request.routeOptions.url === "/projects/:projectId/settings/ink-studio") return;
       // Wait before entering the drain set: a closing turn's snapshot needs
       // this set empty, while publish/build need that snapshot to finish.
-      if (/\/(?:publish|interactive-story\/build)(?:\?|$)/.test(request.url))
+      if (/\/(?:publish|interactive-story\/build)$/.test(route))
         await agents.turnsClosed(id);
       // Export reads the current workspace, including from a project list
       // that has not observed its version. Still drain it before a restore.
-      const read = request.method === "GET" || request.method === "HEAD" ||
+      const read = reading || inspectPreview ||
         (request.method === "POST" && request.routeOptions.url === "/projects/:projectId/export");
-      // Naming changes project metadata, not an editor's workspace content.
-      const metadata = request.method === "PATCH" && request.routeOptions.url === "/projects/:projectId";
       writes.track(
         request,
         await writes.enter(
@@ -131,7 +133,7 @@ export function registerCheckpointRoutes(
     const id = (request.params as { projectId?: string }).projectId;
     // A normal read's content belongs to its pre-handler version. A restore
     // can start after its handler settles, before this response is sent.
-    if (id && exempt(request.url))
+    if (id && exempt(request.routeOptions.url ?? ""))
       reply.header("x-workspace-version", writes.version(id));
   });
 
@@ -239,6 +241,7 @@ export function registerCheckpointRoutes(
             "Recover the interrupted file restore first.",
             "workspace_busy",
           );
+        await options.beforeRestore?.(project);
         await previews.stop(project);
         const previousNotice = await readWorkspaceNotice(project);
         const changed = new Set<string>();

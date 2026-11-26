@@ -35,7 +35,7 @@ export class ConversationManager {
   readonly #pending = new Map<string, { stored: StoredConversation; manager: SessionManager; titled: boolean }>();
   readonly #cache: ConversationCache;
 
-  constructor(images?: ConversationImageStore) { this.#cache = new ConversationCache(images); }
+  constructor(images?: ConversationImageStore, private readonly onUnreadable?: (file: string) => void) { this.#cache = new ConversationCache(images); }
 
   forget(project: ProjectState): void {
     for (const [id, pending] of this.#pending) if (pending.stored.summary.projectId === project.id) this.#pending.delete(id);
@@ -49,7 +49,7 @@ export class ConversationManager {
   }
 
   async list(project: ProjectState): Promise<ConversationSummary[]> {
-    const persisted = (await this.#sessions(project)).map((session) => summary(project.id, session));
+    const persisted = (await this.#sessions(project)).map(session => session.summary);
     const persistedIds = new Set(persisted.map((conversation) => conversation.id));
     for (const conversationId of persistedIds) this.#pending.delete(key(project.id, conversationId));
     const pending = [...this.#pending.values()]
@@ -97,10 +97,10 @@ export class ConversationManager {
   }
 
   async get(project: ProjectState, conversationId: string): Promise<StoredConversation | undefined> {
-    const session = (await this.#sessions(project)).find((candidate) => candidate.id === conversationId);
+    const session = (await this.#sessions(project)).find(candidate => candidate.summary.id === conversationId);
     if (session) {
       this.#pending.delete(key(project.id, conversationId));
-      return { summary: summary(project.id, session), sessionPath: session.path };
+      return session;
     }
     return this.#pending.get(key(project.id, conversationId))?.stored;
   }
@@ -206,18 +206,26 @@ export class ConversationManager {
     return { mode: state.mode, ...(state.plan ? { plan: state.plan } : {}) };
   }
 
-  async #sessions(project: ProjectState): Promise<ConversationInfo[]> {
+  async #sessions(project: ProjectState): Promise<StoredConversation[]> {
     const directory = sessionDirectory(project);
     const files = await readdir(directory).catch((cause: NodeJS.ErrnoException) => {
       if (cause.code === "ENOENT") return [];
       throw cause;
     });
-    const sessions: ConversationInfo[] = [];
+    const sessions: StoredConversation[] = [];
     for (const name of files) {
       if (!name.endsWith(".jsonl")) continue;
       const file = path.join(directory, name);
-      const info = await this.#cache.info(project, file);
-      if (info) sessions.push(info);
+      try {
+        const info = await this.#cache.info(project, file);
+        if (info) sessions.push({ summary: summary(project.id, info), sessionPath: file });
+      } catch (cause) {
+        // Invalid Pi records, dates and per-file access must not hide sibling chats.
+        const code = (cause as NodeJS.ErrnoException).code;
+        if (!(cause instanceof TypeError || cause instanceof RangeError || cause instanceof SyntaxError ||
+          code === "ENOENT" || code === "EISDIR" || code === "EACCES" || code === "EPERM" || code === "ELOOP")) throw cause;
+        this.onUnreadable?.(file);
+      }
     }
     return sessions;
   }

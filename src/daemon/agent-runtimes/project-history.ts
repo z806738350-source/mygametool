@@ -99,7 +99,7 @@ async function markCodexCompaction(root: string): Promise<void> {
 }
 
 /** Checkpoint the private stores and rewrite pages after native project deletion. */
-export async function compactCodexHistory(root: string): Promise<void> {
+export async function compactCodexHistory(root: string, pendingOnly = false): Promise<void> {
   root = path.resolve(root);
   const directory = path.join(root, "codex-home");
   for (const name of CODEX_HISTORY_FILES) {
@@ -107,6 +107,7 @@ export async function compactCodexHistory(root: string): Promise<void> {
     const marker = codexCompactionMarker(directory, name);
     try {
       const pending = await ordinary(root, marker);
+      if (pendingOnly && !pending) continue;
       if (pending && !(await lstat(marker)).isFile()) continue;
       let hasSidecars = false;
       // SQLite can open or remove adjacent files while recovering or checkpointing.
@@ -137,7 +138,7 @@ export async function compactCodexHistory(root: string): Promise<void> {
       }
       if (pending) await rm(marker, { force: true });
     } catch {
-      // An unavailable, busy or unfamiliar store can be left for a later shutdown.
+      // An unavailable, busy or unfamiliar store can be retried at startup or shutdown.
     }
   }
 }

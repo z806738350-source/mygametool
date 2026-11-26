@@ -361,6 +361,7 @@ export class PluginSetupManager {
     return result;
   }
   async installDraft(id: string, revision: string): Promise<PluginSetupState> {
+    this.capabilities.configuration.assertAvailable();
     const state = await this.#loadState(id);
     if (state.mode === "configure") throw new Error("Configuration sessions cannot install plugin packages");
     if (state.busy) throw new Error("Wait for the builder to finish before installing");

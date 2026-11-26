@@ -48,12 +48,10 @@ if (localLaunch) {
 }
 const developmentRendererUrl = process.env.OHMYGAME_RENDERER_URL ?? "http://127.0.0.1:43120";
 const useBuiltRenderer = app.isPackaged || process.argv.includes("--built-renderer");
-const storageCleanup = new StorageCleanupService({
-  root: repositoryRoot,
-  supported: !app.isPackaged && process.platform === "darwin" && process.arch === "arm64" && useBuiltRenderer && Boolean(localLaunch)
+const manualSourceLaunch = !app.isPackaged && process.platform === "darwin" && process.arch === "arm64" && useBuiltRenderer
     && localLaunch?.profileDirectory === path.join(repositoryRoot, ".runtime/local-execution/manual-data/desktop")
-    && (!localLaunch.envFile || localLaunch.envFile === path.join(repositoryRoot, ".env")),
-});
+    && (!localLaunch.envFile || localLaunch.envFile === path.join(repositoryRoot, ".env"));
+const storageCleanup = new StorageCleanupService({ root: repositoryRoot, supported: manualSourceLaunch });
 if (!useBuiltRenderer) {
   const renderer = new URL(developmentRendererUrl);
   if (renderer.protocol !== "http:" || !isLoopbackHostHeader(renderer.host)) throw new Error("The development renderer must use loopback HTTP");
@@ -557,6 +555,12 @@ try {
     allowedOrigins: [rendererOrigin],
     piAgentDirectory: process.env.PI_CODING_AGENT_DIR ?? path.join(app.getPath("userData"), "pi-agent"),
     ...(localLaunch ? { localEnvFile: localLaunch.envFile, reuseLocalEnv: localLaunch.reuseLocalEnv, localLaunchId: localLaunch.launchId } : {}),
+    ...(manualSourceLaunch && dataDirectory === path.dirname(localLaunch.profileDirectory) ? {
+      recoverExitedDaemonVm: async (pid: number) => {
+        const launcher = await import(pathToFileURL(path.join(repositoryRoot, "scripts/local-launch.mjs")).href);
+        await launcher.recoverOwnedVm(launcher.launchPaths(repositoryRoot), { launchId: localLaunch.launchId, electronPid: process.pid }, pid);
+      },
+    } : {}),
     bundledPluginsDirectory: app.isPackaged ? path.join(process.resourcesPath, "plugins") : undefined,
     playerDirectory: app.isPackaged
       ? path.join(process.resourcesPath, "app.asar.unpacked", "dist", "player")

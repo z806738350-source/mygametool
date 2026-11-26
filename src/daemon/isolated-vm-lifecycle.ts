@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, realpath, rename, rm, rmdir } from "node:fs/promises";
 import path from "node:path";
+import { getIsolatedCommandRejection, isolatedReadinessError, isolatedVmLeaseBusyError } from "./isolated-tool-receipts.js";
 
 async function vmCommand(
   runtimeRoot: string,
@@ -87,7 +88,6 @@ export class IsolatedVmLifecycle {
   readonly #lock: string;
   readonly #sessionId = randomUUID();
   #starting?: Promise<void>;
-  #readySucceeded = false;
   #closing?: Promise<void>;
   #owned = false;
   #locked = false;
@@ -111,14 +111,17 @@ export class IsolatedVmLifecycle {
   ready(): Promise<void> {
     if (this.#closed)
       return Promise.reject(new Error("Isolated execution is closing"));
-    if (!this.#starting || this.#readySucceeded) {
-      this.#readySucceeded = false;
-      this.#starting = this.#start().then(() => {
-        this.#readySucceeded = true;
-      });
-    }
-    // A rejected start/status remains latched: its outcome needs confirmed cleanup.
-    return this.#starting;
+    return this.#starting ??= this.#start().then(
+      () => { this.#starting = undefined; },
+      cause => {
+        // A failed start can already have changed the VM. Only retry known pre-start refusals.
+        if (!this.#locked || getIsolatedCommandRejection(cause)) {
+          this.#starting = undefined;
+          if (!getIsolatedCommandRejection(cause)) throw isolatedReadinessError(cause);
+        }
+        throw cause;
+      },
+    );
   }
 
   async #command(args: string[], timeout: number): Promise<string> {
@@ -217,15 +220,16 @@ export class IsolatedVmLifecycle {
     } else {
       try {
         await mkdir(this.#lock, { mode: 0o700 });
-      } catch {
-        throw new Error(
-          "The isolated VM has an existing lifecycle lease; finish or clean up that session first",
-        );
+      } catch (cause) {
+        if ((cause as NodeJS.ErrnoException).code === "EEXIST") {
+          throw isolatedVmLeaseBusyError("The isolated VM has an existing lifecycle lease; finish or clean up that session first");
+        }
+        throw new Error("The isolated VM lifecycle lease could not be created", { cause });
       }
       this.#locked = true;
     }
     try {
-      const status = await this.#status();
+      const status = await this.#status().catch(cause => { throw isolatedReadinessError(cause); });
       await this.#assertLease(this.#owned, this.#owned ? "owned" : undefined);
       if (status === "Running") {
         if (!this.#owned) await this.#release();

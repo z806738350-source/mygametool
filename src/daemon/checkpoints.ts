@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type { Stats } from "node:fs";
 import {
   chmod,
@@ -16,6 +17,8 @@ import {
 import path from "node:path";
 import ignore, { type Ignore } from "ignore";
 import type { ProjectState, TurnChanges } from "../shared/contracts.js";
+import { CANVAS_BOARD_SCHEMA, CANVAS_LAYOUT_SCHEMA, canvasBoardPath, isCanvasIndex, type CanvasBoard } from "../shared/canvas-workspace.js";
+import { parseCanvasJson } from "./canvas-files.js";
 import { countLineChanges } from "../shared/line-diff.js";
 import { changeText, MAX_CHANGE_BYTES } from "./file-line-changes.js";
 import {
@@ -366,21 +369,20 @@ export class CheckpointStore {
   }
 
   /**
-   * Resolves when no snapshot, restore or undo of the project is under way or
-   * waiting in this store. A caller that is about to remove the project waits
+   * Resolves after checkpoint writes and maintenance settle for a project, or
+   * for all current projects during shutdown. A caller removing a project waits
    * for it, because an operation that is still running writes to the store.
    * From then on until the folder is gone it must ask for no further one: an
    * operation that starts while the folder is being removed writes into it.
    */
-  async settled(project: CheckpointProject): Promise<void> {
-    const key = checkpointDirectory(project);
-    // An operation that is asked for while this waits is waited for as well.
-    for (
-      let queued = this.#queues.get(key);
-      queued;
-      queued = this.#queues.get(key)
-    )
-      await queued;
+  async settled(project?: CheckpointProject): Promise<void> {
+    const keys = project ? [checkpointDirectory(project)] : new Set([...this.#queues.keys(), ...this.#prunes.keys()]);
+    await Promise.all([...keys].map(async key => {
+      // Pruning starts reading references before it queues its filesystem writes.
+      while (this.#queues.has(key) || this.#prunes.has(key)) {
+        await Promise.allSettled([this.#queues.get(key), this.#prunes.get(key)?.result]);
+      }
+    }));
   }
 
   /** Lists the files that differ between two snapshots, in path order. A path that either of them could not read is not listed. */
@@ -401,6 +403,37 @@ export class CheckpointStore {
         kind: !change.from ? "added" : !change.to ? "removed" : "modified",
       }))
       .sort((left, right) => compare(left.path, right.path));
+  }
+
+  /** A reopened board may autosave its pan/zoom before a failed image request is resumed. */
+  async onlyCanvasViewportChanged(project: CheckpointProject, from: string, to: string): Promise<boolean> {
+    const gitdir = checkpointDirectory(project);
+    const [before, after] = await Promise.all([readCommit(gitdir, from), readCommit(gitdir, to)]);
+    if (before.unreadable.length || after.unreadable.length) return false;
+    const { changes, omitted } = await this.#compare(gitdir, before, after);
+    if (omitted.length || !changes.length) return false;
+    const layouts = [];
+    for (const change of changes) {
+      const id = /^canvas\/editor\/([a-zA-Z0-9_-]{1,100})\.json$/.exec(change.path)?.[1];
+      if (!id || !change.from || !change.to || change.from.mode !== "100644" || change.to.mode !== change.from.mode) return false;
+      layouts.push({ id, path: change.path, from: change.from.oid, to: change.to.oid });
+    }
+    // Canvas uses this same size limit and schemas when it opens project JSON.
+    const limit = 4 * 1024 * 1024;
+    const text = (bytes: Uint8Array | undefined) => new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    const index: unknown = JSON.parse(text(await this.read(project, from, "canvas/index.json", limit)));
+    if (!isCanvasIndex(index)) return false;
+    for (const layout of layouts) {
+      if (!index.boards.some(board => board.id === layout.id)) return false;
+      const boardPath = canvasBoardPath(layout.id);
+      const board = parseCanvasJson<CanvasBoard>(text(await this.read(project, from, boardPath, limit)), boardPath, CANVAS_BOARD_SCHEMA);
+      if (board.id !== layout.id) return false;
+      const readLayout = async (oid: string) => parseCanvasJson<CanvasBoard["editorLayout"]>(
+        text(await readBlobLimited(gitdir, oid, limit)), layout.path, CANVAS_LAYOUT_SCHEMA);
+      const [left, right] = await Promise.all([readLayout(layout.from), readLayout(layout.to)]);
+      if (isDeepStrictEqual(left.viewport, right.viewport) || !isDeepStrictEqual({ ...left, viewport: right.viewport }, right)) return false;
+    }
+    return true;
   }
 
   /** Immutable, bounded text statistics for the end-of-turn summary. */

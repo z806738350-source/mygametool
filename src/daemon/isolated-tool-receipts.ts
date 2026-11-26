@@ -22,7 +22,7 @@ export interface IsolatedOperationReceipt {
   readonly generation?: number;
   readonly snapshotId?: string;
   readonly phase: (typeof phases)[number];
-  readonly rejection?: "input_budget";
+  readonly rejection?: "input_budget" | "vm_lease_busy" | "readiness_check";
   readonly mode?: "shell" | "build" | "install" | "preview";
 }
 export interface IsolatedRepairTarget {
@@ -95,7 +95,8 @@ type Scope = Evidence & {
   resolutions: readonly IsolatedRepairResolution[];
 };
 const scopes = new AsyncLocalStorage<Scope>();
-const budgets = new WeakSet<object>();
+type Rejection = NonNullable<IsolatedOperationReceipt["rejection"]>;
+const rejections = new WeakMap<object, Rejection>();
 const trusted = new WeakMap<object, Evidence>();
 const repairProofs = new WeakMap<object, Readonly<IsolatedRepairProof>>();
 const repairPending = new WeakMap<object, Readonly<IsolatedRepairPending>>();
@@ -106,14 +107,27 @@ const resolutions = new WeakMap<
 const failureMessage =
   "The isolated command receipt could not be safely recorded. Review the original operation before continuing; do not repeat it.";
 
-/** This brand describes a file-budget rejection, not whether an entire tool had effects. */
-export function isolatedInputBudgetError(message: string): Error {
-  const error = new Error(message);
-  budgets.add(error);
+/** The reason alone does not prove that every command in a tool call was rejected. */
+export function isolatedCommandRejection(message: string | Error, reason: Rejection): Error {
+  const error = typeof message === "string" ? new Error(message) : message;
+  rejections.set(error, reason);
   return error;
 }
+export function isolatedInputBudgetError(message: string): Error {
+  return isolatedCommandRejection(message, "input_budget");
+}
+export function isolatedVmLeaseBusyError(message: string): Error {
+  return isolatedCommandRejection(message, "vm_lease_busy");
+}
+/** A read-only runtime check failed, or VM admission ended without acquiring a lease or starting the VM. */
+export function isolatedReadinessError(cause: unknown): Error {
+  return isolatedCommandRejection(cause instanceof Error ? cause : "Isolated readiness check failed", "readiness_check");
+}
+export function getIsolatedCommandRejection(value: unknown): Rejection | undefined {
+  return value && typeof value === "object" ? rejections.get(value) : undefined;
+}
 export function isIsolatedInputBudgetError(value: unknown): boolean {
-  return !!value && typeof value === "object" && budgets.has(value);
+  return getIsolatedCommandRejection(value) === "input_budget";
 }
 export function getIsolatedOperationReceipts(
   value: unknown,
@@ -717,7 +731,8 @@ export async function withIsolatedOperationScope<T>(
           const retained = new Error(
             cause instanceof Error ? cause.message : failureMessage,
           );
-          if (isIsolatedInputBudgetError(cause)) budgets.add(retained);
+          const rejection = getIsolatedCommandRejection(cause);
+          if (rejection) rejections.set(retained, rejection);
           inheritIsolatedRepairPending(retained, cause);
           trusted.set(retained, scope);
           throw retained;
@@ -734,7 +749,7 @@ export async function withIsolatedOperationScope<T>(
 /** Await before prepare/run. No scope preserves existing non-agent backend callers. */
 export async function reportIsolatedOperation(
   input: IsolatedOperationReceipt,
-  budgetError?: unknown,
+  rejectionError?: unknown,
 ): Promise<void> {
   const scope = scopes.getStore();
   if (!scope) return;
@@ -744,7 +759,7 @@ export async function reportIsolatedOperation(
       !receipt ||
       scope.invalid ||
       (receipt.phase === "input_rejected" &&
-        !isIsolatedInputBudgetError(budgetError))
+        receipt.rejection !== getIsolatedCommandRejection(rejectionError))
     ) {
       scope.invalid = true;
       throw new Error(failureMessage);
@@ -799,7 +814,7 @@ export function parseIsolatedOperationReceipt(
       (typeof input.snapshotId !== "string" ||
         !/^[a-f0-9]{64}$/.test(input.snapshotId))) ||
     (input.phase === "input_rejected"
-      ? input.rejection !== "input_budget"
+      ? !isCommandRejection(input.rejection)
       : input.rejection !== undefined) ||
     (input.mode !== undefined &&
       !["shell", "build", "install", "preview"].includes(String(input.mode)))
@@ -817,7 +832,7 @@ export function parseIsolatedOperationReceipt(
     ...(input.snapshotId !== undefined
       ? { snapshotId: input.snapshotId as string }
       : {}),
-    ...(input.rejection ? { rejection: "input_budget" as const } : {}),
+    ...(input.rejection ? { rejection: input.rejection as Rejection } : {}),
     ...(input.mode
       ? { mode: input.mode as IsolatedOperationReceipt["mode"] }
       : {}),
@@ -883,8 +898,11 @@ export function isolatedCommandsNotSubmitted(
   return [...operations.values()].every(
     (receipt) =>
       receipt.phase === "input_rejected" &&
-      receipt.rejection === "input_budget",
+      isCommandRejection(receipt.rejection),
   );
+}
+function isCommandRejection(value: unknown): value is Rejection {
+  return value === "input_budget" || value === "vm_lease_busy" || value === "readiness_check";
 }
 /** Resolve a host task alias without guessing a user or granting receipt evidence. */
 export function retainedToolTask(

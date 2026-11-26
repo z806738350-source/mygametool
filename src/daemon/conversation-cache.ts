@@ -28,8 +28,8 @@ export class ConversationCache {
   constructor(private readonly images?: ConversationImageStore) {}
 
   async info(project: ProjectState, file: string): Promise<ConversationInfo | undefined> {
-    const stats = await stat(file).catch(() => undefined);
-    if (!stats) { this.#metadata.delete(file); this.#cache.delete(file); return undefined; }
+    const stats = await sessionStat(file);
+    if (!stats?.isFile()) { this.#metadata.delete(file); this.#cache.delete(file); return undefined; }
     const signature = fileSignature(stats);
     const cached = this.#metadata.get(file);
     if (cached?.signature === signature) return cached.info;
@@ -58,8 +58,8 @@ export class ConversationCache {
   }
 
   async #read(project: ProjectState, file: string): Promise<SessionManager | undefined> {
-    const stats = await stat(file).catch(() => undefined);
-    if (!stats) { this.#cache.delete(file); return undefined; }
+    const stats = await sessionStat(file);
+    if (!stats?.isFile()) { this.#cache.delete(file); return undefined; }
     const signature = fileSignature(stats);
     const cached = this.#cache.get(file);
     if (cached?.signature === signature) {
@@ -119,7 +119,7 @@ export class ConversationCache {
     this.#cache.set(file, loaded);
     while (this.#cache.size > 32) this.#cache.delete(this.#cache.keys().next().value!);
     // A run may finish while this asynchronous read yields. Include its final append.
-    const latest = await stat(file).catch(() => undefined);
+    const latest = await sessionStat(file);
     if (!latest || fileSignature(latest) !== signature) return this.#read(project, file);
     return manager;
   }
@@ -137,6 +137,13 @@ export class ConversationCache {
     }) as typeof message.content;
     return entry;
   }
+}
+
+function sessionStat(file: string) {
+  return stat(file).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") throw error;
+    return undefined;
+  });
 }
 
 async function hashPrefix(file: string, size: number): Promise<Hash> {

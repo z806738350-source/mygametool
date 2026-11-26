@@ -193,6 +193,7 @@ describe("bundled plugins", () => {
       displayName: "Web Game Studio",
       projectTypes: ["web-game"],
       skills: [
+        { id: "skills/eight-direction-character/SKILL.md", name: "Eight Direction Character" },
         { name: "Game Playtest" },
         { name: "Game Ui Frontend" },
         { name: "Phaser 2d Game" },

@@ -1,3 +1,4 @@
+import { spriteWalkFinishTool } from "../sprite-walk-agent.js";
 import { assertLocalExecutionAllowed, LOCAL_EXECUTION_ENABLED } from "../local-execution-policy.js";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -168,6 +169,7 @@ export class AgentRuntimeService {
     await recoverAgentProcesses(path.join(this.#root, "processes"));
     await recoverAgentDirectories(path.join(this.#root, "sessions"));
     await recoverAgentDirectories(path.join(this.#root, "probes"));
+    await compactCodexHistory(this.#root, true);
     try {
       const stored = JSON.parse(
         await readFile(path.join(this.#root, "limits.json"), "utf8"),
@@ -772,11 +774,11 @@ export class AgentRuntimeService {
     nativeSession = new NativeCodingSession({
       runtime: request.runtime,
       // Native tool schemas and image-preparation instructions are fixed at session creation.
-      ...(request.runtime === "codex-cli" ? { contextVersion: "controlled-codex-v16" } : {}),
-      // Retain the existing Skill restrictions while rebuilding older image/tool contracts.
-      ...(request.runtime === "qoder-cli" ? { contextVersion: "controlled-qoder-v15" } : {}),
+      ...(request.runtime === "codex-cli" ? { contextVersion: "controlled-codex-v20" } : {}),
+      ...(request.runtime === "qoder-cli" ? { contextVersion: "controlled-qoder-v19" } : {}),
       model: request.model,
       supportsImages,
+      finishWalkReview: spriteWalkFinishTool(request.tools),
       ...(request.reasoningLevel
         ? { nativeReasoningLevel: request.reasoningLevel }
         : {}),

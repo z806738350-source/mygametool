@@ -160,6 +160,7 @@ export interface NativeSessionOptions {
   snapshotBeforeMessage?: () => Promise<string>;
   /** Text that the next message must carry, such as a notice that files were restored. */
   turnNotice?: () => Promise<string | undefined>;
+  finishWalkReview?: (signal: AbortSignal) => Promise<string | undefined>;
   requestApproval(
     details: ApprovalRequestDetails,
     toolCallId: string,
@@ -819,6 +820,17 @@ export class NativeCodingSession implements CodingSession {
             ...(requiresImageInput ? { requiresImageInput: true } : {}),
           },
         );
+      }
+      while (outcome.status === "completed" && this.options.finishWalkReview && !this.#readOnly &&
+          !this.#steering.length && !this.#followUps.length && !signal.aborted && !this.options.continuationTools?.stopRequested) {
+        const notice = await this.options.finishWalkReview(signal);
+        if (!notice || signal.aborted || this.#steering.length || this.#followUps.length) break;
+        await this.options.assertContinuation?.();
+        signal.throwIfAborted();
+        turn.closeAssistant("stop");
+        turn = new TurnRecorder(this, this.options.model);
+        bindRecorder();
+        outcome = await runNative({ text: notice, images: [], readOnly: this.#readOnly, ...(requiresImageInput ? { requiresImageInput: true } : {}) });
       }
     } catch (cause) {
       outcome = signal.aborted

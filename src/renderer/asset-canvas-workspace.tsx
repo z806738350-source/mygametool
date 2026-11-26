@@ -1,5 +1,6 @@
 import { isMeshyModelReference } from "../shared/disabled-media-providers.js";
 import { workspaceVersion } from "./workspace-version.js";
+import type { CanvasCharacterViewStatus } from "../shared/canvas-workspace.js";
 import { validVideoReferencePreparation, VIDEO_REFERENCE_BUDGET_ERROR } from "../shared/video-reference-preparation.js";
 import { CanvasTableNode, type CanvasTables, type TableNodeRuntime } from "./canvas-table-node.js";
 import {
@@ -333,6 +334,9 @@ type ReferenceStripRuntime = Omit<ReferenceMediaNodeRuntime, "generating" | "err
 interface ImageNodeRuntime extends ReferenceMediaNodeRuntime {
   models: ImageModel[];
   providers: MediaProviderStatus[];
+  managed?: CanvasCharacterViewStatus;
+  onViewOriginal?: () => void;
+  onPrepareRevision?: () => void;
 }
 
 interface VideoNodeRuntime extends ReferenceMediaNodeRuntime {
@@ -387,7 +391,7 @@ const STORY_NODE_TYPES: NodeTypes = {
   file: FileNode,
 };
 
-export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled, hidden = false, storage, documents, tables, assets: localAssets, conflicted = false, overlay, onSaveReady, onSyncReady, onResolveReady, onStatusChange, onSelectionChange, expandedDocument }: {
+export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled, hidden = false, storage, documents, tables, assets: localAssets, conflicted = false, overlay, onSaveReady, onSyncReady, onResolveReady, onStatusChange, onSelectionChange, expandedDocument, onAskAgent }: {
   project: ProjectState;
   initialNodeId?: string;
   onInitialNodeHandled?: () => void;
@@ -403,6 +407,7 @@ export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled
   onResolveReady?: (resolve: ((version: "local" | "remote") => Promise<void>) | undefined) => void;
   onStatusChange?: (status: "loading" | "saved" | "saving" | "error" | "sync-error" | "load-error") => void;
   onSelectionChange?: (nodes: AssetCanvasNode[]) => void;
+  onAskAgent?: (text: string) => void;
   expandedDocument?: { id: string; nodeId?: string; busy?: boolean; onClose(): void };
 }) {
   const projectId = project.id;
@@ -480,6 +485,7 @@ export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled
   const textModelCatalog = useAgentModels();
   const defaultTextModel = project.modelSelections?.agent ?? textModelCatalog.defaultModel ?? textModelCatalog.models[0];
   const [canvasJobs, setCanvasJobs] = useState<Record<string, ToolJob>>({});
+  const [characterViews, setCharacterViews] = useState<Record<string, CanvasCharacterViewStatus>>({});
   const [revealNodeIds, setRevealNodeIds] = useState<string[]>([]);
   const canvasJobsRef = useRef(canvasJobs); canvasJobsRef.current = canvasJobs;
   const [mediaConfirmation, setMediaConfirmation] = useState<{ nodeId: string; jobId: string }>();
@@ -620,8 +626,11 @@ export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled
     let timer: number | undefined;
     const poll = async () => {
       try {
-        const jobs = await storageRef.current.jobs();
+        const storage = storageRef.current;
+        const snapshot = project.type === "web-game" && storage.boardJobs ? await storage.boardJobs() : undefined;
+        const jobs = snapshot?.jobs ?? await storage.jobs();
         if (stopped) return;
+        if (snapshot) setCharacterViews(Object.fromEntries(snapshot.characterViews.map(view => [view.nodeId, view])));
         const latestJobs = new Map<string, ToolJob>();
         for (const job of jobs) {
           const nodeId = job.context?.nodeId;
@@ -1567,13 +1576,15 @@ export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled
 
   async function generateMedia(node: AssetCanvasFlowNode, recoverJobId?: string, confirmedJobId?: string): Promise<void> {
     const previous = canvasJobsRef.current[node.id];
+    const managed = characterViews[node.id];
+    if (managed && managed.state !== "ready" && managed.state !== "not-submitted") return;
     if (unavailableModel3DSelection(node, [...model3DModels, ...operationModels3D]) || recoverJobId && isMeshyModelReference(previous?.model)) {
       setGenerationError({ nodeId: node.id, message: t("modelUsage.meshyUnavailable") });
       return;
     }
     if (previous?.status === "running" || startingCanvasNodesRef.current.has(node.id)) return;
     if (confirmedJobId && previous?.id !== confirmedJobId) return;
-    if (!recoverJobId && mediaGenerationNeedsConfirmation(previous) && confirmedJobId !== previous.id) {
+    if (!managed && !recoverJobId && mediaGenerationNeedsConfirmation(previous) && confirmedJobId !== previous.id) {
       if (mediaConfirmationRef.current) return;
       mediaConfirmationRef.current = { nodeId: node.id, jobId: previous.id };
       setMediaConfirmation(mediaConfirmationRef.current);
@@ -1597,6 +1608,24 @@ export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled
         next.delete(node.id);
         return next;
       });
+    }
+  }
+
+  async function useOriginalCharacterView(view: CanvasCharacterViewStatus): Promise<void> {
+    if (!view.jobId || startingCanvasNodesRef.current.has(view.nodeId)) return;
+    startingCanvasNodesRef.current.add(view.nodeId);
+    setStartingCanvasNodes((current) => new Set(current).add(view.nodeId));
+    setGenerationError(undefined);
+    try {
+      const job = await storageRef.current.recoverImage(view.jobId);
+      setCanvasJobs((current) => ({ ...current, [view.nodeId]: job }));
+      const assetId = job.status === "succeeded" ? job.run?.files[0]?.assetId : undefined;
+      if (assetId) setViewedAsset({ nodeId: view.nodeId, assetId, mediaType: "image" });
+    } catch (error) {
+      setGenerationError({ nodeId: view.nodeId, message: errorMessage(error) });
+    } finally {
+      startingCanvasNodesRef.current.delete(view.nodeId);
+      setStartingCanvasNodes((current) => new Set([...current].filter(id => id !== view.nodeId)));
     }
   }
 
@@ -1859,14 +1888,16 @@ export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled
     }
     if (!isMediaNodeType(node.type)) return node;
     const linkedPrompt = resolveLinkedPrompt(node, nodes, documents);
-    const nodeJob = canvasJobs[node.id];
+    const managed = node.type === "image" ? characterViews[node.id] : undefined;
+    const latest = canvasJobs[node.id];
+    const nodeJob = !managed || managed.jobId === latest?.id ? latest : undefined;
     const runtime: MediaNodeRuntime = {
       generating: nodeJob?.status === "running",
       generationStatus: nodeJob?.status,
       recovering: nodeJob?.status === "running" && (nodeJob.imageRecoveryOnly || nodeJob.videoRecoveryOnly),
       busy: nodeJob?.status === "running" || startingCanvasNodes.has(node.id) || Boolean(uploadingNodeId),
       ...(node.type === "video" && nodeJob?.videoReferencePreparation ? { notice: videoReferencePreparationNotice(nodeJob.videoReferencePreparation) } : {}),
-      ...(generationError?.nodeId === node.id ? { error: generationError.message } : nodeJob?.status === "failed" || nodeJob?.status === "cancelled" ? { error: nodeJob.error } : {}),
+      ...(generationError?.nodeId === node.id ? { error: generationError.message } : (!managed || nodeJob?.imageRecoveryOnly) && (nodeJob?.status === "failed" || nodeJob?.status === "cancelled") ? { error: nodeJob.error } : {}),
       onCancel: nodeJob?.status === "running" ? () => void cancelCanvasJob(node.id) : undefined,
       onRecover: nodeJob && (node.type === "image" && nodeJob.canRecoverImage || node.type === "video" && nodeJob.canRecoverVideo && storageRef.current.resumeVideo) && (nodeJob.status === "failed" || nodeJob.status === "cancelled") ? () => void generateMedia(node, nodeJob.id) : undefined,
       onChange: (data) => {
@@ -1907,7 +1938,16 @@ export function CanvasBoardEditor({ project, initialNodeId, onInitialNodeHandled
     return {
       ...node,
       data: node.type === "image"
-        ? { ...node.data, imageRuntime: { ...referenceRuntime, models: imageModels, providers: imageProviders } satisfies ImageNodeRuntime }
+        ? { ...node.data, imageRuntime: {
+          ...referenceRuntime, models: imageModels, providers: imageProviders,
+          ...(managed ? {
+            managed,
+            onViewOriginal: () => void useOriginalCharacterView(managed),
+            ...(onAskAgent ? { onPrepareRevision: () => onAskAgent(
+              `Prepare a new ${managed.direction} standing-view revision for character set ${managed.setId}, within design revision ${managed.designRevision}. Keep the prior view revision ${managed.viewRevision} and its original request and result. Use prepare_character_views in plan mode for this direction only. Stop after preparing the new Canvas node and show me its prompt and references for review before generating or publishing anything.`,
+            ) } : {}),
+          } : {}),
+        } satisfies ImageNodeRuntime }
         : { ...node.data, videoRuntime: { ...referenceRuntime, models: videoModels, providers: videoProviders } satisfies VideoNodeRuntime },
     };
   });
@@ -2236,6 +2276,22 @@ function ImageNode({ data, selected }: Pick<NodeProps<AssetCanvasFlowNode>, "dat
     if (!option || !runtime) return;
     runtime.onChange({ ...data, imageRuntime: undefined, resolution: option.resolution, aspectRatio: option.aspectRatio });
   }
+
+  const managed = runtime?.managed;
+  if (managed) return (
+    <MediaNodeShell kind="image" selected={selected} panelOpen={data.panelOpen} assetId={data.assetId} assetAspectRatio={data.assetAspectRatio} aspectRatio={data.aspectRatio} runtime={runtime} details={data.nodeDetails}>
+      <p className="story-media-status is-neutral" role="status">{t(`assetCanvas.characterView.${managed.state}`, { direction: managed.direction, revision: managed.viewRevision })}</p>
+      {runtime.error ? <p className="story-media-status" role="alert">{imageRecoveryMessage(runtime.error)}</p> : null}
+      <div className="story-media-controls">
+        {managed.state === "available" || managed.state === "recoverable" ? <button type="button" className="canvas-chip story-media-recover" disabled={runtime.busy} onClick={runtime.onViewOriginal}>
+          {managed.state === "available" ? <Maximize size={12} aria-hidden="true" /> : <Download size={12} aria-hidden="true" />}
+          {t(managed.state === "available" ? "assetCanvas.characterView.viewOriginal" : "assetCanvas.characterView.recoverOriginal")}
+        </button> : null}
+        {runtime.onPrepareRevision && managed.state !== "preparing" && managed.state !== "running" ? <button type="button" className="canvas-chip" disabled={runtime.busy} onClick={runtime.onPrepareRevision}>{t("assetCanvas.characterView.prepareRevision")}</button> : null}
+        {managed.state === "ready" || managed.state === "not-submitted" || managed.state === "running" && runtime.onCancel ? <GenerateMediaButton kind="image" runtime={runtime} disabled={runtime.busy} /> : null}
+      </div>
+    </MediaNodeShell>
+  );
 
   return (
     <MediaNodeShell kind="image" selected={selected} panelOpen={data.panelOpen} assetId={data.assetId} assetAspectRatio={data.assetAspectRatio} aspectRatio={data.aspectRatio} runtime={runtime} details={data.nodeDetails}>

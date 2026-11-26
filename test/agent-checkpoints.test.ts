@@ -180,11 +180,6 @@ async function studio(steps: Step[], type = "web-game") {
   ));
   cleanup.push(() => rm(directory, { recursive: true, force: true }));
   const { baseUrl, requests, setWorkspace } = await scriptedModel(steps);
-  // A model request that fails is not tried again, so a step that fails ends the turn at once.
-  await writeFile(
-    path.join(directory, "settings.json"),
-    JSON.stringify({ retry: { enabled: false } }),
-  );
   const runtime = await ModelRuntime.create({
     authPath: path.join(directory, "auth.json"),
     modelsPath: path.join(directory, "models.json"),
@@ -1388,7 +1383,8 @@ describe("Agent turn changes", () => {
   it("gives a turn that failed its end, so it can be undone", async () => {
     const { detail, send, file, missing, ended, undo } = await studio([
       { write: { "notes.txt": "first" } },
-      { fail: 500 },
+      // An authentication failure is terminal. A server error can resume this same turn.
+      { fail: 401 },
     ]);
     await send("Write the notes");
     const turn = await ended("Write the notes");
@@ -2225,6 +2221,23 @@ describe("The end of a turn", () => {
     { say: "Wrote the notes." },
   ];
 
+  it("admits a sibling conversation after the completed turn's checkpoint closes", async () => {
+    const { another, post, send, detail } = await studio([...turn(), { say: "Checked the notes." }]);
+    const sibling = await another();
+    const closing = hold("snapshot", 2);
+    await send("Write the notes");
+    await closing.reached;
+    let answered = false;
+    const next = post("Check the notes", sibling).then(response => { answered = true; return response; });
+    try {
+      expect((await detail()).agent.status).toBe("idle");
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(answered).toBe(false);
+    } finally { closing.release(); }
+    const response = await next;
+    expect(response.statusCode, response.body).toBe(202);
+  });
+
   it("takes a message, ignores Stop and shows the turn as over while its end is being recorded", async () => {
     const { app, base, detail, userMessages, post, send, ended, published } =
       await studio([...turn(), { say: "Added a title." }]);
@@ -2501,6 +2514,29 @@ describe("The end of a turn", () => {
       );
     expect(view.mock.calls.length).toBe(perRequest + 1);
     expect(message!.changes).toMatchObject({ files: 1 });
+  });
+
+  it("waits for an in-flight checkpoint prune before closing the app", async () => {
+    const { app, send } = await studio(turn());
+    const reached = gate(), resume = gate();
+    const prune = CheckpointStore.prototype.prune;
+    const pending = vi.spyOn(CheckpointStore.prototype, "prune").mockImplementation(function (this: CheckpointStore, project, referenced, options) {
+      return prune.call(this, project, async () => {
+        reached.open();
+        await resume.opened;
+        return referenced();
+      }, options);
+    });
+    await send("Write the notes");
+    await reached.opened;
+    const closing = app.close().then(() => "closed");
+    try {
+      expect(await Promise.race([closing, new Promise(resolve => setTimeout(() => resolve("waiting"), 100))])).toBe("waiting");
+    } finally {
+      resume.open();
+      await closing;
+      await pending.mock.results[0]!.value;
+    }
   });
 
   it("waits for turn closure before reading the completed range", async () => {

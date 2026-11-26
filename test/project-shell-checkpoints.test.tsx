@@ -4,6 +4,7 @@ import { act, useEffect, type ComponentProps } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DesktopRuntimeState } from "../src/shared/desktop-runtime.js";
+import { LOCAL_IMAGE_BUDGET_MESSAGE } from "../src/shared/agent-errors.js";
 import type {
   CheckpointChangeItem,
   ConversationDetail,
@@ -279,6 +280,23 @@ it("keeps a failed 3D review decision above the actions and lets the user retry 
 });
 
 describe("checkpoints in the project shell", () => {
+  it("retries only the failed local image request without sending another user message", async () => {
+    const saved = detail("failed-turn");
+    const turn = saved.turns[0]!;
+    turn.status = "failed";
+    turn.items[1] = { id: "failure", turnId: turn.id, type: "agentMessage", status: "failed", text: "",
+      error: { message: LOCAL_IMAGE_BUDGET_MESSAGE, diagnostics: { statusCode: 413, errorCode: "request_size_exceeded" } } };
+    const url = "/projects/project/conversations/conversation/turns/saved-user/retry-local-image-request";
+    const daemon = await openProject(route => route === url ? Response.json({ turnId: turn.id, queued: false }, { status: 202 }) : undefined, saved);
+    daemon.conversation = { ...saved, turns: [{ ...turn, id: "saved-user", items: turn.items.map(item => ({ ...item, turnId: "saved-user" })) }] };
+    await click("Retry this model request");
+    expect(daemon.requests.filter(request => request.method === "POST" && request.route.includes("/turns"))).toEqual([{ method: "POST", route: url }]);
+    await act(async () => daemon.send(1, "item.started", { item: { id: "retry", turnId: "saved-user", type: "retry", source: "manual-local-image",
+      status: "inProgress", attempt: 1, maxAttempts: 1, delayMs: 0, error: { message: LOCAL_IMAGE_BUDGET_MESSAGE } } }, "conversation", "saved-user"));
+    expect(buttons()).not.toContain("Retry this model request");
+    expect(container.textContent).toContain("Retrying this image request");
+  });
+
   it("opens a project with a retired Agent and no chats without explicitly requesting the removed model", async () => {
     const empty = detail("unused");
     empty.turns = [];

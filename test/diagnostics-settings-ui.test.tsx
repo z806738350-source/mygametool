@@ -3,9 +3,10 @@ import path from "node:path";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import type { AgentRuntimeStatus } from "../src/shared/agent-runtimes.js";
 
 const exportDiagnostics = vi.fn();
-const listAgentRuntimes = vi.fn();
+const listAgentRuntimes = vi.fn<(recheck?: boolean) => Promise<AgentRuntimeStatus[]>>();
 const getExternalAgentSettings = vi.fn();
 vi.doMock(path.resolve("src/renderer/auth.tsx"), () => ({
   useAuth: () => ({ state: { status: "signed-out" }, openSignIn: vi.fn() }),
@@ -14,6 +15,8 @@ vi.doMock(path.resolve("src/renderer/api.ts"), async (importOriginal) => ({
   ...(await importOriginal<object>()),
   exportDiagnostics,
   listAgentRuntimes,
+  listModels: vi.fn(async () => ({ models: [], defaultReasoningLevel: "medium" })),
+  waitForRuntime: vi.fn(async () => {}),
   getExternalAgentSettings,
 }));
 const { SettingsPage } = await import("../src/renderer/settings-page.js");
@@ -90,8 +93,27 @@ it("explains a failed export", async () => {
   expect(button.disabled).toBe(false);
 });
 
-it.each(["agents", "mcp-server"] as const)("keeps the retired %s page explicit without probing or offering enable controls", async (section) => {
-  await act(async () => root.render(<SettingsPage section={section} onBack={() => {}} onSectionChange={() => {}} />));
+it("opens controlled agent settings without refreshing or enabling the runtime", async () => {
+  listAgentRuntimes.mockResolvedValue([{
+    id: "qoder-cli",
+    name: "Qoder",
+    installed: true,
+    enabled: false,
+    auth: { status: "unknown", billing: "unknown" },
+    commandSandbox: "none",
+    permissionMode: "standard",
+    diagnostics: [],
+  }]);
+  await act(async () => root.render(<SettingsPage section="agents" onBack={() => {}} onSectionChange={() => {}} />));
+  expect(listAgentRuntimes).toHaveBeenCalled();
+  expect(listAgentRuntimes).not.toHaveBeenCalledWith(true);
+  const toggle = container.querySelector<HTMLInputElement>('input[role="switch"][aria-label="Offer Qoder models"]');
+  expect(toggle?.checked).toBe(false);
+  expect(getExternalAgentSettings).not.toHaveBeenCalled();
+});
+
+it("explains that MCP connections are unavailable without probing or offering enable controls", async () => {
+  await act(async () => root.render(<SettingsPage section="mcp-server" onBack={() => {}} onSectionChange={() => {}} />));
   expect(container.textContent).toContain("External CLI agents and MCP connections are not integrated");
   expect(container.textContent).toContain("Use the built-in Agent with KunpoAPI");
   expect(container.querySelector('input[role="switch"]')).toBeNull();

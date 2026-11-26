@@ -72,12 +72,14 @@ async function fixture(
     Response.json({ data: [{ id: "gpt-image-2" }, { id: "text-model" }] }),
   ),
   kunpoKey?: string,
+  savedImageSettings?: string,
 ) {
   vi.stubEnv("OPENAI_API_KEY", "");
   const directory = await mkdtemp(
     path.join(tmpdir(), "ohmygame-openai-images-"),
   );
   directories.push(directory);
+  if (savedImageSettings !== undefined) await writeFile(path.join(directory, "openai-images.json"), savedImageSettings, { mode: 0o600 });
   // OpenAI connection tests must not discover a real Codex image provider.
   await writeFile(path.join(directory, "agent-runtimes.json"), JSON.stringify({ runtimes: { "codex-cli": { binaryPath: path.join(directory, "missing-codex") } } }));
   if (credential)
@@ -246,18 +248,25 @@ describe("OpenAI image connections", () => {
     ).not.toContainEqual(expect.objectContaining({ provider: "openai" }));
   });
 
-  it("starts with the default connection when saved image settings are unreadable", async () => {
-    vi.stubEnv("OPENAI_API_KEY", "");
-    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-openai-images-"));
-    directories.push(directory);
-    await writeFile(path.join(directory, "openai-images.json"), JSON.stringify({ version: 2, mode: "future" }));
-    const runtime = await createLocalModelRuntime(path.join(directory, "local-api-keys.json"), async () => []);
-    const app = createApp({ dataDirectory: directory, piAgentDirectory: directory, createModelRuntime: async () => runtime });
-    apps.push(app);
-    await app.ready();
+  it("keeps unreadable image settings disabled with a configured chat key until explicitly repaired", async () => {
+    const original = JSON.stringify({ version: 2, mode: "future" });
+    const { directory, app, save, generation } = await fixture(undefined, undefined, "existing-chat-key", original);
     const response = await app.inject({ method: "GET", url: endpoint });
     expect(response.statusCode, response.body).toBe(200);
-    expect(response.json()).toMatchObject({ mode: "connection", configured: false, models: [] });
+    expect(response.json()).toMatchObject({ mode: "disabled", connectionAvailable: true, configured: false, models: [] });
+    const catalog = await app.inject({ method: "GET", url: "/image-models/catalog" });
+    expect(catalog.json().models).not.toContainEqual(expect.objectContaining({ provider: "openai" }));
+    const created = await app.inject({ method: "POST", url: "/tools/generate-image/jobs", payload: {
+      prompt: "An orchard", imageModel: { provider: "openai", id: "gpt-image-2.6-sunburst" },
+    } });
+    expect(created.statusCode, created.body).toBe(202);
+    await vi.waitFor(async () => {
+      const jobs = (await app.inject({ method: "GET", url: "/tool-jobs" })).json();
+      expect(jobs.find((job: { id: string }) => job.id === created.json().id)?.status).toBe("failed");
+    });
+    expect(generation).not.toHaveBeenCalled();
+    expect(await readFile(path.join(directory, "openai-images.json"), "utf8")).toBe(original);
+    expect(await save()).toMatchObject({ mode: "separate", configured: true });
   });
 
   it("supports image-only connections and restores saved models and visibility after restart", async () => {
@@ -323,7 +332,7 @@ describe("OpenAI image connections", () => {
   });
 
   it("uses the image connection through the application's generation tool and honours its default", async () => {
-    const { app, generation, save } = await fixture();
+    const { app, generation, save } = await fixture(undefined, undefined, "independent-chat-key");
     await save();
     expect(
       (
@@ -352,6 +361,20 @@ describe("OpenAI image connections", () => {
     expect(generation.mock.calls[0]?.[0]).toBe(
       "http://127.0.0.1:43199/v1/images/generations",
     );
+    expect(new Headers(generation.mock.calls[0]?.[1]?.headers).get("authorization")).toBe("Bearer image-test-key");
+  });
+
+  it("does not use a disabled chat provider for a shared image connection or model discovery", async () => {
+    const { app, generation, discovery, save } = await fixture(undefined, undefined, "disabled-chat-key");
+    await save({ ...config, mode: "connection", apiKey: undefined });
+    const off = await app.inject({ method: "PATCH", url: "/settings/models/providers/kunpo/enabled", payload: { enabled: false } });
+    expect(off.statusCode, off.body).toBe(200);
+    expect((await app.inject({ method: "GET", url: endpoint })).json()).toMatchObject({ mode: "connection", connectionAvailable: false });
+    const found = await app.inject({ method: "POST", url: endpoint + "/discover", payload: { mode: "connection" } });
+    expect(found.statusCode).toBe(400);
+    expect((await app.inject({ method: "GET", url: "/image-models/catalog" })).json().models).not.toContainEqual(expect.objectContaining({ provider: "openai" }));
+    expect(discovery).not.toHaveBeenCalled();
+    expect(generation).not.toHaveBeenCalled();
   });
 
   it("reuses a saved key only for its paired endpoint and preserves working settings after failures", async () => {

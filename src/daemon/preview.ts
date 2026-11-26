@@ -1,4 +1,5 @@
 import { assertLocalExecutionAllowed } from "./local-execution-policy.js";
+import { inheritToolPreflightFailure, toolPreflightError } from "./agent-tool-errors.js";
 import type { IsolatedProjectExecution } from "./isolated-project-execution.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { watch, type FSWatcher } from "node:fs";
@@ -69,7 +70,10 @@ export class PreviewCancelledError extends Error {
 
 class ProjectExecutionBusyError extends ProjectWorkspaceError {
   readonly statusCode = 409;
-  constructor() { super("A project command or build is running. Wait for it to finish."); }
+  constructor(reason: "project_execution_busy" | "playtest_project_busy" = "project_execution_busy") {
+    super("A project command or build is running. Wait for it to finish.");
+    inheritToolPreflightFailure(this, toolPreflightError(this.message, reason));
+  }
 }
 
 /** An automatic start found nothing to run yet, which is expected before the first files exist. */
@@ -236,7 +240,7 @@ export class PreviewManager {
     const suspend = !!starting || this.#running.has(project.id);
     let succeeded = false;
     try {
-      if (!stopPreview && (suspend || ["ready", "starting"].includes(project.preview.status)))
+      if (!stopPreview && (suspend || (["ready", "starting"].includes(project.preview.status) && !this.#static.has(project.id))))
         throw new Error("Stop the preview yourself before changing project capacity; no running preview was interrupted");
       if (suspend) {
         await this.stop(project, "execution");
@@ -255,7 +259,8 @@ export class PreviewManager {
 
   ensureStarted(project: ProjectState, manual = true): Promise<string> {
     try { this.options.assertAvailable?.(project.id); } catch (cause) { return Promise.reject(cause); }
-    if (this.#executionBusy.has(project.id) && !this.#static.has(project.id)) return Promise.reject(new ProjectExecutionBusyError());
+    if (this.#executionBusy.has(project.id) && (this.#running.has(project.id) || this.#stopping.has(project.id)))
+      return Promise.reject(new ProjectExecutionBusyError("playtest_project_busy"));
     if (!previewable(project))
       return Promise.reject(
         new ProjectWorkspaceError(
@@ -279,7 +284,7 @@ export class PreviewManager {
       if (child && this.options.execution) return this.#beginStart(project, false, false, child);
       return Promise.resolve(project.preview.url);
     }
-    return this.start(project, false, manual);
+    return this.#beginStart(project, false);
   }
 
   start(
@@ -342,6 +347,8 @@ export class PreviewManager {
         ? { workspacePath: project.workspacePath, startupDirectory: ".", previewMode: "static" }
         : project);
       assertCurrent();
+      if (this.#executionBusy.has(project.id) && !(workspace.runnable && workspace.mode === "static"))
+        throw new ProjectExecutionBusyError("playtest_project_busy");
       if (!workspace.runnable) {
         const message = workspace.error ?? "Workspace is not runnable yet";
         if (

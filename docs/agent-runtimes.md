@@ -105,10 +105,10 @@ defaults.
 
 Submit the opaque `requestId` from the active approval card, URL-encoded. The approval endpoint accepts up to 1,024 decoded characters to accommodate existing compound provider IDs. The daemon issues a local UUID for longer IDs and for every new turnaround review. A decision applies once in its originating project and conversation.
 
-Discovery is lazy; Pi requests do not wait for it. An explicit executable wins.
-Otherwise choose the newest installed SemVer among PATH, login-shell PATH,
-common install directories, and known bundled copies. Resolve the executable
-to an absolute path and deduplicate real paths. Version/probe caches are
+Discovery runs independently of Pi requests. An explicit executable wins.
+Codex uses discovery order and gives bundled app copies priority on macOS.
+Runtimes that compare versions choose the newest installed SemVer.
+Discovery resolves absolute paths and deduplicates real paths. Version/probe caches are
 bounded, expire failed results, honor Recheck, and discard in-flight catalog
 results after configuration changes. Paginated native catalogs must be read
 completely. A successful model listing is not proof of account entitlement;

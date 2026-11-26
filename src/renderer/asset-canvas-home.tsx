@@ -130,7 +130,8 @@ export function AssetCanvasHome({ onNavigate, onOpenProject }: {
                 },
                 onDuplicate: () => void action(() => duplicateProject(project.id)),
                 onDelete: () => {
-                  if (confirmProjectDeletion(project)) return action(() => deleteProject(project.id));
+                  const confirmation = confirmProjectDeletion(project);
+                  if (confirmation) return action(() => deleteProject(confirmation));
                 },
               }}
             />)}

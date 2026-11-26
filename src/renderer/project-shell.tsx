@@ -1,6 +1,7 @@
 import { referencedIntegration, usePluginIntegrationGate } from "./plugin-integration.js";
 import { isAgentRuntimeId, type ApprovalDecision } from "../shared/agent-runtimes.js";
 import type { IsolatedSourceConfirmation } from "../shared/execution-storage.js";
+import { isLocalSessionImageBudgetError } from "../shared/agent-errors.js";
 import type { VolumeMigrationConfirmation } from "../shared/volume-migration.js";
 import {
   ArrowLeft,
@@ -55,6 +56,7 @@ import {
   reapplyCheckpoint,
   restoreUnfinished,
   reviseLastPrompt,
+  retryLocalImageRequest,
   refinePlan,
   sendPrompt,
   steerPendingPrompt,
@@ -132,6 +134,7 @@ export function ProjectShell({
   const [state, dispatch] = useReducer(rendererReducer, initialRendererState);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [sendingInitialPrompt, setSendingInitialPrompt] = useState(false);
+  const [retryingImageRequest, setRetryingImageRequest] = useState(false);
   const [initialPromptDeferred, setInitialPromptDeferred] = useState(false);
   const [creatingConversation, setCreatingConversation] = useState(false);
   const [agentCollapsed, setAgentCollapsed] = useState(view === "design" && !initialPrompt && !initialDraft);
@@ -408,6 +411,10 @@ export function ProjectShell({
   const approvalAgent = approval ? modelCatalog.models.find((model) => model.provider === state.settings.model?.provider)?.providerName : undefined;
   const currentConversationBusy = Boolean(activeTurn);
   const agentBusy = sendingInitialPrompt || currentConversationBusy || state.agent.status === "running" || state.agent.status === "cancelling";
+  const lastTurn = state.turns.at(-1);
+  const lastError = lastTurn?.items.findLast(item => item.type === "agentMessage" && item.error);
+  const retryImageTurn = lastTurn?.status === "failed" && lastError?.type === "agentMessage" && isLocalSessionImageBudgetError(lastError.error)
+    && !lastTurn.items.some(item => item.type === "retry" && item.source === "manual-local-image") ? lastTurn : undefined;
   const activePlanItem = activeTurn
     ? activeTurn.items.findLast((item) => item.type === "plan")
     : undefined;
@@ -471,6 +478,28 @@ export function ProjectShell({
       await compactConversation(project.id, conversation.id, instructions);
     } catch (error) {
       dispatch({ type: "notice", message: errorMessage(error) });
+    }
+  }
+
+  async function retryImageRequest() {
+    if (!project || !conversation || !retryImageTurn || retryingImageRequest) return;
+    setRetryingImageRequest(true);
+    try {
+      // Live turn IDs are transient. Resolve the same saved checkpoint before attaching the retry to its history.
+      const saved = await getConversation(project.id, conversation.id);
+      const selected = retryImageTurn.items.find(item => item.type === "userMessage");
+      const latest = saved.turns.at(-1);
+      const user = latest?.items.find(item => item.type === "userMessage");
+      if (latest?.status !== "failed" || !selected?.checkpointId || selected.checkpointId !== user?.checkpointId) {
+        dispatch({ type: "notice", message: t("timeline.retryTurnChanged") });
+        return;
+      }
+      if (latest.id !== retryImageTurn.id) dispatch({ type: "conversation-loaded", detail: saved });
+      await retryLocalImageRequest(project.id, conversation.id, latest.id);
+    } catch (error) {
+      dispatch({ type: "notice", message: errorMessage(error) });
+    } finally {
+      setRetryingImageRequest(false);
     }
   }
 
@@ -826,6 +855,9 @@ export function ProjectShell({
                 onBranch={branchChat}
                 branchDisabled={creatingConversation || state.connection !== "open"}
               />
+              {retryImageTurn && <button type="button" className="settings-secondary-button"
+                disabled={retryingImageRequest || agentBusy || restoring || unfinishedRestore || state.pendingPrompts.length > 0 || state.connection !== "open"}
+                onClick={retryImageRequest}>{t("timeline.retryLocalImageRequest")}</button>}
               </ErrorBoundary>
             </Activity>
           </div>

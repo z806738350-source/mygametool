@@ -281,7 +281,8 @@ time, directory, command, manager and the last 8 KiB of process output.
 ## Automatic policy and idle collection
 
 An Agent command or local build borrows the project's single guest execution
-slot. A ready static preview can stay open. After a successful operation an
+slot. A playable host-served static page can open or stay open while the guest
+slot is occupied. A running script preview must yield that slot. After a successful operation an
 open editor with automatic preview enabled resumes the script preview; a manual
 stop remains in effect. An uncertain failed operation does not start a new job.
 

@@ -181,7 +181,14 @@ it.each([
       input.dispatchEvent(new Event("change", { bubbles: true }));
       await vi.waitFor(() => expect(upload).toHaveBeenCalled(), { timeout: 5000 });
     });
-    expect(upload).toHaveBeenCalledWith(expect.objectContaining({ name: "corrected-front.png", purpose: "reference" }));
+    expect(upload).toHaveBeenCalledWith(
+      {
+        name: "corrected-front.png",
+        purpose: "reference",
+        image: { mediaType: "image/png", data: "dGVzdA==" },
+      },
+      "views",
+    );
     expect(canvasProps.nodes[0]!.data.images).toEqual(["corrected-front", "left", "back"].map(assetId => ({ type: "library", assetId })));
   }
   if (!fixture.mode && !("pose" in fixture)) {

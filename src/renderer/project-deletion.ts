@@ -4,13 +4,20 @@ import { t } from "./i18n.js";
 import { readCanvasDraftStatus, type CanvasDraftStatus } from "./canvas-draft-safety.js";
 import { composerDrafts } from "./composer-drafts.js";
 
-export function clearProjectBrowserData(projectId: string): void {
-  composerDrafts.deleteProject(projectId);
-  const keys = Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i));
-  for (const key of keys) if (key && storedBrowserProjectId(key) === projectId) localStorage.removeItem(key);
+export interface ConfirmedProjectDeletion {
+  id: string;
+  name: string;
+  draftStatus: CanvasDraftStatus;
 }
 
-/** A missing/corrupt recovery cannot authorize removing its project. */
+export function clearProjectBrowserData(projectId: string): void {
+  composerDrafts.deleteProject(projectId);
+  try {
+    const keys = Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i));
+    for (const key of keys) if (key && storedBrowserProjectId(key) === projectId) localStorage.removeItem(key);
+  } catch { /* Storage access can fail even after the host has confirmed deletion. */ }
+}
+
 export function projectDraftStatus(projectId: string): CanvasDraftStatus {
   const canvas = readCanvasDraftStatus(undefined, projectId);
   let composer: CanvasDraftStatus;
@@ -25,18 +32,12 @@ export function assertProjectCanvasDraftsSaved(projectId: string): void {
   if (status !== "clear") throw new Error(t(`projects.canvasDrafts.${status}`));
 }
 
-export function assertProjectDraftsSaved(projectId: string): void {
-  const status = projectDraftStatus(projectId);
-  if (status !== "clear") throw new Error(t(`projects.drafts.${status}`));
-}
-
-export function confirmProjectDeletion(project: ProjectState): boolean {
-  const status = projectDraftStatus(project.id);
-  if (status !== "clear") {
-    window.alert(t(`projects.drafts.${status}`));
-    return false;
+export function confirmProjectDeletion(project: ProjectState): ConfirmedProjectDeletion | undefined {
+  const draftStatus = projectDraftStatus(project.id);
+  const warning = draftStatus === "clear" ? "" : `\n\n${t(`projects.discardDraftWarning.${draftStatus}`)}`;
+  if (window.confirm(projectDeletionConfirmation(project) + warning)) {
+    return { id: project.id, name: project.name, draftStatus };
   }
-  return window.confirm(projectDeletionConfirmation(project));
 }
 
 export function projectDeletionConfirmation(project: ProjectState): string {

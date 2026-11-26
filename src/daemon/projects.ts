@@ -466,7 +466,7 @@ export class ProjectManager {
     await assertLocalImagePublicationsSettled(await this.getLocalImageRecoveryAnchor(id, true));
   }
 
-  async delete(id: string): Promise<ProjectState> {
+  async delete(id: string, beforeRemove?: () => Promise<void>): Promise<ProjectState> {
     const project = this.#projects.get(id);
     if (!project) throw new Error(`Project not found: ${id}`);
     const operation = (this.#metadataWrites.get(id) ?? Promise.resolve()).catch(() => {}).then(async () => {
@@ -480,7 +480,12 @@ export class ProjectManager {
         if (canonical === attachments && (await lstat(attachments)).isDirectory())
           await rm(attachments, { recursive: true, force: true });
       }
+      await beforeRemove?.();
       await rm(this.#projectDirectory(id), { recursive: true, force: false });
+      if (beforeRemove && process.platform !== "win32") {
+        const directory = await open(this.#projectsDirectory, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try { await directory.sync(); } finally { await directory.close(); }
+      }
       this.#projects.delete(id);
     });
     this.#metadataWrites.set(id, operation);
@@ -533,6 +538,7 @@ export class ProjectManager {
   ): Promise<string> {
     const project = this.#projects.get(id);
     if (!project) throw new Error(`Project not found: ${id}`);
+    this.assetLibrary?.assertAvailable();
     if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(fileName)) throw new Error(`Invalid asset name: ${fileName}`);
     const assetsDirectory = path.join(project.workspacePath, "assets");
     const generatedDirectory = path.join(assetsDirectory, "generated");
@@ -666,6 +672,7 @@ export class ProjectManager {
       signal?.throwIfAborted();
       const project = this.#projects.get(id); if (!project) throw new Error(`Project not found: ${id}`);
       if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(fileName)) throw new Error("Invalid image file name");
+      this.assetLibrary?.assertAvailable();
       const anchor = await this.getLocalImageRecoveryAnchor(id);
       return withLocalImageRecovery(anchor, { rawBytes: contents.byteLength, workingBytes: 0, beforeBytes: 0, afterBytes: 32 * 1024 * 1024, manifestBytes: 2 * 1024 * 1024, reviewBytes: 2 * 1024 * 1024, additionalEntries: 256 }, async () => {
         signal?.throwIfAborted(); const originalId = await retainImageOriginal(anchor.storage, Buffer.from(contents)), relative = `assets/generated/${fileName}`;

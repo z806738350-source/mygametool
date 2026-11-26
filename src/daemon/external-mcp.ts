@@ -185,6 +185,7 @@ export interface ExternalMcpAnswer {
 
 export interface ExternalMcpOptions {
   dataDirectory: string;
+  onEndpointCleanupError?: (error: unknown) => void;
   projects: () => ProjectState[];
   /** The project's tools for one external session; the session keeps its playtest windows. */
   tools: (project: ProjectState, sessionId: string) => ToolDefinition[];
@@ -361,7 +362,11 @@ export class ExternalMcpService {
   /** Turning the feature off or closing the daemon ends every session; running jobs keep going. */
   async #revoke(): Promise<void> {
     this.#token = undefined;
-    await rm(this.#endpointPath, { force: true });
+    try { await rm(this.#endpointPath, { force: true }); }
+    catch (error) {
+      if (LOCAL_EXECUTION_ENABLED) throw error;
+      this.#options.onEndpointCleanupError?.(error);
+    }
     await Promise.allSettled(
       [...this.#sessions.values()].map((session) => this.#endSession(session)),
     );

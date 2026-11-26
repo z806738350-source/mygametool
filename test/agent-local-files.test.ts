@@ -227,7 +227,7 @@ describe("local secure execution boundaries", () => {
     await expect(lstat(path.join(directory, relative.split("/")[0]!))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("blocks protected read and media targets while ordinary missing-file reads stay retryable", async () => {
+  it("blocks protected reads while ordinary missing-file reads stay retryable", async () => {
     const directory = await workspace(), guard = new AutoContinueTools(createLocalAgentFileTools(directory));
     const read = guard.wrap().find(tool => tool.name === "read")!;
     const missing = await rejected(read.execute("missing", { path: "missing.txt" }, undefined, undefined, undefined as never));
@@ -236,10 +236,26 @@ describe("local secure execution boundaries", () => {
     const denied = await rejected(read.execute("private", { path: "../outside" }, undefined, undefined, undefined as never));
     expect(getToolPreflightFailure(denied)).toEqual({ effect: "none", disposition: "blocked", reason: "unsafe_path" });
     await expect(guard.prepare(new AbortController().signal)).rejects.toThrow();
-    const write = createLocalAgentFileTools(directory).find(tool => tool.name === "write")!;
+  });
+
+  it("lets the same task correct a missing edit target or text write aimed at project media", async () => {
+    const directory = await workspace();
+    const guard = new AutoContinueTools(createLocalAgentFileTools(directory));
+    const tools = guard.wrap();
+    const edit = tools.find(tool => tool.name === "edit")!, write = tools.find(tool => tool.name === "write")!;
+    await writeFile(path.join(directory, "binary.dat"), Buffer.from([0xff]));
+    for (const file of ["missing.ts", "binary.dat", "binary.dat/child", "."]) {
+      const failure = await rejected(edit.execute("edit-" + file, { path: file, oldText: "a", newText: "b" }, undefined, undefined, undefined as never));
+      expect(getToolPreflightFailure(failure)).toMatchObject({ reason: "invalid_text_file", disposition: "correctable" });
+    }
     const media = await rejected(write.execute("media", { path: "original.png", content: "text" }, undefined, undefined, undefined as never));
-    expect(getToolPreflightFailure(media)?.disposition).toBe("blocked");
+    expect(getToolPreflightFailure(media)).toMatchObject({ reason: "invalid_text_file", disposition: "correctable" });
+    await guard.prepare(new AbortController().signal);
+    await write.execute("new-file", { path: "sprite.ts", content: "text" }, undefined, undefined, undefined as never);
+    expect(await readFile(path.join(directory, "sprite.ts"), "utf8")).toBe("text");
     await expect(lstat(path.join(directory, "original.png"))).rejects.toMatchObject({ code: "ENOENT" });
+    const outside = await rejected(write.execute("outside", { path: "../outside.png", content: "text" }, undefined, undefined, undefined as never));
+    expect(getToolPreflightFailure(outside)).toMatchObject({ reason: "unsafe_path", disposition: "blocked" });
   });
 
   it.each(["mkdir", "create", "truncate", "write", "close"])("keeps failure after %s unknown even if content writing was not completed", async (point) => {
@@ -534,6 +550,74 @@ describe("project-local agent file tools", () => {
     await expect(read.execute("invalid", { path: "placeholder.png" }, undefined, undefined, {} as never)).rejects.toThrow("does not contain a supported");
     await link(path.join(directory, "mockup.png"), path.join(directory, "linked.png"));
     await expect(read.execute("linked", { path: "linked.png" }, undefined, undefined, {} as never)).rejects.toThrow("non-linked");
+  });
+
+  it("reads a character on light and dark backgrounds without changing the original or exposing it to text models", async () => {
+    const directory = await workspace();
+    const rgba = Buffer.alloc(5 * 5 * 4);
+    for (let y = 1; y <= 3; y++) for (let x = 1; x <= 3; x++) {
+      rgba.set(x === 1 ? [255, 255, 255, 128] : [60, 90, 180, 255], (y * 5 + x) * 4);
+    }
+    const original = await sharp(rgba, { raw: { width: 5, height: 5, channels: 4 } }).png().toBuffer();
+    const file = "candidate.png";
+    await writeFile(path.join(directory, file), original);
+    const read = createProjectFileReadTool(directory, true);
+    const args = { path: file, characterPreviewHeight: 3 };
+    const preview = (await read.execute("paired", args, undefined, undefined, {} as never)).content[0];
+    if (preview?.type !== "image") throw new Error("Missing paired preview");
+    const { data, info } = await sharp(Buffer.from(preview.data, "base64")).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    expect(info).toMatchObject({ width: 38, height: 19, channels: 3 });
+    const pixel = (x: number, y: number) => [...data.subarray((y * info.width + x) * 3, (y * info.width + x) * 3 + 3)];
+    expect(pixel(0, 0)).toEqual([242, 242, 242]);
+    expect(pixel(19, 0)).toEqual([36, 36, 36]);
+    expect(pixel(9, 9)).toEqual([60, 90, 180]);
+    expect(pixel(28, 9)).toEqual(pixel(9, 9));
+    expect(pixel(8, 9)[0]).toBeCloseTo(248, 0);
+    expect(pixel(27, 9)[0]).toBeCloseTo(145, 0);
+    expect((await read.execute("original", { path: file }, undefined, undefined, {} as never)).content)
+      .toEqual([{ type: "image", mimeType: "image/png", data: original.toString("base64") }]);
+    await expect(createProjectFileReadTool(directory).execute("text", args, undefined, undefined, {} as never)).rejects.toThrow("image input enabled");
+    await expect(read.execute("oversized", { ...args, characterPreviewHeight: 385 }, undefined, undefined, {} as never)).rejects.toThrow(/preview height/);
+    const known = (images: boolean) => ({ id: "model", provider: "fixture", input: images ? ["text", "image"] : ["text"] });
+    const model = vi.fn().mockReturnValueOnce(known(true)).mockReturnValue(known(false));
+    for (const catalog of [model, undefined]) {
+      const bridge = new ToolBridge([read], false, false, undefined, catalog);
+      expect(await bridge.call("read_project_file", args, "rechecked")).toMatchObject({
+        isError: true, result: { content: [{ type: "text", text: expect.stringContaining("capability is unverified or changed") }] },
+      });
+    }
+  });
+
+  it("compares ordered project views at one height on both backgrounds and preserves the opposite view's facing", async () => {
+    const directory = await workspace();
+    const solid = (size: number, background: string) => sharp({ create: { width: size, height: size, channels: 3, background } });
+    await writeFile(path.join(directory, "NE.png"), await solid(4, "#ff0000").png().toBuffer());
+    await writeFile(path.join(directory, "N.png"), await solid(2, "#00ff00").png().toBuffer());
+    const northwest = await solid(4, "#0000ff").composite([
+      { input: { create: { width: 2, height: 4, channels: 3, background: "#ffff00" } }, left: 0, top: 0 },
+    ]).png().toBuffer();
+    await writeFile(path.join(directory, "NW.png"), northwest);
+    const read = createProjectFileReadTool(directory, true);
+    const args = { path: "NE.png", characterPreviewHeight: 4, characterComparePaths: ["N.png", "NW.png"] };
+    const run = (input: object) => read.execute("compare", input, undefined, undefined, {} as never);
+    const { content } = await run(args);
+    expect(content).toHaveLength(2);
+    expect(content[0]).toMatchObject({ type: "text", text: expect.stringContaining('["NE.png","N.png","NW.png"]') });
+    const image = content[1];
+    if (image?.type !== "image") throw new Error("Missing comparison image");
+    const { data, info } = await sharp(Buffer.from(image.data, "base64")).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    expect(info).toMatchObject({ width: 60, height: 40, channels: 3 });
+    const rgb = (x: number, y: number) => data.subarray((y * info.width + x) * 3, (y * info.width + x + 1) * 3).toString("hex");
+    expect(rgb(0, 0)).toBe("f2f2f2");
+    expect(rgb(0, 20)).toBe("242424");
+    for (const y of [8, 11, 28, 31]) expect([8, 28, 48, 51].map(x => rgb(x, y))).toEqual(["ff0000", "00ff00", "ffff00", "0000ff"]);
+    await symlink(path.join(directory, "NW.png"), path.join(directory, "linked.png"));
+    await expect(run({ ...args, characterComparePaths: ["linked.png"] })).rejects.toThrow("Symbolic links");
+    await expect(run({ ...args, characterComparePaths: ["../NW.png"] })).rejects.toThrow("parent paths");
+    await expect(run({ ...args, characterComparePaths: ["./NE.png"] })).rejects.toThrow("distinct project");
+    await expect(run({ ...args, characterComparePaths: ["N.png", "NW.png", "extra.png"] })).rejects.toThrow("one or two");
+    await expect(run({ ...args, characterPreviewHeight: undefined })).rejects.toThrow("characterPreviewHeight");
+    await expect(createProjectFileReadTool(directory).execute("text", args, undefined, undefined, {} as never)).rejects.toThrow("image input enabled");
   });
 
   it.each(["png", "jpeg", "webp"] as const)("reads an authorized %s attachment receipt as original image bytes without a filename extension", async (format) => {

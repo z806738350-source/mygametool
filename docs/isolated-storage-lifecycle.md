@@ -7,9 +7,9 @@ refused; existing volumes are never silently adopted, reformatted or removed.
 
 Deleting a project closes its admission gate before draining work. Agent turns,
 session initialization, compaction, contextual generation, preview and execution
-cannot start after that gate closes. Active generation cleanup, unfinished
-checkpoint recovery and retained guest changes cause a refusal. Pending source
-and artifact returns must settle before host deletion.
+cannot start after that gate closes. Active generation cleanup and unfinished
+checkpoint recovery cause a refusal. Pending source and artifact returns must
+settle before host deletion.
 
 Guest retirement rechecks namespace, generation, ownership, operation leases,
 mounts and processes. Only confirmed retirement permits host deletion. A private,
@@ -21,7 +21,9 @@ The managed local desktop launcher compacts Chromium's local storage after
 the window exits when a project was deleted. It copies the live entries into
 a replacement database, excluding only the deleted project's editor keys and
 preserving settings and other origins. An interrupted cleanup is retried before
-the next launch. This step runs after Chromium has closed the profile.
+the next launch. With the same cleanup receipt, the launcher removes exactly
+attributed rows in the bounded desktop diagnostic logs. These steps run with
+Chromium and the log writers closed.
 
 An explicit confirmed deletion may start the existing local VM through the same
 owned lifecycle used by execution. It never creates a replacement VM or allocates
@@ -38,21 +40,27 @@ retirement request be sent; an existing volume is bound to its freshly inspected
 generation. After each preparatory wait, shutdown and deletion-epoch guards prevent a late retirement from an
 obsolete attempt. Only the guest's confirmed retirement permits host deletion.
 
-If VM startup or inventory fails before any retirement request, a new deletion
-returns to `aborted` and project admission reopens. Existing pending records keep
-their phase; starting the application never resumes deletion automatically. Once
-a retirement request has been sent, even a typed refusal is not permission to
-erase that pending state: guest reconciliation may already have changed storage.
-Lost replies and partial deletion require fresh inspection on an explicit retry;
-they never cause an automatic second request. Dirty or active volumes remain
-protected, and a partial deletion cannot guess away a remaining image.
+If inventory shows idle execution storage with unreturned changes, the project
+card asks whether to discard those changes and continue. Cancel to keep them and
+use **Execution storage and recovery**. A confirmation applies to the same
+project and freshly rechecked execution generation only.
 
-Host removal is recursive and irreversible once `deleting-host` begins. Its
-journal prevents automatic continuation, but it does not restore already removed
-files after a partial filesystem failure or power loss. Missing or damaged host
-metadata requires separate inspection rather than a claim that deletion or
-recovery completed. The guest volume must have been confirmed retired before
-this host phase can begin.
+If VM startup or inventory fails, or discard confirmation is needed before any
+retirement request, a new deletion returns to `aborted` and project admission
+reopens. Existing pending records keep their phase. Starting the application
+never resumes deletion automatically. Once a retirement request has been sent,
+even a typed refusal keeps that record pending because guest reconciliation may
+already have changed storage.
+Lost replies and partial deletion require fresh inspection on an explicit retry;
+they never cause an automatic second request. Active volumes stay protected, and
+a partial deletion cannot guess away a remaining image.
+
+The guest volume must be confirmed retired before host cleanup begins.
+Once the shared stores and external attachments have been handled, the journal
+records `removing-project` immediately before removing the private host project
+directory. Startup can finish that exact removal after an interruption, before
+loading projects or compacting browser state. Earlier cleanup phases with a
+remaining project directory still require an explicit retry or review.
 
 Explicit project deletion also waits for native Agent disposal, removes that
 project's private Blender jobs and image-recovery originals, and drops its
@@ -61,8 +69,9 @@ are removed with project storage. Project-owned generation receipts/results and
 native Codex/Qoder histories are removed as well, including attributable content
 logs; shared results owned by another project are preserved. Cleanup errors leave
 deletion pending and may be retried explicitly; normal cancellation or an uncertain tool result never
-triggers this disposal. Completed deletion journals are removed, including
-completed journals left by earlier app versions. Unsaved Library copies with
+triggers this disposal. Marked Codex SQLite compaction is retried at startup
+after native process recovery as well as on normal exit. Completed and aborted
+deletion journals are removed at startup. Unsaved Library copies with
 an explicit project source are removed unless another project owns or uses them;
 shared copies retain that other project's association for its eventual deletion.
 Unreadable project references block this cleanup. Explicitly saved Library assets,
@@ -85,13 +94,21 @@ inspection instead of invoking an unconfirmed automatic deletion. No settings
 query or failed quick start acquires VM ownership as a cleanup side effect.
 
 All four renderer deletion entry points inspect this project's canvas, document,
-table, Playable and composer drafts; the DELETE client checks again immediately
-before sending. After confirmed deletion, the browser removes that project's
-drafts and saved canvas, document, table and playtest state. A project missing
+table, Playable and composer drafts. If drafts exist or cannot be checked, the
+deletion confirmation warns that continuing discards them. The client rechecks
+before each DELETE and asks again if the draft check now requires consent the
+user has yet to give. After the host confirms deletion, the browser clears that
+project's drafts and saved canvas, document, table and playtest state when
+storage is accessible. A project missing
 from a listing is not evidence of deletion: loading damaged metadata can fail,
 so listing never discards browser recovery drafts. This does not atomically lock
 another window's unpersisted memory: browser protection covers mounted editor
 readers and persisted drafts.
+
+Project cards read the current workspace version for a confirmed deletion
+without updating any editor's cached version. The same version is sent when
+confirming discard of an execution copy. The daemon checks it again under the
+exclusive workspace lock before retiring storage.
 
 Every writable guest operation is dirty before writing. Capture alone does not
 mark source saved: the host checks its unchanged baseline, publishes through the
@@ -217,9 +234,11 @@ the guest only after the committed host receipt is durable. Ordinary failures
 roll back only owned files; concurrent saves are preserved and unresolved
 results retain the journal. Originals are never automatically garbage-collected.
 
-After an abrupt process exit, a pending journal blocks new execution, Agent
-tools, generation and project mutation/deletion. Read-only inspection remains
-available. An explicit recovery captures the guest again and reconciles only
+After an abrupt process exit, a pending host publication blocks new execution,
+generation, workspace changes and project deletion. A new conversation can open
+to inspect the retained operation. The Agent can read files and workflow guides,
+check existing samples, manage its plan and close its own playtest. Renaming the
+project or a conversation and releasing a preview lease also remain available. An explicit recovery captures the guest again and reconciles only
 the exact bound transaction under the workspace guard. It verifies every retained
 version before continuing, recognizes its own interrupted staging links, and
 refuses changed permissions, unknown links, missing/corrupt originals, different

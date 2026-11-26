@@ -206,6 +206,7 @@ const capacityRoots = [
   "image-originals",
   "image-preparations",
   "image-transactions",
+  "character-publications",
   "space-reservations",
 ] as const;
 type CapacityRoot = (typeof capacityRoots)[number];
@@ -700,6 +701,7 @@ export async function inspectRecoverySpace(
       "image-originals",
       "image-preparations",
       "image-transactions",
+      "character-publications",
       "space-reservations",
     ]) {
       const root = path.join(local.storage, name);
@@ -709,7 +711,7 @@ export async function inspectRecoverySpace(
           !(await lstat(root)).isDirectory()
         )
           throw refusal("linked local image recovery storage");
-        if (name === "image-transactions") {
+        if (name === "image-transactions" || name === "character-publications") {
           transactions += (await readdir(root)).length;
           if (transactions > 2000)
             throw refusal(
@@ -910,7 +912,7 @@ export function inspectRecoveryCapacity(
           usage.entries++;
           if (
             top &&
-            (name === "isolated-changes" || name === "image-transactions")
+            (name === "isolated-changes" || name === "image-transactions" || name === "character-publications")
           )
             usage.transactions++;
           const target = path.join(directory, entry.name),
@@ -2372,7 +2374,7 @@ export function reconnectRetainedRecoverySpace(
   });
 }
 
-async function validateLocalAnchor(
+export async function validateLocalAnchor(
   anchor: LocalImageRecoveryAnchor,
   sameFilesystem: boolean,
 ): Promise<LocalImageRecoveryAnchor> {
@@ -2552,6 +2554,25 @@ export function reserveLocalImageRecoverySpace(
     },
     anchor,
   );
+}
+
+/** Recover an exact existing host-owned intent, without allocating or changing its plan. */
+export function findLocalImageRecoverySpace(
+  input: LocalImageRecoveryAnchor,
+  ownerKey: string,
+): Promise<RecoverySpaceReservation | undefined> {
+  return serial(async () => {
+    if (!/^[a-f0-9]{32}$/.test(ownerKey)) throw refusal("invalid host reservation owner");
+    const anchor = await validateLocalAnchor(input, true);
+    localAnchors.set(anchor.workspace, anchor);
+    await loadLocalAnchor(anchor);
+    const matches = [...records.values()].filter(({ intent }) =>
+      intent.kind === "local-image" && intent.workspace === anchor.workspace && intent.storage === anchor.storage &&
+      intent.owner.projectId === anchor.projectId && intent.owner.ownerKey === ownerKey);
+    if (matches.length > 1 || matches[0]?.activeScopes)
+      throw refusal("the exact local image reservation is still in use or ambiguous");
+    return matches[0] ? tokenFor(matches[0]) : undefined;
+  });
 }
 
 export async function assertLocalImagePublicationsSettled(

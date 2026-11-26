@@ -1,14 +1,33 @@
-import { mkdtemp, readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
+import { temporaryTestDirectory } from "./temporary-test-directory.js";
 import { latestNativeSession } from "../src/daemon/agent-runtimes/native-session.js";
 import { ConversationImageStore } from "../src/daemon/conversation-images.js";
 import { ConversationManager, defaultConversationTitle } from "../src/daemon/conversations.js";
 import type { ProjectState } from "../src/shared/contracts.js";
 
 describe("ConversationManager", () => {
+  it("lists and opens healthy chats alongside damaged session metadata and non-file entries", async () => {
+    const project = await createProject();
+    const conversations = new ConversationManager();
+    const good = await conversations.create(project);
+    appendCompletedTurn(conversations.open(project, good), "Still available", "Done");
+    const directory = sessionDirectory(project);
+    const header = { type: "session", version: 3, id: "damaged", timestamp: "invalid", cwd: project.workspacePath };
+    const damaged = JSON.stringify(header) + "\n";
+    const file = path.join(directory, "damaged.jsonl");
+    await writeFile(file, damaged);
+    await mkdir(path.join(directory, "folder.jsonl"));
+    const reloaded = new ConversationManager();
+    expect((await reloaded.list(project)).map(item => item.id)).toEqual([good.summary.id]);
+    expect((await reloaded.get(project, good.summary.id))?.summary.title).toBe("Still available");
+    expect(await readFile(file, "utf8")).toBe(damaged);
+    await writeFile(file, JSON.stringify({ ...header, timestamp: new Date(0).toISOString() }) + "\n");
+    expect((await reloaded.get(project, "damaged"))?.summary.createdAt).toBe(new Date(0).toISOString());
+  });
+
   it.each(["user", "toolResult"] as const)("detects %s images in the active conversation context without changing the session", async (role) => {
     const project = await createProject(), conversations = new ConversationManager();
     const stored = await conversations.create(project);
@@ -199,7 +218,7 @@ describe("ConversationManager", () => {
 });
 
 async function createProject(): Promise<ProjectState> {
-  const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-conversations-"));
+  const directory = await temporaryTestDirectory("ohmygame-conversations-");
   return {
     id: path.basename(directory),
     name: "Project",

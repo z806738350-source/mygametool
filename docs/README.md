@@ -139,6 +139,7 @@ For the additional engine, mini-game, and asset-tool Beta packages, use the
   [React Three Fiber](../plugins/web-game-studio/skills/react-three-fiber-game/SKILL.md),
   [Three.js](../plugins/web-game-studio/skills/three-webgl-game/SKILL.md),
   [Sprite Pipeline](../plugins/web-game-studio/skills/sprite-pipeline/SKILL.md),
+  [Eight Direction Character](../plugins/web-game-studio/skills/eight-direction-character/SKILL.md),
   and [Web 3D Assets](../plugins/web-game-studio/skills/web-3d-asset-pipeline/SKILL.md).
 - [Three.js World](../plugins/threejs-world/skills/threejs-world/SKILL.md) and
   its references: [world contract](../plugins/threejs-world/skills/threejs-world/references/world-contract.md),

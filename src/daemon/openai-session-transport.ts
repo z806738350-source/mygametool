@@ -152,9 +152,9 @@ export class OpenAISessionTransport {
             if (!this.socket || this.socket.readyState !== 1 || Date.now() - this.openedAt >= 55 * 60 * 1000) this.dispose();
             let outgoing = this.socket && options.transport !== "websocket" && options.cacheRetention !== "none" ? this.delta(body) : undefined;
             if (!outgoing) { this.continuation = undefined; outgoing = body; }
-            const changed = this.images.budget(outgoing, imageScope, reduceRequest);
+            const changed = await this.images.budget(outgoing, imageScope, reduceRequest, request.signal);
             if (changed && outgoing !== body) {
-              this.dispose(); this.images.budget(body, imageScope); outgoing = body;
+              this.dispose(); await this.images.budget(body, imageScope, false, request.signal); outgoing = body;
             }
             if (Buffer.byteLength(JSON.stringify({ type: "response.create", ...outgoing })) > MODEL_REQUEST_HIGH_BYTES) throw new ImageBudgetError();
             try { response = await this.send(outgoing, body, request, options, used); }
@@ -174,13 +174,13 @@ export class OpenAISessionTransport {
               } else {
                 // No event has escaped to Pi here. A network/handshake failure can safely fall back.
                 this.fallbackUntil = Date.now() + FALLBACK_MS;
-                this.images.budget(body, imageScope, reduceRequest);
+                await this.images.budget(body, imageScope, reduceRequest, request.signal);
                 response = transportResponse(await delegate(this.httpRequest(request, body)), "sse");
               }
             }
           } else {
             if (!this.busy) this.dispose();
-            this.images.budget(body, imageScope, reduceRequest);
+            await this.images.budget(body, imageScope, reduceRequest, request.signal);
             response = transportResponse(await delegate(this.httpRequest(request, body)), "sse");
           }
         } catch (error) {

@@ -27,6 +27,7 @@ describe("OhMyGame system prompt", () => {
       expect(text).toContain("user approval of the inspected turnaround");
       expect(text).toContain("final acceptance before replacing approved art");
       expect(text).toContain("read_workflow_guide with guide ohmygame");
+      expect(text.includes("read_workflow_guide with guide eight-direction-character")).toBe(type === "web-game");
       for (const reference of ["canvas.md", "media.md", "images.md", "textures.md", "modeling.md", "isolated-recovery.md", "project.md"])
         expect(text).toContain(reference);
       expect(text).not.toContain("may be empty");

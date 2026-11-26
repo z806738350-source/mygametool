@@ -24,6 +24,7 @@ import { projectToolSearch } from "./pi-tool-search.js";
 import { readWorkspaceNotice } from "./workspace-notice.js";
 import type { AgentContextUsage, AgentMessagePhase, AgentReasoningLevel, AgentStatus, ConversationAgentState, ConversationAttachment, PendingPrompt, PlanMode, PlanSessionState, PlanState, PluginMention, ProjectAgentActivity, ProjectState, PromptImage, PromptReference, QuestionnaireAnswer, QuestionnaireQuestion, QuestionnaireResult, ResponsesTransportMode, ThreadItem, ThreadItemError, ToolArtifact, ToolId, TurnChanges } from "../shared/contracts.js";
 import { hasPluginMentionToken, parsePluginMentions, serializePluginMentions } from "../shared/plugins.js";
+import { isLocalSessionImageBudgetError } from "../shared/agent-errors.js";
 import type { RuntimeEventBus } from "../shared/events.js";
 import type { AgentRuntimeId, ApprovalDecision, ApprovalRequestDetails } from "../shared/agent-runtimes.js";
 import { isVolumeMigrationReview, validVolumeMigrationConfirmation, type VolumeMigrationConfirmation } from "../shared/volume-migration.js";
@@ -52,6 +53,8 @@ import { AUTO_CONTINUE_DELAYS, AUTO_CONTINUE_ENTRY, AUTO_CONTINUE_PROMPT, AutoCo
 import { getToolConfirmedFailure } from "./agent-tool-errors.js";
 import { answerModelTriangleQuestion, type ModelTriangleAnswer } from "./model-report-answer.js";
 import { readCanvasBoard } from "./canvas-workspace.js";
+import { spriteWalkFinishTool } from "./sprite-walk-agent.js";
+import { characterViewProgressReminder } from "./character-view-progress.js";
 import { readSafeProjectFile } from "./safe-project-file.js";
 
 const CONTINUATION_SUPERSEDED = Symbol("newer user message");
@@ -79,8 +82,8 @@ export interface CodingSession {
   recordLocalModelReport?(prompt: string, answer: string, checkpoint: string | undefined, emit: (event: AgentSessionEvent) => void): void;
   /** Application-owned continuation; never repeats the original prompt or SDK retry loop. */
   readonly interruption?: AgentInterruption;
-  prepareContinuation?(signal: AbortSignal): Promise<void>;
-  resumeAfterInterruption?(): Promise<void>;
+  prepareContinuation?(signal: AbortSignal, originalUserId?: string): Promise<void>;
+  resumeAfterInterruption?(manualLocalImageRetry?: boolean): Promise<void>;
   /** Compatibility for sessions predating the shared interruption protocol. */
   prepareHttp500Continuation?(signal: AbortSignal): Promise<void>;
   resumeAfterHttp500?(): Promise<void>;
@@ -166,11 +169,12 @@ export function conversationItems(entries: readonly SessionEntry[], markInterrup
         || !Number.isInteger(saved.attempt) || Number(saved.attempt) < 1 || Number(saved.attempt) > AUTO_CONTINUE_DELAYS.length
         || !["inProgress", "completed", "failed"].includes(String(saved.status)) || typeof failure?.message !== "string") continue;
       const interrupted = markInterrupted && saved.status === "inProgress";
+      const manual = saved.source === "manual-local-image";
       const item: Extract<ThreadItem, { type: "retry" }> = { id: saved.id, turnId: turnId ?? entry.id, type: "retry",
-        attempt: Number(saved.attempt), maxAttempts: AUTO_CONTINUE_DELAYS.length,
+        attempt: Number(saved.attempt), maxAttempts: manual ? 1 : AUTO_CONTINUE_DELAYS.length, ...(manual ? { source: "manual-local-image" as const } : {}),
         delayMs: typeof saved.delayMs === "number" && saved.delayMs >= 0 && saved.delayMs <= 45_000 ? saved.delayMs : 0,
         status: interrupted ? "failed" : saved.status as "inProgress" | "completed" | "failed",
-        error: interrupted ? normalizeAgentError("The application restarted during automatic continuation. It was stopped; review the saved task before continuing.") : normalizeAgentError(failure.message, failure.diagnostics),
+        error: interrupted ? normalizeAgentError(manual ? "The application restarted during the requested image-budget retry. Review the saved task before continuing." : "The application restarted during automatic continuation. It was stopped; review the saved task before continuing.") : normalizeAgentError(failure.message, failure.diagnostics),
         timestamp: Date.parse(entry.timestamp) };
       const previous = items.findIndex(candidate => candidate.id === item.id);
       if (previous < 0) items.push(item); else items[previous] = item;
@@ -255,7 +259,8 @@ export function conversationItems(entries: readonly SessionEntry[], markInterrup
         : normalizeAgentError(storedError.message, storedError.diagnostics);
       const previous = items.findLastIndex((item) => item.turnId === turnId && item.type === "agentMessage");
       const item = items[previous];
-      if (item?.type === "agentMessage" && item.status === "failed") items[previous] = { ...item, error };
+      const requestedRetry = items.findLastIndex(candidate => candidate.turnId === turnId && candidate.type === "retry" && candidate.source === "manual-local-image");
+      if (item?.type === "agentMessage" && item.status === "failed" && previous > requestedRetry) items[previous] = { ...item, error };
       else items.push({ id: entry.id, turnId, type: "agentMessage", text: "", status: "failed", error, timestamp: Date.parse(entry.timestamp) });
       turnFinished = true;
       continue;
@@ -453,6 +458,7 @@ interface AgentManagerOptions {
   checkpoints?: {
     snapshot(project: ProjectState): Promise<string>;
     changed(project: ProjectState, from: string, to: string): Promise<TurnChanges>;
+    onlyCanvasViewportChanged?(project: ProjectState, from: string, to: string): Promise<boolean>;
   };
   errorDiagnostics?: () => NonNullable<ThreadItemError["diagnostics"]>;
 }
@@ -473,6 +479,39 @@ interface ManagedSession {
   unsubscribe: () => void;
   designContext?: string;
   runtimeRevision?: number;
+}
+
+interface LocalImageRetry {
+  checkpoint: { id: string; commit: string };
+  workspaceCommit: string;
+  error: ThreadItemError;
+  session: CodingSession;
+}
+
+function localImageRetry(session: CodingSession, turnId: string): LocalImageRetry {
+  const branch = session.sessionManager?.getBranch() ?? [];
+  const user = branch.findLastIndex(entry => entry.type === "message" && entry.message.role === "user");
+  const checkpoint = branch[user - 1];
+  const before = checkpoint?.type === "custom" && checkpoint.customType === CHECKPOINT_ENTRY && parseStoredCheckpoint(checkpoint.data);
+  const tail = branch.slice(user + 1).filter(entry => entry.type !== "session_info" && entry.type !== "context_edit");
+  const [failed, diagnostic, closed] = tail.slice(-3);
+  const end = closed?.type === "custom" && closed.customType === TURN_END_ENTRY && parseStoredTurnEnd(closed.data);
+  const saved = diagnostic?.type === "custom" && diagnostic.customType === AGENT_ERROR_ENTRY ? record(diagnostic.data) : undefined;
+  const error = record(saved?.error);
+  if (!session.prepareContinuation || !session.resumeAfterInterruption || session.runtime || branch[user]?.id !== turnId || !before ||
+      !end || end.checkpoint !== checkpoint.id || failed?.type !== "message" || failed.message.role !== "assistant" ||
+      failed.message.stopReason !== "error" || String(failed.message.api) === "ohmygame-native" ||
+      saved?.version !== 1 || saved.beforeUserMessage || typeof error?.message !== "string" ||
+      !isLocalSessionImageBudgetError(assistantMessageError(failed.message)) || !isLocalSessionImageBudgetError(normalizeAgentError(error.message, error.diagnostics)) ||
+      tail.some(entry => entry.type === "custom" && entry.customType === AUTO_CONTINUE_ENTRY && record(record(entry.data)?.item)?.source === "manual-local-image")) {
+    throw new Error("Only the latest completed Pi turn with an unretried local image budget error can be resumed.");
+  }
+  if (!session.model || failed.message.provider !== session.model.provider || failed.message.model !== session.model.id ||
+      (failed.message.thinkingLevel !== undefined && failed.message.thinkingLevel !== session.thinkingLevel)) {
+    throw new Error("The model or reasoning level changed since the failed request.");
+  }
+  return { checkpoint: { id: checkpoint.id, commit: before.commit }, workspaceCommit: end.commit,
+    error: normalizeAgentError(error.message, error.diagnostics), session };
 }
 
 interface ActiveTurn {
@@ -516,6 +555,7 @@ interface ActiveTurn {
   cancelOrigin?: "user" | "host";
   run?: Promise<AgentRunResult>;
   autoContinuationItem?: Extract<ThreadItem, { type: "retry" }>;
+  localImageRetry?: LocalImageRetry;
   items: Map<string, ThreadItem>;
   startedEventId?: number;
   startedAt?: number;
@@ -823,13 +863,15 @@ export class AgentManager {
       });
       return { turnId, queued: true, result };
     }
-    if (active?.ended) {
-      // The conversation reads as idle, so this is a message for a new run and not one to queue in the run
-      // that is over. It waits in the conversation's queue, behind the mutation that closes the turn, and is
-      // then taken as if it had been sent a moment later.
-      const taken = this.#withQueueMutation(key, async () => {
+    const closing = active?.ended ? active : !active && this.options.checkpoints
+      ? [...this.#activeTurns.values()].find(turn => turn.projectId === project.id && turn.ended)
+      : undefined;
+    if (closing) {
+      // A completed run can still be recording its final checkpoint for the shared workspace.
+      const closingKey = conversationKey(project.id, closing.conversationId);
+      const taken = this.#withQueueMutation(closingKey, async () => {
         // A turn that could not be closed is still there, and then nothing can start.
-        if (this.#activeTurns.get(key) === active) throw new Error("Agent run is no longer active");
+        if (this.#activeTurns.get(closingKey) === closing) throw new Error("Agent run is no longer active");
         const next = this.prompt(project, conversation, prompt, references, images, mode, mentions, turnId, attachmentContext, attachments);
         // A message queued behind the new run waits for a later mutation of this queue, so that is handed on and not awaited here.
         return { followUp: next.queued ? next.result : undefined };
@@ -955,6 +997,38 @@ export class AgentManager {
       this.#revisions.delete(key);
       this.#flushInvalidatedProject(project.id);
     }
+  }
+
+  async retryLocalImageRequest(project: ProjectState, conversation: StoredConversation, turnId: string) {
+    const key = conversationKey(project.id, conversation.summary.id);
+    if (this.#activeTurns.get(key)?.ended) await this.#turnClosed(key);
+    const assertIdle = () => {
+      this.#projectAdmission?.(project.id);
+      if (this.#closing || this.isProjectBusy(project.id) || this.#pendingPrompts.get(key)?.length ||
+          this.#steeringPrompts.get(key)?.length || this.planState(conversation).mode !== "normal") {
+        throw new Error("Wait for the project agent, queued messages and plan to finish before retrying.");
+      }
+    };
+    assertIdle();
+    const { session } = await this.#getSession(project, conversation);
+    assertIdle();
+    const retry = localImageRetry(session, turnId);
+    this.#revisions.add(key);
+    try {
+      const leaf = session.sessionManager!.getBranch().at(-1)?.id;
+      if (!await this.#matchesLocalImageWorkspace(project, retry.workspaceCommit))
+        throw new Error("The workspace changed since the local image error. Review current files before starting new work.");
+      this.#projectAdmission?.(project.id);
+      if (this.#closing || this.#sessions.get(key)?.session !== session || session.sessionManager!.getBranch().at(-1)?.id !== leaf)
+        throw new Error("The conversation changed before the local image request could be retried.");
+      return { turnId, result: this.#startPrompt(project, conversation, "", [], [], turnId, retry) };
+    } finally { this.#revisions.delete(key); }
+  }
+
+  async #matchesLocalImageWorkspace(project: ProjectState, expected: string): Promise<boolean> {
+    const store = this.options.checkpoints;
+    const current = await store?.snapshot(project);
+    return current === expected || !!(current && await store?.onlyCanvasViewportChanged?.(project, expected, current));
   }
 
   /**
@@ -1133,7 +1207,7 @@ export class AgentManager {
     references: PromptReference[],
     images: PromptImage[],
     turnId: string,
-    revision?: "last-turn",
+    revision?: "last-turn" | LocalImageRetry,
     mode: PlanMode = "normal",
     plan?: PlanState,
     mentions: PluginMention[] = [],
@@ -1168,10 +1242,21 @@ export class AgentManager {
       checkpoints: [],
       ...(left ? { left } : {}),
     };
+    if (typeof revision === "object") {
+      const item: Extract<ThreadItem, { type: "retry" }> = { type: "retry", id: `${turnId}:manual-local-image`, turnId,
+        source: "manual-local-image", status: "inProgress", attempt: 1, maxAttempts: 1, delayMs: 0, error: revision.error };
+      revision.session.sessionManager!.appendCustomEntry(AUTO_CONTINUE_ENTRY, { version: 1, item });
+      active.localImageRetry = revision;
+      active.autoContinuationItem = item;
+      active.continuationAbort = new AbortController();
+      active.userMessageStarted = true;
+      active.checkpointId = revision.checkpoint.id;
+      active.checkpoints.push(revision.checkpoint);
+    }
     this.#activeTurns.set(conversationKey(project.id, active.conversationId), active);
     this.#setState(project.id, active.conversationId, { status: "running" });
     const contexts = promptContextLabels(attachmentContext);
-    const started = this.events.publish(
+    const started = typeof revision === "object" ? this.#startItem(project.id, active, active.autoContinuationItem!) : this.events.publish(
       project.id,
       "agent.started",
       { prompt, ...(mentions.length ? { mentions } : {}), ...(images.length ? { images } : {}), ...(attachments.length ? { attachments } : {}), ...(contexts.length ? { contexts } : {}), ...(revision ? { revision } : {}) },
@@ -1236,7 +1321,7 @@ export class AgentManager {
       const key = conversationKey(project.id, active.conversationId);
       const canAnswerLocally = () => !this.#queueMutations.has(key) &&
         !this.#pendingPrompts.get(key)?.length && !this.#steeringPrompts.get(key)?.length;
-      const report = session.recordLocalModelReport && session.sessionManager && active.mode === "normal" && !active.left &&
+      const report = !active.localImageRetry && session.recordLocalModelReport && session.sessionManager && active.mode === "normal" && !active.left &&
         !images.length && !active.references.length && !active.attachments.length && !active.mentions.length && canAnswerLocally()
         ? answerModelTriangleQuestion(active.prompt, session.sessionManager.getBranch()) : undefined;
       const useReport = report && await canUseLocalModelReport(active.attachmentContext, report, project.workspacePath);
@@ -1247,15 +1332,30 @@ export class AgentManager {
         return "cancelled";
       }
 
-      appendPromptDetails(session.sessionManager, active, prompt);
+      if (!active.localImageRetry) appendPromptDetails(session.sessionManager, active, prompt);
       if (useReport && canAnswerLocally()) {
         session.recordLocalModelReport!(prompt, report.text, checkpoint, (event) => this.#forwardEvent(project.id, active.conversationId, event));
       } else {
         const activeTools = this.options.activeToolNames?.(project, active.mode, session) ?? BASE_TOOL_NAMES;
         session.setActiveToolsByName?.(session.getAllTools?.().some((tool) => tool.name === "recall_image")
           ? [...new Set([...activeTools, "recall_image"])] : activeTools);
-        await this.#promptWithContinuation(project, active, session, () => images.length
-          ? session.prompt(prompt, { images: images.map(toPiImage) }) : session.prompt(prompt));
+        if (active.localImageRetry) {
+          const retry = active.localImageRetry;
+          const signal = active.continuationAbort!.signal;
+          await session.prepareContinuation!(signal, active.turnId);
+          signal.throwIfAborted();
+          this.#projectAdmission?.(project.id);
+          if (retry.session !== session || !await this.#matchesLocalImageWorkspace(project, retry.workspaceCommit))
+            throw new Error("The workspace or session changed before the local image request resumed.");
+          signal.throwIfAborted();
+          await session.resumeAfterInterruption!(true);
+          const error = lastAssistantError(session.messages);
+          if (error) throw new Error(error.message);
+          if (!isCancelling(active)) this.#finishContinuation(project.id, active, "completed");
+        } else {
+          await this.#promptWithContinuation(project, active, session, () => images.length
+            ? session.prompt(prompt, { images: images.map(toPiImage) }) : session.prompt(prompt));
+        }
       }
       if (isCancelling(active)) {
         this.#markCancelled(project.id, active);
@@ -1267,6 +1367,7 @@ export class AgentManager {
         return "cancelled";
       }
       const error = thrownAgentError(cause);
+      if (active.localImageRetry) this.#finishContinuation(project.id, active, "failed", error);
       this.#markError(project.id, active, active.lastError?.message === error.message ? active.lastError : error);
       throw cause;
     }
@@ -1670,6 +1771,8 @@ export class AgentManager {
         throw new Error("Confirm the exact migration plan, capacity and retained old volume before allowing this one migration");
     } else if (volumeMigrationConfirmation !== undefined) throw new Error("A migration confirmation cannot authorize another approval kind");
     if (decision === "allow-session" && !pending.item.request.canAllowSession) throw new Error("This request can only be allowed once");
+    if (sourceConfirmation !== undefined && !pending.item.request.isolatedSourceReview)
+      throw new Error("A source confirmation can only authorize the corresponding retained file review");
     if (decision !== "deny" && pending.item.request.isolatedSourceReview && (decision !== "allow" || !validSourceConfirmation(pending.item.request.isolatedSourceReview, sourceConfirmation)))
       throw new Error("Confirm the exact retained file list and the separate code risk before allowing this recovery");
     this.#approvals.get(key)?.delete(requestId);
@@ -1697,6 +1800,7 @@ export class AgentManager {
   activeItems(projectId: string, conversationId: string): ThreadItem[] {
     const active = this.#activeTurns.get(conversationKey(projectId, conversationId));
     if (!active) return [];
+    if (active.localImageRetry) return [...active.items.values()];
     const timestamp = active.startedAt === undefined ? {} : { timestamp: active.startedAt };
     const contexts = promptContextLabels(active.attachmentContext);
     return [{
@@ -2531,7 +2635,7 @@ function carryTurnEnds(sessionManager: NonNullable<CodingSession["sessionManager
   const ids = new Set(kept.map((entry) => entry.id));
   // The turns that stay are the checkpoints whose message is still there; the last checkpoint may have lost its own.
   const turns = new Set<string>();
-  const ended = new Set<string>();
+  const ended = new Map<string, string>();
   let checkpoint: string | undefined;
   for (const entry of kept) {
     if (entry.type === "message" && entry.message.role === "user") {
@@ -2541,15 +2645,21 @@ function carryTurnEnds(sessionManager: NonNullable<CodingSession["sessionManager
       checkpoint = entry.id;
     } else if (entry.type === "custom" && entry.customType === TURN_END_ENTRY) {
       const end = parseStoredTurnEnd(entry.data);
-      if (end) ended.add(end.checkpoint);
+      if (end) ended.set(end.checkpoint, entry.id);
     }
   }
+  // A manual retry may close the same user checkpoint again with further changes.
+  const latest = new Map<string, { id: string; end: StoredTurnEnd }>();
   for (const entry of left) {
-    if (entry.type !== "custom" || entry.customType !== TURN_END_ENTRY || ids.has(entry.id)) continue;
+    if (entry.type !== "custom" || entry.customType !== TURN_END_ENTRY) continue;
     const end = parseStoredTurnEnd(entry.data);
-    if (!end || !turns.has(end.checkpoint) || ended.has(end.checkpoint)) continue;
-    sessionManager.appendCustomEntry(TURN_END_ENTRY, end);
-    ended.add(end.checkpoint);
+    if (end && turns.has(end.checkpoint)) latest.set(end.checkpoint, { id: entry.id, end });
+  }
+  for (const { id, end } of latest.values()) {
+    if (ids.has(id)) continue;
+    const current = ended.get(end.checkpoint);
+    if (current && !left.some(entry => entry.id === current)) continue;
+    ended.set(end.checkpoint, sessionManager.appendCustomEntry(TURN_END_ENTRY, end));
   }
   if (!undone) return;
   // The last undo of a turn says how it stands, and is read after the end of that turn.
@@ -3233,7 +3343,7 @@ function appendPlanState(sessionManager: CodingSession["sessionManager"], state:
 
 const BASE_TOOL_NAMES = ["read", "write", "edit", "ls", "find", "grep", "read_attachment", "recall_image", "recall_tool_text"];
 const LOCAL_AGENT_TOOL_NAMES = new Set([
-  ...BASE_TOOL_NAMES, "read_workflow_guide", "inspect_3d_views", "blender_status", "run_blender", "recover_blender_run", "review_tripo_model", "questionnaire", "update_plan", "canvas_check", "canvas_initialize", "prepare_three_runtime", "ensure_ink_runtime", "list_media_capabilities",
+  ...BASE_TOOL_NAMES, "read_workflow_guide", "inspect_3d_views", "blender_status", "run_blender", "recover_blender_run", "review_tripo_model", "questionnaire", "update_plan", "canvas_check", "canvas_initialize", "prepare_three_runtime", "ensure_ink_runtime", "prepare_character_views", "review_sprite_walk", "repair_sprite_walk", "review_sprite_action", "repair_sprite_action", "list_media_capabilities",
   "isolated_shell", "recover_isolated_changes", "build_game", "playable_add_node", "playable_check", "game_use", "generate_canvas_media", "get_model_asset", "optimize_image_asset", "use_canvas_asset",
   "generate_image", "generate_reference_image", "generate_video", "generate_3d_asset", "generate_3d_from_views", "animate_3d_asset",
   "generate_speech", "generate_sound_effect", "generate_music", "recover_media", "recover_canvas_media", "replace_canvas_media",
@@ -3346,18 +3456,39 @@ export async function createPiSession(
   const mediaTools = new Set(localTools.filter(tool => !BASE_TOOL_NAMES.includes(tool.name) && tool.prepareArguments).map(tool => tool.name));
   const finishTurn = session.agent.finishTurn;
   let repeatedTool: string | undefined;
+  let retryHistory: AgentMessage[] | undefined;
+  const finishWalk = spriteWalkFinishTool(customTools);
+  let lastCharacterReview: ReturnType<typeof characterViewProgressReminder>;
+  let characterNotice: string | undefined;
   session.agent.finishTurn = async (turn, signal) => {
     const decision = (await finishTurn?.(turn, signal)) ?? undefined;
     if (continuationTools.stopRequested && !continuationTools.repairable) return { action: "end" };
     if (decision?.action === "end" || signal?.aborted || session.pendingMessageCount) return decision;
     repeatedTool = repeatedMediaRejection(turn.newMessages, mediaTools);
-    return repeatedTool ? { action: "end" } : decision;
+    if (repeatedTool) return { action: "end" };
+    if (project.type === "web-game" && turn.message.stopReason === "stop" && !decision && !continuationTools.stopRequested) {
+      const walk = await finishWalk?.(signal);
+      if (walk) { characterNotice = walk; return { action: "continue" }; }
+      const review = characterViewProgressReminder(retryHistory ? [...retryHistory, ...turn.newMessages] : turn.newMessages);
+      if (review && (review.user !== lastCharacterReview?.user || review.setId !== lastCharacterReview?.setId ||
+          review.progress > lastCharacterReview.progress)) {
+        lastCharacterReview = review;
+        characterNotice = review.text;
+        sessionManager.appendCustomEntry("ohmygame-character-progress", { setId: review.setId, progress: review.progress });
+        return { action: "continue" };
+      }
+    }
+    return decision;
   };
   const streamFunction = session.agent.streamFunction;
   session.agent.streamFunction = (...args) => {
     // Pi swallows extension exceptions and may call a provider with an aborted signal.
     assertCheckpoint();
-    return streamFunction(...args);
+    if (!characterNotice) return streamFunction(...args);
+    const [model, context, options] = args;
+    const notice = characterNotice;
+    characterNotice = undefined;
+    return streamFunction(model, { ...context, messages: [...context.messages, { role: "system", content: notice, timestamp: Date.now() }] }, options);
   };
   const convertToLlm = session.agent.convertToLlm;
   const pastDesignContexts = new WeakMap<UserPromptMessage, UserPromptMessage>();
@@ -3376,8 +3507,20 @@ export async function createPiSession(
   session.subscribe(event => {
     if (event.type === "message_start" && isUserMessage(event.message)) continuationTools.reset();
   });
-  const prepareContinuation = async (signal: AbortSignal) => {
+  const prepareContinuation = async (signal: AbortSignal, originalUserId?: string) => {
       assertCheckpoint();
+      if (originalUserId) {
+        const branch = sessionManager.getBranch();
+        const user = branch.findLastIndex(entry => entry.type === "message" && entry.message.role === "user");
+        if (user < 0 || branch[user]!.id !== originalUserId) throw new Error("The original user request changed before the retry.");
+        continuationTools.reset(originalUserId);
+        const task = branch.slice(user);
+        retryHistory = task.flatMap(entry => entry.type === "message" ? [entry.message] : []);
+        const prior = characterViewProgressReminder(retryHistory);
+        const marker = task.findLast(entry => entry.type === "custom" && entry.customType === "ohmygame-character-progress" && record(entry.data)?.setId === prior?.setId);
+        const progress = marker?.type === "custom" ? record(marker.data)?.progress : undefined;
+        lastCharacterReview = prior && typeof progress === "number" ? { ...prior, progress } : undefined;
+      }
       await continuationTools.prepare(signal, async (result, tool, callId) => {
         const confirmedFailure = getToolConfirmedFailure(result);
         await session.sendCustomMessage({ customType: "ohmygame-recovered-media", display: false,
@@ -3385,10 +3528,11 @@ export async function createPiSession(
           details: { tool, originalCallId: callId, ...(confirmedFailure ? { isError: true, confirmedFailure } : {}) } }, { triggerTurn: false });
       });
   };
-  const resumeAfterInterruption = async () => {
+  const resumeAfterInterruption = async (manualLocalImageRetry?: boolean) => {
       assertCheckpoint();
       await session.sendCustomMessage({ customType: AUTO_CONTINUE_ENTRY, display: false,
-        content: continuationTools.repairOnly ? `${AUTO_CONTINUE_PROMPT}\n\nOnly controlled reads and recover_isolated_changes inspect/review/optimize/adopt/recover are allowed. Settle the exact original snapshots; never replay the failed command or submit a replacement. After settlement read current project files before further changes.\n${continuationTools.recoverySummary ?? ""}` : AUTO_CONTINUE_PROMPT }, { triggerTurn: true });
+        content: AUTO_CONTINUE_PROMPT + (manualLocalImageRetry ? "\nThe user requested a retry of the model request after the local image budget error. Continue the authorized task with the retained images. Read character review previews in small groups when further inspection is needed." : "") +
+          (continuationTools.repairOnly ? `\n\n${continuationTools.recoverySummary ?? ""}` : "") }, { triggerTurn: true });
       assertCheckpoint();
       continuationTools.assertSafe();
       if (repeatedTool) throw new RepeatedMediaArgumentsError(repeatedTool);
@@ -3417,6 +3561,9 @@ export async function createPiSession(
       if (textOnly && args[1]?.images?.length) throw new Error("The selected connection does not have image input enabled. Choose an image-enabled connection before sending images or screenshots.");
       checkpointFailure = undefined;
       repeatedTool = undefined;
+      characterNotice = undefined;
+      retryHistory = undefined;
+      lastCharacterReview = undefined;
       continuationTools.reset();
       await prompt(...args);
       assertCheckpoint();

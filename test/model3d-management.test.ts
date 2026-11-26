@@ -53,6 +53,23 @@ async function generate(app: ReturnType<typeof createApp>, provider: string, id:
 }
 
 describe("native 3D model management", () => {
+  it("opens projects when retired media credentials are unreadable and preserves each original during cleanup", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-legacy-credentials-"));
+    const damaged = ["tripo.json", "minimax.json", "seedance.json", "volcengine-tts.json", "volcengine-seed-audio.json"];
+    for (const name of damaged) await writeFile(path.join(directory, name), "{", { mode: 0o600 });
+    const { app, request } = await fixture("tripo", directory);
+    expect((await app.inject("/projects")).statusCode).toBe(200);
+    expect((await app.inject("/settings/models/providers/tripo")).statusCode).toBe(503);
+    for (const route of [
+      "legacy-media-keys/tripo", "legacy-media-keys/minimax-video-cn", "providers/byteplus-modelark/seedance-key",
+      "providers/volcengine-tts", "providers/volcengine-seed-audio",
+    ]) {
+      expect((await app.inject({ method: "DELETE", url: `/settings/models/${route}` })).statusCode).toBe(503);
+    }
+    for (const name of damaged) expect(await readFile(path.join(directory, name), "utf8")).toBe("{");
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it("adopts a newly bundled version without losing saved names, defaults, or visibility", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-preset-upgrade-")); directories.push(directory);
     const previous = { id: "meshy-6", name: "Saved Meshy 6", settings: { ...defaultModel3DSettings("standard", "meshy"),

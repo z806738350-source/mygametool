@@ -64,8 +64,8 @@ export function Home({ onNavigate, onCreate, onOpen, inert = false }: HomeProps)
   }
 
   async function remove(project: ProjectState) {
-    if (!confirmProjectDeletion(project)) return;
-    await runProjectAction(() => deleteProject(project.id));
+    const confirmation = confirmProjectDeletion(project);
+    if (confirmation) await runProjectAction(() => deleteProject(confirmation));
   }
 
   async function runProjectAction(action: () => Promise<unknown>) {

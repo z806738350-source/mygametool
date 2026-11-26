@@ -25,6 +25,18 @@ async function secureApp(preparedDirectory?: string, dataDirectory?: string) {
 }
 
 describe("preinstalled plugins in the local edition", () => {
+  it("opens projects with an unreadable receipt when there is no active preinstalled catalog", async () => {
+    const directory = await temporary("ohmygame-inactive-preinstall-");
+    const folder = path.join(directory, "plugins");
+    await mkdir(folder, { recursive: true });
+    const receipt = path.join(folder, "preinstalled-plugins.json");
+    await writeFile(receipt, "{");
+    const { app, request } = await secureApp(undefined, directory);
+    expect((await app.inject("/projects")).statusCode).toBe(200);
+    expect(await readFile(receipt, "utf8")).toBe("{");
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it("does not call the seed executor or wait for prepared Plugin installation at startup", async () => {
     const seed = vi.spyOn(PreinstalledPluginManager.prototype, "seed");
     const prepared = await preparedPlugin();

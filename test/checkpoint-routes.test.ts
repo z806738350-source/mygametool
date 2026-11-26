@@ -1,9 +1,11 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, it } from "vitest";
 import { createApp, type AppOptions } from "../src/daemon/app.js";
+import { CharacterViewPublicationJournal, type CharacterViewOperationIdentity } from "../src/daemon/character-view-publication.js";
 import {
   CheckpointStore,
   checkpointDirectory,
@@ -42,7 +44,7 @@ const createSession: NonNullable<AppOptions["createSession"]> = async (
   };
 };
 
-async function fixture() {
+async function fixture(type?: ProjectState["type"]) {
   const directory = await mkdtemp(
     path.join(tmpdir(), "ohmygame-checkpoint-routes-"),
   );
@@ -56,7 +58,7 @@ async function fixture() {
     await app.inject({
       method: "POST",
       url: "/projects",
-      payload: { name: "Checkpoint" },
+      payload: { name: "Checkpoint", ...(type ? { type } : {}) },
     })
   ).json<ProjectState>();
   const store = new CheckpointStore();
@@ -120,6 +122,52 @@ async function fixture() {
     after,
   };
 }
+
+it("recovers proven character publications at startup and protects only the uncertain project's restore and deletion", async () => {
+  const { app, directory, project, base, checkpointId } = await fixture("web-game");
+  await writeFile(path.join(project.workspacePath, "canvas", "jobs.json"), "[]");
+  const other = (await app.inject({ method: "POST", url: "/projects", payload: { name: "Other game", type: "web-game" } })).json<ProjectState>();
+  const data = await realpath(directory);
+  const fingerprint = createHash("sha256").update("character publication fixture").digest("hex");
+  const start = async (target: ProjectState, identity: CharacterViewOperationIdentity) => {
+    const storage = path.join(data, "image-recovery", target.id);
+    const journal = new CharacterViewPublicationJournal({ workspace: await realpath(target.workspacePath), projectId: target.id, storage });
+    const result = await journal.begin(identity);
+    if (result.state !== "started") throw new Error("Expected a new character view operation");
+    const receiptPath = path.join(storage, "character-publications", `${createHash("sha256").update(identity.operationId).digest("hex")}.json`);
+    return { operation: result.operation, receiptPath };
+  };
+  const uncertain = await start(project, { operationId: "test/uncertain", fingerprint, action: "plan", purpose: "plan" });
+  await uncertain.operation.markEffectsStarted();
+  await writeFile(path.join(project.workspacePath, "partial-plan.json"), "{}");
+  uncertain.operation.detach();
+
+  const committed = await start(other, { operationId: "test/commit", fingerprint, action: "publish", purpose: "complete" });
+  const after = Buffer.from('{"version":1}');
+  await committed.operation.prepareCommit({ marker: { path: "manifest.json", before: null, after }, result: { version: 1 } });
+  await writeFile(path.join(other.workspacePath, "manifest.json"), after);
+  committed.operation.detach();
+  await app.close();
+
+  const restarted = createApp({ dataDirectory: directory, createSession });
+  cleanup.push(() => restarted.close());
+  expect((await restarted.inject({ method: "GET", url: "/projects" })).statusCode).toBe(200);
+  expect(JSON.parse(await readFile(committed.receiptPath, "utf8"))).toMatchObject({ terminal: { state: "committed" }, cleaned: true });
+  expect(JSON.parse(await readFile(uncertain.receiptPath, "utf8"))).toMatchObject({ phase: "effects" });
+  const changes = await restarted.inject({ method: "GET", url: `${base}/${checkpointId}/changes` });
+  expect(changes.statusCode, changes.body).toBe(200);
+  const undo = await restarted.inject({ method: "POST", url: `${base}/${checkpointId}/undo`, payload: {} });
+  expect(undo.statusCode, undo.body).toBe(409);
+  expect(undo.json().error).toMatch(/character view publication/);
+  expect(await readFile(path.join(project.workspacePath, "game.txt"), "utf8")).toBe("after");
+  const refused = await restarted.inject({ method: "DELETE", url: `/projects/${project.id}` });
+  expect(refused.statusCode, refused.body).toBe(409);
+  expect(refused.json().error).toMatch(/character view publication/);
+  expect(JSON.parse(await readFile(uncertain.receiptPath, "utf8")).terminal).toBeUndefined();
+  const deleted = await restarted.inject({ method: "DELETE", url: `/projects/${other.id}` });
+  expect(deleted.statusCode, deleted.body).toBe(204);
+  await expect(readFile(committed.receiptPath)).rejects.toMatchObject({ code: "ENOENT" });
+});
 
 it("serves persisted and live turn diffs, undoes only files, and rejects old editor writes", async () => {
   const { checkpointId, app, project, session, userId, base } = await fixture();
@@ -272,15 +320,17 @@ it("recovers the recorded interrupted operation and blocks creative writes until
   });
   expect(blocked.statusCode).toBe(409);
   expect(blocked.json().code).toBe("workspace_recovery");
-  const metadata = await readFile(path.join(project.storagePath!, "project.json"), "utf8");
+  expect((await app.inject({ method: "HEAD", url: `/projects/${project.id}/files/content?path=game.txt` })).statusCode).toBe(200);
+  const inspection = await app.inject({ method: "POST", url: `/projects/${project.id}/preview/inspect`,
+    payload: { startupDirectory: ".", startupScript: "dev", previewPath: "/", previewViewport: "fit" } });
+  expect(inspection.statusCode, inspection.body).toBe(200);
   const rename = await app.inject({
     method: "PATCH",
     url: `/projects/${project.id}`,
-    payload: { name: "Must wait for recovery" },
+    payload: { name: "Workspace awaiting restore" },
   });
-  expect(rename.statusCode).toBe(409);
-  expect(rename.json().code).toBe("workspace_recovery");
-  expect(await readFile(path.join(project.storagePath!, "project.json"), "utf8")).toBe(metadata);
+  expect(rename.statusCode).toBe(200);
+  expect(JSON.parse(await readFile(path.join(project.storagePath!, "project.json"), "utf8")).name).toBe("Workspace awaiting restore");
   for (const route of ["canvas/workspace", "playable"]) {
     const read = await app.inject({
       method: "GET",
@@ -306,8 +356,9 @@ it("recovers the recorded interrupted operation and blocks creative writes until
   ).toEqual({ unfinished: false });
 });
 
-it.each([false, true])("renames restored project metadata without accepting old file writes (restart: %s)", async (restart) => {
+it.each([false, true])("manages a restored project from the list while refusing stale mutations (restart: %s)", async (restart) => {
   const { checkpointId, app, directory, project, base } = await fixture();
+  await writeFile(path.join(project.workspacePath, "canvas", "jobs.json"), "[]");
   const undo = await app.inject({
     method: "POST",
     url: `${base}/${checkpointId}/undo`,
@@ -368,6 +419,13 @@ it.each([false, true])("renames restored project metadata without accepting old 
     payload: { name: "fresh.txt", kind: "file" },
   });
   expect(fresh.statusCode, fresh.body).toBe(201);
+  const removed = await active.inject({
+    method: "DELETE",
+    url: `/projects/${project.id}`,
+    headers: { "x-workspace-version": read.headers["x-workspace-version"] },
+  });
+  expect(removed.statusCode, removed.body).toBe(204);
+  expect((await active.inject({ method: "GET", url: `/projects/${project.id}` })).statusCode).toBe(404);
 });
 
 it("shows binary and oversized files without unbounded text reads", async () => {

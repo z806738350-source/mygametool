@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, expect, it } from "vitest";
@@ -39,6 +39,7 @@ it("reloads an uncertain guest retirement as pending and allows a confirmed sour
 });
 it("keeps a host deletion failure blocked across crashes and never clears it as a source recovery", async () => {
   const { lifecycle, directory } = await fixture();
+  await mkdir(path.join(directory, "projects", id), { recursive: true });
   await expect(lifecycle.delete(id, async (stage) => { await stage("volume-retired"); await stage("deleting-host"); throw new Error("permission"); })).rejects.toThrow("permission");
   const restarted = new ProjectLifecycle(directory); await restarted.load();
   await expect(restarted.recovered(id)).rejects.toThrow("Host project deletion has already begun");
@@ -47,15 +48,53 @@ it("keeps a host deletion failure blocked across crashes and never clears it as 
   await restarted.delete(id, async (stage) => { await stage("retiring-volume"); });
   await expect(readFile(path.join(directory, "project-lifecycle", id + ".json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 });
-it("removes only a previously completed deletion record on startup", async () => {
+it.skipIf(process.platform === "win32")("keeps an unreadable deletion record pending for its own project", async () => {
+  const { directory, lifecycle } = await fixture();
+  const records = path.join(directory, "project-lifecycle");
+  await mkdir(records, { mode: 0o700 });
+  await symlink(path.join(directory, "missing-record"), path.join(records, id + ".json"));
+  await lifecycle.load();
+  lifecycle.assertAvailable(other);
+  expect(() => lifecycle.assertAvailable(id)).toThrow("deletion is pending");
+  await expect(lifecycle.delete(id, async () => { throw new Error("unexpected deletion"); })).rejects.toThrow("requires review");
+  expect(await readdir(records)).toEqual([id + ".json"]);
+});
+it("prunes completed, aborted and interrupted temporary records on startup", async () => {
   const { lifecycle, directory } = await fixture();
   await mkdir(path.join(directory, "project-lifecycle"), { mode: 0o700 });
-  for (const [projectId, phase] of [[id, "complete"], [other, "deleting-host"]])
+  for (const [projectId, phase] of [[id, "complete"], [other, "aborted"]])
     await writeFile(path.join(directory, "project-lifecycle", projectId + ".json"), JSON.stringify({ version: 1, projectId, phase, updatedAt: "now" }), { mode: 0o600 });
+  const temporary = path.join(directory, "project-lifecycle", `.${id}.${other}.tmp`);
+  await writeFile(temporary, "{", { mode: 0o600 });
   await lifecycle.load();
-  await expect(readFile(path.join(directory, "project-lifecycle", id + ".json"))).rejects.toMatchObject({ code: "ENOENT" });
-  expect(lifecycle.pending(id)).toBe(false); expect(lifecycle.pending(other)).toBe(true);
-  expect(JSON.parse(await readFile(path.join(directory, "project-lifecycle", other + ".json"), "utf8")).phase).toBe("deleting-host");
+  expect(await readdir(path.join(directory, "project-lifecycle"))).toEqual([]);
+  expect(lifecycle.pending(id)).toBe(false); expect(lifecycle.pending(other)).toBe(false);
+});
+it("collects a legacy host journal only if its project directory is truly gone", async () => {
+  const { lifecycle, directory } = await fixture();
+  const projects = path.join(directory, "projects");
+  await mkdir(path.join(projects, other), { recursive: true });
+  for (const target of [id, other]) await expect(lifecycle.delete(target, async stage => {
+    await stage("deleting-host"); throw new Error("interrupted");
+  })).rejects.toThrow("interrupted");
+  const restarted = new ProjectLifecycle(directory);
+  await restarted.load();
+  expect(await readdir(path.join(directory, "project-lifecycle"))).toEqual([other + ".json"]);
+  expect(restarted.pending(other)).toBe(true);
+});
+it.skipIf(process.platform === "win32")("never resumes final project removal through a linked folder", async () => {
+  const { lifecycle, directory } = await fixture();
+  const projects = path.join(directory, "projects");
+  await mkdir(path.join(projects, other), { recursive: true });
+  await symlink(path.join(projects, other), path.join(projects, id), "dir");
+  await writeFile(path.join(projects, other, "keep.txt"), "keep");
+  await expect(lifecycle.delete(id, async stage => {
+    await stage("removing-project"); throw new Error("interrupted");
+  })).rejects.toThrow("interrupted");
+  const restarted = new ProjectLifecycle(directory);
+  await restarted.load();
+  expect(await readFile(path.join(projects, other, "keep.txt"), "utf8")).toBe("keep");
+  expect(restarted.pending(id)).toBe(true);
 });
 it("blocks a damaged journal instead of treating uncertain cleanup as complete", async () => {
   const { lifecycle, directory } = await fixture();

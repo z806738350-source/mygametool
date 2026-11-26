@@ -177,12 +177,27 @@ def stopped(identifier, control=False):
             pass
     run(['systemctl', 'reset-failed', *units], False)
 
+def forward_output(fd, total, drain=False):
+    while True:
+        try:
+            data = os.read(fd, 8192)
+        except BlockingIOError:
+            return total, False
+        if not data:
+            return total, True
+        total += len(data)
+        if total > 512 * 1024:
+            raise RuntimeError('Isolated output exceeded its limit')
+        emit('stdout', data=base64.b64encode(data).decode())
+        if not drain:
+            return total, False
+
 def guardian(identifier):
     os.set_blocking(1, False)
     unit = unit_name(identifier)
     control = 'ohmygame-control-' + identifier + '.service'
     manifest = STATE / (identifier + '.json')
-    journal = None
+    output = selector = None
     binding = None
     claimed = succeeded = launch_attempted = False
     exit_code = None
@@ -236,8 +251,10 @@ def guardian(identifier):
         pathlib.Path('/workspace').mkdir(exist_ok=True)
         pathlib.Path('/cache').mkdir(exist_ok=True)
         pathlib.Path('/packages').mkdir(exist_ok=True)
+        fifo = STATE.parent / ('ohmygame-control-' + identifier) / 'output'
         limits = {
             'User': identity['name'], 'Group': identity['name'], 'WorkingDirectory': '/workspace/' + relative,
+            'StandardOutput': 'file:' + str(fifo), 'StandardError': 'inherit',
             'BindPaths': str(workspace) + ':/workspace ' + str(cache) + ':/cache',
             'BindReadOnlyPaths': str(workspace.parent / 'packages') + ':/packages',
             'ReadWritePaths': '/workspace /cache', 'PrivateNetwork': 'yes',
@@ -271,20 +288,27 @@ def guardian(identifier):
                 storage.validate_binding(binding, phases=('running',))
                 inactive_units(identifier, control=False)
                 write_record(manifest, {'port': port, 'unit': unit, **binding})
-                launch_attempted = True
-                run(command)
-        journal = subprocess.Popen(['journalctl', '--no-pager', '--follow', '--output=cat', '--unit=' + unit, '--since=-5s'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        select = selectors.DefaultSelector()
-        select.register(sys.stdin.buffer, selectors.EVENT_READ, 'input')
-        select.register(journal.stdout, selectors.EVENT_READ, 'log')
+                # The service manager opens the FIFO before exec. Only the job inherits
+                # its write end, so EOF includes even a short command's final bytes.
+                os.mkfifo(fifo, 0o600)
+                try:
+                    output = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+                    launch_attempted = True
+                    run(command)
+                finally:
+                    fifo.unlink()
+        selector = selectors.DefaultSelector()
+        selector.register(sys.stdin.buffer, selectors.EVENT_READ, 'input')
+        selector.register(output, selectors.EVENT_READ, 'log')
         last_heartbeat = time.monotonic()
         started = last_heartbeat
         input_buffer = b''
         ready = mode != 'preview'
         total_output = 0
+        eof = False
         emit('started', id=identifier)
         while True:
-            for key, _ in select.select(.2):
+            for key, _ in selector.select(.2):
                 if key.data == 'input':
                     chunk = os.read(sys.stdin.fileno(), 8192)
                     if not chunk:
@@ -298,23 +322,15 @@ def guardian(identifier):
                             raise ValueError('Invalid isolated control message')
                         last_heartbeat = time.monotonic()
                 else:
-                    data = os.read(journal.stdout.fileno(), 8192)
-                    if data:
-                        total_output += len(data)
-                        if total_output > 512 * 1024:
-                            raise RuntimeError('Isolated output exceeded its limit')
-                        emit('stdout', data=base64.b64encode(data).decode())
+                    total_output, eof = forward_output(output, total_output)
+                    if eof:
+                        selector.unregister(output)
             state = properties(unit)
-            if state.get('ActiveState') not in ('active', 'activating'):
-                drain_until = time.monotonic() + .25
-                while time.monotonic() < drain_until:
-                    if io_select.select([journal.stdout], [], [], .05)[0]:
-                        data = os.read(journal.stdout.fileno(), 8192)
-                        total_output += len(data)
-                        if total_output > 512 * 1024:
-                            raise RuntimeError('Isolated output exceeded its limit')
-                        if data:
-                            emit('stdout', data=base64.b64encode(data).decode())
+            if state.get('ActiveState') not in ('active', 'activating', 'deactivating', 'reloading'):
+                if not eof:
+                    total_output, eof = forward_output(output, total_output, drain=True)
+                if not eof:
+                    raise RuntimeError('Isolated output is still open after service exit')
                 code = int(state.get('ExecMainStatus', '1'))
                 if state.get('Result') != 'success':
                     code = code or 1
@@ -349,13 +365,10 @@ def guardian(identifier):
                         raise RuntimeError('Isolated lease disappeared during cleanup; workspace retained')
                 manifest.unlink(missing_ok=True)
             finally:
-                if journal:
-                    journal.terminate()
-                    try:
-                        journal.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        journal.kill()
-                        journal.wait(timeout=3)
+                if selector is not None:
+                    selector.close()
+                if output is not None:
+                    os.close(output)
             if exit_code is not None:
                 emit('exit', id=identifier, code=exit_code)
 
@@ -484,7 +497,7 @@ def launch(identifier):
             storage.validate_binding(binding, phases=('prepared',))
             inactive_units(identifier)
             write_record(STATE / (identifier + '.request'), spec)
-    os.execv('/usr/bin/systemd-run', ['systemd-run', '--quiet', '--pipe', '--wait', '--service-type=exec', '--unit=ohmygame-control-' + identifier + '.service', '--property=RuntimeMaxSec=920s', '--property=MemoryMax=128M', '--property=TasksMax=24', '--', '/usr/bin/python3', SELF, 'guardian', identifier])
+    os.execv('/usr/bin/systemd-run', ['systemd-run', '--quiet', '--pipe', '--wait', '--service-type=exec', '--unit=ohmygame-control-' + identifier + '.service', '--property=RuntimeDirectory=ohmygame-control-' + identifier, '--property=RuntimeDirectoryMode=0700', '--property=RuntimeMaxSec=920s', '--property=MemoryMax=128M', '--property=TasksMax=24', '--', '/usr/bin/python3', SELF, 'guardian', identifier])
 
 def main():
     operation = sys.argv[1]

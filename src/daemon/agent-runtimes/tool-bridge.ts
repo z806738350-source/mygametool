@@ -107,7 +107,9 @@ export class ToolBridge {
         (this.sessionManager || this.model ? { ...(this.sessionManager ? { sessionManager: this.sessionManager } : {}), ...(this.model ? { model: this.model() } : {}) } : undefined) as never,
       );
       // A saved review may take time to inspect; recheck the host catalog before releasing pixels.
-      if (name === "recover_isolated_changes" && (input as Record<string, unknown>).action === "read_image") {
+      const params = input as Record<string, unknown>;
+      if (name === "recover_isolated_changes" && params.action === "read_image" ||
+          (name === "read" || name === "read_project_file") && params.characterPreviewHeight !== undefined) {
         signal?.throwIfAborted();
         if (!this.model?.().input.includes("image")) return failure("The current model's image capability is unverified or changed; no retained image was delivered or visually inspected");
       }

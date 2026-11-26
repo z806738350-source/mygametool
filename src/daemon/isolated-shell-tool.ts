@@ -92,6 +92,11 @@ export function createBuildGameTool(
   });
 }
 
+// Use only for a rejected call that has not reached the recovery backend.
+function invalidRecoveryInput(message: string): Error {
+  return toolPreflightError(message, "invalid_recovery_input");
+}
+
 export function createIsolatedRecoveryTool(
   inspect: () => Promise<{
     state: string;
@@ -140,6 +145,12 @@ export function createIsolatedRecoveryTool(
   let uncertainGeneration: string | undefined;
   let reviewed: IsolatedSourceReview | undefined;
   let uncertainReview: string | undefined;
+  function clearSettledInspection(generation: string) {
+    if (inspectedGeneration === generation) {
+      inspectedGeneration = undefined;
+      inspectionRefusal = undefined;
+    }
+  }
   return defineTool({
     name: "recover_isolated_changes",
     label: "Recover retained isolated changes",
@@ -181,6 +192,7 @@ export function createIsolatedRecoveryTool(
             minItems: 1,
             maxItems: 16,
             uniqueItems: true,
+            description: "Only for optimize. Review examines the whole retained generation.",
           }),
         ),
         maxEdge: Type.Optional(
@@ -190,7 +202,7 @@ export function createIsolatedRecoveryTool(
             Type.Literal(1024),
             Type.Literal(1536),
             Type.Literal(2048),
-          ]),
+          ], { description: "Only for optimize. Omit to preserve image dimensions." }),
         ),
       },
       { additionalProperties: false },
@@ -218,7 +230,7 @@ export function createIsolatedRecoveryTool(
         if (Object.keys(input).some(key => !["action", "reviewId", "path", "variant", "sha256"].includes(key)) ||
           !input.reviewId || !/^[a-f0-9]{64}$/.test(input.reviewId) || !input.path ||
           !input.variant || !["raw", "working"].includes(input.variant) || !input.sha256 || !/^[a-f0-9]{64}$/.test(input.sha256))
-          throw new Error("Read only an exact retained review image with reviewId, path, variant and SHA-256; approval arguments are not accepted");
+          throw invalidRecoveryInput("Read only an exact retained review image with reviewId, path, variant and SHA-256; approval arguments are not accepted");
         transferPath(input.path);
         if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(input.path) || !/\.(?:png|jpe?g|webp)$/i.test(input.path)) throw new Error("Choose a retained static PNG, JPEG or WebP path from this review");
         if (!context?.model?.input?.includes("image")) throw new Error("Image input is unavailable or unverified for this model; no retained image was read or visually inspected");
@@ -247,9 +259,9 @@ export function createIsolatedRecoveryTool(
         };
       }
       if (input.path !== undefined || input.variant !== undefined || input.sha256 !== undefined)
-        throw toolPreflightError("path, variant and sha256 are valid only for read_image", "invalid_recovery_input");
+        throw invalidRecoveryInput("path, variant and sha256 are valid only for read_image");
       if (input.action === "upgrade_capacity" || input.action === "inspect_capacity_migration") {
-        if (Object.keys(input).some(key => key !== "action" && !(input.action === "upgrade_capacity" && key === "targetProfileId")) || (input.targetProfileId !== undefined && !["capacity-128-v2", "capacity-128-media64-v3"].includes(input.targetProfileId))) throw new Error("Native capacity migration accepts only its action and an exact target profile; approval cannot come from model arguments");
+        if (Object.keys(input).some(key => key !== "action" && !(input.action === "upgrade_capacity" && key === "targetProfileId")) || (input.targetProfileId !== undefined && !["capacity-128-v2", "capacity-128-media64-v3"].includes(input.targetProfileId))) throw invalidRecoveryInput("Native capacity migration accepts only its action and an exact target profile; approval cannot come from model arguments");
         if (input.action === "upgrade_capacity" && (uncertainGeneration || uncertainReview || reviewed && !reviewed.completed)) throw new Error("Resolve the original retained operation before changing capacity");
         const run = input.action === "upgrade_capacity" ? legacy?.upgradeCapacity : legacy?.inspectCapacityMigration;
         if (!run) throw new Error("Native capacity migration is unavailable; no volume was changed");
@@ -258,7 +270,7 @@ export function createIsolatedRecoveryTool(
         return { content: [{ type: "text", text: JSON.stringify(capacityMigration) }], details: { capacityMigration } };
       }
       if (input.action === "plan_first_allocation") {
-        if (Object.keys(input).some(key => key !== "action")) throw new Error("First-allocation planning accepts only action; it cannot select, approve or allocate a profile");
+        if (Object.keys(input).some(key => key !== "action")) throw invalidRecoveryInput("First-allocation planning accepts only action; it cannot select, approve or allocate a profile");
         if (!legacy?.planFirstAllocation) throw new Error("First-allocation planning is unavailable; no volume or configuration was changed");
         signal?.throwIfAborted();
         const firstAllocationPlan = await legacy.planFirstAllocation(signal);
@@ -272,7 +284,7 @@ export function createIsolatedRecoveryTool(
           ) ||
           input.profileId === undefined
         )
-          throw new Error(
+          throw invalidRecoveryInput(
             "Capacity planning accepts only action and one profileId; it cannot select a generation, review or migration",
           );
         const profile = getCapacityProfile(input.profileId);
@@ -287,10 +299,10 @@ export function createIsolatedRecoveryTool(
           details: { capacityProposal },
         };
       }
-      if (input.targetProfileId !== undefined) throw new Error("targetProfileId is valid only for upgrade_capacity");
+      if (input.targetProfileId !== undefined) throw invalidRecoveryInput("targetProfileId is valid only for upgrade_capacity");
       if (input.action === "capacity") {
         if (Object.keys(input).some((key) => key !== "action"))
-          throw new Error(
+          throw invalidRecoveryInput(
             "Capacity accepts only action; it cannot select a generation, review or image preparation",
           );
         if (!legacy?.capacity)
@@ -305,14 +317,14 @@ export function createIsolatedRecoveryTool(
         };
       }
       if (input.profileId !== undefined)
-        throw new Error(
+        throw invalidRecoveryInput(
           "profileId is valid only for a read-only plan_capacity proposal",
         );
       if (
         input.action !== "optimize" &&
         (input.paths !== undefined || input.maxEdge !== undefined)
       )
-        throw new Error(
+        throw invalidRecoveryInput(
           "Image paths and maxEdge are only valid for explicit retained-image optimization",
         );
       if (input.action === "verify") {
@@ -323,12 +335,13 @@ export function createIsolatedRecoveryTool(
           !/^[a-f0-9]{64}$/.test(input.reviewId) ||
           (expected && input.reviewId !== expected)
         )
-          throw new Error(
+          throw invalidRecoveryInput(
             "Verify only the original reviewed transaction; inspection cannot authorize a new recovery",
           );
         const originalReviewId = input.reviewId;
         const result = await legacy.verify(originalReviewId, signal);
         if (reviewed?.reviewId === originalReviewId) {
+          clearSettledInspection(reviewed.generation);
           if (uncertainGeneration === reviewed.generation)
             uncertainGeneration = undefined;
           reviewed = { ...reviewed, completed: true };
@@ -359,14 +372,14 @@ export function createIsolatedRecoveryTool(
           input.reviewId !== reviewed.reviewId ||
           !input.paths?.length
         )
-          throw new Error(
+          throw invalidRecoveryInput(
             "Review the complete current retained batch before preparing its listed images",
           );
         if (
           input.generation !== undefined &&
           input.generation !== reviewed.generation
         )
-          throw new Error(
+          throw invalidRecoveryInput(
             "This optimization belongs to a different retained generation",
           );
         if (uncertainReview || uncertainGeneration)
@@ -401,7 +414,7 @@ export function createIsolatedRecoveryTool(
             inspectedGeneration &&
             input.generation !== inspectedGeneration)
         )
-          throw new Error(
+          throw invalidRecoveryInput(
             "Inspect the current retained generation before requesting its controlled review",
           );
         reviewed = await legacy.review(
@@ -423,7 +436,7 @@ export function createIsolatedRecoveryTool(
       }
       if (input.action === "adopt") {
         if (!legacy || !reviewed || input.reviewId !== reviewed.reviewId)
-          throw new Error(
+          throw invalidRecoveryInput(
             "Review the complete current batch before requesting adoption",
           );
         if (reviewed.blockers.length)
@@ -438,13 +451,14 @@ export function createIsolatedRecoveryTool(
           input.generation !== undefined &&
           input.generation !== reviewed.generation
         )
-          throw new Error(
+          throw invalidRecoveryInput(
             "This adoption belongs to a different retained generation",
           );
         if (uncertainReview || uncertainGeneration)
           throw new Error(
             "This recovery result is uncertain. Inspect the original transaction in Execution storage & recovery; do not resend it or submit a replacement review",
           );
+        const adopted = reviewed;
         uncertainReview = input.reviewId;
         let result: Awaited<ReturnType<typeof recover>>;
         try {
@@ -460,7 +474,8 @@ export function createIsolatedRecoveryTool(
           throw error;
         }
         uncertainReview = undefined;
-        reviewed = undefined;
+        clearSettledInspection(adopted.generation);
+        if (reviewed?.reviewId === adopted.reviewId) reviewed = undefined;
         const summary = (
           result as typeof result & { publicationUnchanged?: boolean }
         ).publicationUnchanged
@@ -519,7 +534,7 @@ export function createIsolatedRecoveryTool(
         !/^[0-9]{1,32}$/.test(input.generation) ||
         input.generation !== inspectedGeneration
       )
-        throw new Error(
+        throw invalidRecoveryInput(
           "Inspect the current recoverable isolated generation before recovering it.",
         );
       if (uncertainReview)

@@ -148,6 +148,10 @@ describe("Ink Studio activation", () => {
     expect(JSON.stringify(guide.parameters)).toContain('"ink-studio"');
     await expect(guide.execute("read-ink", { guide: "ink-studio" }, undefined, undefined, {} as never))
       .resolves.toMatchObject({ details: { guide: "ink-studio", source: "skills/ink-studio/SKILL.md" } });
+    const missing = await guide.execute("missing", { guide: "ink-studio", reference: "overview.md" }, undefined, undefined, {} as never);
+    expect(missing.details).toMatchObject({ source: "skills/ink-studio/SKILL.md" });
+    expect(missing.content[0]).toMatchObject({ text: expect.stringContaining("no reference named overview.md") });
+    expect(missing.content[0]).toMatchObject({ text: expect.stringContaining("browser-api.md") });
     const published = await runtime.execute("install-ink", {}, undefined, undefined, {} as never);
     expect(published.details).toMatchObject({ inkRuntime: { status: "created" } });
 

@@ -2,6 +2,7 @@ export const LEGACY_RASTER_BYTES = 512 * 1024;
 export const RASTER_BYTES = 32 * 1024 * 1024;
 export const RASTER_PIXELS = 32 * 1024 * 1024;
 export const RASTER_BATCH_BYTES = 64 * 1024 * 1024;
+export const MAX_CHARACTER_PREVIEW_SIZE = 384;
 
 let decoding: Promise<void> = Promise.resolve();
 /** Bound full pixel work across preparation, approval and publication callers. */

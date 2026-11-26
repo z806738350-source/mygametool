@@ -17,7 +17,9 @@ export async function prepareSessionImageDisplay(
   input: Buffer,
   mimeType: SessionImageMimeType,
   signal?: AbortSignal,
+  maxBytes = SESSION_IMAGE_DISPLAY_BYTES,
 ) {
+  const byteLimit = Math.min(SESSION_IMAGE_DISPLAY_BYTES, maxBytes);
   signal?.throwIfAborted();
   if (
     !input.length ||
@@ -64,7 +66,7 @@ export async function prepareSessionImageDisplay(
     sourceMimeType: mimeType,
   };
   if (
-    input.length <= SESSION_IMAGE_DISPLAY_BYTES &&
+    input.length <= byteLimit &&
     Math.max(source.width, source.height) <= SESSION_IMAGE_DISPLAY_EDGE
   )
     return {
@@ -79,7 +81,8 @@ export async function prepareSessionImageDisplay(
       scannerRevision: revision,
     };
   return serializeRasterDecoding(async () => {
-    for (const edge of [SESSION_IMAGE_DISPLAY_EDGE, 768, 384]) {
+    const edges = byteLimit < SESSION_IMAGE_DISPLAY_BYTES ? [SESSION_IMAGE_DISPLAY_EDGE, 768, 384, 192, 96] : [SESSION_IMAGE_DISPLAY_EDGE, 768, 384];
+    for (const edge of edges) {
       current();
       const pipeline = sharp(input, {
         failOn: "warning",
@@ -100,7 +103,7 @@ export async function prepareSessionImageDisplay(
           : pipeline.jpeg({ quality: 80 })
       ).toBuffer({ resolveWithObject: true });
       current();
-      if (encoded.data.length > SESSION_IMAGE_DISPLAY_BYTES) continue;
+      if (encoded.data.length > byteLimit) continue;
       const displayMimeType = source.hasAlpha
         ? ("image/png" as const)
         : ("image/jpeg" as const);

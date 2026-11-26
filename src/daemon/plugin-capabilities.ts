@@ -97,6 +97,7 @@ export class PluginCapabilities {
     serverId: string,
     bundle: PluginMcpPackage,
   ): McpServerDefinition {
+    this.settings.assertAvailable();
     const { root } = bundle;
     const template = this.#template(plugin, serverId, bundle);
     const serializedTemplate = JSON.stringify(template);
@@ -134,6 +135,7 @@ export class PluginCapabilities {
   }
   async effective(projectType?: ProjectType): Promise<EffectiveMcpConfig> {
     const mcpServers: Record<string, McpServerDefinition> = {};
+    if (!this.configuration.available || !this.settings.available) return { mcpServers };
     for (const plugin of await this.all()) {
       if (
         !plugin.enabled ||
@@ -160,6 +162,11 @@ export class PluginCapabilities {
     return { mcpServers };
   }
   async decorate(plugin: PluginDetail): Promise<PluginDetail> {
+    if (!this.configuration.available) return {
+      ...plugin,
+      mcpServers: plugin.mcpServers?.map(server => ({ ...server, enabled: false, status: "not-configured" })),
+      connections: plugin.connections.map(connection => ({ ...connection, enabled: false, status: "not-configured" })),
+    };
     const bundle = plugin.mcpServers?.length
       ? await this.#package(plugin)
       : undefined;
@@ -350,6 +357,7 @@ export class PluginCapabilities {
     input: CreateMcpPluginRequest,
     allowSecrets = true,
   ): Promise<PluginDetail> {
+    this.configuration.assertAvailable();
     const { manifest, servers, values } = mcpPluginPackage(input, allowSecrets);
     const source = path.join(
       this.dataDirectory,
@@ -372,7 +380,7 @@ export class PluginCapabilities {
     return this.settings.decorate(plugin);
   }
   async migrate(legacy: LegacyMcpConfiguration): Promise<void> {
-    if (this.configuration.migrated) return;
+    if (!this.configuration.available || !this.settings.available || this.configuration.migrated) return;
     const definitions = await legacy.readAndBackup();
     const owners = this.configuration.legacyOwners;
     const godot = (await this.all()).find(

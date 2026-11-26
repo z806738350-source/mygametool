@@ -9,9 +9,11 @@ import { Type } from "typebox";
 import { isDeepSeekFileModel } from "./deepseek-image-files.js";
 import { PNG_SIGNATURE } from "./image-format.js";
 import type { PromptImage } from "../shared/contracts.js";
+import { LOCAL_IMAGE_BUDGET_MESSAGE } from "../shared/agent-errors.js";
 import { containsKnownSensitiveValue } from "../shared/sensitive-values.js";
 import { KUNPO_ASTRA_MODEL_ID, KUNPO_BASE_URL, KUNPO_PROVIDER_ID } from "../shared/kunpo-models.js";
-export { prepareSessionImageDisplay } from "./retained-image-display.js";
+import { prepareSessionImageDisplay } from "./retained-image-display.js";
+export { prepareSessionImageDisplay };
 
 export const IMAGE_OFFLOAD_ENTRY = "ohmygame-image-offload-v1";
 export const IMAGE_ORIGINS_ENTRY = "ohmygame-image-origins-v1";
@@ -37,11 +39,13 @@ interface ImageOccurrence {
   image: ImageContent;
   toolCallId?: string;
   game: boolean;
+  resizableRead?: boolean;
+  display?: { image: ImageContent; marker: string };
   protected: boolean;
   previousObservation?: boolean;
 }
 interface OffloadData { scope: string; images: string[] }
-interface SentToolPictures { output: Json[]; omittedText: string; ids: string[]; bytes: number }
+interface SentToolPictures { output: Json[]; omittedText: string; ids: string[]; markers: string[]; bytes: number }
 interface ImageOrigins { version: 1; messageHash: string; assetIds: Array<string | null> }
 const originId = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value) && !containsKnownSensitiveValue(value);
 
@@ -97,7 +101,7 @@ export class ImageBudgetError extends Error {
   readonly status = 413;
   readonly code = "request_size_exceeded";
   constructor() {
-    super("The model request exceeds the local image/history budget. Original images remain in the session. Reduce the current images or compact the text history before retrying.");
+    super(LOCAL_IMAGE_BUDGET_MESSAGE);
   }
 }
 
@@ -111,6 +115,7 @@ export interface WireImage {
   data: string;
   mime: string;
   id?: string;
+  replace(image: ImageContent, marker?: string): void;
   omit(): void;
   file?: (id: string) => void;
 }
@@ -123,6 +128,15 @@ const googleOutput = (response: Json) => object(response.response)
   ? String(response.response.output ?? response.response.error ?? "") : "";
 export function wireImages(payload: unknown): WireImage[] {
   const images: WireImage[] = [];
+  const labels = new Map<string, { owner: Json; key: string }>();
+  const marked = (owner: Json, key: string) => {
+    const value = owner[key];
+    const ids = typeof value === "string" ? markerIds(value) : [];
+    for (const id of ids) labels.set(id, { owner, key });
+    return ids;
+  };
+  const googleMarkers = (part: Json) => object(part.response)
+    ? marked(part.response, typeof part.response.error === "string" ? "error" : "output") : [];
   const visit = (value: unknown, inheritedIds: string[] = [], googleResponse?: Json) => {
     if (Array.isArray(value)) {
       let ids = [...inheritedIds];
@@ -135,14 +149,14 @@ export function wireImages(payload: unknown): WireImage[] {
           if (item.role === "user" && object(head) && ["Attached image(s) from tool result:", "Tool result image:"].includes(String(head.text))) {
             visit(parts, deferred); deferred = []; continue;
           }
-          if (item.role === "tool" && typeof item.content === "string") deferred.push(...markerIds(item.content));
+          if (item.role === "tool" && typeof item.content === "string") deferred.push(...marked(item, "content"));
           else {
             const toolParts = parts.filter((part) => object(part) && object(part.functionResponse) && !Array.isArray(part.functionResponse.parts));
-            if (toolParts.length) for (const part of toolParts) deferred.push(...markerIds(googleOutput((part as Json).functionResponse as Json)));
+            if (toolParts.length) for (const part of toolParts) deferred.push(...googleMarkers((part as Json).functionResponse as Json));
             else if (item.role && !(item.role === "assistant" && item.content === "I have processed the tool results.")) deferred = [];
           }
           if (typeof item.text === "string") {
-            const markers = markerIds(item.text);
+            const markers = marked(item, "text");
             if (markers.length) ids = markers;
             for (const omitted of omittedIds(item.text)) {
               const index = ids.indexOf(omitted); if (index >= 0) ids.splice(0, index + 1);
@@ -156,7 +170,7 @@ export function wireImages(payload: unknown): WireImage[] {
     if (!object(value) || ArrayBuffer.isView(value)) return;
     if (object(value.functionResponse)) {
       const response = value.functionResponse;
-      if (Array.isArray(response.parts)) visit(response.parts, markerIds(googleOutput(response)), response);
+      if (Array.isArray(response.parts)) visit(response.parts, googleMarkers(response), response);
       return;
     }
     let data: string | undefined;
@@ -182,11 +196,30 @@ export function wireImages(payload: unknown): WireImage[] {
     if (data !== undefined && mime?.startsWith("image/") && kind) {
       const format = kind;
       const id = inheritedIds.shift();
+      const label = id && labels.get(id);
       const replaceBlock = (block: Json) => {
         for (const key of Object.keys(value)) delete value[key];
         Object.assign(value, block);
       };
       images.push({ data, mime, id,
+        replace: ({ mimeType, data }, marker) => {
+          if (id && label && marker) {
+            const text = String(label.owner[label.key]);
+            label.owner[label.key] = text.split("\n").map(line => line === imageText(id) ? marker : line).join("\n");
+          }
+          const url = `data:${mimeType};base64,${data}`;
+          if (format === "responses") value.image_url = url;
+          else if (format === "completions") (value.image_url as Json).url = url;
+          else if (format === "anthropic") Object.assign(value.source as Json, { media_type: mimeType, data });
+          else if (format === "google") {
+            const inline = (value.inlineData ?? value.inline_data) as Json;
+            inline[Object.hasOwn(inline, "mimeType") ? "mimeType" : "mime_type"] = mimeType; inline.data = data;
+          } else {
+            const image = value.image as Json;
+            image.format = mimeType.slice("image/".length);
+            (image.source as Json).bytes = new Uint8Array(Buffer.from(data, "base64"));
+          }
+        },
         omit: () => {
           if (format === "google" && googleResponse && Array.isArray(googleResponse.parts) && object(googleResponse.response)) {
             // FunctionResponse.parts accepts image/file data only; placeholders belong in its output.
@@ -221,14 +254,18 @@ function sentToolPictures(callId: string, output: unknown, observed: Map<string,
   const ids = markerIds(label.text);
   if (ids.length !== pictures.length) return;
   let bytes = 0;
+  const markers: string[] = [];
   for (const [i, picture] of pictures.entries()) {
-    const source = observed.get(ids[i]!);
-    if (!source || source.toolCallId !== callId || picture?.type !== "input_image" ||
-        picture.image_url !== `data:${source.image.mimeType};base64,${source.image.data}`) return;
-    bytes += source.image.data.length;
+    const id = ids[i]!;
+    const source = observed.get(id);
+    if (!source || source.toolCallId !== callId || picture?.type !== "input_image") return;
+    const shown = source.display ?? { image: source.image, marker: imageText(id) };
+    if (picture.image_url !== `data:${shown.image.mimeType};base64,${shown.image.data}`) return;
+    markers.push(shown.marker);
+    bytes += shown.image.data.length;
   }
-  const markers = new Map(ids.map(id => [imageText(id), omittedText(id)]));
-  return { ids, bytes, output, omittedText: label.text.split("\n").map((line: string) => markers.get(line) ?? line).join("\n") };
+  const omitted = new Map(ids.map((id, i) => [markers[i]!, omittedText(id)]));
+  return { ids, markers, bytes, output, omittedText: label.text.split("\n").map((line: string) => omitted.get(line) ?? line).join("\n") };
 }
 
 /** A retained output must differ from the current one only by images that aged out of the working set. */
@@ -237,7 +274,7 @@ function onlyRetiredPictures(previous: SentToolPictures, output: unknown, retire
   const remaining = pictures.filter((_, index) => !retired.has(previous.ids[index]!));
   if (remaining.length === pictures.length) return false;
   if (!remaining.length) return previous.omittedText === output;
-  const markers = new Map([...retired].map(id => [imageText(id), omittedText(id)]));
+  const markers = new Map(previous.ids.flatMap((id, i) => retired.has(id) ? [[previous.markers[i]!, omittedText(id)] as const] : []));
   const text = (label!.text as string).split("\n").map(line => markers.get(line) ?? line).join("\n");
   return isDeepStrictEqual(output, [{ ...label, text }, ...remaining]);
 }
@@ -444,7 +481,7 @@ export class SessionImages {
         const image = assetId && preview.data === block.data && preview.mimeType === block.mimeType ? { ...preview, libraryAssetId: assetId } : preview;
         if (read && image.mimeType !== block.mimeType) convertedRead = true;
         if (id) {
-          occurrences.set(id, { image, game, toolCallId: message.role === "toolResult" ? message.toolCallId.split("|")[0] : undefined,
+          occurrences.set(id, { image, game, resizableRead: resizeReadImages && message.role === "toolResult" && ["read", "read_project_file"].includes(message.toolName), toolCallId: message.role === "toolResult" ? message.toolCallId.split("|")[0] : undefined,
             protected: working ? working.required.has(messageIndex) : messageIndex === lastUser || recentImages.includes(messageIndex),
             previousObservation: working !== undefined && !working.required.has(messageIndex) });
           content.push({ type: "text" as const, text: imageText(id) });
@@ -555,7 +592,7 @@ export class SessionImages {
   }
 
   /** The caller has already applied Files conversion or extracted the actual WS delta. */
-  budget(payload: unknown, scope: string, force = false): boolean {
+  async budget(payload: unknown, scope: string, force = false, signal?: AbortSignal): Promise<boolean> {
     const images = this.applyOmissions(payload, scope);
     const target = scope === ASTRA_INLINE_SCOPE ? astraHistory : inlineHistory;
     // SDKs such as Bedrock serialize binary blobs as Base64, not numeric object keys.
@@ -578,8 +615,46 @@ export class SessionImages {
         && requestBytes() <= MODEL_REQUEST_HIGH_BYTES) break;
       image.omit(); selected.push(image.id!); bytes -= Buffer.byteLength(image.data); count--;
     }
+    // The latest comparison cannot lose a view. Only scale its verified read results
+    // if optional history alone could not make the actual inline request fit.
+    let bodyBytes = requestBytes();
+    const excess = Math.max(bytes - INLINE_IMAGE_HIGH_BYTES, bodyBytes - MODEL_REQUEST_HIGH_BYTES);
+    if (excess > 0 && !force && count <= INLINE_IMAGE_HIGH_COUNT) {
+      const reads = images.flatMap(slot => {
+        const occurrence = slot.id && this.occurrences.get(slot.id);
+        if (!occurrence || !occurrence.protected || !occurrence.resizableRead ||
+            occurrence.image.data !== slot.data || occurrence.image.mimeType !== slot.mime ||
+            !(slot.mime === "image/jpeg" || slot.mime === "image/png" || slot.mime === "image/webp")) return [];
+        return [{ slot, occurrence, mime: slot.mime } as const];
+      }).sort((a, b) => a.slot.data.length - b.slot.data.length);
+      // Reserve envelope space for the source/display dimensions before dividing Base64 bytes.
+      const readBytes = reads.reduce((sum, { slot }) => sum + slot.data.length, 0);
+      let available = readBytes - Math.max(bytes - INLINE_IMAGE_HIGH_BYTES, bodyBytes + 128 * reads.length - MODEL_REQUEST_HIGH_BYTES);
+      const replacements = [];
+      for (const [index, { slot, occurrence, mime }] of reads.entries()) {
+        const share = Math.floor(available / (reads.length - index) / 4) * 4;
+        if (share <= 0) throw new ImageBudgetError();
+        available -= Math.min(slot.data.length, share);
+        if (slot.data.length <= share) continue;
+        try {
+          const display = await prepareSessionImageDisplay(Buffer.from(slot.data, "base64"), mime, signal, share / 4 * 3);
+          const image = { type: "image" as const, mimeType: display.mimeType, data: display.bytes.toString("base64") };
+          const marker = imageText(slot.id!) + ` Displayed at ${display.displayWidth}x${display.displayHeight} from the ${display.sourceWidth}x${display.sourceHeight} source. Use source coordinates for pixel landmarks.`;
+          replacements.push({ slot, occurrence, image, marker });
+        } catch {
+          signal?.throwIfAborted();
+          throw new ImageBudgetError();
+        }
+      }
+      for (const { slot, occurrence, image, marker } of replacements) {
+        slot.replace(image, marker);
+        occurrence.display = { image, marker };
+        bytes += image.data.length - slot.data.length;
+      }
+      if (replacements.length) bodyBytes = requestBytes();
+    }
     if (bytes > INLINE_IMAGE_HIGH_BYTES || count > INLINE_IMAGE_HIGH_COUNT
-      || requestBytes() > MODEL_REQUEST_HIGH_BYTES || force && !selected.length) throw new ImageBudgetError();
+      || bodyBytes > MODEL_REQUEST_HIGH_BYTES || force && !selected.length) throw new ImageBudgetError();
     if (selected.length) this.manager.appendCustomEntry(IMAGE_OFFLOAD_ENTRY, { scope, images: selected } satisfies OffloadData);
     return selected.length > 0;
   }

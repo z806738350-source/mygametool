@@ -101,6 +101,7 @@ vi.doMock(path.resolve("src/renderer/canvas-api.ts"), async (original) => ({
   saveCanvasDocument: api.saveDocument,
   saveCanvasBoard: api.saveBoard,
   listCanvasJobs: async () => [],
+  listCanvasBoardJobs: async () => ({ jobs: [], characterViews: [] }),
   generateCanvasMedia: api.generateMedia,
 }));
 vi.doMock(path.resolve("src/renderer/library-assets.ts"), async (original) => ({

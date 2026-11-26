@@ -13,8 +13,10 @@ import { imageDownloadNetworkStatus } from "./provider-network.js";
 export function openAIImageConnection(
   store: OpenAIImageSettingsStore,
   runtime: () => Promise<ModelRuntime>,
+  chatProviderEnabled = () => true,
 ) {
   const chatSource = async (): Promise<ImageSource | undefined> => {
+    if (!chatProviderEnabled()) return undefined;
     const models = await runtime();
     if (!models.hasConfiguredAuth("kunpo") || models.isUsingOAuth("kunpo"))
       return undefined;
@@ -45,7 +47,7 @@ export function openAIImageConnection(
     async get(): Promise<OpenAIImageConnectionSettings> {
       const models = await runtime();
       const connectionAvailable =
-        models.hasConfiguredAuth("kunpo") && !models.isUsingOAuth("kunpo");
+        chatProviderEnabled() && models.hasConfiguredAuth("kunpo") && !models.isUsingOAuth("kunpo");
       return {
         ...store.get(),
         connectionAvailable,
@@ -61,7 +63,7 @@ export function openAIImageConnection(
       const imageSource = await source(settings);
       const connected =
         Boolean(imageSource) ||
-        (await runtime()
+        (chatProviderEnabled() && await runtime()
           .then((models) => models.hasConfiguredAuth("kunpo"))
           .catch(() => false));
       return {

@@ -60,12 +60,9 @@ export function isCodexNpmShim(binaryPath: string): boolean {
 }
 
 /**
- * Finds a CLI's executable: the one the person chose, or else the newest of
- * those on PATH, the login shell's PATH, the usual install folders and the
- * copies other apps bundle. A computer often has several, such as an old
- * global npm install next to the Codex in the ChatGPT app, and the oldest one
- * found first may not know the account's current models. The result is an
- * absolute path that is then always run as is.
+ * Honors an explicit selection. Codex uses discovery order without running
+ * candidates, with bundled apps first on macOS. Other runtimes compare
+ * discovered versions. The result is an absolute path.
  */
 export async function resolveBinary(
   id: AgentRuntimeId,

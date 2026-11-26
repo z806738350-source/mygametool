@@ -136,7 +136,7 @@ export function turnRange(
         ? parseStoredTurnEnd(candidate.data)
         : undefined,
     )
-    .find((candidate) => candidate?.checkpoint === checkpointId);
+    .findLast((candidate) => candidate?.checkpoint === checkpointId);
   return end ? { before: checkpoint.commit, after: end.commit } : undefined;
 }
 

@@ -75,6 +75,11 @@ time. Queued and steering messages get their before checkpoint when consumed,
 not when enqueued. Each range is linked by checkpoint entry IDs, which remain
 the same when the live conversation is reloaded from disk.
 
+An interrupted file restore still allows project and conversation renames,
+preview configuration inspection and closing a preview. Reading a Canvas or
+playable view can initialize files, so those views wait for recovery.
+A restore in progress also coordinates changes to the conversation being rewound.
+
 Checkpoint boundaries drain daemon HTTP handlers and canvas generation callbacks,
 including callbacks whose job already reports cancellation. Ordinary snapshots
 keep preview servers and pages running, including while a server is starting;
@@ -96,11 +101,14 @@ restored files; delayed writes carry the version of the editor that
 created them and receive `409 workspace_stale` after restoration. Unsaved canvas
 recovery drafts use that version in their local storage keys, so an old draft
 cannot silently reappear after Undo or a daemon restart. Generation instructions
-and candidate history remain available for explicit adoption.
+and candidate history remain available for explicit adoption. If one project's
+saved version cannot be read, its versioned writes wait. The daemon rechecks
+the record on later requests and still requires the matching version after repair.
+Other projects remain available.
 
 Renaming a project changes metadata outside the creative workspace, so its
 name-only `PATCH /projects/:projectId` does not require a file version. It still
-waits for snapshots, is refused during restoration or unfinished recovery, and
+waits for snapshots, is refused during an active restore, and
 keeps lifecycle and request-draining protection. A rename does not advance an
 editor's cached workspace version or make an old draft safe to save.
 

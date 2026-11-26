@@ -1,10 +1,13 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DaemonSupervisor } from "../src/desktop/daemon-supervisor.js";
 import { startDaemon } from "../src/desktop/daemon-process.js";
 import type { DesktopRuntimeState } from "../src/shared/desktop-runtime.js";
+// @ts-ignore The import-safe source launcher is plain JavaScript.
+import { launchPaths, recoverOwnedVm } from "../scripts/local-launch.mjs";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -12,7 +15,7 @@ afterEach(async () => {
 });
 
 async function fixture(
-  options: { maxAutomaticRestarts?: number; projectChild?: boolean; localEnv?: boolean; start?: boolean; failFirst?: boolean } = {},
+  options: { maxAutomaticRestarts?: number; projectChild?: boolean; localEnv?: boolean; start?: boolean; failFirst?: boolean; recoverExitedDaemonVm?: (pid: number) => Promise<void> } = {},
 ) {
   const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-supervisor-"));
   cleanups.push(() => rm(directory, { recursive: true, force: true }));
@@ -68,6 +71,7 @@ async function fixture(
     environment: {},
     healthTimeoutMs: 2_000,
     maxAutomaticRestarts: options.maxAutomaticRestarts,
+    recoverExitedDaemonVm: options.recoverExitedDaemonVm,
     ...(options.localEnv ? { localEnvFile: envFile } : {}),
     onState: (state: DesktopRuntimeState) => states.push(state),
   };
@@ -78,6 +82,37 @@ async function fixture(
 }
 
 describe("background service recovery", () => {
+  it.skipIf(process.platform === "win32").each(["owned", "foreign"] as const)("recovers a daemon crash while respecting the %s VM lease", async (ownership) => {
+    const owner = { launchId: randomUUID(), electronPid: process.pid };
+    let execution: string;
+    const { supervisor, directory } = await fixture({ recoverExitedDaemonVm: (pid) => recoverOwnedVm({ execution }, owner, pid) });
+    execution = launchPaths(await realpath(directory)).execution;
+    const lock = path.join(execution, "manual-vm.lock");
+    const bin = path.join(execution, "tools/lima/bin");
+    await mkdir(lock, { recursive: true, mode: 0o700 });
+    await mkdir(bin, { recursive: true });
+    await writeFile(path.join(bin, "limactl"), '#!/bin/sh\necho "$*" >> calls\n', { mode: 0o700 });
+    const file = path.join(lock, "owner.json");
+    const receipt = { version: 1, instance: "omg", state: "owned", sessionId: randomUUID(),
+      ownerPid: Number(await readFile(path.join(directory, "pid"), "utf8")),
+      ownerLaunchId: ownership === "owned" ? owner.launchId : randomUUID(), ownerParentPid: process.pid };
+    await writeFile(file, JSON.stringify(receipt), { mode: 0o600 });
+    if (ownership === "owned") {
+      await expect(recoverOwnedVm({ execution }, owner, process.pid)).rejects.toThrow();
+      await expect(recoverOwnedVm({ execution }, owner, receipt.ownerPid)).rejects.toThrow();
+    }
+    await fetch(`${supervisor.runtime.url}/crash`);
+    await vi.waitFor(() => expect(supervisor.state()).toMatchObject({ status: "ready", generation: 2 }), { timeout: 3_000 });
+    const calls = readFile(path.join(execution, "calls"), "utf8");
+    if (ownership === "owned") {
+      expect(await calls).toBe("stop --tty=false omg\n");
+      await expect(readFile(file)).rejects.toMatchObject({ code: "ENOENT" });
+    } else {
+      await expect(calls).rejects.toMatchObject({ code: "ENOENT" });
+      expect(JSON.parse(await readFile(file, "utf8"))).toEqual(receipt);
+    }
+  });
+
   it("imports once per desktop lifetime and reuses the snapshot on automatic and manual daemon restarts", async () => {
     const { supervisor, directory, envFile, launchOptions } = await fixture({ localEnv: true });
     const generation = async (number: number) => JSON.parse(await readFile(path.join(directory, `generation-${number}.json`), "utf8"));

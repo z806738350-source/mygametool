@@ -7,7 +7,8 @@ import type { Node } from "@xyflow/react";
 import type { EditorCanvas } from "../src/renderer/editor-canvas.js";
 import type { CanvasBoardStorage } from "../src/renderer/canvas-board-storage.js";
 import type { CanvasDocuments } from "../src/renderer/canvas-document-node.js";
-import type { ProjectState } from "../src/shared/contracts.js";
+import type { ProjectState, ToolJob } from "../src/shared/contracts.js";
+import type { CanvasBoardJobs, CanvasCharacterViewStatus } from "../src/shared/canvas-workspace.js";
 import {
   createAssetCanvasDocument,
   createAssetGenerationNode,
@@ -15,23 +16,35 @@ import {
 
 type CanvasProps = Parameters<typeof EditorCanvas<Node>>[0];
 const captured = { props: undefined as CanvasProps | undefined };
+let boardJobs: CanvasBoardJobs | undefined;
+const generate = vi.fn<CanvasBoardStorage["generate"]>();
+const recover = vi.fn<CanvasBoardStorage["recoverImage"]>();
+const askAgent = vi.fn<(text: string) => void>();
+vi.doMock("@xyflow/react", async (original) => ({
+  ...(await original<typeof import("@xyflow/react")>()), Handle: () => null,
+}));
 vi.doMock(path.resolve("src/renderer/editor-canvas.tsx"), async (original) => ({
   ...(await original<typeof import("../src/renderer/editor-canvas.js")>()),
   EditorCanvas: (props: CanvasProps) => {
     captured.props = props;
     return (
       <div>
-        {props.nodes.map((node) => (
-          <div
-            key={node.id}
-            className="react-flow__node"
-            data-id={node.id}
-            tabIndex={0}
-          >
-            <button type="button">Node action</button>
-            <textarea aria-label={`${node.id} input`} />
-          </div>
-        ))}
+        {props.nodes.map((node) => {
+          const TestNode = boardJobs && node.type === "image" && props.nodeTypes?.[node.type];
+          return (
+            <div
+              key={node.id}
+              className="react-flow__node"
+              data-id={node.id}
+              tabIndex={0}
+            >
+              <button type="button">Node action</button>
+              <textarea aria-label={`${node.id} input`} />
+              {TestNode ? <TestNode id={node.id} data={node.data} type="image" zIndex={0} positionAbsoluteX={0} positionAbsoluteY={0}
+                selected={Boolean(node.selected)} dragging={false} selectable draggable deletable isConnectable /> : null}
+            </div>
+          );
+        })}
       </div>
     );
   },
@@ -50,6 +63,7 @@ vi.doMock(path.resolve("src/renderer/api.ts"), async (original) => ({
   listAudioModelCatalog: async () => ({ models: [], providers: [] }),
   listModel3DCatalog: async () => ({ models: [], providers: [] }),
   listModel3DOperations: async () => [],
+  getLibraryAsset: async () => new Blob(["fixture"], { type: "image/png" }),
 }));
 vi.doMock(path.resolve("src/renderer/library-assets.ts"), async (original) => ({
   ...(await original<typeof import("../src/renderer/library-assets.js")>()),
@@ -67,6 +81,8 @@ beforeEach(async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   localStorage.clear();
   captured.props = undefined;
+  boardJobs = undefined;
+  generate.mockReset(); recover.mockReset(); askAgent.mockReset();
   const canvas = createAssetCanvasDocument();
   const position = { x: 0, y: 0 };
   canvas.nodes = [
@@ -101,10 +117,9 @@ beforeEach(async () => {
     reconcile: (_submitted, current) => current,
     resolveConflict: async (_version, value) => value,
     jobs: async () => [],
-    generate: async () => {
-      throw new Error("Not used in selection tests");
-    },
-    recoverImage: vi.fn(),
+    boardJobs: async () => boardJobs ?? { jobs: [], characterViews: [] },
+    generate,
+    recoverImage: recover,
     cancel: async () => {
       throw new Error("Not used in selection tests");
     },
@@ -124,6 +139,7 @@ beforeEach(async () => {
           add: vi.fn(),
         }}
         assets={[]}
+        onAskAgent={askAgent}
       />,
     ),
   );
@@ -267,4 +283,44 @@ it("selects unselected nodes when clicking nondraggable areas without stealing i
   await select(["image", "video"]);
   await act(async () => captured.props!.onNodeClick!({ target: nodeElement("image"), shiftKey: true } as never, flowNode("image")));
   expect(flowNode("image").selected).toBe(true); expect(flowNode("video").selected).toBe(true);
+});
+
+it("uses the retained original job for view and recovery, and drafts only an explicit new revision", async () => {
+  const view = { nodeId: "image", setId: "hero", designRevision: "v1", direction: "NW", viewRevision: "r1", jobId: "original" } as const;
+  const job: ToolJob = { id: "original", toolId: "generate-image", status: "running", createdAt: "", title: "Original", imageRecoveryOnly: true };
+  const setView = async (state: CanvasCharacterViewStatus["state"], jobs: ToolJob[] = []) => {
+    boardJobs = { characterViews: [{ ...view, state }], jobs };
+    await act(async () => vi.advanceTimersByTimeAsync(1500));
+  };
+  const button = (label: string) => [...nodeElement("image").querySelectorAll("button")].find(node => node.textContent?.trim() === label);
+  const generateButton = () => nodeElement("image").querySelector<HTMLButtonElement>('[aria-label="Generate image"]');
+  await select(["image"]);
+  await setView("preparing");
+  expect(generateButton()).toBeNull();
+  await setView("ready");
+  expect(generateButton()?.disabled).toBe(false);
+  await setView("unknown");
+  expect(nodeElement("image").textContent).toContain("may have been submitted");
+  expect(generateButton()).toBeNull();
+  expect(button("Recover original result")).toBeUndefined();
+  await act(async () => button("Prepare a new view revision")!.click());
+  expect(askAgent).toHaveBeenCalledWith(expect.stringContaining("NW standing-view revision for character set hero"));
+  expect(askAgent).toHaveBeenCalledWith(expect.stringContaining("before generating or publishing anything"));
+  expect(generate).not.toHaveBeenCalled();
+  expect(recover).not.toHaveBeenCalled();
+
+  await setView("recoverable");
+  recover.mockResolvedValueOnce(job);
+  await act(async () => button("Recover original result")!.click());
+  expect(recover).toHaveBeenCalledExactlyOnceWith("original");
+  await setView("running", [job]);
+  expect(nodeElement("image").textContent).toContain("request is running");
+  expect(button("Prepare a new view revision")).toBeUndefined();
+
+  await setView("available");
+  recover.mockResolvedValueOnce({ ...job, status: "succeeded", run: { id: "run", files: [{ assetId: "retained", mediaType: "image/png" }] } as ToolJob["run"] });
+  await act(async () => button("View original result")!.click());
+  expect(recover).toHaveBeenLastCalledWith("original");
+  expect(container.querySelector('[role="dialog"]')).not.toBeNull();
+  expect(generate).not.toHaveBeenCalled();
 });

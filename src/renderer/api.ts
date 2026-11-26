@@ -94,7 +94,7 @@ import type { ExternalAgentClientId, ExternalAgentSettings, UpdateExternalAgentS
 import type { DesktopClipboardFile } from "../shared/file-transfer.js";
 import type { WebGamePlayerBridge } from "../shared/web-game-player.js";
 import type { NetworkConnectionTest, NetworkSettings, NetworkSettingsState } from "../shared/network-settings.js";
-import { assertProjectCanvasDraftsSaved, assertProjectDraftsSaved, clearProjectBrowserData } from "./project-deletion.js";
+import { assertProjectCanvasDraftsSaved, clearProjectBrowserData, projectDraftStatus, type ConfirmedProjectDeletion } from "./project-deletion.js";
 import type { OnboardingState, UpdateOnboardingRequest } from "../shared/onboarding.js";
 import type { ExecutionStorageOverview } from "../shared/execution-storage.js";
 import type { IsolatedSourceConfirmation } from "../shared/execution-storage.js";
@@ -299,9 +299,50 @@ export async function importProject(file: File): Promise<ProjectState> {
   return response.json() as Promise<ProjectState>;
 }
 
-export async function deleteProject(projectId: string): Promise<void> {
-  assertProjectDraftsSaved(projectId);
-  await request(`/projects/${projectId}`, { method: "DELETE" });
+export async function deleteProject(confirmation: ConfirmedProjectDeletion | string): Promise<void> {
+  const projectId = typeof confirmation === "string" ? confirmation : confirmation.id;
+  let approvedDraftStatus = typeof confirmation === "string" ? "clear" : confirmation.draftStatus;
+  function confirmCurrentDrafts(): boolean {
+    const status = projectDraftStatus(projectId);
+    if (status === "clear" || status === approvedDraftStatus || approvedDraftStatus === "unknown") return true;
+    if (typeof confirmation === "string") throw new Error(t(`projects.discardDraftWarning.${status}`));
+    const warning = t(`projects.discardDraftWarning.${status}`);
+    if (!window.confirm(t("projects.confirmDiscardDrafts", { name: confirmation.name, warning }))) return false;
+    approvedDraftStatus = status;
+    return true;
+  }
+
+  const path = `/projects/${projectId}`;
+  let headers: HeadersInit | undefined;
+  if (typeof confirmation !== "string") {
+    // A project card has no editor version. Read the current version for this
+    // deletion only, without updating the version used by open editors.
+    const response = await fetch(apiUrl(path), { cache: "no-store", headers: runtimeHeaders() });
+    if (!response.ok) throw await responseError(response);
+    const version = response.headers.get("x-workspace-version");
+    await response.body?.cancel();
+    if (!version) throw new Error(t("projects.deleteVersionUnavailable"));
+    headers = { "x-workspace-version": version };
+  }
+  if (!confirmCurrentDrafts()) return;
+  const send = async (url: string) => {
+    try {
+      await request(url, { method: "DELETE", headers });
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "workspace_stale")
+        throw new ApiError(t("projects.deleteWorkspaceChanged"), error.status, error.code);
+      throw error;
+    }
+  };
+  try {
+    await send(path);
+  } catch (error) {
+    if (!(error instanceof ApiError) || !error.discardExecutionGeneration || typeof confirmation === "string") throw error;
+    if (!window.confirm(t("projects.confirmDiscardExecution", { name: confirmation.name }))) return;
+    if (!confirmCurrentDrafts()) return;
+    const query = new URLSearchParams({ discardExecutionGeneration: error.discardExecutionGeneration });
+    await send(`${path}?${query}`);
+  }
   clearProjectBrowserData(projectId);
 }
 
@@ -1194,6 +1235,10 @@ export async function answerQuestionnaire(
   });
 }
 
+export async function retryLocalImageRequest(projectId: string, conversationId: string, turnId: string): Promise<void> {
+  await request(`/projects/${projectId}/conversations/${conversationId}/turns/${encodeURIComponent(turnId)}/retry-local-image-request`, { method: "POST" });
+}
+
 export async function reviseLastPrompt(
   projectId: string,
   conversationId: string,
@@ -1301,6 +1346,7 @@ export class ApiError extends Error {
     readonly conflicts?: string[],
     /** Those paths cannot be put back, whatever the request says to do with them. */
     readonly blocked?: boolean,
+    readonly discardExecutionGeneration?: string,
   ) {
     super(message);
   }
@@ -1327,12 +1373,14 @@ export async function request<T>(path: string, init: WorkspaceRequestInit = {}):
 }
 
 async function responseError(response: Response): Promise<ApiError> {
-  const body = await response.json().catch(() => ({})) as { error?: string; message?: string; code?: string; conflicts?: unknown; blocked?: unknown };
+  const body = await response.json().catch(() => ({})) as { error?: string; message?: string; code?: string; conflicts?: unknown; blocked?: unknown; generation?: unknown };
   const conflicts = Array.isArray(body.conflicts) && body.conflicts.every((path) => typeof path === "string") ? body.conflicts as string[] : undefined;
-  const message = body.code === "execution_retirement_unavailable"
-    ? t("api.executionRetirementUnavailable")
-    : body.message ?? body.error ?? t("api.requestFailed", { status: response.status });
-  return new ApiError(message, response.status, body.code, conflicts, body.blocked === true || undefined);
+  const discardGeneration = response.status === 409 && body.code === "execution_discard_required" &&
+    typeof body.generation === "string" && /^[1-9][0-9]{0,15}$/.test(body.generation) ? body.generation : undefined;
+  let message = body.message ?? body.error ?? t("api.requestFailed", { status: response.status });
+  if (body.code === "execution_retirement_unavailable") message = t("api.executionRetirementUnavailable");
+  if (body.code === "execution_discard_state_changed") message = t("api.executionDiscardStateChanged");
+  return new ApiError(message, response.status, body.code, conflicts, body.blocked === true || undefined, discardGeneration);
 }
 
 async function streamProjectEvents(

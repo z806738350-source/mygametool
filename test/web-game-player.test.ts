@@ -77,6 +77,28 @@ const loads = () => electron.views[0]!.webContents.executeJavaScript.mock.calls.
 const editor = () => new electron.Window() as unknown as Electron.BrowserWindow;
 
 describe("shared desktop game", () => {
+  it("limits fullscreen to the owned game frame and denies automatic fullscreen", async () => {
+    const games = create();
+    await games.attach("game", "mount", editor(), url, layout, async () => target);
+    const contents = electron.views[0]!.webContents;
+    const [check] = contents.session.setPermissionCheckHandler.mock.calls[0]!;
+    const [requestPermission] = contents.session.setPermissionRequestHandler.mock.calls[0]!;
+    for (const [source, permission, origin, isMainFrame, allowed] of [
+      [contents, "fullscreen", target.url, false, true],
+      [contents, "fullscreen", "http://127.0.0.1:45678", false, false],
+      [contents, "fullscreen", target.url, true, false],
+      [null, "fullscreen", target.url, false, false],
+      [contents, "automatic-fullscreen", target.url, false, false],
+      [contents, "media", target.url, false, false],
+    ] as const) {
+      const details = { requestingUrl: origin + "/game", isMainFrame };
+      expect(check(source, permission, origin, details)).toBe(allowed);
+      const answer = vi.fn();
+      requestPermission(source, permission, answer, details);
+      expect(answer).toHaveBeenCalledWith(allowed);
+    }
+    games.close();
+  });
   it("moves the same view to Play and back without reloading, and reopens it at its current route", async () => {
     const states = vi.fn();
     const games = create(states);

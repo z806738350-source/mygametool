@@ -28,7 +28,30 @@ describe("plugin runtime", () => {
       const result = await tool.execute("read", { guide, reference }, undefined, undefined, {} as never);
       return result.content.map(block => block.type === "text" ? block.text : "").join("\n");
     };
+    const studio = await read("web-game-studio");
+    expect(studio).toContain("generate_canvas_media");
+    expect(studio).toContain("guide `eight-direction-character`");
+    const spritePath = "plugins/web-game-studio/skills/sprite-pipeline";
+    expect(await read("sprite-pipeline")).toBe(await readFile(path.join(spritePath, "SKILL.md"), "utf8"));
+    expect(await read("sprite-pipeline", "action-review.md")).toBe(await readFile(path.join(spritePath, "references/action-review.md"), "utf8"));
+    const characterGuide = "eight-direction-character";
+    const characterPath = "plugins/web-game-studio/skills/eight-direction-character";
+    expect(await read(characterGuide)).toBe(await readFile(path.join(characterPath, "SKILL.md"), "utf8"));
+    for (const reference of ["directions.md", "generation.md", "alignment.md", "delivery.md"]) {
+      expect(await read(characterGuide, reference)).toBe(await readFile(path.join(characterPath, "references", reference), "utf8"));
+    }
+    await expect(read(characterGuide, "references/directions.md")).rejects.toThrow("filename");
+    const outsideWeb = workflowGuideTools({ type: "general" }, store, settings)[0]!;
+    await expect(outsideWeb.execute("read", { guide: characterGuide }, undefined, undefined, {} as never)).rejects.toThrow("unavailable");
+    const webStudio = store.read("ohmygame:web-game-studio")!;
+    const characterComponent = "skill:skills/eight-direction-character/SKILL.md";
+    await settings.updateComponent(webStudio, characterComponent, false);
+    await expect(read(characterGuide)).rejects.toThrow("unavailable");
     expect(await read("web-game-studio")).toContain("generate_canvas_media");
+    await settings.updateComponent(webStudio, characterComponent, true);
+    expect(await read(characterGuide)).toContain("# Eight Direction Character");
+    await settings.update(webStudio, { enabled: false, components: {} });
+    await expect(read(characterGuide, "directions.md")).rejects.toThrow("unavailable");
     expect(await read("threejs-world", "world-contract.md")).toContain("Three.js");
     const blender = await read("blender-assets");
     expect(blender).toBe(await readFile("plugins/blender/skills/blender-assets/SKILL.md", "utf8"));
@@ -83,7 +106,7 @@ describe("plugin runtime", () => {
     const general = await resolvePluginSkills([store], settings, "general");
     expect(general.filter((skill) => skill.pluginDisplayName === "Game Studio")).toHaveLength(3);
     expect(general.some((skill) => skill.pluginDisplayName === "Web Game Studio")).toBe(false);
-    expect(webBefore.filter((skill) => skill.pluginDisplayName === "Web Game Studio")).toHaveLength(9);
+    expect(webBefore.filter((skill) => skill.pluginDisplayName === "Web Game Studio")).toHaveLength(10);
     expect(webBefore.some((skill) => skill.pluginDisplayName === "Game Studio")).toBe(false);
 
     const plugin = store.read("ohmygame:game-studio")!;

@@ -89,11 +89,13 @@ describe("PreviewManager source-edition execution contracts", () => {
     expect(project.preview.stopReason).toBeUndefined();
     project.previewMode = "static";
     await writeFile(path.join(workspacePath, "index.html"), "static game");
-    const url = await manager.start(project);
-    await manager.withExecutionSlot(project, async () => {
-      expect(await manager.ensureStarted(project)).toBe(url);
-      expect(await (await fetch(url)).text()).toContain("static game");
-    });
+    const url = await manager.withExecutionSlot(project, () => manager.ensureStarted(project));
+    for (const stopPreview of [true, false]) {
+      await manager.withExecutionSlot(project, async () => {
+        expect(await manager.ensureStarted(project)).toBe(url);
+        expect(await (await fetch(url)).text()).toContain("static game");
+      }, stopPreview);
+    }
     expect(guest.start).not.toHaveBeenCalled();
     expect(project.preview.url).toBe(url);
   });

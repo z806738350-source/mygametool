@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PreviewManager } from "../src/daemon/preview.js";
+import { ProjectLifecycleError } from "../src/daemon/project-lifecycle.js";
 import { ProjectManager } from "../src/daemon/projects.js";
 import {
   previewScriptArguments,
@@ -80,6 +81,26 @@ describe("preview policy and lifecycle", () => {
     expect(gate).toHaveBeenCalledTimes(2);
     expect(project.preview.url).toBeUndefined();
     expect(project.preview.status).toBe("stopped");
+  });
+
+  it("rejects late preview activity without replacing the admitted page or crashing the daemon", async () => {
+    const { project } = await fixture();
+    let closing = false;
+    const preview = manager({ assertAvailable: () => {
+      if (closing) throw new ProjectLifecycleError("Project deletion is pending");
+    } });
+    const url = await preview.ensureStarted(project);
+    const html = await (await fetch(url)).text();
+    const bridge = new URL(html.match(/src="([^"]+bridge[^"]+)"/)![1], url);
+    const heartbeat = () => fetch(bridge, {
+      method: "POST", headers: { origin: bridge.origin }, body: JSON.stringify({ type: "heartbeat" }),
+    });
+    closing = true;
+    expect((await fetch(url)).status).toBe(409);
+    expect((await heartbeat()).status).toBe(409);
+    closing = false;
+    expect((await heartbeat()).status).toBe(200);
+    expect(await (await fetch(url)).text()).toContain("Static General game");
   });
 
   it.each(["stop", "disable", "release"])(

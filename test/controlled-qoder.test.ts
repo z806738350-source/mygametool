@@ -278,14 +278,19 @@ it.skipIf(process.platform !== "darwin" || process.arch !== "arm64")(
     const auth = vi
       .spyOn(discovery, "probeAuth")
       .mockRejectedValue(new Error("No authentication process may run"));
+    const cli = vi
+      .spyOn(discovery, "runCli")
+      .mockRejectedValue(new Error("No CLI process may run"));
     const spawn = vi.fn();
     setAgentProcessSpawner(spawn as never);
-    await expect(resolveControlledQoder(binary)).rejects.toThrow(
-      "has not passed",
-    );
+    await expect(resolveControlledQoder(binary)).rejects.toMatchObject({
+      code: "AGENT_RUNTIME_INCOMPATIBLE",
+      capability: "controlled Qoder tool isolation",
+    });
     expect(shell).not.toHaveBeenCalled();
     expect(version).not.toHaveBeenCalled();
     expect(auth).not.toHaveBeenCalled();
+    expect(cli).not.toHaveBeenCalled();
     expect(spawn).not.toHaveBeenCalled();
     await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
   },

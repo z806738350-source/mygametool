@@ -165,8 +165,9 @@ function localProvider(id: string, config: ProviderConfig, previous?: Provider, 
       // Only this reviewed adapter policy is copied; user-provided compat never enters the runtime.
       ...(id === KUNPO_PROVIDER_ID && (model.id === "claude-opus-5-5" || model.id === KUNPO_FABLE_MODEL_ID) && api === "anthropic-messages"
         ? { compat: { forceAdaptiveThinking: true, supportsTemperature: false, ...(model.id === KUNPO_FABLE_MODEL_ID ? { supportsLongCacheRetention: false } : {}) } } : {}),
-      // The SDK then emits strict:false for ordinary tools. Omitting it lets Responses normalize optional inputs to required.
-      ...(id === KUNPO_PROVIDER_ID && model.id === KUNPO_ASTRA_MODEL_ID && api === "openai-responses"
+      // Pi sends strict:false for ordinary tools on these gateways, preserving omitted optional arguments.
+      ...(id === KUNPO_PROVIDER_ID && ((model.id === KUNPO_ASTRA_MODEL_ID && api === "openai-responses")
+        || (model.id === "gpt-5.6-sol" && api === "openai-completions"))
         ? { compat: { supportsStrictMode: true } } : {}),
     } as RuntimeModel];
   });

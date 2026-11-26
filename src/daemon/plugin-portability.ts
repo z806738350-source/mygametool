@@ -67,6 +67,7 @@ export class PluginPortability {
   ) {}
 
   async export(id: string): Promise<Buffer> {
+    this.settings.assertAvailable();
     let plugin = await this.local.read(id);
     if (!plugin || pluginCollection(plugin) !== "personal")
       throw new LocalPluginError("Select an installed Personal plugin", 404);
@@ -218,6 +219,10 @@ export class PluginPortability {
   async restore(bytes: Buffer, expectedRevision?: string) {
     return this.#archive(bytes, async (root, backup) => {
       const preview = await this.#preview(root, backup);
+      if (backup) {
+        this.settings.assertAvailable();
+        this.capabilities.configuration.assertAvailable();
+      }
       const plugin = await this.local.installPortable(
         root,
         preview.marketplace,

@@ -4,6 +4,24 @@ import { expect, it, vi } from "vitest";
 import { createApp } from "../src/daemon/app.js";
 import { temporaryTestDirectory } from "./temporary-test-directory.js";
 
+it("opens local projects while unreadable legacy search credentials stay untouched", async () => {
+  const dataDirectory = await temporaryTestDirectory("ohmygame-search-unreadable-");
+  const file = path.join(dataDirectory, "web-search-settings.json");
+  const original = '{"version":1,"parallelApiKey":"legacy-test-key"';
+  await writeFile(file, original, { mode: 0o600 });
+  const app = createApp({ dataDirectory });
+  try {
+    expect((await app.inject({ method: "GET", url: "/projects" })).statusCode).toBe(200);
+    for (const [method, url] of [["GET", "/settings/web-search"], ["DELETE", "/settings/web-search/credentials"]] as const) {
+      const response = await app.inject({ method, url });
+      expect(response.statusCode, response.body).toBe(503);
+      expect(response.body).toContain("web-search-settings.json");
+      expect(response.body).not.toContain("legacy-test-key");
+    }
+    expect(await readFile(file, "utf8")).toBe(original);
+  } finally { await app.close(); }
+});
+
 it("rejects new web search configuration, reports the legacy key and clears it only on DELETE", async () => {
   const dataDirectory = await temporaryTestDirectory("ohmygame-search-api-");
   const file = path.join(dataDirectory, "web-search-settings.json");

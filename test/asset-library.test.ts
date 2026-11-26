@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { AssetLibrary, normalizeGenerationProvenance, publicGenerationParameters } from "../src/daemon/asset-library.js";
+import { createApp } from "../src/daemon/app.js";
 import { CheckedMediaSnapshotStore } from "../src/daemon/checked-media-snapshot.js";
 import { inspectVolumeMigrationHeadroom } from "../src/daemon/recovery-space.js";
 import { registerSensitiveValue } from "../src/shared/sensitive-values.js";
@@ -599,6 +600,72 @@ describe("AssetLibrary", () => {
     await writeFile(path.join(dataDirectory, "library", "assets.json"), JSON.stringify({ version: 1, assets: "invalid", sources: {} }));
 
     await expect(new AssetLibrary(dataDirectory).load()).rejects.toThrow("Invalid Library metadata");
+  });
+
+  it.each(["damaged", "missing"])("serves projects and conversations while a %s Library index protects retained assets and paid work", async kind => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-library-repair-"));
+    const generate = vi.fn().mockRejectedValue(new Error("Unexpected provider request"));
+    const options = { dataDirectory: directory, piAgentDirectory: path.join(directory, "agent"), imageGenerator: { generate } };
+    const ledger = path.join(directory, "library", "assets.json");
+    const library = new AssetLibrary(directory);
+    let app = createApp(options);
+    try {
+      const project = (await app.inject({ method: "POST", url: "/projects", payload: { name: "Library fixture", type: "general" } })).json();
+      const projectUrl = "/projects/" + project.id;
+      await app.close();
+      await library.load();
+      const bytes = Buffer.from("retained project asset");
+      const asset = await library.add("retained.mp4", bytes, { saved: false, sourceKey: "project:" + project.id + ":retained" });
+      const original = await readFile(ledger), media = (await library.content(asset.id)).absolutePath;
+      if (kind === "missing") await rm(ledger);
+      else await writeFile(ledger, '{"version":1,"unparsed":"private-fixture"');
+      const diskState = () => readFile(ledger, "utf8").catch((cause: NodeJS.ErrnoException) => { if (cause.code !== "ENOENT") throw cause; return undefined; });
+      const damaged = await diskState();
+      await expect(library.load()).rejects.toThrow();
+      expect(() => library.get(asset.id)).toThrow("Library is unavailable");
+      await expect(library.removeProjectCopies(project.id, async () => [])).rejects.toMatchObject({ statusCode: 503 });
+      await expect(library.add("duplicate.mp4", bytes)).rejects.toMatchObject({ statusCode: 503 });
+      const projects = new ProjectManager(directory, library);
+      await projects.load();
+      const target = path.join(project.workspacePath, "assets/generated/kept.png");
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, "original project bytes");
+      await expect(projects.addGeneratedAsset(project.id, "kept.png", bytes)).rejects.toMatchObject({ statusCode: 503 });
+      await expect(projects.addGeneratedWorkingImage(project.id, "kept.png", bytes)).rejects.toMatchObject({ statusCode: 503 });
+      expect(await readFile(target, "utf8")).toBe("original project bytes");
+      app = createApp(options);
+      const created = await app.inject({ method: "POST", url: projectUrl + "/conversations", payload: {} });
+      expect(created.statusCode, created.body).toBe(201);
+      const conversation = created.json();
+      for (const url of [projectUrl, projectUrl + "/conversations", projectUrl + "/conversations/" + conversation.id]) {
+        const response = await app.inject({ method: "GET", url });
+        expect(response.statusCode, response.body).toBe(200);
+      }
+      const blocked = [
+        await app.inject({ method: "GET", url: "/library/assets" }),
+        await app.inject({ method: "POST", url: "/library/assets/" + asset.id + "/save" }),
+        await app.inject({ method: "POST", url: "/tools/generate-image/jobs", payload: { prompt: "A garden" } }),
+        await app.inject({ method: "DELETE", url: projectUrl }),
+      ];
+      for (const response of blocked) {
+        expect(response.statusCode, response.body).toBe(503);
+        expect(response.body).not.toContain("private-fixture");
+      }
+      expect(generate).not.toHaveBeenCalled();
+      expect((await app.inject({ method: "GET", url: "/tool-jobs" })).json()).toEqual([]);
+      expect((await app.inject({ method: "GET", url: projectUrl + "/conversations/" + conversation.id })).statusCode).toBe(200);
+      expect(await diskState()).toEqual(damaged);
+      expect(await readFile(media)).toEqual(bytes);
+      await app.close();
+      await writeFile(ledger, original);
+      app = createApp(options);
+      expect((await app.inject({ method: "GET", url: "/library/assets" })).json()).toMatchObject([{ id: asset.id }]);
+      expect((await app.inject({ method: "POST", url: "/library/assets/" + asset.id + "/save" })).statusCode).toBe(200);
+    } finally {
+      await app.close();
+      await library.close();
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("migrates legacy sources without guessing from prompts or changing asset IDs", async () => {

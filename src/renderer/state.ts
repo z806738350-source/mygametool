@@ -174,6 +174,8 @@ export function reduceRuntimeEvent(state: RendererState, event: RuntimeEvent): R
       if (!conversation) return next;
       const item = { ...event.data.item, timestamp: eventTime(event) };
       const result = upsertTurnItem(next, conversation.id, item.turnId, item);
+      if (item.type === "retry" && item.source === "manual-local-image" && item.status === "inProgress")
+        return { ...result, agent: { status: "running" }, turns: updateTurn(result.turns, item.turnId, turn => ({ ...turn, status: "inProgress" })) };
       return item.type === "contextCompaction" ? { ...result, agent: { status: "running" } } : result;
     }
     case "item.reasoning.textDelta":
